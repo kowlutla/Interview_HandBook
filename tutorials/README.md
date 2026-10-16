@@ -1,6 +1,6 @@
 # Tutorials Index
 
-All 61 system design tutorial topics are stored flat in sequential order (001 to 061):
+All 55 system design tutorial topics are stored flat in sequential order (001 to 055):
 
 - `001.introduction-to-system-design.md`
 - `002.scalability-fundamentals.md`
@@ -49,17 +49,11 @@ All 61 system design tutorial topics are stored flat in sequential order (001 to
 - `045.system-design-interview-framework.md`
 - `046.cloud-computing-fundamentals.md`
 - `047.multi-tenancy-patterns.md`
-- `048.vpc-and-cloud-networking.md`
-- `049.infrastructure-as-code.md`
-- `050.browser-performance-and-rendering.md`
-- `051.client-side-storage-and-offline-first.md`
-- `052.state-sync-and-conflict-resolution.md`
-- `053.frontend-scalability-micro-frontends.md`
-- `054.fintech-ledger-patterns.md`
-- `055.real-time-collaboration-webrtc.md`
-- `056.high-throughput-gaming-patterns.md`
-- `057.back-of-the-envelope-estimation.md`
-- `058.bloom-filters-and-probabilistic-data-structures.md`
-- `059.lsm-trees-vs-b-trees.md`
-- `060.system-design-interview-framework.md`
-- `061.faang-evaluation-rubrics-and-anti-patterns.md`
+- `048.infrastructure-as-code.md`
+- `049.state-sync-and-conflict-resolution.md`
+- `050.real-time-collaboration-webrtc.md`
+- `051.back-of-the-envelope-estimation.md`
+- `052.bloom-filters-and-probabilistic-data-structures.md`
+- `053.lsm-trees-vs-b-trees.md`
+- `054.system-design-interview-framework.md`
+- `055.faang-evaluation-rubrics-and-anti-patterns.md`
