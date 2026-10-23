@@ -40,6 +40,75 @@ A controlled resilience experiment starts with a hypothesis, measurable steady s
 
 Post-incident reviews should identify contributing conditions and systemic controls, not stop at individual actions. Track detection time, mitigation time, customer impact, recovery correctness and follow-up effectiveness.
 
+
+## 14.1A Reliability is an end-to-end property
+
+A service can be locally reliable while the user journey is unreliable. If a synchronous request requires several independent dependencies, each dependency adds a possible failure point. For a simple series model with availability values A1 through An, end-to-end availability is approximately the product of those values. This approximation assumes independence and that every dependency is required.
+
+Fallbacks, caches, replicas and alternate paths can change the model, but only if they work under the same failure and load conditions. A fallback that calls the same failing dependency is not a real alternate path. A cache fallback may preserve reads but not writes, so the degraded contract must be explicit.
+
+## 14.1B Timeouts, retries, circuit breakers, and bulkheads
+
+A timeout bounds waiting. It should fit inside an end-to-end deadline and account for connection acquisition, remote processing, and cleanup. A timeout that is too short can reject healthy but slow work; one that is too long can retain resources and increase queueing.
+
+Retries are useful for transient failures only when the operation is safe to repeat. Use bounded attempts, exponential backoff, jitter, deadlines, and retry budgets. Retrying a non-idempotent write after an uncertain timeout can duplicate effects.
+
+A circuit breaker tracks failures or slow calls and temporarily prevents new calls to a dependency. Common states are closed, open and half-open, but thresholds and behavior vary by implementation. A breaker can prevent resource waste; it cannot repair the dependency or determine whether a timed-out write committed.
+
+Bulkheads isolate resource pools or workload classes so one failing dependency or tenant cannot consume every worker, connection, or queue slot. Isolation needs capacity planning: overly small pools can reject useful work, while shared downstream dependencies can still be overwhelmed.
+
+## 14.1C Graceful degradation and criticality
+
+Define which capabilities are essential and which can be reduced during an incident. A commerce system might preserve checkout and order status while temporarily disabling recommendations or expensive personalization. Degradation should be deliberate, visible where appropriate, and safe for business invariants.
+
+Prioritization requires bounded queues and resource reservations. If optional background work can consume all database connections, the critical path is not actually protected. Separate concurrency limits, priorities, quotas and dependency budgets can help.
+
+Fallback data must be safe for the operation. Serving a stale public product description may be acceptable; serving stale authorization or inventory data can create security or correctness failures. Each fallback needs a freshness and correctness contract.
+
+## 14.1D Redundancy, replication, backup, and restore
+
+These mechanisms protect against different failures:
+- Redundancy provides alternate capacity.
+- Replication maintains copies, often for availability or data-loss reduction.
+- Backups preserve recoverable historical state.
+- Point-in-time recovery reconstructs state to a chosen time using base backups and logs where supported.
+- Integrity checks detect corruption.
+- Restore exercises prove that the recovery procedure works.
+
+Replication can immediately propagate accidental deletion or corrupted writes. A backup can be useless if it shares the compromised credentials or failure domain. Protect backup credentials separately, test restoration regularly, and verify application-level invariants after recovery.
+
+## 14.1E Recovery objectives and runbooks
+
+RTO and RPO must be attached to a defined scenario and scope. “Recover within one hour” should specify whether that means the first health response, core writes restored, all regions restored, or the entire backlog drained. RPO should state which writes count as acknowledged and what data loss is acceptable.
+
+A recovery runbook should define:
+- Trigger and decision authority.
+- Preconditions and safety checks.
+- Steps to promote, restore or redirect.
+- How to prevent old writers from returning.
+- How to validate data freshness and integrity.
+- How to handle in-flight or uncertain operations.
+- Communication and escalation.
+- Rollback or failback criteria.
+- Evidence that recovery is complete.
+
+Runbooks should be exercised under realistic constraints. A procedure that depends on one unavailable administrator, expired credentials, or undocumented manual knowledge is a reliability risk.
+
+## 14.1F Incident response and learning
+
+During an incident, separate detection, diagnosis, mitigation, recovery and prevention. Mitigation reduces current harm; root-cause analysis explains contributing conditions; prevention changes the system so the same class of failure is less likely or less damaging.
+
+Useful measures include time to detect, time to mitigate, time to recover, affected users/operations, data integrity impact, and follow-up completion. Avoid treating mean time metrics as complete summaries: distributions and severe outliers matter.
+
+A blameless review does not mean no accountability. It means understanding why actions appeared reasonable given the information and controls available, then improving detection, guardrails, architecture and procedures.
+
+## 14.1G Chaos experiments and game days
+
+A safe experiment defines a hypothesis, expected steady state, target failure, scope, monitoring, abort conditions, and recovery plan. Begin in a controlled environment and expand blast radius only when evidence supports it. Test dependency latency, connection exhaustion, zone loss, process restart, stale credentials, backup restore, and failover where appropriate.
+
+A successful experiment is not simply “the service stayed up.” It should verify correctness, error budgets, recovery objectives, and whether alerts and runbooks led to the expected response. Experiments should not create uncontrolled risk for customers.
+
+
 ## Further reading
 - Google [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
 - Google [SRE Workbook: Error Budget Policy](https://sre.google/workbook/error-budget-policy/).
