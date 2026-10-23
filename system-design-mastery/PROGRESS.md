@@ -27,6 +27,9 @@ Check items only when the work has actually been performed.
 
 ## Textbook implementation
 - [x] Draft all 19 chapter files.
+- [x] Reorganize the textbook into 19 chapter folders, each with one coherent README.md chapter page.
+- [x] Avoid over-fragmentation: consolidate chapters into a single reading file per folder rather than many tiny lesson files.
+- [x] Add Mermaid diagrams where request flows, data paths, decision loops, or recovery sequences benefit from visualization.
 - [x] Create glossary.
 - [x] Create reference library.
 - [ ] Review each module for accuracy, clarity, depth and prerequisite coverage.
@@ -35,7 +38,7 @@ Check items only when the work has actually been performed.
 
 ## Validation
 - [x] Validate relative internal Markdown links in all created Markdown files against the expected file set; no broken internal targets found.
-- [ ] Validate Mermaid diagrams.
+- [ ] Validate Mermaid diagrams with a renderer; currently added diagrams have only been manually reviewed.
 - [x] Independently recalculate the chapter's traffic, bandwidth, storage, Little's Law and fan-out examples; results match within rounding.
 - [ ] Review assumptions, caveats and implementation-specific claims.
 - [ ] Audit for missing topics, duplication and out-of-scope content.
@@ -43,4 +46,4 @@ Check items only when the work has actually been performed.
 - [ ] Report limitations honestly; do not claim the textbook complete until all acceptance checks pass.
 
 ## Current status
-The independent curriculum and all 19 chapter drafts have been committed, with additional depth added to distributed-systems consistency and consensus. Internal Markdown targets were checked and quantitative examples independently recalculated. This is still a substantial first draft rather than a validated final textbook: Mermaid syntax has only had a manual review, not a dedicated renderer test, and a full claim-by-claim technical review remains open. The GitHub commit comparison confirms all 25 changed paths are inside system-design-mastery/; no paths outside the target appear in that comparison.
+The independent curriculum and all 19 chapter drafts have been reorganized into chapter folders with one full-length README.md per chapter. Mermaid diagrams have been added where they clarify flows or decisions. The current structure is intentionally not split into many tiny files. Revalidate internal links and chapter paths after the restructure; Mermaid rendering and a full claim-by-claim technical review remain open. Verify repository boundary again after this reorganization.
