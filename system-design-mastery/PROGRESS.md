@@ -11,7 +11,7 @@ Check items only when the work has actually been performed.
 - [x] Established strict write boundary: system-design-mastery/.
 - [x] Designed an independent curriculum around learning dependencies rather than existing numbering.
 - [ ] Inspect the complete repository tree and check for any pre-existing target files not covered by the initial checks.
-- [ ] Compare changed paths and verify all writes are confined to the target directory.
+- [x] Compare commits from the first textbook creation through the latest edit; all 25 changed paths are under system-design-mastery/.
 
 ## Planning artifacts
 - [x] Textbook landing page.
@@ -43,4 +43,4 @@ Check items only when the work has actually been performed.
 - [ ] Report limitations honestly; do not claim the textbook complete until all acceptance checks pass.
 
 ## Current status
-The independent curriculum and all 19 chapter drafts have been committed, with additional depth added to distributed-systems consistency and consensus. Internal Markdown targets were checked and quantitative examples independently recalculated. This is still a substantial first draft rather than a validated final textbook: Mermaid syntax has only had a manual review, not a dedicated renderer test, and a full claim-by-claim technical and repository-boundary audit remains open.
+The independent curriculum and all 19 chapter drafts have been committed, with additional depth added to distributed-systems consistency and consensus. Internal Markdown targets were checked and quantitative examples independently recalculated. This is still a substantial first draft rather than a validated final textbook: Mermaid syntax has only had a manual review, not a dedicated renderer test, and a full claim-by-claim technical review remains open. The GitHub commit comparison confirms all 25 changed paths are inside system-design-mastery/; no paths outside the target appear in that comparison.
