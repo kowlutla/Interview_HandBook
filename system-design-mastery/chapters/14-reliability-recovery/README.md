@@ -167,6 +167,37 @@ Practice failure scenarios such as zone loss, exhausted connection pools, corrup
 - What evidence proves the user-visible service and data are healthy again?
 
 
+
+## 14.3 Worked SLO and error-budget example
+
+Suppose an API has a monthly availability SLO of 99.9%, measured over eligible requests. The error-budget fraction is (1 - 0.999 = 0.001), or 0.1% of eligible requests. If the service receives 50 million eligible requests in the measurement window, the illustrative budget is 50,000 unsuccessful requests. This request-based calculation is appropriate only if the SLI definition counts eligible requests and treats failures consistently.
+
+If the service has a time-based SLO instead, the budget is based on the time window and allowed unavailability. Do not mix a request-based budget with a time-based availability calculation without stating the SLI.
+
+### Burn rate
+
+Burn rate compares the observed error rate with the error rate allowed by the SLO. For a 99.9% target, the allowed error fraction is 0.1%. If 1% of eligible requests fail over a chosen window, the observed error rate is ten times the budget rate: a burn rate of 10 for that window.
+
+A short window can detect a severe outage quickly but may be noisy at low traffic. A longer window reduces noise but may delay detection. Multi-window alerting uses windows and thresholds selected for the service's criticality, SLO period and response process. There is no single alert threshold that is correct for every service.
+
+### Budget policy should change engineering behavior
+
+An error budget is useful only when the team has agreed how to act on it. Possible policies include pausing risky releases during a fast burn, prioritizing reliability work when the budget is exhausted, or reducing rollout size until the service stabilizes. The policy should distinguish user-impacting failures from events excluded by the SLI definition and should not encourage hiding errors by changing the measurement.
+
+### SLO review checklist
+
+- Is the SLI based on real user outcomes and eligible traffic?
+- Are failures, timeouts, partial responses and dependency errors classified consistently?
+- Is the SLO window explicit?
+- Is the error budget calculated from the actual SLI and window?
+- Are burn-rate alerts tied to a response action?
+- Can low traffic or missing telemetry make the SLI look healthier than reality?
+- Are deployments and configuration changes correlated with SLO changes?
+- Does budget policy lead to specific engineering choices?
+- Are exclusions documented and resistant to gaming?
+- Is the SLO reviewed when user expectations or architecture changes?
+
+
 ## Further reading
 - Google [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
 - Google [SRE Workbook: Error Budget Policy](https://sre.google/workbook/error-budget-policy/).
