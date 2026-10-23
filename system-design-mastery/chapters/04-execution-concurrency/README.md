@@ -80,7 +80,6 @@ flowchart LR
   F --> G[Result or failure]
 ```
 
-
 ---
 
 [Back to textbook contents](../../README.md) · [Curriculum](../../CURRICULUM.md) · [Roadmap](../../ROADMAP.md)
