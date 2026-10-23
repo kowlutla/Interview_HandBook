@@ -138,6 +138,57 @@ Retries need backoff, jitter, deadlines, and retry budgets. Retrying at every la
 No execution model eliminates the need for bounded resource use, observability, and explicit failure handling.
 
 
+
+## 4.15 Runtime resource limits that become architecture limits
+
+A service consumes more than CPU and heap. It may be limited by memory, garbage-collection pauses, native memory, thread stacks, file descriptors, sockets, ephemeral ports, connection pools, disk I/O, kernel queues or downstream quotas. These limits interact: adding threads can increase memory and context switching; increasing connections can overload a database; increasing buffers can postpone overload while increasing tail latency.
+
+### Thread-per-request versus event-loop models
+
+A thread-per-request model is often straightforward for blocking code, but each active request consumes thread and stack resources. If requests spend most of their time waiting on I/O, a large number of blocked threads can reduce efficiency. Event-loop or asynchronous models can manage many waiting operations with fewer threads, but blocking one event-loop thread can delay unrelated requests. Async code does not eliminate CPU limits, memory limits, backpressure or the need to bound in-flight work.
+
+Choose an execution model based on the libraries, workload, concurrency, latency target and team ability to diagnose it. A nonblocking API wrapped around a blocking database driver may simply move the queue to a different place.
+
+### Pool sizing is a queueing and bottleneck decision
+
+A worker pool, HTTP connection pool and database connection pool are queues and concurrency limits at different layers. If every layer allows large queues, requests can wait multiple times and exceed their deadline before the final operation begins. If every layer is unbounded, overload can consume memory and starve healthy work.
+
+A practical pool-size process is:
+1. Identify the resource the pool protects.
+2. Measure service time and sustainable concurrency for that resource.
+3. Set a bounded maximum active count and bounded wait queue.
+4. Define acquisition timeout and rejection behavior.
+5. Observe active, idle, queued, timed-out and rejected work.
+6. Test under saturation and downstream slowdown.
+
+Do not copy a generic pool-size formula without measuring the workload. For a database, more simultaneous connections can reduce throughput when lock contention and I/O become the bottleneck.
+
+### Garbage collection and memory pressure
+
+Managed runtimes allocate objects and reclaim unreachable memory, but collection consumes CPU and can create pauses or concurrent overhead. Allocation rate, live-set size, object lifetime, heap configuration, native allocations and container memory limits all affect behavior. A process can be terminated for exceeding a container limit even when the managed heap itself appears below its configured maximum because native memory, stacks, direct buffers and runtime overhead also consume memory.
+
+Measure allocation rate, live-set/heap occupancy, pause duration, GC CPU, promotion and out-of-memory events. Increasing heap size may reduce collection frequency but increase pause or container pressure; reducing allocations or limiting in-flight payloads may be more effective.
+
+### File descriptors, sockets and ephemeral ports
+
+Open files, sockets and pipes consume file descriptors subject to process and operating-system limits. Leaked connections, excessive logging files, unbounded outbound sockets or too many concurrent connections can exhaust descriptors. Outbound connections also interact with ephemeral-port ranges, NAT mappings, connection reuse and TIME_WAIT behavior.
+
+Connection pooling and keep-alive reduce setup cost but require lifecycle management, idle timeout alignment and stale-connection handling. Monitor connection churn, pool wait, socket errors and descriptor usage instead of diagnosing every connection failure as a network problem.
+
+### Execution-model checklist
+
+- Is the workload CPU-bound, I/O-bound or mixed?
+- Which operations block threads or event-loop workers?
+- Are active work and waiting queues bounded?
+- Do pool sizes multiply across service replicas?
+- What are heap, native memory, stack and container limits?
+- Are GC pauses or allocation rates contributing to tail latency?
+- Can file descriptors, sockets or ephemeral ports be exhausted?
+- Are connection reuse and idle timeouts aligned across proxies and clients?
+- What is rejected or shed when a resource limit is reached?
+- Can telemetry identify the actual saturated resource?
+
+
 ## Further reading
 - [Linux man-pages: pthreads](https://man7.org/linux/man-pages/man7/pthreads.7.html).
 - [Java concurrency package documentation](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html).
