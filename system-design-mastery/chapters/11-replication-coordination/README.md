@@ -5,11 +5,60 @@ A leader coordinates writes or a replicated state machine. Election chooses a ca
 
 Consensus algorithms such as Raft and Paxos coordinate agreement despite specified failures. Guarantees depend on assumptions including non-Byzantine participants, durable state, quorum membership and correct implementation. Raft separates leader election, log replication and safety; it is not simply the node with the most votes. See [Raft resources](https://raft.github.io/).
 
+
+## 11.1A Replicated state machine model
+
+A common use of consensus is to replicate an ordered log of commands. If replicas apply the same deterministic commands in the same committed order from the same initial state, their state machines can converge to the same state. Consensus chooses which log entries are committed; application logic still must be deterministic and side effects must be handled carefully.
+
+A command may be appended to a leader's local log before it is committed. A client acknowledgment should reflect the protocol's commit rule, not merely local receipt. If a leader fails, a new leader must be elected according to rules that preserve committed entries. Acknowledging before the required replication point can lose data after failover.
+
+## 11.1B Raft at a conceptual level
+
+Raft divides the problem into leader election, log replication and safety:
+
+1. Each server is a follower unless it times out waiting for a valid leader heartbeat.
+2. A follower can become a candidate, increment its term and request votes.
+3. A candidate wins only under the election rules, normally requiring a majority.
+4. The leader receives client commands and appends log entries.
+5. It replicates entries to followers; commitment follows the protocol's rules for terms and replication.
+6. Followers apply committed entries in order.
+7. A new term and leader change must preserve the committed log prefix.
+
+A term acts as an epoch that helps distinguish stale leadership. Majority intersection is central to safety, but not the whole proof: voting restrictions, log freshness, commit rules and membership transitions are also necessary. The original Raft paper explains the complete algorithm and assumptions: [Ongaro and Ousterhout](https://web.stanford.edu/~ouster/cgi-bin/papers/raft-atc14.pdf).
+
+## 11.1C Paxos and consensus guarantees
+
+Paxos describes agreement through proposers, acceptors and learners, with phases that establish a proposal number and then attempt acceptance. Its safety depends on quorum intersection and rules requiring later proposers to preserve previously accepted values. Multi-Paxos amortizes leadership/phase work for a sequence of decisions.
+
+Raft and Paxos are different presentations and protocol families, not interchangeable implementation details. Both require careful persistence and membership handling. Consensus can make a replicated log agree on order; it does not automatically make external side effects transactional or make an application-level workflow correct.
+
+### Replicated state machine at a glance
+
+```mermaid
+flowchart TD
+  A[Client command] --> B[Leader proposes log entry]
+  B --> C[Replicate to quorum]
+  C --> D{Commit rule satisfied?}
+  D -- No --> E[Wait or recover]
+  D -- Yes --> F[Mark committed]
+  F --> G[Apply in order]
+  G --> H[Return result under protocol contract]
+```
+
+Consensus algorithms differ in their exact rules, but the critical distinction is between receiving a command, replicating a log entry, committing it, applying it, and acknowledging the client. These are not interchangeable events.
+
 ## Leases and fencing tokens
 A lease grants ownership for a bounded interval under a clock or coordination model. A paused process can outlive its lease from its own perspective. Fencing tokens address stale ownership by attaching an ordered token to operations; the protected resource rejects tokens older than the latest accepted token. The resource must enforce fencing—having a lock service issue tokens is insufficient if the database accepts stale writes.
 
 ## Distributed locks
 A distributed lock is useful only when ownership and expiry semantics match the protected operation. A lock alone may not prevent stale writes during partitions, pauses or lease expiry. Prefer idempotent operations and resource-enforced version checks where possible.
+
+
+## 11.2A Lock ownership versus resource correctness
+
+Consider worker A acquires a lease and pauses. Its lease expires; worker B acquires a new lease and writes a newer value. A resumes and writes its stale value. Even if the lock service correctly transferred ownership, the resource can be corrupted unless it rejects A's stale operation. A fencing token makes the ordering visible to the resource: A has token 41, B token 42, and writes with a token older than the latest accepted token are rejected.
+
+If the resource cannot enforce a fencing or version condition, the lock may be suitable only for efficiency (avoiding duplicate work), not for protecting a correctness-critical invariant.
 
 ## Two-phase commit
 Two-phase commit coordinates a transaction across participants:
@@ -22,6 +71,19 @@ Two-phase commit coordinates a transaction across participants:
 A saga decomposes a business workflow into local transactions with compensating actions. Compensation is not always a perfect inverse: a shipped parcel cannot literally be unshipped, and a refund is a new business event rather than erasure of a charge. Sagas trade one global atomic commit for explicit workflow state, retries, idempotency and compensation.
 
 Orchestration centralizes workflow decisions; choreography distributes reactions through events. Both need explicit timeouts, duplicate handling, terminal states and observability.
+
+
+### Choosing between 2PC and a saga
+
+| Concern | Two-phase commit | Saga |
+|---|---|---|
+| Atomicity model | One coordinated transaction across participants | Sequence of local commits with compensations |
+| Failure behavior | Participants may block awaiting coordinator recovery | Workflow remains partially progressed until retry/compensation |
+| Visibility | Usually presents one atomic outcome when protocol completes | Intermediate states can be visible |
+| Compensation | Not the main model | Explicit business compensation required |
+| Fit | Participants support a common transaction protocol and atomicity is required | Long-running business process across independently owned services |
+
+A saga does not provide the same isolation as a global transaction. Concurrent workflows can observe intermediate state, so reservation, inventory and payment flows need domain-level state transitions and concurrency controls.
 
 ## Idempotency and deduplication
 At-least-once delivery can produce duplicates. Deduplication stores a message ID or business idempotency key with the effect. To close crash windows, the deduplication record and business state change should be atomic in one transactional boundary or coordinated by an equivalent protocol.
@@ -97,39 +159,11 @@ Before introducing a distributed lock, ask:
 
 A lock adds a coordination dependency and can become a bottleneck. Prefer the simplest mechanism that preserves the invariant.
 
-
-
-## 11.6 Consensus, leadership and distributed transaction boundaries
-
-### Consensus is agreement on an ordered history
-
-Consensus protocols help a set of participants agree on decisions despite specified failures. Replicated state machine designs commonly use consensus to agree on a command order, then apply that order to replicas. Consensus does not automatically make arbitrary external side effects exactly once: a command handler that sends an email or charges a payment must still handle retries and the boundary between committed log state and external action.
-
-Leader election alone is not consensus over application state. A system needs protocol rules for terms/epochs, votes, log or state replication, commit decisions, membership changes and recovery. The safety property is that conflicting histories are not both committed; liveness depends on timing and a sufficiently available quorum under the protocol's assumptions.
-
-### Leases, epochs and fencing
-
-A lease grants ownership for a time interval under specific clock and coordination assumptions. A client may pause or lose connectivity and continue acting after its lease has expired. Therefore, a lease alone does not necessarily stop a stale owner from modifying an external resource.
-
-A fencing token is a monotonically increasing generation/epoch attached to operations. The resource being protected must reject tokens older than the latest accepted token. If the resource does not validate the token, the fencing mechanism cannot protect it. This is why “we have a distributed lock” is not enough to establish correctness.
-
-### Two-phase commit versus Saga
-
-Two-phase commit (2PC) coordinates participants through a prepare phase and a commit/abort decision. It can provide atomic transaction semantics across participating transactional resources, but participants may hold prepared state while waiting for the coordinator or recovery decision. Coordinator durability, participant recovery, timeouts and operational diagnosis matter.
-
-A Saga decomposes a long workflow into local transactions with compensating actions or forward recovery. It avoids one global database transaction but does not make the workflow instantaneously atomic: intermediate states are visible, compensations can fail, and some actions are not truly reversible. Use an explicit state machine, idempotent steps, deadlines, retry policy, manual intervention paths and audit history.
-
-Choose 2PC when participating resources support the required protocol and atomicity is worth the coupling/availability cost. Choose a Saga when the business process can tolerate intermediate states and has well-defined compensation or forward-recovery semantics. Neither pattern is universally superior.
-
-### Distributed locks are coordination tools, not the final invariant
-
-A lock may prevent cooperating workers from intentionally doing the same work, but correctness can still fail if a client pauses, a lease expires, the lock service partitions, or the protected resource accepts stale operations. Use lock ownership tokens and resource-side fencing when stale writers are dangerous. Prefer database uniqueness constraints or atomic conditional updates when they can enforce the invariant more simply.
-
-### Membership changes and quorum reasoning
+## 11.5H Membership changes and quorum reasoning
 
 A quorum intersection argument depends on the configured membership and protocol. Changing replica membership while writes are in flight can create configurations whose quorums do not intersect safely unless reconfiguration is part of the protocol. Do not treat “majority of current nodes” as a universal algorithm. Joint consensus or equivalent protocol rules are needed for safe transitions in systems that use them.
 
-### Coordination review checklist
+## 11.5I Coordination review checklist
 
 - What exact state or decision must participants agree on?
 - What failures and timing assumptions does the protocol tolerate?
@@ -143,64 +177,6 @@ A quorum intersection argument depends on the configured membership and protocol
 - How is recovery tested under pauses, partitions, duplicate messages and restarts?
 
 
-## 11.1A Replicated state machine model
-
-A common use of consensus is to replicate an ordered log of commands. If replicas apply the same deterministic commands in the same committed order from the same initial state, their state machines can converge to the same state. Consensus chooses which log entries are committed; application logic still must be deterministic and side effects must be handled carefully.
-
-A command may be appended to a leader's local log before it is committed. A client acknowledgment should reflect the protocol's commit rule, not merely local receipt. If a leader fails, a new leader must be elected according to rules that preserve committed entries. Acknowledging before the required replication point can lose data after failover.
-
-## 11.1B Raft at a conceptual level
-
-Raft divides the problem into leader election, log replication and safety:
-
-1. Each server is a follower unless it times out waiting for a valid leader heartbeat.
-2. A follower can become a candidate, increment its term and request votes.
-3. A candidate wins only under the election rules, normally requiring a majority.
-4. The leader receives client commands and appends log entries.
-5. It replicates entries to followers; commitment follows the protocol's rules for terms and replication.
-6. Followers apply committed entries in order.
-7. A new term and leader change must preserve the committed log prefix.
-
-A term acts as an epoch that helps distinguish stale leadership. Majority intersection is central to safety, but not the whole proof: voting restrictions, log freshness, commit rules and membership transitions are also necessary. The original Raft paper explains the complete algorithm and assumptions: [Ongaro and Ousterhout](https://web.stanford.edu/~ouster/cgi-bin/papers/raft-atc14.pdf).
-
-## 11.1C Paxos and consensus guarantees
-
-Paxos describes agreement through proposers, acceptors and learners, with phases that establish a proposal number and then attempt acceptance. Its safety depends on quorum intersection and rules requiring later proposers to preserve previously accepted values. Multi-Paxos amortizes leadership/phase work for a sequence of decisions.
-
-Raft and Paxos are different presentations and protocol families, not interchangeable implementation details. Both require careful persistence and membership handling. Consensus can make a replicated log agree on order; it does not automatically make external side effects transactional or make an application-level workflow correct.
-
-## 11.2A Lock ownership versus resource correctness
-
-Consider worker A acquires a lease and pauses. Its lease expires; worker B acquires a new lease and writes a newer value. A resumes and writes its stale value. Even if the lock service correctly transferred ownership, the resource can be corrupted unless it rejects A's stale operation. A fencing token makes the ordering visible to the resource: A has token 41, B token 42, and writes with a token older than the latest accepted token are rejected.
-
-If the resource cannot enforce a fencing or version condition, the lock may be suitable only for efficiency (avoiding duplicate work), not for protecting a correctness-critical invariant.
-
-## 11.4A Choosing between 2PC and a saga
-
-| Concern | Two-phase commit | Saga |
-|---|---|---|
-| Atomicity model | One coordinated transaction across participants | Sequence of local commits with compensations |
-| Failure behavior | Participants may block awaiting coordinator recovery | Workflow remains partially progressed until retry/compensation |
-| Visibility | Usually presents one atomic outcome when protocol completes | Intermediate states can be visible |
-| Compensation | Not the main model | Explicit business compensation required |
-| Fit | Participants support a common transaction protocol and atomicity is required | Long-running business process across independently owned services |
-
-A saga does not provide the same isolation as a global transaction. Concurrent workflows can observe intermediate state, so reservation, inventory and payment flows need domain-level state transitions and concurrency controls.
-
-## Replicated state machine at a glance
-
-```mermaid
-flowchart TD
-  A[Client command] --> B[Leader proposes log entry]
-  B --> C[Replicate to quorum]
-  C --> D{Commit rule satisfied?}
-  D -- No --> E[Wait or recover]
-  D -- Yes --> F[Mark committed]
-  F --> G[Apply in order]
-  G --> H[Return result under protocol contract]
-```
-
-Consensus algorithms differ in their exact rules, but the critical distinction is between receiving a command, replicating a log entry, committing it, applying it, and acknowledging the client. These are not interchangeable events.
 
 ## Further reading
 - [Raft paper and resources](https://raft.github.io/).
