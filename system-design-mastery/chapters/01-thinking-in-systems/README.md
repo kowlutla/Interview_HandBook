@@ -178,6 +178,19 @@ An architecture decision record (ADR) should briefly capture:
 
 An ADR protects against hindsight bias and makes trade-offs visible. It is not a substitute for design detail, code, runbooks, or experiments. Record decisions at the level where they affect future choices; do not create paperwork for every trivial implementation detail.
 
+```mermaid
+flowchart TD
+  A[Understand user outcome] --> B[Define boundary and assumptions]
+  B --> C[Measure workload and quality goals]
+  C --> D[Identify invariants and constraints]
+  D --> E[Compare candidate designs]
+  E --> F[Trace failure modes and operating cost]
+  F --> G[Choose and record decision]
+  G --> H[Validate with evidence]
+  H -->|Assumptions invalid| B
+  H -->|Evidence supports design| I[Keep under review]
+```
+
 ## 1.10 A practical architecture reasoning loop
 
 Architecture is not a one-time diagram. Requirements and constraints shape candidate designs; the design is validated against realistic workloads and failure modes; production evidence then informs the next decision.
