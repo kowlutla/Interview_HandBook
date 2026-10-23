@@ -101,6 +101,7 @@ A lock adds a coordination dependency and can become a bottleneck. Prefer the si
 ## Further reading
 - [Raft paper and resources](https://raft.github.io/).
 - Fischer, Lynch and Paterson, [consensus impossibility result](https://doi.org/10.1145/3149.214121).
+- [Raft paper (USENIX)](https://web.stanford.edu/~ouster/cgi-bin/papers/raft-atc14.pdf).
 
 
 ## 11.1A Replicated state machine model
@@ -146,11 +147,6 @@ If the resource cannot enforce a fencing or version condition, the lock may be s
 | Fit | Participants support a common transaction protocol and atomicity is required | Long-running business process across independently owned services |
 
 A saga does not provide the same isolation as a global transaction. Concurrent workflows can observe intermediate state, so reservation, inventory and payment flows need domain-level state transitions and concurrency controls.
-
-## Further reading
-- [Raft paper (USENIX)](https://web.stanford.edu/~ouster/cgi-bin/papers/raft-atc14.pdf).
-- Fischer, Lynch and Paterson, [consensus impossibility result](https://doi.org/10.1145/3149.214121).
-
 
 ## Replicated state machine at a glance
 
