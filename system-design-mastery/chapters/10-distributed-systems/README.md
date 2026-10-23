@@ -54,6 +54,80 @@ sequenceDiagram
 
 Uncertainty must be handled in the API and state model, not merely by increasing timeout values.
 
+
+## 10.7A Failure models: crash, omission, partition, and Byzantine behavior
+
+A distributed protocol should state which failures it tolerates. A **crash-stop** process halts and does not return. A **crash-recovery** process may restart with durable state. An **omission** failure drops a message or action. A **network partition** prevents some participants from communicating while other parts may continue. A **Byzantine** participant may send arbitrary or contradictory messages; most ordinary service architectures do not provide Byzantine fault tolerance and should not imply they do.
+
+The chosen model affects what guarantees are possible. A consensus protocol designed for crash failures does not automatically tolerate malicious nodes. Durable local state, message authentication, membership, quorum rules, and recovery behavior are part of the model.
+
+## 10.7B Failure detectors and suspicion
+
+A timeout-based failure detector produces suspicion, not certainty. Short timeouts detect failures quickly but can falsely suspect slow or paused nodes; long timeouts reduce false suspicion but delay failover. Adaptive detectors can use observed latency, but still need safe protocol behavior when a suspicion is wrong.
+
+Heartbeats are useful signals but are not proof that the full request path is healthy. A process can send heartbeats while its database connection pool is exhausted. Separate process liveness, readiness to serve, and end-to-end synthetic checks according to the decision each signal drives.
+
+## 10.7C Happens-before and causal reasoning
+
+The happens-before relation captures causal order. It includes program order within one process and message send-before-receive relationships, then takes the transitive closure. If neither event happens before the other, they are concurrent in this model—even if their wall-clock timestamps differ.
+
+Lamport clocks preserve causal order but may order concurrent events arbitrarily. Vector clocks can represent more causal information but can grow with participants and are not a universal fit for large dynamic systems. Physical clocks with uncertainty bounds can support specialized ordering systems, but only when their synchronization assumptions and error bounds are part of the design.
+
+## 10.7D Consistency versus isolation
+
+Consistency in distributed systems describes what values and operation order clients can observe across replicas. Database isolation describes how concurrent transactions interact relative to one another. The terms are related but not interchangeable.
+
+A linearizable key-value store can still be used incorrectly by an application that performs a read, makes a decision, and then issues an unrelated write without an atomic condition. Conversely, a transaction may have strong local isolation while reads from a lagging replica violate a client's read-your-writes expectation. State the operation boundary and invariant explicitly.
+
+## 10.7E Linearizability, sequential consistency, and serializability
+
+Linearizability requires each operation to appear at one point between invocation and response, respecting real-time order. Sequential consistency requires a single total order consistent with each process's program order but need not respect real-time order between processes. Serializability requires a concurrent database transaction execution to be equivalent to some serial execution; it does not by itself require that serial order to respect real-time order.
+
+Strict serializability combines serializability with real-time order. These properties answer different questions: operation-level histories, process ordering, and transaction schedules. A system's guarantee must be named at the right level rather than summarized as strong.
+
+## 10.7F Read and session guarantees
+
+Applications may need narrower guarantees than global linearizability:
+- **Read-your-writes:** after a client successfully updates a value, its later reads see that update or a newer one.
+- **Monotonic reads:** once a client observes a version, it does not later observe an older version.
+- **Monotonic writes:** a client's writes are applied in the order the client issued them.
+- **Writes-follow-reads:** a write that depends on a previously read value respects the required causal order.
+
+These guarantees can be implemented with session routing, version tokens, causal metadata, or waiting for replicas to catch up. They must specify scope and behavior when the necessary replica or metadata is unavailable.
+
+## 10.7G Quorums and their hidden assumptions
+
+The familiar condition R + W > N gives read/write quorum intersection for a fixed set of N replicas under a simple counting model. It is not a complete consistency proof. The protocol also needs to determine which version is returned, how concurrent writes are ordered or merged, how replicas persist values, and how membership changes preserve safety.
+
+For example, a read quorum may intersect a write quorum at a replica that has not yet durably applied the newest version under the actual protocol. A stale leader may accept writes unless epochs and fencing prevent it. A configuration change can invalidate old quorum assumptions. Always reason from the full protocol and acknowledgment contract.
+
+## 10.7H CAP, PACELC, and per-operation policy
+
+During a partition, a service can reject or delay operations that require a single coherent history, or accept operations on separated sides and reconcile later. The latter behavior cannot guarantee linearizability for all those operations during the partition. Availability in the theorem is a formal response guarantee, not a promise of business usefulness.
+
+PACELC emphasizes the normal-operation trade-off between latency and consistency when no partition is occurring. Different endpoints may choose different policies: cached catalog reads can tolerate bounded staleness, while inventory reservation or financial transfers may require coordination. A product is not necessarily one uniform CAP category.
+
+## 10.7I Conflict resolution and CRDT limits
+
+Concurrent updates can be handled through serialization, application-specific conflict resolution, last-writer-wins, version metadata, or CRDTs. Each has a distinct contract. Last-writer-wins is deterministic only when its ordering and tie-breaking rules are defined; it may discard a legitimate domain update.
+
+CRDT convergence relies on the data type's algebra and delivery assumptions. Convergence does not guarantee that a business invariant holds at every point. If two regions independently allocate the last available seat, merging counters later cannot undo the oversell. The system must reserve capacity, coordinate the invariant, or define an acceptable conflict/compensation policy.
+
+## 10.7J Distributed design reasoning checklist
+
+- Which failure model is assumed?
+- What does the caller know after a timeout?
+- What safety property must never be violated?
+- What liveness behavior is required during partitions?
+- What consistency or session guarantee does each operation need?
+- Where are acknowledged writes durable?
+- How are leadership epochs and stale writers handled?
+- Do quorum assumptions still hold during reconfiguration?
+- What happens when operations are concurrent?
+- Does conflict resolution preserve business invariants?
+- How is the behavior tested under delay, loss, restart, and partition?
+
+
 ## Further reading
 - Gilbert and Lynch, [CAP paper](https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf).
 - Lamport, [Time, Clocks, and the Ordering of Events](https://lamport.azurewebsites.net/pubs/time-clocks.pdf).
