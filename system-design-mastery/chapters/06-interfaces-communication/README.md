@@ -230,6 +230,8 @@ flowchart TD
 
 
 ## Further reading
+- AWS API Gateway, [HTTP API throttling](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-throttling.html) as an implementation-specific token-bucket example.
+- OWASP, [API Security Top 10](https://owasp.org/API-Security/editions/2023/en/0x00-header/) for common API threat categories.
 - IETF [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html).
 - [gRPC concepts](https://grpc.io/docs/what-is-grpc/core-concepts/).
 - [GraphQL specification](https://spec.graphql.org/).
