@@ -13,7 +13,6 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 ## Network and identity standards
 - IETF, [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html).
 - IETF, [RFC 9293 — TCP](https://www.rfc-editor.org/rfc/rfc9293.html).
-- IETF, [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
 - IETF, [RFC 9000 — QUIC](https://www.rfc-editor.org/rfc/rfc9000.html).
 - IETF, [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html).
 - IETF, [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html).
@@ -51,20 +50,16 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 
 ## Architecture styles, traffic management and security
 - Microsoft Azure Architecture Center, [Architecture styles](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles) and [Microservices architecture style](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/microservices).
-- Microsoft Azure Architecture Center, [Cloud Design Patterns](https://learn.microsoft.com/en-us/azure/architecture/patterns/).
 - AWS, [Elastic Load Balancing documentation](https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/what-is-load-balancing.html).
 - AWS API Gateway, [HTTP API throttling](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-throttling.html). Treat documented throttles as implementation behavior, not universal API gateway semantics.
 - Cloudflare, [Origin Cache Control](https://developers.cloudflare.com/cache/concepts/cache-control/) and [CDN-Cache-Control](https://developers.cloudflare.com/cache/concepts/cdn-cache-control/). These describe Cloudflare-specific behavior; use RFC 9111 for general HTTP caching semantics.
 - OWASP, [API Security Top 10](https://owasp.org/API-Security/editions/2023/en/0x00-header/).
-- AWS, [Well-Architected Framework pillars](https://docs.aws.amazon.com/wellarchitected/2024-06-27/framework/the-pillars-of-the-framework.html).
 
 
 ## Protocol standards and secure integrations
 - IETF, [RFC 8200 — IPv6 Specification](https://www.rfc-editor.org/rfc/rfc8200.html).
 - IETF, [RFC 4033 — DNS Security Introduction and Requirements](https://www.rfc-editor.org/rfc/rfc4033.html).
 - IETF, [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
-- IETF, [RFC 9000 — QUIC Transport](https://www.rfc-editor.org/rfc/rfc9000.html).
-- IETF, [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html) and [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html).
 - OWASP, [Webhook Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Webhook_Security_Cheat_Sheet.html).
 - CISA and international partners, [Software Bill of Materials (SBOM) guidance](https://www.cisa.gov/sbom).
 
