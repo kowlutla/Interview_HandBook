@@ -124,6 +124,61 @@ For browser-based and native public clients, Authorization Code with PKCE is the
 Scopes are not a complete authorization decision. The resource server may still need object-level, tenant-level and relationship checks. Token validation also needs key rotation, trusted issuer metadata, algorithm allow-lists, clock-skew policy, and failure behavior when keys cannot be refreshed. Do not log raw tokens.
 
 
+
+## 16.2 Threat modeling a system architecture
+
+Threat modeling is a structured way to ask what can go wrong, which assets and trust boundaries matter, and which controls reduce risk. It should begin while architecture is being shaped, not after deployment. A threat model is an explicit set of assumptions and decisions that can be updated when a new component, data flow or trust relationship is introduced.
+
+### Identify assets, actors and trust boundaries
+
+List assets such as credentials, personal data, payment instructions, tenant records, signing keys, service availability and audit evidence. Identify actors: end users, administrators, service identities, third-party providers, compromised clients and automated workers. Draw data flows and mark boundaries where data crosses a browser, edge, service, queue, database, cloud account or external organization.
+
+A trust boundary is not necessarily a network boundary. Two services inside the same cluster may have different permissions and data ownership; two components in one process may have different levels of trust. Every boundary should answer who can call, what identity is asserted, which data may cross, and how the receiver validates it.
+
+### Abuse cases and control mapping
+
+Ask how an attacker or faulty caller could read another tenant's object, escalate privileges, replay a command, exhaust expensive resources, trick the service into calling an internal endpoint, poison a cache, misuse a webhook, or alter a deployment artifact. Map each threat to preventive controls, detection signals, and recovery steps.
+
+For example, SSRF defenses should constrain destinations and redirect behavior, validate resolved addresses where appropriate, and protect metadata endpoints; a URL syntax check alone is not enough. API resource-abuse defenses may need payload caps, pagination, query complexity limits, concurrency quotas and per-tenant budgets—not only request-per-second limits.
+
+### Authentication, authorization and identity propagation
+
+Authentication establishes which principal is making a request; authorization decides whether that principal may perform the action on the specific resource under current policy. Role-based access control (RBAC) assigns permissions through roles; attribute-based access control (ABAC) evaluates attributes such as subject, resource, action and context. Relationship-based models can express access derived from ownership or sharing relationships.
+
+Do not assume that a valid JWT means the caller is authorized. Validate issuer, audience, expiry, token purpose and cryptographic profile; then perform the resource-level policy check. When identity crosses service boundaries, define whether the caller's identity is delegated, exchanged for a service token, or represented as a trusted assertion. Never trust client-supplied identity headers without a protected, verified propagation path.
+
+### Zero trust, least privilege and service identity
+
+Zero trust means do not grant implicit trust solely because a request originates on an internal network. Authenticate and authorize principals, minimize permissions, and evaluate access according to the resource and context. This does not mean every request must call a central policy server synchronously; policy caching and local enforcement can be designed with explicit freshness and revocation trade-offs.
+
+Service identity and mutual TLS can authenticate workloads and protect traffic between services, but transport identity does not replace application authorization. Rotate credentials, define trust roots, limit certificate scope and lifetime, and plan for identity-provider or certificate-authority outages.
+
+### Secrets, encryption and key lifecycle
+
+Encryption in transit and at rest protects different exposure paths. Key management must define generation, storage, access, rotation, backup, revocation and destruction. Rotation needs overlap where old and new keys coexist, and services must reload credentials without causing a fleet-wide reconnect storm.
+
+Secrets should not be embedded in container images, source repositories, build logs, crash dumps or ordinary application telemetry. Access should be auditable and narrowly scoped. If a secret is exposed, revoking it is not enough if the same credential was copied into multiple systems; identify all uses and rotate the full dependency chain.
+
+### Multi-tenant isolation and privacy lifecycle
+
+Tenant isolation should be enforced at every layer: API authorization, cache keys, database queries, object-storage paths, search filters, background jobs, analytics exports and operational tools. A tenant ID supplied by the client is an input, not proof of authority. Use explicit tenant context derived from an authenticated identity and propagate it safely.
+
+Privacy requires data minimization, purpose limitation, retention, deletion, export, access logging and control over derived copies. Deleting a source row may not delete caches, search indexes, analytics tables, backups or event logs immediately. Define what deletion means for each storage class, the allowed delay, and any legal retention exception.
+
+### Security design checklist
+
+- What assets are most sensitive and what are the abuse cases?
+- Where are the trust boundaries, including internal service boundaries?
+- Is every resource access authorized at the resource owner?
+- Can a tenant identifier, object ID or forwarded header be spoofed?
+- Are API cost, payload size and concurrency bounded?
+- How are secrets and signing keys rotated and revoked?
+- What happens when identity or key-distribution dependencies fail?
+- Can sensitive data leak through logs, caches, search, backups or analytics?
+- How are security events correlated and investigated?
+- Is there a tested response for credential compromise or tenant-isolation failure?
+
+
 ## Further reading
 - IETF [RFC 9700 — OAuth 2.0 Security BCP](https://www.rfc-editor.org/rfc/rfc9700.html).
 - OpenID Foundation [specifications](https://openid.net/developers/specs/).
