@@ -344,6 +344,61 @@ A NAT gateway is not an application proxy: it typically does not understand user
 - Has reachability been tested from a compromised workload's perspective?
 
 
+
+## 5.22 Protocol details and operational edge cases
+
+### IPv4 and IPv6 coexistence
+
+IPv4 uses 32-bit addresses; IPv6 uses 128-bit addresses and has different address representation, neighbor discovery and routing behavior. IPv6 is not simply IPv4 with longer addresses: assumptions about broadcast, address configuration, firewall defaults, ICMP behavior, DNS records and network tooling may differ. Dual-stack services can succeed over one family and fail over the other, making client fallback and observability important.
+
+DNS commonly publishes A records for IPv4 and AAAA records for IPv6. A client may choose either path based on its resolver and connection strategy. If IPv6 is advertised but routing or firewall policy is broken, users may see intermittent or delayed connection failures. Test both address families from realistic client networks rather than assuming IPv4 success proves the service is reachable.
+
+### DNS security, caching and change propagation
+
+DNSSEC adds origin authentication and integrity validation for DNS data through a chain of trust; it does not encrypt ordinary DNS queries or hide queried names. DNS over TLS and DNS over HTTPS protect the transport between a client and its chosen resolver, but they do not by themselves prove that an answer is authoritative. These are distinct controls.
+
+DNS changes propagate according to TTLs and resolver/client behavior, but a TTL is not a universal guarantee that all clients will switch at the same moment. Existing TCP connections, application DNS caches, proxy pools and service-discovery caches may continue using an old endpoint. For failover, consider the complete client-to-origin path, not only the DNS record. Validate DNSSEC deployment and key rollover with operational tooling; misconfiguration can make valid records fail validation.
+
+### TLS certificate chains and mutual TLS
+
+In server-authenticated TLS, the client validates that the certificate is valid for the intended hostname, chains to a trusted authority, is within its validity period, and satisfies relevant usage and policy requirements. A certificate being present does not prove that hostname verification is correct. Trust-store differences, missing intermediates, expiry, clock skew and incomplete rotation can cause failures for only some clients.
+
+Mutual TLS (mTLS) additionally authenticates the client using a certificate. It is useful for workload-to-workload identity when certificate issuance, trust roots, identity mapping and rotation are well managed. A valid client certificate establishes an authenticated peer identity; the application still needs authorization for the requested action. Certificate revocation and short-lived credentials have deployment-specific trade-offs, so document what the runtime actually checks.
+
+### HTTP/2, HTTP/3 and head-of-line blocking
+
+HTTP/2 multiplexes multiple request streams over one TCP connection. Because TCP delivers an ordered byte stream, packet loss can delay progress for multiple HTTP/2 streams sharing that connection until missing bytes are recovered. HTTP/3 maps HTTP semantics onto QUIC, which multiplexes independent streams over UDP and can avoid transport-level cross-stream blocking from loss on another stream. HTTP/3 still experiences congestion, loss and connection-level limits; it does not make the network lossless or every request independent of all shared resources.
+
+QUIC integrates TLS 1.3 handshake mechanisms and supports connection migration in appropriate circumstances. UDP-based transport may encounter different firewall, NAT and middlebox behavior from TCP. Real performance depends on client support, path conditions, deployment and fallback behavior; protocol version alone is not a latency guarantee.
+
+### L4 and L7 routing, health and affinity
+
+Layer 4 balancing uses transport-level information such as addresses and ports, while Layer 7 balancing can route using application information such as HTTP host, path, headers or method. L7 routing enables richer policy but requires the proxy to understand the protocol and may add parsing, TLS termination and per-request processing overhead.
+
+Round-robin distributes eligible requests in sequence; least-connections considers active connection counts; weighted policies reflect capacity or rollout intent; consistent hashing tries to preserve key-to-target mapping as membership changes. No algorithm automatically balances actual work cost. A long-lived WebSocket, a large report query and a tiny read request are not equivalent units of load.
+
+Health checks should test the condition relevant to routing, not indiscriminately require every downstream dependency to be healthy. If a transient database problem causes every application target to fail readiness at once, a load balancer may remove all capacity and amplify the outage. Separate process liveness, readiness to accept work, and deeper dependency diagnostics.
+
+### DDoS and resource-exhaustion boundaries
+
+Distributed denial-of-service attacks can consume network bandwidth, connection state, TLS handshake capacity, request parsing, application concurrency or expensive downstream operations. Protection therefore spans provider/network capacity, edge filtering, connection and request limits, WAF rules, per-identity quotas, payload limits, and application-level cost controls. A WAF alone cannot absorb traffic that saturates an upstream link before reaching it.
+
+Design graceful overload behavior for legitimate flash crowds as well as hostile traffic. Protect scarce resources early, bound work at every layer, keep health endpoints lightweight, and ensure emergency controls do not accidentally block administrative recovery paths. Rate limits should account for authenticated identity and operation cost where possible; IP-only limits can be unfair behind NAT and ineffective against distributed sources.
+
+### Network protocol review checklist
+
+- Are IPv4 and IPv6 both supported and tested where advertised?
+- Are DNS record changes, TTLs, client caches and persistent connections considered during failover?
+- Is DNSSEC distinguished from encrypted DNS transport?
+- Are certificate hostname checks, chains, expiry and rotation tested?
+- Does mTLS identity map to an explicit authorization policy?
+- Are HTTP/2 and HTTP/3 behavior and fallback understood for the target clients?
+- Are balancing algorithms evaluated against request cost and long-lived connections?
+- Can readiness checks accidentally remove all targets during a dependency incident?
+- Which layer absorbs volumetric traffic, and which protects expensive application work?
+- Are emergency traffic controls observable and reversible?
+
+
 ## Further reading
 - AWS, [Elastic Load Balancing overview](https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/what-is-load-balancing.html) for product-specific load-balancer behavior.
 - Cloudflare, [Origin Cache Control](https://developers.cloudflare.com/cache/concepts/cache-control/) and [CDN-Cache-Control](https://developers.cloudflare.com/cache/concepts/cdn-cache-control/) for CDN-specific cache behavior; use RFC 9111 for general HTTP semantics.
