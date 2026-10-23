@@ -100,6 +100,19 @@ Quotas are capacity constraints and can cause partial outages when traffic grows
 - Cost includes transfer, observability, backups, and operational work.
 
 
+
+## 18.1I Cloud service models and placement trade-offs
+
+Cloud service models describe which layers the provider operates, but exact responsibility depends on the product:
+- **Infrastructure as a Service (IaaS):** the customer commonly manages guest operating systems, runtime, application and much of the network/security configuration, while the provider manages physical infrastructure and virtualization.
+- **Platform as a Service (PaaS):** the provider manages more of the runtime platform; the customer still owns application behavior, identity policy, data protection and configuration.
+- **Software as a Service (SaaS):** the provider operates the application, while the customer still manages appropriate access, configuration, data governance and user lifecycle.
+
+Serverless is an execution and operations model rather than a universal synonym for PaaS. It can reduce server management but introduces quotas, cold-start or scale-from-zero behavior, execution limits, provider-specific event semantics, and sometimes stronger coupling to managed services.
+
+Placement choices include virtual machines, containers on managed orchestration, managed application platforms, functions, and managed data services. Compare them by startup behavior, scaling granularity, isolation, runtime control, operational burden, portability, quotas, network topology, observability, and cost under idle and peak load. The most abstract service is not automatically the cheapest or most reliable for every workload.
+
+
 ## Further reading
 - Docker [container fundamentals](https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-a-container/).
 - Kubernetes [documentation](https://kubernetes.io/docs/home/).
