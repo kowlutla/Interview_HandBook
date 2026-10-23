@@ -107,6 +107,59 @@ Capacity planning must include indexes, replicas, logs, temporary compaction spa
 - Include operational skill and migration cost in the decision.
 
 
+
+## 8.2 Choosing among data-system families
+
+A storage model should follow the shape of the data, access patterns, correctness constraints, and operational needs. “NoSQL” is not one model with one consistency or scaling behavior; key-value, document, wide-column, graph, search and time-series systems optimize different access paths.
+
+| Family | Natural access pattern | Strengths | Main design costs |
+|---|---|---|---|
+| Relational | Predicate queries, joins, constraints, transactions | Rich query model and integrity enforcement | Schema/query/index tuning; distributed writes can be complex |
+| Key-value | Lookup by known key | Simple, predictable access and horizontal distribution in some systems | Secondary queries and relationships may need application-managed indexes |
+| Document | Retrieve/update aggregate-shaped documents | Flexible nested records and aggregate-oriented access | Cross-document invariants and joins may be limited or costly |
+| Wide-column | Partition-key access over large distributed datasets | High write throughput and partitioned scale for designed queries | Query-first modeling, partition-key discipline and limited ad hoc joins |
+| Graph | Relationship traversal and path queries | Traversal follows explicit edges and relationship semantics | Distributed traversals and graph partitioning can be expensive |
+| Time-series | Time-bounded reads, rollups, retention | Time-oriented compression, downsampling and lifecycle features | High-cardinality labels, late events and retention/aggregation policy |
+| Search engine | Full-text, relevance, filtering and faceting | Inverted indexes, analyzers, ranking and text retrieval | Usually a derived index with refresh lag and expensive index maintenance |
+| Object storage/data lake | Large blobs, immutable files, datasets | Low-cost durable bulk storage and ecosystem integration | Object-level rather than general multi-object transactions; metadata/catalog and file-layout concerns |
+| Analytical warehouse/columnar store | Large scans, aggregates, reporting | Column pruning, compression and analytical execution | Not automatically suitable for high-rate transactional point updates |
+
+These are common tendencies, not guarantees for every product. Verify each candidate's transaction, consistency, partitioning, indexing, backup, restore and operational model.
+
+## 8.3 Search indexes are usually derived data
+
+A search engine often indexes data from an authoritative database through change data capture, an outbox/event stream, periodic bulk indexing or application dual writes. Direct dual writes create a partial-failure problem: the database update may succeed while the search update fails, or vice versa. Prefer a durable change path and an idempotent indexer where correctness matters.
+
+Search results may be stale because indexing and refresh are asynchronous. Define whether the user can tolerate eventual visibility, how updates/deletes propagate, and how a full rebuild is performed. The index should be reconstructible from authoritative data or durable change history where feasible. Search ranking, analyzers, tokenization, language support and filters are product semantics, not just storage implementation details.
+
+## 8.4 Row stores, columnar stores, lakehouses and warehouses
+
+Row-oriented storage places fields for a record together, often helping point lookups and transactional updates. Columnar formats group values by column, enabling compression and reading only selected columns during analytical scans. These are workload tendencies rather than strict boundaries; many systems support mixed execution or storage modes.
+
+A data lake commonly stores large datasets in object storage and relies on file formats, catalogs and processing engines. A warehouse offers managed analytical storage/query semantics. A lakehouse architecture attempts to add table metadata and transactional or governance capabilities over lake storage. These designs still need file-size management, partition pruning, schema evolution, late data handling, access controls, compaction, lineage and cost governance.
+
+Small files can overwhelm metadata and scheduling; excessively large files can hurt parallelism and selective reads. Partitioning by a high-cardinality or poorly selective column can create too many tiny files or skew. Choose file layout from actual query predicates and write cadence.
+
+## 8.5 Secondary indexes and materialized views
+
+A secondary index creates an alternate access path at the cost of write amplification, storage and consistency maintenance. In distributed stores, a secondary query may scatter across partitions unless the index maps the predicate to a narrower set of locations. Indexing every field can turn writes into many independent updates and increase recovery complexity.
+
+A materialized view precomputes a query or aggregation. It trades refresh work and storage for faster reads. The design must define freshness, refresh cadence, incremental update correctness, rebuild behavior, and what readers see during refresh. Materialized views can be derived from an authoritative source, but their lag should be visible to consumers when it affects decisions.
+
+## 8.6 Storage selection checklist
+
+- What are the dominant read/write/query shapes?
+- Which invariants require transactions or constraints?
+- Are relationships traversed by joins, graph paths, or precomputed views?
+- Is the workload transactional, analytical, search-oriented, or mixed?
+- What consistency and freshness do derived indexes provide?
+- How are schema changes, backfills and full rebuilds performed?
+- How are partition keys, hot keys and query fan-out controlled?
+- What are retention, deletion, backup and point-in-time recovery requirements?
+- Which index, compaction and file-layout costs appear under steady-state load?
+- Can the team operate, restore and migrate the chosen system?
+
+
 ## Further reading
 - [PostgreSQL storage documentation](https://www.postgresql.org/docs/current/storage.html).
 - O'Neil et al., [The Log-Structured Merge-Tree](https://doi.org/10.1007/s002360050048).
