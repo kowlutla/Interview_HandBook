@@ -123,6 +123,61 @@ These methods complement rather than replace domain-specific indicators. A datab
 Avoid dashboards that show only averages. Pair rates with p95/p99 duration, queue depth and queue age, and annotate deployments or configuration changes. Use bounded metric labels for service, route template, status class and dependency; put high-cardinality identifiers in controlled logs or traces instead.
 
 
+
+## 17.2 Observability in practice: from symptom to cause
+
+Observability is the ability to infer system behavior from emitted evidence. Logs, metrics and traces are complementary views, not interchangeable storage formats. A dashboard can show that latency rose; traces may reveal which dependency consumed time; structured logs may explain a particular rejected operation. None guarantees that the system emitted enough context or that sampling retained the relevant event.
+
+### Metrics: dimensions, cardinality and histograms
+
+A metric time series is identified by its metric name and label set. Labels such as route template, status class, service and region are usually bounded. User IDs, request IDs, raw URLs, search terms and arbitrary tenant names can create unbounded cardinality, increasing memory, storage, query cost and alert complexity. Put per-request identifiers in logs or traces where access and retention can be controlled.
+
+Counters measure cumulative events; gauges represent current values; histograms capture distributions or buckets of observations. Averages hide tail behavior and can improve while a small fraction of requests become catastrophically slow. Percentiles must be calculated with a method appropriate to the telemetry system; averaging per-instance p99 values does not generally yield the fleet-wide p99.
+
+### RED and USE are starting frameworks
+
+RED focuses on request-driven services: rate, errors and duration. USE focuses on resources: utilization, saturation and errors. Neither is a complete dashboard. Add domain success rates, queue age, retry volume, connection acquisition latency, cache freshness, replication lag and dependency-specific signals where they explain the user journey.
+
+A high CPU percentage is not itself an incident; a growing queue, rising tail latency and falling successful throughput may show that CPU is the constrained resource. Interpret signals together and compare them to a known baseline and service objective.
+
+### Distributed tracing and context propagation
+
+A trace connects spans across a request path. Context propagation must survive HTTP/RPC calls, message headers, async task boundaries and scheduled work. If a consumer starts a new trace without linking the producer context, the causal chain is lost. Sampling reduces cost but may discard rare failures; tail-based sampling or targeted error retention can help when supported and appropriately bounded.
+
+Tracing can add overhead and can expose sensitive attributes if instrumentation is careless. Do not place secrets, raw tokens or unnecessary personal data in span attributes. A trace ID is correlation metadata, not an authentication credential.
+
+### Alerting on user impact and error-budget burn
+
+An alert should prompt a defined action. Page on conditions that require immediate human intervention; route lower urgency issues to tickets or dashboards. Avoid paging on every transient internal error when user-visible SLOs remain healthy, but ensure that a fast-burn outage is detected before the budget is exhausted.
+
+A multi-window, multi-burn-rate approach compares recent error-budget consumption over different windows to balance fast detection with noise. Exact thresholds depend on the SLO period, service criticality and response process. Alert on symptoms first, then use component signals for diagnosis.
+
+### Incident diagnosis as hypothesis testing
+
+Start with impact and timeline: which user journeys, regions, tenants or operations are affected, and when did the change begin? Compare recent deployments, configuration changes, traffic shifts, dependency health, saturation, error rates and queue age. Form hypotheses, choose a signal that can falsify each hypothesis, and avoid changing many variables at once.
+
+During mitigation, prefer reversible changes that reduce impact: rollback a bad release, disable a risky feature, shed optional work, or route around a proven failure. Verify that the user-visible SLI recovers and that the mitigation did not violate data correctness. A green process health check is not sufficient evidence of recovery.
+
+### Runbooks and postmortems
+
+A useful runbook includes symptoms, scope, diagnostic commands or dashboards, safe mitigations, escalation contacts, rollback criteria, and verification steps. Keep it versioned with the service and test it during exercises. A postmortem should document impact, contributing conditions, detection gaps, response timeline and follow-up actions without blaming individuals.
+
+Actions should change the system or its operating environment: add a guardrail, improve capacity, make a dangerous state unrepresentable, add a missing signal, automate a safe recovery step, or clarify ownership. “Be more careful” is not a reliable corrective action.
+
+### Observability checklist
+
+- Can user-visible success, latency and availability be measured?
+- Are labels bounded and sensitive data excluded?
+- Do metrics expose saturation, queue age and tail latency?
+- Does trace context survive async boundaries and messages?
+- Is sampling appropriate for rare failures?
+- Are alerts tied to actionable user impact or error-budget burn?
+- Can on-call staff identify recent deployments and configuration changes?
+- Are runbooks executable and recovery steps verified?
+- Do postmortems produce measurable engineering changes?
+- Is telemetry itself bounded, available and protected?
+
+
 ## Further reading
 - [OpenTelemetry documentation](https://opentelemetry.io/docs/).
 - Google [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
