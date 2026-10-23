@@ -35,6 +35,13 @@ Each chapter is a folder with a single, full-length Markdown chapter page (READM
 18. [Cloud infrastructure and delivery](chapters/18-cloud-delivery/README.md)
 19. [Cross-cutting advanced reasoning](chapters/19-advanced-cross-cutting/README.md)
 
+
+## Core building blocks covered
+
+The curriculum explicitly covers the path from user to data and back: DNS, TLS, firewalls/WAF, reverse proxies, L4/L7 load balancers, API gateways, ingress, CDNs and edge caches; application runtimes and architecture styles; synchronous APIs and asynchronous messaging; relational and non-relational data stores; storage engines, caches, search and analytics; service discovery and configuration; service meshes; identity and authorization; observability; deployment, scaling, failover and disaster recovery.
+
+A component's name appearing in a chapter is not considered sufficient coverage. Each important building block must be explained through its purpose, how it works, variants, when to use it, trade-offs, failure modes, security boundaries, metrics, and interactions with neighboring components. See the [mandatory topic inventory](CURRICULUM.md#mandatory-topic-inventory-coverage-audit).
+
 ## How to learn from this book
 Read in order on the first pass. For each concept, ask: what problem does it solve, what assumptions does it require, what guarantee does it provide, how can it fail, and what trade-off does it introduce? Redraw diagrams from memory and recalculate examples after changing their assumptions.
 
