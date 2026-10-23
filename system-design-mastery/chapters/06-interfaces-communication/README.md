@@ -149,6 +149,70 @@ Propagate a deadline or remaining budget, reserve time for cleanup and response 
 - Are deadlines and retry budgets propagated end to end?
 
 
+
+## 6.11 API gateways and API management
+
+An API gateway is an API-facing entry point that applies shared routing and policy before forwarding requests to backend services. Depending on the product, it can provide TLS termination, route selection, authentication integration, coarse-grained authorization, quotas, rate limiting, request-size limits, schema validation, transformation, API version routing, and access telemetry.
+
+The gateway is not automatically the system's only security enforcement point. It may authenticate a caller and enforce a coarse scope, but the service that owns a resource must still enforce object-level authorization and domain invariants. A caller allowed to invoke an endpoint is not necessarily allowed to read every object identifier supplied to it.
+
+### Gateway versus adjacent components
+
+| Component | Primary responsibility | What it does not automatically guarantee |
+|---|---|---|
+| Reverse proxy | Receive requests on behalf of origins and forward or transform them | API product lifecycle or domain authorization |
+| Load balancer | Select eligible targets and distribute traffic | Correct API contracts or business-level access control |
+| API gateway | Govern API entry, routing, consumer policy and API-facing concerns | Correct authorization inside every domain service |
+| Ingress controller | Apply platform-specific routing into a cluster | Global traffic management or complete API governance |
+| Service mesh | Commonly govern service-to-service identity, traffic policy and telemetry | Consumer-facing API design or business correctness |
+| WAF | Inspect requests against security rules | Proof that a permitted request is authorized for its target object |
+
+These roles can overlap in a product, but they should remain distinct in the architecture's reasoning.
+
+### Gateway responsibilities and placement
+
+Good gateway responsibilities are cross-cutting and boundary-oriented: mapping public routes to backend destinations, authenticating requests according to a defined trust model, applying coarse quotas, rejecting oversized or malformed requests, propagating correlation and deadline metadata, and producing route-level telemetry.
+
+Domain-specific decisions that require authoritative business state should remain with the domain owner. If the gateway accumulates account rules, order orchestration, customer policy, and data transformations, it can become a centralized distributed monolith: every release depends on the gateway, and a gateway defect affects unrelated services.
+
+### Rate limits, quotas, and resource protection
+
+A simple per-IP rate limit can be insufficient behind NAT, and it may be bypassed by distributed callers. Limits may be scoped by user, tenant, API key, route, operation cost, or global service capacity. A request-count limit alone may not protect expensive operations such as broad searches, GraphQL queries, exports or report generation. Use payload limits, pagination caps, query complexity limits, concurrency budgets and downstream cost controls where appropriate.
+
+Local gateway counters are fast but each replica may allow its own quota; distributed counters can enforce a more global policy but add latency and a dependency. Define the behavior if the limiter's state store is unavailable: fail-open may protect availability but allow abuse; fail-closed may block legitimate traffic. Security-sensitive policies may need fail-closed behavior, while carefully bounded low-risk operations may use a different fallback.
+
+### Authentication, authorization, and trust boundaries
+
+A gateway can validate an access token's issuer, audience, expiry and required claims according to the token profile. It should not treat a decoded JWT as trusted merely because it is syntactically valid. Key rotation, allowed algorithms, clock skew, issuer metadata and token purpose matter. If identity is propagated to backend headers, the gateway must strip client-supplied versions and generate trusted values; backend services should authenticate the gateway or use service identity/mTLS when appropriate.
+
+Authorization checks must be performed at the resource boundary. OWASP identifies broken object-level authorization and unrestricted resource consumption among major API risks; see the [OWASP API Security Top 10](https://api-security.owasp.org/editions/2023/en/0x00-header/). Gateway authentication does not remove the need for per-object and per-property authorization.
+
+### Routing, transformations, and compatibility
+
+Gateways can route by host, path, header, API version, tenant or canary cohort. Transformations can help migrate clients, but hidden rewrites make debugging and contract ownership harder. Record the external request, selected route/version, upstream outcome and relevant transformation version without logging secrets or sensitive payloads.
+
+A gateway canary can send a small percentage of traffic to a new backend, but the data model and contracts must remain compatible while old and new versions coexist. Routing policy is not a substitute for backward-compatible schema changes or safe database migration.
+
+### Gateway resilience and observability
+
+The gateway is on the critical path and often has a large blast radius. Run multiple instances across failure domains, set bounded connection pools and concurrency, apply per-route deadlines, and ensure retries do not multiply downstream load. Retry only when the operation's semantics allow it and the remaining deadline can accommodate another attempt.
+
+Monitor request rate, status/error class, route latency, upstream latency, rejected requests, throttling, active connections, queueing, configuration version, certificate expiry and dependency health. Distinguish a live process from a gateway able to authenticate, resolve routes and reach required backends. Roll out policy changes progressively and retain a rollback path.
+
+### API gateway design checklist
+
+- Which cross-cutting concerns belong here, and which stay in domain services?
+- Is gateway authentication distinct from resource authorization?
+- Are quotas based on caller identity and operation cost?
+- What happens if authentication, rate-limit state, DNS or routing dependencies fail?
+- Are deadlines and correlation context propagated?
+- Are retries safe and bounded?
+- Can configuration and certificate changes be rolled back?
+- Can the gateway be bypassed to reach a protected origin directly?
+- Are route-level and upstream metrics sufficient to diagnose failures?
+- Does the gateway risk becoming a centralized business-logic bottleneck?
+
+
 ## Further reading
 - IETF [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html).
 - [gRPC concepts](https://grpc.io/docs/what-is-grpc/core-concepts/).
