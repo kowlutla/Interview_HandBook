@@ -1,20 +1,31 @@
 # Glossary
 
 - **Admission control:** deciding whether to accept work based on capacity or policy.
-- **Availability:** proportion of time or requests meeting a defined success criterion.
+- **API gateway:** API-facing entry point that routes requests and may enforce shared authentication integration, quotas, validation, transformation and telemetry; it does not replace domain-level authorization.
 - **Backpressure:** mechanism that slows upstream production when downstream capacity is insufficient.
+- **CDN (Content Delivery Network):** geographically distributed edge infrastructure that can cache and deliver eligible content closer to users.
+- **Circuit breaker:** temporarily stops calls to a failing dependency to limit wasted work and cascading failure.
+- **Connection draining:** stops assigning new work to a target while allowing eligible in-flight work to complete within a bounded period.
+- **Control plane:** components that configure, coordinate or observe a system's behavior rather than directly handling its main application traffic.
+- **Data plane:** components that process the system's primary traffic or data operations under the active configuration.
+- **Fencing token:** ordered token used to reject stale actors after ownership changes.
+- **Load balancer:** component that selects eligible targets for connections or requests according to routing, health, capacity and policy.
+- **Microservices:** independently deployable services organized around capabilities and explicit contracts; they add network, data consistency and operational costs.
+- **Origin shield:** intermediate cache layer used by a CDN to reduce repeated cache-miss traffic reaching the origin.
+- **Reverse proxy:** server-side proxy that receives requests on behalf of backend/origin services and forwards them.
+- **Service mesh:** infrastructure for service-to-service traffic policy, workload identity and telemetry, commonly implemented with proxies and a control plane.
+- **Write amplification:** physical storage writes relative to logical application writes; important for storage-engine capacity and latency.
+- **Availability:** proportion of time or requests meeting a defined success criterion.
 - **Bandwidth:** transfer rate; distinguish bit/s from byte/s.
 - **Bulkhead:** isolation limiting the impact one failure or workload can have on another.
 - **Cache hit ratio:** fraction of lookups served by cache; define denominator and measurement window.
 - **Causal consistency:** causally related operations are observed in an order consistent with that causality.
 - **CAP theorem:** under its formal model, during a network partition a distributed read/write object cannot guarantee both linearizability and availability for every request.
-- **Circuit breaker:** temporarily stops calls to a failing dependency to limit wasted work and cascading failure.
 - **Concurrency:** tasks are in progress over overlapping periods; they need not execute simultaneously.
 - **Consistency model:** rules defining which values and operation orders clients may observe.
 - **Consensus:** processes agree on a value or ordered decisions despite a specified class of failures.
 - **Durability:** acknowledged committed changes survive the failures covered by the system's contract.
 - **Eventual consistency:** if updates stop and communication/reconciliation continues under the model's assumptions, replicas eventually converge; interim reads are not fully specified by this phrase alone.
-- **Fencing token:** ordered token used to reject stale actors after ownership changes.
 - **Idempotency:** repeating an operation has the same intended effect within a defined scope and key lifetime.
 - **Latency:** elapsed time between defined start and end events.
 - **Linearizability:** each operation appears to take effect atomically between invocation and response, respecting real-time order.
