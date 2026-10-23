@@ -160,6 +160,45 @@ A materialized view precomputes a query or aggregation. It trades refresh work a
 - Can the team operate, restore and migrate the chosen system?
 
 
+
+## 8.7 Distributed file systems and object, block, and file interfaces
+
+The phrase “storage” covers different interfaces and failure models. **Block storage** exposes addressable blocks or volumes to a host, leaving the filesystem and many data-layout decisions to the consumer. **File storage** exposes a shared directory/file namespace with filesystem semantics. **Object storage** exposes objects addressed by keys, usually with metadata and API operations rather than arbitrary in-place byte updates.
+
+A distributed file system presents file-like operations across multiple machines. Depending on its design, it may distribute metadata separately from file contents, replicate blocks, use erasure coding, cache client data, or provide different consistency guarantees. It should not be assumed to behave exactly like a local disk under concurrent access, network partition or server restart.
+
+### Metadata, data placement and failure recovery
+
+Distributed file systems must locate files and blocks, track replicas or erasure-coded fragments, recover failed nodes, detect corruption and rebalance placement. Metadata availability can become a bottleneck even when bulk data is distributed. A design may use a metadata service, partitioned namespace, decentralized placement, or a combination; the recovery and consistency model depends on that choice.
+
+Replication stores multiple copies and can improve availability at the cost of storage and write traffic. Erasure coding stores data and parity fragments and can reduce storage overhead for large durable datasets, but reconstruction consumes network and CPU and may be slower during degraded operation. Neither approach removes the need for integrity checks, failure-domain-aware placement and tested recovery.
+
+### Object storage is not a general POSIX filesystem
+
+Object stores are well suited to large immutable or versioned objects, backups, media, data lakes and durable artifacts. They commonly support multipart upload, metadata and lifecycle policies, but do not necessarily provide arbitrary in-place updates, atomic rename or filesystem locking semantics. Applications should use the documented API consistency contract and avoid assuming local-filesystem behavior.
+
+When writing a large object, multipart upload can improve parallelism and allow retries by part, but incomplete uploads need cleanup. Object versioning can help recover from accidental overwrite or deletion, yet retention and deletion policies must account for versions, replication and legal requirements. Access policy should include both the object and the mechanism used to issue temporary access URLs.
+
+### Storage selection example
+
+A low-latency database volume may favor block storage with predictable IOPS and a supported filesystem/database configuration. A shared team directory may need file semantics and coordinated access. Large media objects or backups may favor object storage with lifecycle and versioning. An analytical data lake may combine object storage with columnar files, a catalog and compute engines.
+
+The cheapest per-gigabyte option may not be cheapest overall. Include request charges, retrieval tiers, cross-zone/region transfer, replication, metadata operations, recovery speed and engineering effort. A restore path that takes several days can violate a recovery objective even when the storage is durable.
+
+### Distributed storage review checklist
+
+- Does the application need block, file, or object semantics?
+- What consistency and atomicity does the storage interface guarantee?
+- How are metadata and data placement scaled and recovered?
+- Is durability provided by replication, erasure coding, or another mechanism?
+- Are replicas placed across independent failure domains?
+- How is silent corruption detected and repaired?
+- Are multipart uploads, versions, incomplete uploads and deletion handled?
+- What are the restore throughput and cost under failure conditions?
+- Do lifecycle and retention policies match recovery and compliance needs?
+- Have application assumptions been checked against the actual storage API contract?
+
+
 ## Further reading
 - [PostgreSQL storage documentation](https://www.postgresql.org/docs/current/storage.html).
 - O'Neil et al., [The Log-Structured Merge-Tree](https://doi.org/10.1007/s002360050048).
