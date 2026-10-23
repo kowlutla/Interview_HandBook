@@ -13,8 +13,8 @@ A rate is quantity divided by time. Requests/s, MB/s, and events/s are not inter
 Suppose a service receives 30 million requests per day.
 
 - Seconds/day = 86,400.
-- Average rate = 30,000,000 / 86,400 ≈ 347 requests/s.
-- If a measured peak-to-average factor is 5, peak estimate ≈ 1,735 requests/s.
+- Average rate = 30,000,000 / 86,400 ≈ 347.22 requests/s.
+- If a measured peak-to-average factor is 5, peak estimate ≈ 1,736 requests/s.
 
 The factor 5 is an explicit assumption, not a universal property. Traffic may be more bursty around releases, notifications, or daily batch jobs. Use time-series data when available.
 
@@ -22,17 +22,17 @@ Averages hide synchronized bursts. Capacity must be sized against the workload i
 
 ## 3.3 Read/write mix
 
-If 70% of 1,735 requests/s are reads:
-- Reads ≈ 1,214.5/s.
-- Writes ≈ 520.5/s.
+If 70% of the estimated 1,736 requests/s are reads:
+- Reads ≈ 1,215/s.
+- Writes ≈ 521/s.
 
 This arithmetic does not imply equal resource cost. One write may update several indexes and replicas; one read may scan millions of rows. Request mix is a starting point, and operation-weighted CPU, I/O and lock demand matter more.
 
 ## 3.4 Bandwidth
 
-Assume peak traffic is 1,735 requests/s and average response payload is 24 KiB = 24 × 1,024 = 24,576 bytes.
+Assume peak traffic is approximately 1,736 requests/s and average response payload is 24 KiB = 24 × 1,024 = 24,576 bytes.
 
-Payload egress ≈ 1,735 × 24,576 = 42,639,360 bytes/s ≈ 40.7 MiB/s ≈ 341 Mbit/s.
+Payload egress ≈ 1,736 × 24,576 = 42,663,936 bytes/s ≈ 40.7 MiB/s ≈ 341.3 Mbit/s.
 
 This excludes request payloads, protocol headers, TLS overhead, retransmissions, replication, and traffic between internal services. A network estimate that ignores response size can be wrong by orders of magnitude.
 
