@@ -22,15 +22,15 @@ Do not infer “Deep” from a heading or keyword match. This is an initial audi
 | API gateways and API management | 06 — 6.11 API gateways and API management | Developing | Dedicated gateway responsibilities, limits, auth boundary, routing, transformation, high availability and failure policy. |
 | API styles, contracts, retries, idempotency, streaming | 06 | Developing | Section 6.12 now covers webhook signing, replay, idempotency, ordering, schema evolution, and SSRF. Continue verifying provider-specific contract caveats and add a worked OpenAPI/versioning example. |
 | Architectural styles and patterns | 01, 15, 19 | Developing | A systematic comparison of layered/N-tier, client-server, modular monolith, SOA, microservices, event-driven, hexagonal, pipe/filter, serverless, CQRS/event sourcing and hybrids. |
-| Relational modeling, SQL, indexes, transactions | 07 | Developing | Validate examples; deepen query plans, isolation, constraints, migrations, operations and workload-based index selection. |
+| Relational modeling, SQL, indexes, transactions | 07 | Developing | Sections 7.2 now adds shard-key trade-offs, cross-shard operations and a safe resharding sequence. Continue validating isolation/query-plan examples and database-specific guarantees. |
 | NoSQL models, search, analytics, data lakes | 08, 19 | Mentioned / Developing | Sections 8.2–8.7 now compare major storage families, derived search indexes, row/columnar and lakehouse workloads, materialized views, and distributed file/object/block semantics. Verify product-specific guarantees and add a comparative access-pattern example. |
 | Storage engines, WAL, B-tree, LSM, compaction | 08 | Developing | Add recovery/write-path examples and compare amplification and workload implications. |
 | Caching at client, CDN, application and data layers | 09, 05 | Developing | Deepen strategies, stampede/penetration/avalanche, coherence, freshness contracts and outage protection. |
-| Distributed failure, consistency, clocks, CAP/PACELC | 10 | Developing | Validate formal distinctions, add timelines/counterexamples, and make assumptions explicit. |
+| Distributed failure, consistency, clocks, CAP/PACELC | 10 | Developing | Section 10.18 now adds a write-timeout/read-replica timeline and explains why quorum arithmetic alone does not prove linearizability. Verify the consistency claims against primary literature and implementation contracts. |
 | Replication, consensus, leases, locks, fencing, transactions | 11 | Developing | Compare Raft/Paxos concepts, failover safety, 2PC/Saga and distributed lock limits with examples. |
 | Queues, pub/sub, logs, Kafka, CDC and stream processing | 12 | Developing | Expand ordering, delivery, consumer recovery, event time, retention, schema evolution and replay examples. |
 | Scaling, hashing, partitioning, hotspots, overload | 13 | Developing | Add worked algorithms, failure-domain capacity, admission control, load shedding and autoscaling pitfalls. |
-| Reliability, SLOs, redundancy, backup/restore, DR | 14 | Developing | Add quantitative availability/recovery examples, restore testing, multi-region failure modes and incident workflows. |
+| Reliability, SLOs, redundancy, backup/restore, DR | 14 | Developing | Sections 14.2–14.3 now include availability composition, RTO/RPO, restore validation, and a worked request-based SLO/error-budget/burn-rate example. Continue checking measurement definitions and recovery assumptions. |
 | Security, identity, privacy, tenant isolation | 16 | Developing | Threat-model examples, authorization boundaries, secrets/key lifecycle, abuse controls and privacy lifecycle. |
 | Observability and production operations | 17 | Developing | Deepen alert design, cardinality, sampling, tracing limitations, burn-rate alerts and runbooks. |
 | Cloud, containers, Kubernetes, IaC and delivery | 18 | Developing | Sections 18.2–18.5 now deepen Kubernetes, service mesh, IaC state/drift, SBOM, provenance, signing and build/deployment trust. Still verify supply-chain guidance against primary standards and test examples. |
@@ -49,14 +49,14 @@ The following sections are present and are the starting points for the deeper re
 | Runtime and resource limits | Chapter 04: 4.1–4.14, 4.15 Runtime resource limits |
 | Networking and request path | Chapter 05: 5.1–5.18, 5.19 Load balancers, 5.20 CDNs, 5.21 Network boundaries, 5.22 Protocol details and operational edge cases |
 | API contracts and gateway | Chapter 06: 6.1–6.10H, 6.11 API gateways and API management, 6.12 Webhooks |
-| Relational data and transactions | Chapter 07: Isolation anomalies, Optimistic versus pessimistic concurrency, Query planning, Safe schema migration, Relational systems in practice |
+| Relational data and transactions | Chapter 07: Isolation anomalies, Optimistic versus pessimistic concurrency, Query planning, Safe schema migration, Relational systems in practice, 7.2 Sharding and resharding |
 | Storage families and engines | Chapter 08: B-trees and LSM trees, 8.1A–8.1I, 8.2–8.6 data-system families/search/analytics/indexes, 8.7 Distributed file systems and object/block/file interfaces |
 | Cache behavior | Chapter 09: Common patterns, TTL and invalidation, Failure modes, 9.1A–9.1H, 9.2 Cache patterns and failure modes |
-| Distributed consistency | Chapter 10: Consistency models, CAP and PACELC, 10.7–10.17 |
+| Distributed consistency | Chapter 10: Consistency models, CAP and PACELC, 10.7–10.18 including worked consistency timeline |
 | Replication and coordination | Chapter 11: Leader election, Leases and fencing tokens, Two-phase commit, Sagas and compensation, 11.5A–11.5G, 11.6 Consensus and transaction boundaries |
 | Messaging and stream processing | Chapter 12: Queue, pub-sub and event log, Delivery semantics, Outbox, inbox and CDC, 12.1A–12.1H, 12.2 Message brokers and delivery semantics |
 | Scaling and overload | Chapter 13: Load balancing and consistent hashing, Overload controls, 13.1A–13.1G, 13.2 Admission control, load shedding, and backpressure |
-| Reliability and recovery | Chapter 14: SLI, SLO, SLA and error budget, Recovery objectives, Zones, regions and disaster recovery, 14.1A–14.1G, 14.2 Recovery engineering |
+| Reliability and recovery | Chapter 14: SLI, SLO, SLA and error budget, Recovery objectives, Zones, regions and disaster recovery, 14.1A–14.1G, 14.2 Recovery engineering, 14.3 Worked SLO and error-budget example |
 | Architectural styles and evolution | Chapter 15: Monolith, modular monolith and microservices, Sidecars and service meshes, 15.1A–15.1H, 15.1I Architectural styles |
 | Security and privacy | Chapter 16: Threat modeling, Authorization models, Tenant isolation, OAuth 2.0 and OpenID Connect, 16.2 Threat modeling a system architecture |
 | Observability and operations | Chapter 17: RED and USE, Percentiles and cardinality, SLO-driven alerting, 17.1A–17.1I, 17.2 Observability in practice |
