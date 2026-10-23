@@ -125,6 +125,61 @@ Backfills need throttling, progress checkpoints, idempotency, retry behavior, ob
 - Can backfills pause, resume, and be safely repeated?
 
 
+
+## Relational systems in practice: invariants, query paths, and migrations
+
+### Worked invariant: preventing overselling
+
+Suppose inventory has 3 units and two requests attempt to reserve 2 units each. A naive application reads quantity = 3 in both requests, independently decides the reservation is valid, and then writes quantity = 1. One reservation is lost or both orders may be accepted without a correct stock decrement.
+
+The invariant is that available inventory must never become negative and each successful reservation consumes exactly its quantity. One approach is an atomic conditional update that decrements only when available quantity is at least the requested amount, checking the affected-row count. Another is a transaction with appropriate locking/isolation and a reservation record. The correct implementation depends on the database and data model, but the check and state change must be one atomic boundary.
+
+A unique constraint can prevent duplicate reservation identifiers; it does not by itself enforce the aggregate inventory invariant. Correctness often needs both database constraints and a transaction protocol.
+
+### Isolation levels do not replace invariant analysis
+
+Read committed, repeatable read, snapshot isolation and serializable execution have different semantics across database engines. A transaction can read a consistent snapshot yet still participate in write skew when two transactions update different rows after checking a shared predicate. For example, two doctors may each check that another doctor is on call and independently mark themselves off call; each transaction's local row update succeeds, but the global “at least one doctor on call” invariant is violated.
+
+Possible solutions include a declarative constraint when the invariant can be expressed, locking a shared coordination row, using serializable transactions with retry, or redesigning state so the invariant is enforced by one atomic operation. Choose based on actual database guarantees and test the conflict behavior.
+
+### Query plans: cardinality before syntax
+
+A query's cost is driven by rows read and processed, data distribution, memory, I/O and network round trips—not merely by SQL length. The optimizer estimates cardinalities and selects scans, joins, sort operations and index access. A bad estimate can choose an expensive join order or underestimate memory needs. Compare estimated and actual row counts, index selectivity, rows removed by filters, sort spills and buffer reads.
+
+An index should support a real predicate/order pattern. Composite index order matters: an index on (tenant_id, created_at, id) can support tenant-scoped chronological pagination and the tie-breaker, while it may not be equally useful for a query filtering only on created_at. Every index adds storage and write work, and an index with low selectivity may not beat a table scan.
+
+### Connection pools are admission control
+
+A database connection pool bounds concurrent database work and reuses expensive connections. Too-small pools can create application-side queueing; too-large pools can overwhelm the database with concurrent queries, memory use, lock contention and context switching. Across many application replicas, pool sizes multiply. If 40 replicas each allow 50 active database connections, the database may face 2,000 connections before administrative and other workloads are counted.
+
+Set pool limits from database capacity, query cost, service concurrency and the total replica count. Observe acquisition wait separately from query execution latency. Use bounded acquisition timeouts and fail predictably rather than building an invisible unbounded queue in the application.
+
+### Safe schema evolution across mixed application versions
+
+During rolling deployment, old and new application versions coexist. A safe expand-and-contract migration generally:
+1. Adds new nullable/compatible structures without removing the old contract.
+2. Deploys code that can read/write in a backward-compatible way.
+3. Backfills existing data in bounded, restartable batches.
+4. Validates counts and invariants, then switches reads/writes.
+5. Waits until old application versions and consumers are gone.
+6. Removes obsolete schema only in a later safe step.
+
+Backfills are production workloads: they can saturate I/O, grow logs, hold locks, lag replicas and compete with customer queries. Use checkpoints, rate limits, idempotent batches, observability, and pause/rollback criteria.
+
+### Relational design checklist
+
+- What invariant must always hold, and where is it enforced atomically?
+- Which constraints protect against concurrent duplicate or invalid writes?
+- Which isolation anomalies could violate a multi-row rule?
+- Are actual query plans consistent with the workload assumptions?
+- Does the composite index match the leading predicates and sort order?
+- Is connection-pool concurrency safe across all service replicas?
+- Can a migration run while old and new application versions coexist?
+- Can backfills pause, resume, and be validated without blocking production?
+- What is the backup and point-in-time restore procedure?
+- Which freshness guarantees apply when reads are served from replicas?
+
+
 ## Further reading
 - PostgreSQL [transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html), [indexes](https://www.postgresql.org/docs/current/indexes.html), [EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html), [point-in-time recovery](https://www.postgresql.org/docs/current/continuous-archiving.html).
 - SQLite [atomic commit](https://www.sqlite.org/atomiccommit.html).
