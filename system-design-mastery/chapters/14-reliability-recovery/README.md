@@ -109,6 +109,64 @@ A safe experiment defines a hypothesis, expected steady state, target failure, s
 A successful experiment is not simply “the service stayed up.” It should verify correctness, error budgets, recovery objectives, and whether alerts and runbooks led to the expected response. Experiments should not create uncontrolled risk for customers.
 
 
+
+## 14.2 Recovery engineering: failure detection is not recovery
+
+A failover mechanism is only one part of recovery. A complete recovery path must detect the problem, decide whether to fail over, move or redirect traffic, ensure the destination has valid state, restore capacity, verify correctness, and avoid oscillation when the original component returns. Each step has its own delay and failure modes.
+
+### Availability math and dependency composition
+
+For a serial request path in which every dependency must succeed, end-to-end availability is approximately the product of dependency availabilities when failures are independent. If three required dependencies each have availability 99.9%, the rough combined availability is (0.999^3 approx 99.70\%). Real failures are often correlated, so this calculation is a useful first approximation, not a guarantee.
+
+Redundancy helps only if it reduces the relevant failure probability. Two replicas in one zone may share power, networking, credentials, a control plane or a bad rollout. A redundant application with one database remains dependent on that database unless the data layer has its own recovery strategy.
+
+### RTO and RPO are measurable requirements
+
+- **Recovery Time Objective (RTO):** the target maximum time to restore a service or capability after disruption.
+- **Recovery Point Objective (RPO):** the target maximum amount of data loss measured in time.
+
+These are not synonyms for failover time and replication lag. RTO includes detection, decision, restoration, validation and traffic recovery. RPO depends on the durable recovery point and the actual failure. An asynchronous replica may have low typical lag but still lose a larger amount of acknowledged data under a particular failure.
+
+Define RTO/RPO per business capability and failure scenario. A read-only catalog, order placement, payment ledger and analytics pipeline may have different acceptable recovery targets.
+
+### Backup, replication and restore solve different problems
+
+Replication can improve availability when a node fails, but it can also replicate accidental deletion, corruption or malicious changes. Backups provide a separate recovery path, while point-in-time recovery can restore a database to a chosen point if the required backups and logs are retained and intact.
+
+A backup is not proven useful until restore has been tested. Test data integrity, permissions, key availability, dependencies, restore throughput, runbooks and the time required to bring the restored system online. Include recovery capacity in planning: restoring a large dataset may compete with production traffic for I/O and network bandwidth.
+
+### Failover, fencing and split brain
+
+If two nodes both believe they are active, they may accept conflicting writes. A leader election alone is insufficient if the old leader can still access the resource. Use epochs, terms, leases with well-defined assumptions, and fencing at the resource that protects the invariant. After failover, validate that stale actors cannot continue mutating authoritative state.
+
+Failback is also a protocol: reconcile or discard divergent state according to an explicit policy, validate the returning node, and reintroduce it gradually. Automatic failback without state reconciliation can reintroduce corruption or oscillation.
+
+### Graceful degradation and criticality
+
+Classify operations by criticality and dependencies. During overload or partial failure, preserve the smallest correct core workflow and disable optional work deliberately. For example, an e-commerce system may keep checkout and order persistence available while temporarily disabling recommendations or nonessential analytics. This requires explicit fallback semantics and clear user-visible status.
+
+Stale data is an acceptable fallback only when the domain permits it. A stale product description may be harmless; stale authorization, inventory reservation or account balance may violate correctness. Degradation must be designed per operation, not enabled as a global “return cached data” switch.
+
+### Incident response and recovery validation
+
+Runbooks should state symptoms, impact, safe checks, mitigation choices, escalation, rollback/failover criteria and verification steps. Use automation for deterministic low-risk steps, but add safeguards for destructive actions and ambiguous state. After recovery, verify user-visible success, error rates, data integrity, queue drain, replica convergence and resource headroom.
+
+Practice failure scenarios such as zone loss, exhausted connection pools, corrupt configuration, expired certificates, full disks, unavailable identity provider, delayed queue consumers, and failed restore. Game days should test the recovery mechanism and the team's ability to reason about its guarantees.
+
+### Recovery design checklist
+
+- Which failure scenarios have explicit RTO/RPO?
+- Is the failure detector reliable enough for the action it triggers?
+- Can two actors both believe they are active?
+- Is acknowledged data durable across the intended failure?
+- Are backups isolated from the failures they are meant to recover from?
+- Has a full restore been timed and validated?
+- Is there spare capacity for the surviving region/zone?
+- Which features can be safely degraded?
+- How is failback performed without reintroducing stale state?
+- What evidence proves the user-visible service and data are healthy again?
+
+
 ## Further reading
 - Google [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
 - Google [SRE Workbook: Error Budget Policy](https://sre.google/workbook/error-budget-policy/).
