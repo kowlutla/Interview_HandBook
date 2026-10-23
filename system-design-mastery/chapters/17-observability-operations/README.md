@@ -105,6 +105,24 @@ Runbooks should state symptoms, safe checks, mitigation steps, expected signals,
 - Runbooks define verification and safe abort conditions.
 
 
+
+## 17.1I RED and USE methods: choose signals by component
+
+The **RED method** is useful for request-driven services:
+- **Rate:** requests or operations per unit time.
+- **Errors:** failed or incorrect requests under a defined denominator.
+- **Duration:** latency distribution, usually including tail percentiles.
+
+The **USE method** is useful for resources:
+- **Utilization:** how busy the resource is.
+- **Saturation:** queued or delayed work beyond immediate service capacity.
+- **Errors:** resource-level errors, such as device or connection failures.
+
+These methods complement rather than replace domain-specific indicators. A database may need lock waits, query duration, connection acquisition latency and replication lag. A message consumer may need lag age, processing rate and retry rate. A user journey may need a business success rate that cannot be inferred from HTTP status alone.
+
+Avoid dashboards that show only averages. Pair rates with p95/p99 duration, queue depth and queue age, and annotate deployments or configuration changes. Use bounded metric labels for service, route template, status class and dependency; put high-cardinality identifiers in controlled logs or traces instead.
+
+
 ## Further reading
 - [OpenTelemetry documentation](https://opentelemetry.io/docs/).
 - Google [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
