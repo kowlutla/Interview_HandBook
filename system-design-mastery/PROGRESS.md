@@ -33,6 +33,7 @@ Check items only when the work has actually been performed.
 - [x] Create glossary.
 - [x] Create reference library.
 - [ ] Review each module for accuracy, clarity, depth and prerequisite coverage.
+- [x] Expand chapters 1–5 with additional first-principles explanations, mechanisms, edge cases, failure modes, operational checklists, and worked reasoning where appropriate.
 - [ ] Cross-chapter terminology and consistency review.
 - [ ] Expand any chapter whose coverage remains too compressed for textbook-level mastery.
 
@@ -46,4 +47,4 @@ Check items only when the work has actually been performed.
 - [ ] Report limitations honestly; do not claim the textbook complete until all acceptance checks pass.
 
 ## Current status
-The independent curriculum and all 19 chapter drafts have been reorganized into chapter folders with one full-length README.md per chapter. Mermaid diagrams have been added to all 19 chapters where they clarify flows, boundaries, data paths, or decisions. The current structure is intentionally not split into many tiny files. Relative internal links were checked across all 19 chapter pages with no broken internal targets found. The repository comparison confirms the reviewed changes remain inside system-design-mastery/. Dedicated Mermaid renderer validation and a full claim-by-claim technical review remain open. Actual animated media is not used: GitHub Markdown is best served by clear Mermaid diagrams and stepwise sequence/flow diagrams, which remain readable and version-controlled.
+The independent curriculum and all 19 chapter drafts have been reorganized into chapter folders with one full-length README.md per chapter. Chapters 1–5 have received a deeper content pass adding conceptual distinctions, internal mechanics, examples, trade-offs, failure modes, and practical review/troubleshooting checklists. The current structure is intentionally not split into many tiny files. Mermaid diagrams are present across the chapter set, but renderer validation remains open. Relative internal links were checked across all 19 chapter pages in an earlier validation pass; links added or changed during the current deepening pass still need a fresh check. A full claim-by-claim technical review and final repository path audit remain open. Actual animated media is not used: GitHub Markdown is best served by clear Mermaid diagrams and stepwise sequence/flow diagrams, which remain readable and version-controlled.
