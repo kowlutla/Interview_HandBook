@@ -1,0 +1,50 @@
+# Research and Reference Library
+
+Prefer primary sources for formal guarantees. Product documentation describes a particular implementation and should not automatically be generalized. Chapter authors should cite sources close to the claims they support and recheck exact sections during final audit.
+
+## Distributed systems and theory
+- Gilbert and Lynch, *Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services* (2002): [MIT-hosted paper](https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf).
+- Gilbert and Lynch, *Perspectives on the CAP Theorem* (2012): [MIT DSpace record](https://dspace.mit.edu/entities/publication/dfcb6512-af44-4fc9-8e8b-1a8f28f1b53a).
+- Ongaro and Ousterhout, *In Search of an Understandable Consensus Algorithm (Raft)*: [paper and dissertation resources](https://raft.github.io/).
+- Lamport, *Time, Clocks, and the Ordering of Events in a Distributed System* (1978): [original paper](https://lamport.azurewebsites.net/pubs/time-clocks.pdf).
+- Fischer, Lynch and Paterson, *Impossibility of Distributed Consensus with One Faulty Process* (1985): [DOI](https://doi.org/10.1145/3149.214121).
+- Brewer, *CAP Twelve Years Later: How the Rules Have Changed* (2012): [DOI](https://doi.org/10.1109/MC.2012.37).
+
+## Network and identity standards
+- IETF, [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html).
+- IETF, [RFC 9293 — TCP](https://www.rfc-editor.org/rfc/rfc9293.html).
+- IETF, [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
+- IETF, [RFC 9000 — QUIC](https://www.rfc-editor.org/rfc/rfc9000.html).
+- IETF, [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html).
+- IETF, [RFC 5861 — HTTP cache-control extensions](https://www.rfc-editor.org/rfc/rfc5861.html).
+- IETF, [RFC 9700 — OAuth 2.0 Security BCP](https://www.rfc-editor.org/rfc/rfc9700.html).
+- IETF, [RFC 6749 — OAuth 2.0](https://www.rfc-editor.org/rfc/rfc6749.html).
+- OpenID Foundation, [OpenID Connect specifications](https://openid.net/developers/specs/).
+
+## Databases and storage
+- PostgreSQL, [transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html), [indexes](https://www.postgresql.org/docs/current/indexes.html), [EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html), [point-in-time recovery](https://www.postgresql.org/docs/current/continuous-archiving.html).
+- SQLite, [atomic commit](https://www.sqlite.org/atomiccommit.html).
+- O'Neil et al., *The Log-Structured Merge-Tree (LSM-Tree)* (1996): [DOI](https://doi.org/10.1007/s002360050048).
+
+## Messaging and events
+- Apache Kafka, [design](https://kafka.apache.org/documentation/#design), [delivery semantics](https://kafka.apache.org/documentation/#semantics), and [documentation](https://kafka.apache.org/documentation/).
+- Debezium, [outbox event router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html).
+- [CloudEvents specification](https://cloudevents.io/).
+
+## Reliability and operations
+- Google, [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
+- Google, [SRE Workbook: Error Budget Policy](https://sre.google/workbook/error-budget-policy/).
+- Google Cloud, [Well-Architected Reliability pillar](https://docs.cloud.google.com/architecture/framework/reliability).
+- AWS, [Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
+- NIST, [Cybersecurity Framework](https://www.nist.gov/cyberframework).
+
+## Runtime, cloud and architecture
+- Docker, [container fundamentals](https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-a-container/).
+- Kubernetes, [cluster architecture](https://kubernetes.io/docs/concepts/architecture/), [resource management](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/), [probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/).
+- OpenTelemetry, [documentation](https://opentelemetry.io/docs/).
+- Fowler, [Microservices](https://martinfowler.com/articles/microservices.html) and [Strangler Fig Application](https://martinfowler.com/bliki/StranglerFigApplication.html).
+- Microsoft, [Cloud Design Patterns](https://learn.microsoft.com/en-us/azure/architecture/patterns/).
+- Google, [Cloud Architecture Framework](https://cloud.google.com/architecture/framework).
+
+## Evidence labels
+In chapter prose, distinguish formal specification/research, implementation documentation, practitioner guidance, and illustrative assumptions. Avoid copying source wording; synthesize it into an original explanation.
