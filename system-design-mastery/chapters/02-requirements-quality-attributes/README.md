@@ -154,6 +154,21 @@ Security requirements should identify assets, actors, trust boundaries, threats,
 
 Privacy requirements address purpose limitation, data minimization, access, retention, deletion, residency, and audit. “Encrypt the database” is not a complete security or privacy requirement; it does not address excessive authorization, compromised application credentials, data in logs, or retention obligations.
 
+```mermaid
+flowchart TD
+  R[User or business outcome] --> F[Functional requirement]
+  R --> Q[Quality attribute scenario]
+  F --> C[Candidate component or interaction]
+  Q --> T[Measurable target and failure behavior]
+  C --> V[Verification test or experiment]
+  T --> V
+  V --> E[Operational evidence]
+  E --> D{Requirement met?}
+  D -- No --> A[Adjust requirement or design]
+  A --> C
+  D -- Yes --> M[Monitor in production]
+```
+
 ## 2.11 Requirements-to-design traceability
 
 For each critical requirement, document:
