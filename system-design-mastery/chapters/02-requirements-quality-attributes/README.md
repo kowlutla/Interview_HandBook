@@ -214,6 +214,50 @@ You should be able to:
 6. Trace a requirement to a design mechanism, test, metric, and owner.
 7. Identify the ambiguity in a statement such as “all data must be consistent.”
 
+
+## 2.15 Express quality attributes as scenarios
+
+A quality attribute becomes useful when it describes a stimulus, context, response and measurable response criterion. “The system must be scalable” is not testable. “During a five-minute burst to 8,000 requests per second in one region, 99% of read requests complete within 250 ms, error rate remains below 0.5%, and the system returns to normal latency within two minutes after the burst” is much more actionable.
+
+A quality scenario should identify:
+- **Stimulus:** traffic burst, node loss, invalid input, dependency slowdown, data restore, or deployment.
+- **Environment:** normal load, peak load, partial failure, region outage, or degraded network.
+- **Affected element:** API, database, queue, cache, deployment system, or whole user journey.
+- **Response:** continue, reject, degrade, fail over, recover, or alert.
+- **Measure:** latency percentile, success rate, data-loss window, recovery time, cost ceiling, or detection time.
+
+The exact numbers must come from business needs, workload estimates and operational capability—not from a generic “industry standard.”
+
+## 2.16 Distinguish availability, reliability, durability and correctness
+
+These qualities answer different questions:
+- **Availability:** can the system successfully serve the required operation now?
+- **Reliability:** does it continue to behave as required over time and under expected conditions?
+- **Durability:** once data is acknowledged under the stated contract, how likely is it to survive specified failures?
+- **Correctness:** does the result preserve the domain rules and promised semantics?
+
+A service can be available but return stale or incorrect data. A database can be durable but unavailable during failover. A system can meet a latency SLO while silently dropping events. Define the user-visible success condition so a fast error or stale response is not counted as success unless the product contract allows it.
+
+## 2.17 Requirement conflicts and prioritization
+
+Quality attributes can conflict. Stronger consistency may add coordination latency or reduce availability during a partition; additional replicas can improve fault tolerance but increase cost and operational complexity; caching can improve latency while weakening freshness; richer synchronous fan-out can improve completeness while worsening tail latency.
+
+Prioritize by identifying non-negotiable invariants, measurable user outcomes, acceptable degraded behavior, and budget constraints. Do not resolve a conflict with a vague phrase like “highly available and strongly consistent everywhere.” State the failure scenario and the operation's required guarantee.
+
+## 2.18 Requirement review checklist
+
+- Are functional outcomes and explicit non-goals stated?
+- Are peak, burst, geographic and tenant workload assumptions visible?
+- Are latency targets percentiles measured at a user-visible boundary?
+- Does success mean a correct result, not merely an HTTP response?
+- Are freshness and consistency expectations defined per operation?
+- Are durability, RPO and RTO specified for important data?
+- What behavior is acceptable during overload or dependency failure?
+- Which security, privacy and retention constraints are mandatory?
+- How will each requirement be tested and observed?
+- Which assumptions would force an architectural redesign if wrong?
+
+
 ## Further reading
 
 - [Google SRE Book](https://sre.google/sre-book/table-of-contents/) — reliability objectives and operational practice.
