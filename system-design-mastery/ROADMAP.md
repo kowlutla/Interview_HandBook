@@ -74,6 +74,37 @@ flowchart TD
 
 The diagram captures dominant prerequisites rather than every relationship. Security and observability should be considered from the beginning; their later chapters consolidate and deepen those concerns.
 
+
+## Textbook completion workflow (quality gates)
+
+The six learning passes above describe the reading order. They do not imply that the chapters are already complete. Before calling this a dependable reference, use the following editorial sequence:
+
+### Gate A — Inventory-to-chapter audit
+
+For every row in the mandatory topic inventory in `CURRICULUM.md`, record the exact chapter section that teaches it and classify coverage as:
+- **Missing:** no meaningful explanation exists.
+- **Mentioned:** named or briefly described, without enough mechanism or design reasoning.
+- **Developing:** mechanism and trade-offs exist, but examples, edge cases, failure behavior, or operational guidance are missing.
+- **Deep:** purpose, internals, variants, selection criteria, trade-offs, failure modes, security/operations where relevant, diagrams, and worked reasoning are present.
+
+Do not mark a topic Deep merely because the phrase appears in a paragraph. Maintain an evidence-based gap list and resolve it chapter by chapter.
+
+### Gate B — Expand by dependency order
+
+Address foundational gaps before advanced topics: requirements and capacity; runtime and networking; traffic entry and APIs; data and storage; caching; distributed systems and coordination; messaging; scaling and resilience; architecture styles; security; operations; cloud delivery; cross-cutting patterns. This reduces duplicated explanations and avoids teaching a mechanism before its prerequisites.
+
+### Gate C — Technical verification
+
+For claims about protocols, consistency, security, or database behavior, use primary standards, papers, or official documentation. Label implementation-specific behavior and assumptions. Recalculate every numeric example and distinguish a protocol guarantee from a common implementation choice.
+
+### Gate D — Pedagogical verification
+
+For each major concept, check for: motivation, vocabulary, mechanism, a diagram, a concrete example, alternatives, when/when-not to use, failure modes, bottlenecks, observability, security implications where applicable, and a short self-check. Split a chapter into more Markdown files only when the coherent chapter page becomes unwieldy; do not fragment merely to create more files.
+
+### Gate E — Repository and rendering verification
+
+Check internal links, source links, heading structure, code fences, and Mermaid rendering. Verify that changes stay under `system-design-mastery/`. Keep the progress tracker honest: distinguish content drafted from content independently reviewed.
+
 ## Study routine
 1. Read the chapter's motivation and mechanism.
 2. Recreate its important diagram without looking.
