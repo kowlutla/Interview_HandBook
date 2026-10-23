@@ -48,5 +48,15 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 - Microsoft, [Cloud Design Patterns](https://learn.microsoft.com/en-us/azure/architecture/patterns/).
 - Google, [Cloud Architecture Framework](https://cloud.google.com/architecture/framework).
 
+
+## Architecture styles, traffic management and security
+- Microsoft Azure Architecture Center, [Architecture styles](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles) and [Microservices architecture style](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/microservices).
+- Microsoft Azure Architecture Center, [Cloud Design Patterns](https://learn.microsoft.com/en-us/azure/architecture/patterns/).
+- AWS, [Elastic Load Balancing documentation](https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/what-is-load-balancing.html).
+- AWS API Gateway, [HTTP API throttling](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-throttling.html). Treat documented throttles as implementation behavior, not universal API gateway semantics.
+- Cloudflare, [Origin Cache Control](https://developers.cloudflare.com/cache/concepts/cache-control/) and [CDN-Cache-Control](https://developers.cloudflare.com/cache/concepts/cdn-cache-control/). These describe Cloudflare-specific behavior; use RFC 9111 for general HTTP caching semantics.
+- OWASP, [API Security Top 10](https://owasp.org/API-Security/editions/2023/en/0x00-header/).
+- AWS, [Well-Architected Framework pillars](https://docs.aws.amazon.com/wellarchitected/2024-06-27/framework/the-pillars-of-the-framework.html).
+
 ## Evidence labels
 In chapter prose, distinguish formal specification/research, implementation documentation, practitioner guidance, and illustrative assumptions. Avoid copying source wording; synthesize it into an original explanation.
