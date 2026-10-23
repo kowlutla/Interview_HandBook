@@ -220,6 +220,43 @@ You should be able to explain, in your own words:
 6. How a Pareto frontier helps compare feasible designs.
 7. What evidence would cause you to revisit an architecture decision.
 
+
+## 1.13 Architecture decisions as explicit hypotheses
+
+An architecture decision should be treated as a hypothesis about the workload and constraints, not as a permanent truth. For example, “we need microservices to scale” contains several testable assumptions: one part of the system is a bottleneck, that part can be scaled independently, the boundary is stable, and independent deployment is worth the distributed-systems cost.
+
+Record the decision, context, options considered, reason for selection, expected consequences, evidence to collect, and conditions that would trigger reconsideration. A decision record is not a substitute for measurement; it makes the assumptions visible so future evidence can update the design.
+
+### Reversible and irreversible decisions
+
+Some decisions are relatively easy to change, such as a library choice behind a stable interface. Others are expensive to reverse: public API contracts, data ownership, shard keys, event schemas, cryptographic formats, or externally visible consistency guarantees. Prefer experiments and reversible choices when uncertainty is high, while investing more review in decisions that create long-lived data or compatibility obligations.
+
+Do not delay every decision until all uncertainty disappears. Instead, identify which assumptions are most consequential, test them cheaply where possible, and choose a design that limits the cost of being wrong.
+
+## 1.14 Decomposition: cohesion, coupling and ownership
+
+A component should group responsibilities that change together and keep unrelated change separate. **Cohesion** describes how strongly the responsibilities within a component belong together. **Coupling** describes how much one component depends on another's structure, timing, state or release process.
+
+Coupling is not only a code-import relationship. Two services may be operationally coupled if they must deploy together, data-coupled if they share tables, temporal-coupled if every request requires both to be available, or semantically coupled if a field change silently changes another service's interpretation.
+
+A useful boundary gives one owner clear responsibility for an invariant and exposes a contract to others. If multiple components can independently change the same authoritative state, ownership is ambiguous. If a simple user action requires many synchronous calls, the decomposition may create a fragile critical path.
+
+### A decomposition test
+
+For each proposed component, ask:
+1. What capability or invariant does it own?
+2. What state is authoritative inside this boundary?
+3. Which changes should be possible without coordinating with neighbors?
+4. What calls/events cross the boundary and what do they cost?
+5. What happens if a neighbor is slow, unavailable or returns an incompatible response?
+6. How will this component be deployed, scaled, secured, observed and recovered?
+7. Is the boundary worth the operational cost compared with a module in one process?
+
+### Architecture quality is multidimensional
+
+There is rarely one design that maximizes every quality attribute. A design may reduce latency but increase cost, improve availability but permit stale reads, or increase independent deployment while making debugging more difficult. State the chosen objective and the cost being accepted. A trade-off is meaningful only when the relevant constraints and failure behavior are explicit.
+
+
 ## Further reading
 
 - [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) — practitioner guidance for architecture quality.
