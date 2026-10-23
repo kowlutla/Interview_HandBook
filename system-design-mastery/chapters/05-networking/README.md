@@ -301,6 +301,49 @@ sequenceDiagram
 - Is the cost of egress, cache fill and invalidation understood?
 
 
+
+## 5.21 Network boundaries, firewalls, and private connectivity
+
+### Forward proxy, reverse proxy, firewall and WAF
+
+A **forward proxy** makes requests on behalf of clients and can enforce outbound access policy, identity, filtering and logging. A **reverse proxy** receives requests on behalf of servers and forwards them to origins. A **network firewall** filters traffic using network/transport attributes and connection state according to policy. A **Web Application Firewall (WAF)** inspects application-layer requests for configured attack patterns or policy violations. These components overlap in some products but protect different boundaries.
+
+A WAF is not a substitute for secure application code, object-level authorization, input validation or resource limits. A request can be syntactically normal and still perform an unauthorized business operation. Likewise, a network firewall that permits a TCP connection does not establish that the HTTP request is safe.
+
+### Network segmentation and trust zones
+
+Segment networks by workload, sensitivity and trust: public edge, application tier, data tier, management plane, build/deployment plane and outbound integration zones may need different access rules. Default-deny policies reduce accidental reachability, but overly broad shared subnets and permissive security groups can erase the intended boundary.
+
+Model both ingress and egress. A service may need to call a payment provider or identity service but should not be able to reach arbitrary internal addresses. Restrict outbound destinations where practical, log denied traffic, and make the approved dependencies explicit. Network segmentation limits reachability; service identity and application authorization still decide who can perform an action.
+
+### VPCs, subnets, routing and private endpoints
+
+A virtual network provides an isolated address space and routing context. Subnets group addresses and are associated with route and security policy. A route table determines the next hop for destination prefixes; a security group or network ACL applies additional traffic policy according to the cloud/network model. Exact semantics differ among providers.
+
+Private endpoints or private-link-style services can expose a managed service through private network connectivity without requiring a public endpoint. They reduce some exposure but do not remove the need for identity, authorization, DNS correctness, endpoint policy and data exfiltration controls. Private connectivity is not equivalent to “trusted caller.”
+
+Peering and transit routing connect networks, but overlapping address ranges, route propagation, transitive-routing limitations, DNS resolution and firewall policy can complicate topology. Design the address plan and connectivity model before many teams create independent networks.
+
+### NAT, egress and ephemeral capacity
+
+Network Address Translation can allow private workloads to initiate outbound connections through shared public addresses. The shared NAT path has finite connection and port capacity and can become a bottleneck during high connection churn. Connection reuse, destination diversity, idle timeouts and ephemeral-port behavior influence the number of concurrent outbound flows.
+
+A NAT gateway is not an application proxy: it typically does not understand user identity or HTTP operation cost. Use explicit egress proxies or policy enforcement where domain-aware allow-listing, authentication or request inspection is required. Monitor translation capacity, connection failures and egress cost.
+
+### Network security review checklist
+
+- Which trust zones exist, and which flows are explicitly allowed?
+- Are ingress and egress both constrained?
+- Can a public route bypass the intended gateway or WAF?
+- Does a WAF complement, rather than replace, application authorization?
+- Are private endpoints protected by identity and resource policy?
+- Are route tables, peering and DNS behavior understood across networks?
+- Can NAT or ephemeral ports exhaust under connection churn?
+- Are management and deployment paths separated from user traffic?
+- Are network denies and unexpected outbound destinations observable?
+- Has reachability been tested from a compromised workload's perspective?
+
+
 ## Further reading
 - IETF [RFC 9293 — TCP](https://www.rfc-editor.org/rfc/rfc9293.html).
 - IETF [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
