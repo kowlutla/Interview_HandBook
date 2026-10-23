@@ -31,6 +31,73 @@ A broker's exactly-once feature generally applies to a defined scope. It does no
 ## Reconfiguration and split brain
 Membership changes alter which nodes form a quorum. Safe protocols constrain how old and new configurations overlap. Independently changing replica membership can create two groups that each believe they have authority. Split brain is conflicting authority that permits divergent commits, not merely duplicate leader processes.
 
+
+## 11.5A Consensus, replication, and transactions are different problems
+
+These concepts are related but should not be conflated:
+- **Replication** keeps copies of data or state on multiple nodes.
+- **Consensus** lets participants agree on a value or ordered decision under a stated failure model.
+- **Leader election** selects a coordinator but needs a protocol that fences stale leaders.
+- **Distributed transaction** coordinates atomic effects across multiple transactional participants.
+- **Workflow orchestration** advances a multi-step business process and may use compensation rather than global atomicity.
+
+A replicated database may use consensus internally, but that does not mean a transaction spanning two independent databases is atomic. A saga can coordinate business steps without consensus over one global state. Select the mechanism based on the invariant that must be preserved.
+
+## 11.5B Quorums, terms, and epochs
+
+A quorum is a set of participants sufficient for a protocol decision. Majority quorums intersect in a fixed membership set, which helps prevent incompatible decisions from both being accepted. The protocol must also define what a vote means, which state is persisted before responding, how old terms are rejected, and how membership changes occur.
+
+A **term** or **epoch** is a monotonically advancing generation used to distinguish authority over time. A fencing token extends this idea to a protected resource: the resource rejects an operation from an older generation after a newer one has been accepted. Tokens must be ordered and checked atomically with the protected mutation.
+
+A lease based only on elapsed time has assumptions about clocks, pauses, and renewal. Fencing is stronger when the resource enforces it, because a stale process can resume after believing its lease is still valid.
+
+## 11.5C Failure recovery and durable protocol state
+
+Consensus protocols rely on durable state such as terms, votes, and log entries. Restarting a node must not erase state whose persistence is required by the algorithm. Storage ordering and acknowledgement semantics are part of correctness, not merely performance tuning.
+
+After restart, a node may need to recover its log, compare its state with peers, receive missing entries, or install a snapshot. Snapshotting bounds replay cost but requires a well-defined relationship between the snapshot's last included index/term and the retained log. Incorrect truncation can discard entries required for safe recovery.
+
+Operational procedures should never manually edit protocol metadata or independently promote a replica unless the system's documented recovery procedure explicitly supports it.
+
+## 11.5D Split brain, fencing, and failover
+
+Split brain means more than two processes both claiming to be leaders. The dangerous condition is that multiple authorities can accept incompatible writes to the same logical resource. A safe failover path must ensure that an old authority cannot continue committing after a new authority takes over.
+
+Useful safeguards include quorum-backed leadership, terms or epochs, storage-side fencing, single-writer routing, and explicit recovery of in-flight operations. DNS or load-balancer changes alone do not fence a stale writer; old connections and direct network paths may remain active.
+
+## 11.5E Two-phase commit details
+
+In a typical two-phase commit protocol, the coordinator asks each participant to prepare. A participant that votes yes promises it can later commit and durably records enough state to honor that promise. The coordinator durably records the final decision before informing participants. Participants may need to retain locks or prepared state while waiting for the decision.
+
+The difficult case is uncertainty: a prepared participant may not know whether the coordinator decided commit or abort. A timeout does not automatically make unilateral abort safe. Recovery depends on durable coordinator logs and a protocol for learning the decision. Two-phase commit can block under coordinator or network failures; it is not equivalent to a non-blocking saga.
+
+## 11.5F Saga design details
+
+For every saga step, define:
+- The forward action and its durable state transition.
+- An idempotency key and duplicate behavior.
+- Retryable versus terminal errors.
+- Timeout and uncertain-outcome handling.
+- A compensation action, if one exists.
+- The state to expose while the workflow is incomplete.
+- Manual intervention and reconciliation paths.
+
+Compensation is a new domain action, not necessarily a rollback. A cancellation may incur fees; a refund may happen after a charge; a reservation may expire rather than be directly undone. Sagas therefore need explicit business states such as Pending, Reserved, PaymentAuthorized, Confirmed, Compensating, Failed, and Completed, with valid transitions enforced.
+
+## 11.5G Distributed lock decision checklist
+
+Before introducing a distributed lock, ask:
+1. Is the lock protecting correctness or only avoiding duplicate effort?
+2. Can the protected resource enforce a version or fencing token?
+3. What happens if the holder pauses beyond lease expiry?
+4. How are acquisition, renewal, release, and crash recovery handled?
+5. Can an operation complete after the caller times out?
+6. Is the critical section idempotent?
+7. Could partitioning the resource or using a conditional update eliminate the lock?
+
+A lock adds a coordination dependency and can become a bottleneck. Prefer the simplest mechanism that preserves the invariant.
+
+
 ## Further reading
 - [Raft paper and resources](https://raft.github.io/).
 - Fischer, Lynch and Paterson, [consensus impossibility result](https://doi.org/10.1145/3149.214121).
