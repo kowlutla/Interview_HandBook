@@ -275,6 +275,7 @@ On the subscriber side, enforce payload-size limits, method and content-type exp
 
 
 ## Further reading
+- OWASP, [Webhook Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Webhook_Security_Cheat_Sheet.html), covering signatures, replay protection, duplicate processing and SSRF risks.
 - AWS API Gateway, [HTTP API throttling](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-throttling.html) as an implementation-specific token-bucket example.
 - OWASP, [API Security Top 10](https://owasp.org/API-Security/editions/2023/en/0x00-header/) for common API threat categories.
 - IETF [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html).
