@@ -143,12 +143,6 @@ A quorum intersection argument depends on the configured membership and protocol
 - How is recovery tested under pauses, partitions, duplicate messages and restarts?
 
 
-## Further reading
-- [Raft paper and resources](https://raft.github.io/).
-- Fischer, Lynch and Paterson, [consensus impossibility result](https://doi.org/10.1145/3149.214121).
-- [Raft paper (USENIX)](https://web.stanford.edu/~ouster/cgi-bin/papers/raft-atc14.pdf).
-
-
 ## 11.1A Replicated state machine model
 
 A common use of consensus is to replicate an ordered log of commands. If replicas apply the same deterministic commands in the same committed order from the same initial state, their state machines can converge to the same state. Consensus chooses which log entries are committed; application logic still must be deterministic and side effects must be handled carefully.
@@ -207,6 +201,13 @@ flowchart TD
 ```
 
 Consensus algorithms differ in their exact rules, but the critical distinction is between receiving a command, replicating a log entry, committing it, applying it, and acknowledging the client. These are not interchangeable events.
+
+## Further reading
+- [Raft paper and resources](https://raft.github.io/).
+- Fischer, Lynch and Paterson, [consensus impossibility result](https://doi.org/10.1145/3149.214121).
+- [Raft paper (USENIX)](https://web.stanford.edu/~ouster/cgi-bin/papers/raft-atc14.pdf).
+
+
 
 
 ---
