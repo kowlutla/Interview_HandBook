@@ -169,6 +169,21 @@ Peer-to-peer designs let participants act as both clients and servers, avoiding 
 
 CQRS separates command and query models; event sourcing treats a sequence of domain events as authoritative history. Either can be used in a monolith or distributed system. They can support different read models, audit history and replay, but add projection lag, event-schema evolution, migration, replay safety and operational complexity. Use them when those capabilities solve a real problem.
 
+```mermaid
+flowchart TD
+  A[Identify invariant and change pattern] --> B{Need independent deployment or scaling?}
+  B -- No --> C[Modular monolith with explicit modules]
+  B -- Yes --> D{Can state ownership be separated?}
+  D -- No --> E[Redesign boundary or keep shared transaction boundary]
+  D -- Yes --> F{Need independent consumers or replay?}
+  F -- Yes --> G[Consider event-driven integration]
+  F -- No --> H[Consider service-oriented boundary]
+  C --> I[Validate failure, security and operating cost]
+  E --> I
+  G --> I
+  H --> I
+```
+
 ### Architecture style decision table
 
 | Design question | Direction to investigate |
