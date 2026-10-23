@@ -10,7 +10,7 @@ Check items only when the work has actually been performed.
 - [x] Confirmed destination README was absent at the checked path before creation.
 - [x] Established strict write boundary: system-design-mastery/.
 - [x] Designed an independent curriculum around learning dependencies rather than existing numbering.
-- [x] Inspect the complete repository tree: the target contains the six planning/reference documents and 19 chapter README files, with no extra Markdown lesson fragments.
+- [x] Inspect the complete repository tree: the target contains seven planning/reference Markdown files and 19 chapter README files, with no extra Markdown lesson fragments.
 - [x] Compare commits from the first textbook creation through the latest edit; all paths in the checked comparison are under system-design-mastery/.
 
 ## Planning artifacts
@@ -49,7 +49,7 @@ Check items only when the work has actually been performed.
 - [x] Independently recalculate the chapter's traffic, bandwidth, storage, Little's Law and fan-out examples; results match within rounding.
 - [ ] Review assumptions, caveats and implementation-specific claims.
 - [ ] Audit for missing topics, duplication and out-of-scope content.
-- [ ] Verify final repository path boundary.
+- [x] Verify final repository path boundary against the original textbook baseline; the checked comparison contains no paths outside system-design-mastery/.
 - [ ] Report limitations honestly; do not claim the textbook complete until all acceptance checks pass.
 
 ## Current status
