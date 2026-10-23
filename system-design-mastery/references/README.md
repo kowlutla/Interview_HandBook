@@ -58,5 +58,15 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 - OWASP, [API Security Top 10](https://owasp.org/API-Security/editions/2023/en/0x00-header/).
 - AWS, [Well-Architected Framework pillars](https://docs.aws.amazon.com/wellarchitected/2024-06-27/framework/the-pillars-of-the-framework.html).
 
+
+## Protocol standards and secure integrations
+- IETF, [RFC 8200 — IPv6 Specification](https://www.rfc-editor.org/rfc/rfc8200.html).
+- IETF, [RFC 4033 — DNS Security Introduction and Requirements](https://www.rfc-editor.org/rfc/rfc4033.html).
+- IETF, [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
+- IETF, [RFC 9000 — QUIC Transport](https://www.rfc-editor.org/rfc/rfc9000.html).
+- IETF, [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html) and [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html).
+- OWASP, [Webhook Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Webhook_Security_Cheat_Sheet.html).
+- CISA and international partners, [Software Bill of Materials (SBOM) guidance](https://www.cisa.gov/sbom).
+
 ## Evidence labels
 In chapter prose, distinguish formal specification/research, implementation documentation, practitioner guidance, and illustrative assumptions. Avoid copying source wording; synthesize it into an original explanation.
