@@ -5,7 +5,7 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 ## Distributed systems and theory
 - Gilbert and Lynch, *Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services* (2002): [MIT-hosted paper](https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf).
 - Gilbert and Lynch, *Perspectives on the CAP Theorem* (2012): [MIT DSpace record](https://dspace.mit.edu/entities/publication/dfcb6512-af44-4fc9-8e8b-1a8f28f1b53a).
-- Ongaro and Ousterhout, *In Search of an Understandable Consensus Algorithm (Raft)*: [paper and dissertation resources](https://raft.github.io/).
+- Ongaro and Ousterhout, *In Search of an Understandable Consensus Algorithm (Raft)*: [USENIX paper PDF](https://web.stanford.edu/~ouster/cgi-bin/papers/raft-atc14.pdf) and [paper/dissertation resources](https://raft.github.io/).
 - Lamport, *Time, Clocks, and the Ordering of Events in a Distributed System* (1978): [original paper](https://lamport.azurewebsites.net/pubs/time-clocks.pdf).
 - Fischer, Lynch and Paterson, *Impossibility of Distributed Consensus with One Faulty Process* (1985): [DOI](https://doi.org/10.1145/3149.214121).
 - Brewer, *CAP Twelve Years Later: How the Rules Have Changed* (2012): [DOI](https://doi.org/10.1109/MC.2012.37).
@@ -16,6 +16,7 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 - IETF, [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
 - IETF, [RFC 9000 — QUIC](https://www.rfc-editor.org/rfc/rfc9000.html).
 - IETF, [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html).
+- IETF, [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html).
 - IETF, [RFC 5861 — HTTP cache-control extensions](https://www.rfc-editor.org/rfc/rfc5861.html).
 - IETF, [RFC 9700 — OAuth 2.0 Security BCP](https://www.rfc-editor.org/rfc/rfc9700.html).
 - IETF, [RFC 6749 — OAuth 2.0](https://www.rfc-editor.org/rfc/rfc6749.html).
@@ -33,6 +34,7 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 
 ## Reliability and operations
 - Google, [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
+- Google, [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) and [Service Best Practices / Error Budgets](https://sre.google/sre-book/service-best-practices/).
 - Google, [SRE Workbook: Error Budget Policy](https://sre.google/workbook/error-budget-policy/).
 - Google Cloud, [Well-Architected Reliability pillar](https://docs.cloud.google.com/architecture/framework/reliability).
 - AWS, [Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
