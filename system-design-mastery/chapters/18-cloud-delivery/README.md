@@ -209,6 +209,59 @@ An API gateway primarily governs north-south API entry and consumer-facing contr
 - Does the team have the operational capacity to run and upgrade the mesh?
 
 
+
+## 18.4 Infrastructure as code: state, drift and safe change
+
+Infrastructure as code (IaC) represents infrastructure configuration in reviewable, repeatable definitions. It improves reproducibility and change review, but it does not make infrastructure changes automatically safe. Providers, modules, state files, credentials, remote APIs and out-of-band console changes can all affect the result.
+
+### Desired configuration and observed state
+
+A plan or preview compares declared configuration with the tool's view of actual resources and proposes changes. The result depends on provider behavior, state accuracy, refresh behavior, dependencies and external changes. A plan is not a guarantee that the eventual API operations will succeed exactly as predicted; quotas, permissions, concurrent changes and eventual control-plane behavior can alter execution.
+
+Remote state commonly records resource identities and relationships. Protect it like production metadata: restrict access, encrypt storage and transport, enable versioning or recovery where supported, and prevent concurrent writers from corrupting the state. State can contain sensitive values even when outputs are marked sensitive.
+
+### Drift, imports and destructive plans
+
+Drift occurs when actual infrastructure differs from the declared configuration, such as a manual console change or an external controller modifying a field. Decide whether to reconcile the resource back to code, update code to the intended state, or import an existing resource into management. Blindly applying a plan can undo an emergency change or destroy an important resource.
+
+Review replacement and deletion actions carefully. Changes to databases, networking, identity policies, encryption keys and persistent volumes can be disruptive or irreversible. Use environment separation, least-privilege deployment identities, policy checks, approvals for destructive operations, and a recovery path. A successful rollback of the IaC repository does not necessarily reverse a data migration or restore deleted cloud data.
+
+### Modules and environment promotion
+
+Reusable modules should expose stable inputs and outputs, enforce sensible defaults, and make dangerous options explicit. Version modules and providers, pin reviewed dependencies where appropriate, and test changes in an isolated environment. Avoid copy-pasted environment configurations that drift, but also avoid a single global module change that can unintentionally affect every production environment at once.
+
+Promote reviewed artifacts through environments and separate deployment authorization from ordinary source-code write access. Secret values should be sourced from a managed secret system or protected runtime configuration rather than committed to code or written into logs and plan artifacts.
+
+## 18.5 Software supply-chain security for cloud delivery
+
+A deployable artifact depends on source code, build tools, dependencies, base images, build runners, registries, signing identities and deployment permissions. A vulnerability or compromise in any part of that chain can undermine application security even if the application code itself is correct.
+
+### Provenance, SBOM and artifact integrity
+
+A **software bill of materials (SBOM)** records components included in an artifact using a defined format. It helps identify where a vulnerable or disallowed dependency is present, but it is not itself proof that an artifact is safe. Pair it with vulnerability analysis, license policy, artifact provenance, integrity checks and a response process.
+
+Build provenance describes how an artifact was produced, including the source revision and build process under a defined attestation model. Artifact signing can help verify origin and integrity if the signing key, identity and verification policy are protected. Do not treat a valid signature as proof that the source was benign; verify both the artifact and the trustworthiness of the build process.
+
+### Build and deployment boundaries
+
+Use short-lived or narrowly scoped credentials for build and deploy jobs, isolate untrusted pull-request builds from production secrets, pin or verify dependencies where appropriate, and restrict who can publish release artifacts. Protect registry access, scan images and dependencies, and rebuild from reviewed source when a dependency or base image changes.
+
+A secure pipeline needs an exception process: findings must have owners, severity/context, remediation deadlines and documented risk acceptance. “Scan passed” is only as meaningful as the coverage, database freshness, policy thresholds and handling of unscanned components.
+
+### Supply-chain review checklist
+
+- Are IaC state and deployment credentials protected from unauthorized access?
+- Are plans reviewed for destructive replacements and unexpected drift?
+- Can state be recovered and concurrent state writers be controlled?
+- Are modules and providers versioned and tested before broad promotion?
+- Are production deployments separated from untrusted build contexts?
+- Are dependencies, base images and artifacts scanned under a documented policy?
+- Is an SBOM produced in a machine-readable format for release artifacts?
+- Is artifact provenance available and verified by deployment policy?
+- Are signing identities and keys protected and rotated?
+- Can a compromised artifact be traced, blocked and replaced through a tested response?
+
+
 ## Further reading
 - Docker [container fundamentals](https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-a-container/).
 - Kubernetes [documentation](https://kubernetes.io/docs/home/).
