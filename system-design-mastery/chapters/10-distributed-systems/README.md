@@ -171,6 +171,49 @@ Capacity must be planned for the surviving region to handle the required load. I
 - Has failover and failback been tested with real data and clients?
 
 
+
+## 10.18 Worked consistency timeline: write, timeout, and read
+
+Consider a client writing a new shipping address to a service that replicates data to another region. The client sends the write; the primary commits it; the response is lost; and the client times out. The client cannot infer whether the write committed from the timeout alone. Retrying with the same idempotency key can avoid creating a second logical operation, but the read behavior still depends on the system's consistency contract.
+
+### Three possible read paths
+
+1. **Read from the primary or authoritative leader:** after the committed write, a subsequent read may return the new value, subject to the system's transaction and session guarantees.
+2. **Read from an asynchronous replica:** the replica may not yet have applied the write, so the client can observe the older address.
+3. **Read with a session/version token:** the client supplies evidence of the required write version, and the service routes to an appropriate replica or waits until that version is visible. If no replica can satisfy the token, the system must define whether it waits, routes elsewhere, or returns an explicit failure.
+
+A system should not promise read-your-writes while routing every read to an arbitrary lagging replica unless it has a mechanism that enforces that promise.
+
+### Quorum arithmetic is not a full consistency proof
+
+For a fixed set of (N) replicas, read and write quorum sizes (R) and (W) are often discussed using the intersection condition (R + W > N). This arithmetic helps show that read and write sets intersect under the assumed membership and failure model. It does not, by itself, prove linearizability.
+
+The actual guarantee depends on how versions are ordered, which replica acknowledges a write, whether writes are concurrent, how conflicting values are resolved, whether replicas can acknowledge stale state, how membership changes, and whether the read protocol chooses the newest valid committed version. Some systems use consensus or leader-based rules rather than simple independent read/write quorums.
+
+### Distinguish the operation's guarantee
+
+- **Eventual consistency:** if updates stop and the system continues making progress, replicas are expected to converge under the model; this does not promise when a particular read sees a write.
+- **Read-your-writes:** a client sees its own successful prior writes in later reads within the guarantee's defined scope.
+- **Monotonic reads:** a client does not move backward to an older state according to the system's version/order model.
+- **Linearizability:** each operation appears to take effect atomically at a point between invocation and response, respecting real-time order for non-overlapping operations.
+- **Serializability:** transactions behave as if executed in some serial order; it does not by itself imply that the order respects real-time ordering.
+
+These guarantees answer different questions. State which operations receive which guarantee, what happens after a timeout, and how a client can safely retry.
+
+### Consistency review checklist
+
+- What does the write acknowledgment mean: local commit, quorum, or consensus commit?
+- Can a timeout occur after the operation has committed?
+- Is the retry idempotent and how is its result recovered?
+- Which reads may use stale replicas?
+- Are read-your-writes or monotonic-read guarantees required?
+- What does a session/version token represent and how is it validated?
+- What are the assumptions behind quorum intersection?
+- How are concurrent writes and conflict resolution handled?
+- Does the stated guarantee hold during failover and membership changes?
+- Can tests demonstrate the guarantee under delay, duplicate requests and replica lag?
+
+
 ## Further reading
 - Gilbert and Lynch, [CAP paper](https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf).
 - Lamport, [Time, Clocks, and the Ordering of Events](https://lamport.azurewebsites.net/pubs/time-clocks.pdf).
