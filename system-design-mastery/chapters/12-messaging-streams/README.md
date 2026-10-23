@@ -115,6 +115,69 @@ An inbox stores processed message identifiers and the local effect in one transa
 - Who owns dead-letter records and operational recovery?
 
 
+
+## 12.2 Message brokers and delivery semantics in depth
+
+A broker is not merely a network buffer. It defines persistence, routing, acknowledgement, redelivery, ordering scope, retention, consumer coordination, and operational recovery. When choosing a broker or log, ask what is persisted before acknowledgement, how ownership changes, what a consumer can replay, and which failures may duplicate or delay work.
+
+### Queue, pub/sub, and durable log compared
+
+A work queue commonly distributes each message to one competing worker in a consumer group. Pub/sub delivers a publication to multiple independent subscriptions. A durable log retains an ordered sequence within each partition so consumers can track offsets and replay retained history. Products often combine these models, but the delivery and retention contract still matters.
+
+A queue is useful when work should be claimed and completed; pub/sub when independent subscribers need their own delivery; a log when replay and consumer-controlled position are central. None automatically makes business effects exactly once.
+
+### At-most-once, at-least-once, and effectively-once effects
+
+- **At-most-once:** a message may be lost, but the broker/consumer contract avoids redelivery after the chosen acknowledgement point.
+- **At-least-once:** a message is retried until acknowledged under the system's delivery policy; duplicates are possible.
+- **Effectively-once business outcome:** duplicates are made harmless through idempotency, deduplication, transactions or a protocol that atomically couples progress with effects.
+
+“Exactly once” is always scoped. A broker may atomically commit consumed offsets and produced records inside its own transaction model, while an external payment provider or database update remains outside that transaction. Explain the boundary instead of using “exactly once” as an end-to-end guarantee.
+
+### Acknowledgement boundaries and the dual-write problem
+
+If a consumer writes to a database and then acknowledges the message, a crash between those steps may cause the database effect to happen twice. If it acknowledges first and then crashes before the database write, the effect may be lost. Common solutions include idempotent database updates, a deduplication/inbox record in the same transaction as the effect, or an outbox for publishing after a local transaction.
+
+The deduplication key must identify the logical operation and be retained for at least the relevant replay/redelivery horizon. Deduplication storage itself needs capacity, cleanup and concurrency semantics.
+
+### Ordering and partitions
+
+A partitioned log usually preserves order within one partition, not across the entire topic. Partition keys should group events whose relative order matters, such as all events for one account or order. A hot key can concentrate traffic on one partition and defeat horizontal scaling.
+
+Increasing partition count can change key-to-partition mapping in some partitioners and may affect ordering expectations. Consumer-group rebalances temporarily move partition ownership; consumers should handle revoked partitions, commit progress carefully, and avoid overlapping side effects when ownership changes.
+
+### Retry topics, dead-letter queues, and poison messages
+
+A retry policy should distinguish transient failures (temporary network error, rate limit, unavailable dependency) from permanent failures (invalid schema, impossible domain state). Use bounded attempts, exponential backoff with jitter, and a defined terminal path. Immediate requeue can create a hot loop that starves healthy messages.
+
+A dead-letter queue is not a repair strategy by itself. It needs an owner, alerting, reason metadata, retention, inspection, replay tooling and safe reprocessing rules. Replaying a message can repeat an external side effect; require idempotency or an explicit compensating action.
+
+### Backpressure and consumer lag
+
+Lag count alone can be misleading: one million tiny messages may be easier than one thousand large or expensive messages. Track lag age, incoming rate, successful processing rate, retry rate, batch size, processing latency, and estimated drain time. If arrival rate remains above service rate, lag grows without bound unless admission or production is controlled.
+
+Bound consumer concurrency, database connection use, batch size, and in-flight messages. A larger prefetch window may improve throughput but increases memory use and the amount of work that may be repeated after a crash.
+
+### Event time and stream processing
+
+Stream processors distinguish event time (when the event happened) from processing time (when the processor handled it). Events can arrive late or out of order due to retries, network delays and source behavior. Windows aggregate events over a time interval; watermarks express the processor's estimate of how far event time has progressed, not proof that no older event can ever arrive.
+
+Late-event policy may update a result, emit corrections, or drop events after a configured horizon. Stateful operators need checkpointing, state recovery, replay-safe sinks, and a plan for schema changes. “Streaming” does not mean every event is processed instantly or in strict global order.
+
+### Messaging architecture checklist
+
+- What is the durability point for producer acknowledgement?
+- What does acknowledgement mean for consumer progress?
+- Can duplicate delivery repeat a business effect?
+- What is the ordering scope and partition-key strategy?
+- How are retries bounded and classified?
+- Who repairs dead-lettered or poison messages?
+- What happens during consumer rebalance or restart?
+- Is lag measured by age and drain time as well as count?
+- Can a slow consumer apply backpressure safely?
+- What are the event-time, late-data, replay and schema-evolution rules?
+
+
 ## Further reading
 - Apache Kafka [design](https://kafka.apache.org/documentation/#design) and [delivery semantics](https://kafka.apache.org/documentation/#semantics).
 - Debezium [outbox event router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html).
