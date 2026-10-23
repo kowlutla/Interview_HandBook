@@ -13,7 +13,7 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 ## Network and identity standards
 - IETF, [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html).
 - IETF, [RFC 9293 — TCP](https://www.rfc-editor.org/rfc/rfc9293.html).
-- IETF, [RFC 9000 — QUIC](https://www.rfc-editor.org/rfc/rfc9000.html).
+- IETF, [RFC 9000 — QUIC](https://www.rfc-editor.org/info/rfc9000/).
 - IETF, [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html).
 - IETF, [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html).
 - IETF, [RFC 5861 — HTTP cache-control extensions](https://www.rfc-editor.org/rfc/rfc5861.html).
