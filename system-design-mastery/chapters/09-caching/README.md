@@ -126,6 +126,57 @@ Consult [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html) for normative HT
 - Can cached sensitive data be deleted or invalidated across all layers?
 
 
+
+## 9.2 Cache patterns and failure modes in practice
+
+### Read-through, write-through, write-behind and write-around
+
+- **Cache-aside:** the application checks the cache, loads from the source on a miss, and populates the cache. It is flexible but leaves invalidation and stale-fill races to the application.
+- **Read-through:** the cache layer loads missing values from a configured source. It centralizes loading behavior but couples the cache to the loader integration.
+- **Write-through:** a write updates the cache and source as part of the write path according to the cache product's contract. Understand what happens if one side succeeds and the other fails; the label alone does not guarantee a distributed transaction.
+- **Write-behind/write-back:** writes are acknowledged to the cache before later propagation to the source. This can improve write latency but makes the cache part of the durability path; loss or delayed flush can lose acknowledged changes.
+- **Write-around:** writes go directly to the source and may bypass cache population, reducing pollution for write-once/read-rarely data but causing a later read miss.
+
+The correct pattern depends on whether the cache is disposable derived state or part of the acknowledged write path. Never assume a cache is durable because it replicates memory; define persistence and recovery guarantees explicitly.
+
+### Cache stampede, penetration and avalanche
+
+A **stampede** occurs when many callers load the same expired key simultaneously. Request coalescing, TTL jitter, refresh-ahead, bounded concurrency and stale-while-revalidate can help.
+
+**Cache penetration** occurs when repeated requests target keys that do not exist or bypass the cache; negative caching, input validation and rate limits can reduce repeated origin work. Negative entries need short, appropriate lifetimes and must not cache authorization failures as globally reusable absence.
+
+A **cache avalanche** is a burst of misses caused by many entries expiring together or a cache restart. TTL jitter, gradual warm-up, admission controls and origin protection reduce the risk. A cache outage can itself create a massive miss event, so the source must have a defined fallback rather than accepting unbounded traffic.
+
+### Cache invalidation is a consistency protocol
+
+When the source changes, the cache can be updated synchronously, invalidated by an event, or allowed to expire. Synchronous updates may add latency and partial-failure cases; event-driven invalidation introduces delivery delay, duplication and loss; TTL bounds some stale windows but may not satisfy strict correctness.
+
+An out-of-order event can invalidate or overwrite a newer value. Version-aware cache writes can reject older versions if the source provides comparable versions. For important data, define the maximum stale interval, event repair/reconciliation strategy, and behavior when freshness cannot be proven.
+
+### Cache correctness example: price and permissions
+
+A product description may tolerate a few seconds of staleness. A price used to display an estimate may tolerate bounded staleness if checkout revalidates it. A permission revocation often requires much faster enforcement because a stale allow decision can disclose data. These are different freshness contracts and should not share a cache policy just because they return JSON.
+
+Cache keys must include every dimension that changes the representation: tenant, locale, authorization scope, currency, feature version or request header as appropriate. Avoid caching a sensitive response under a key that omits the identity or authorization context. Cache invalidation must include CDN, local process, distributed cache and derived read-model layers where applicable.
+
+### Cache hit ratio is not the goal
+
+A high hit ratio can coexist with poor user latency if misses are extremely slow, hot keys are overloaded, or stale values cause repeated revalidation. Track hit/miss rate, miss latency, origin QPS, eviction, memory pressure, stampede suppression, refresh failures, stale-serving rate, and data-freshness violations. Measure latency at the user-visible boundary.
+
+### Cache review checklist
+
+- Is this cache disposable derived data or part of the durability path?
+- Which freshness contract applies to this data class?
+- What are the read/write patterns and invalidation path?
+- Can old in-flight reads repopulate stale values?
+- What happens when a key is absent or many keys expire together?
+- Are keys partitioned by tenant, authorization, locale and representation?
+- What happens to origin load during cache failure or cold start?
+- Does a high hit ratio hide tail latency or stale results?
+- Can deletion and revocation propagate to all cache layers?
+- Is there a repair path when invalidation messages are lost?
+
+
 ## Further reading
 - [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html).
 - [Redis eviction documentation](https://redis.io/docs/latest/develop/reference/eviction/).
