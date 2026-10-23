@@ -229,6 +229,51 @@ flowchart TD
 - Does the gateway risk becoming a centralized business-logic bottleneck?
 
 
+
+## 6.12 Webhooks: secure, retryable event delivery
+
+A webhook is an HTTP callback in which a publisher sends an event notification to a subscriber-controlled endpoint. It is asynchronous delivery over HTTP, not proof that the subscriber has durably processed the event. The publisher and subscriber need an explicit contract for authentication, retries, duplicates, ordering, timeout, payload schema and redelivery.
+
+### Signing and authenticating deliveries
+
+A common design signs the exact request body with a shared secret using an HMAC-based signature and sends the signature in a header. The subscriber verifies the signature over the original bytes before trusting the event. Re-serializing JSON before verification can change whitespace or field ordering and produce a different signature. Compare signatures using a constant-time comparison and keep signing secrets out of logs.
+
+A signature proves that the sender possessed the signing secret for the signed material; it does not by itself prevent replay. Where the provider's protocol supports them, verify a signed timestamp within a documented tolerance and deduplicate an authenticated event ID. Do not assume every provider signs the same fields or provides the same replay guarantees—follow the provider's protocol.
+
+### Retry, acknowledgement and idempotency
+
+The endpoint should return success only after it has accepted responsibility for the delivery, commonly by durably recording or enqueueing the event. Doing expensive downstream work before responding can cause unnecessary timeouts and retries. A durable inbox or deduplication record can couple the event ID with local processing state.
+
+Retries should use bounded exponential backoff with jitter and a maximum delivery horizon. The publisher may retry after a timeout even when the subscriber completed the operation but its response was lost. Therefore, the subscriber must make duplicate delivery harmless, especially when processing causes payments, fulfillment, account changes or notifications.
+
+A successful HTTP response means only what the webhook contract defines—often that the delivery was accepted, not that every downstream effect is complete. Expose delivery state and provide a safe replay mechanism with audit history.
+
+### Ordering and schema evolution
+
+Publishers may deliver events out of order, particularly when retrying older failures while newer events continue. Include event IDs, event types, occurrence timestamps and aggregate/version identifiers where needed. If order matters, define a sequence or version and reject, buffer or reconcile stale events explicitly; timestamps alone are not always a reliable total order.
+
+Version payload schemas compatibly where possible. Consumers should tolerate additive optional fields, validate required fields, and have a clear path for unknown event types. Do not silently interpret an unknown event as a known one. Document deprecation windows and test consumers against representative old and new payloads.
+
+### Webhook SSRF and endpoint abuse
+
+A publisher that sends requests to user-configured URLs is an outbound HTTP client controlled in part by untrusted input. Restrict schemes and destinations, block loopback, link-local and private ranges as required by the product, validate resolved addresses at connection time, and re-check redirects so a public URL cannot redirect to an internal service. DNS rebinding and alternative address encodings mean a simple string-prefix check is insufficient.
+
+On the subscriber side, enforce payload-size limits, method and content-type expectations, signature verification, rate limits and bounded asynchronous processing. Do not expose detailed verification errors that help attackers. Protect event logs and dead-letter storage from secrets and sensitive payloads.
+
+### Webhook design checklist
+
+- Is the exact signed material documented and verified before processing?
+- Are secrets rotated and revoked safely?
+- Does the protocol provide authenticated timestamps and event IDs, and are they used correctly?
+- Can duplicate delivery repeat a business side effect?
+- Is success returned only after durable acceptance?
+- Are retries bounded, observable and jittered?
+- Is ordering required, and how is stale or out-of-order delivery handled?
+- Can payload schema evolve without breaking old consumers?
+- Are publisher callback URLs protected against SSRF and redirect bypasses?
+- Can operators inspect delivery history and replay safely?
+
+
 ## Further reading
 - AWS API Gateway, [HTTP API throttling](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-throttling.html) as an implementation-specific token-bucket example.
 - OWASP, [API Security Top 10](https://owasp.org/API-Security/editions/2023/en/0x00-header/) for common API threat categories.
