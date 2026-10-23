@@ -179,9 +179,9 @@ This split is only a starting point. A single API request may trigger multiple d
 
 Assume the average response body is 12 KiB and average request body is 1 KiB. Ignoring protocol overhead and compression for the first estimate, application payload bandwidth is approximately:
 
-13,889 requests/s × 13 KiB ≈ 176,000 KiB/s, or about 172 MiB/s.
+13,889 requests/s × 13 KiB ≈ 181,000 KiB/s, or about 176 MiB/s.
 
-This is roughly 1.44 Gbit/s of payload before transport overhead, encryption, retransmission, replication, internal traffic and burst headroom. Measure ingress and egress separately; response sizes and request rates may differ substantially by endpoint.
+This is roughly 1.48 Gbit/s of payload before transport overhead, encryption, retransmission, replication, internal traffic and burst headroom. Measure ingress and egress separately; response sizes and request rates may differ substantially by endpoint.
 
 ### Step 4: estimate concurrency using Little's Law
 
