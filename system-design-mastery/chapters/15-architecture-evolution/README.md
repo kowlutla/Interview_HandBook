@@ -100,6 +100,18 @@ The data plane handles ordinary user traffic; the control plane configures or ch
 Keeping the data plane running during control-plane disruption improves resilience but requires bounded configuration staleness and safe fallback rules. Last-known-good state must itself be authenticated, versioned and protected against rollback to unsafe configuration.
 
 
+
+## 15.1H Service discovery and configuration are runtime dependencies
+
+Service discovery answers how a caller finds a current instance or endpoint. Common approaches include DNS-based discovery, a platform-provided service name, a registry queried by clients, or a proxy/load balancer that performs discovery on behalf of callers. Each approach has different caching, health, propagation and failure semantics.
+
+A registry entry can be stale. A discovered endpoint may fail between lookup and connection; discovery therefore does not remove the need for timeouts, retries under safe semantics, connection draining, and health-aware routing. DNS TTLs and registry refresh intervals trade lookup load against how quickly clients observe changes. Existing pooled connections may outlive a discovery update.
+
+Configuration changes are also distributed state changes. Define configuration ownership, schema and validation, rollout order, versioning, audit, rollback, and behavior when the configuration service is unavailable. A service should reject invalid configuration before activation and should define whether it keeps last-known-good configuration or fails closed. Security-sensitive policy may require a different fallback from a noncritical feature flag.
+
+Do not treat configuration and secrets as interchangeable. Configuration may identify a secret reference, but secret material needs stricter access, rotation, redaction and audit controls. Dynamic configuration should have bounded propagation time and observability so operators can determine which version each instance is using.
+
+
 ## Further reading
 - Fowler, [Microservices](https://martinfowler.com/articles/microservices.html).
 - Fowler, [Strangler Fig Application](https://martinfowler.com/bliki/StranglerFigApplication.html).
