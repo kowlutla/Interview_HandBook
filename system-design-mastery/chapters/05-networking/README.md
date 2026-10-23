@@ -214,6 +214,17 @@ A regional load balancer only distributes traffic among targets it can reach. Gl
 
 Do not automatically spill all traffic from an unhealthy region into another region. The destination must have spare compute, connection, database and downstream capacity. Otherwise, failover turns one regional incident into a global cascading failure.
 
+```mermaid
+flowchart TD
+  C[Client] --> E[Edge proxy or load balancer]
+  E --> H{Target ready?}
+  H -- No --> X[Remove target from new traffic]
+  H -- Yes --> A[Route request to target]
+  A --> R[Bounded request processing]
+  R --> O[Response or explicit failure]
+  X --> E
+```
+
 ### Load-balancer review checklist
 
 - Is balancing per connection, per request, per key, or per region?
@@ -254,6 +265,28 @@ Purge propagation may take time and may not be atomic across every edge. Version
 - **WAF:** inspects traffic against application-layer security rules.
 
 One service can perform several of these functions. Architecture diagrams should still show the logical responsibilities and trust boundaries separately, so a failure or policy bypass can be reasoned about.
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant CDN as Edge cache
+  participant S as Origin shield
+  participant O as Origin
+  U->>CDN: Request cache key
+  alt Fresh cache hit
+    CDN-->>U: Cached response
+  else Miss or stale entry
+    CDN->>S: Fetch or revalidate
+    alt Shield hit
+      S-->>CDN: Cached response
+    else Shield miss
+      S->>O: Fetch from origin
+      O-->>S: Origin response
+      S-->>CDN: Store/return response
+    end
+    CDN-->>U: Response
+  end
+```
 
 ### CDN failure and security checklist
 
