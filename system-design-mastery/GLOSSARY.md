@@ -1,0 +1,32 @@
+# Glossary
+
+- **Admission control:** deciding whether to accept work based on capacity or policy.
+- **Availability:** proportion of time or requests meeting a defined success criterion.
+- **Backpressure:** mechanism that slows upstream production when downstream capacity is insufficient.
+- **Bandwidth:** transfer rate; distinguish bit/s from byte/s.
+- **Bulkhead:** isolation limiting the impact one failure or workload can have on another.
+- **Cache hit ratio:** fraction of lookups served by cache; define denominator and measurement window.
+- **Causal consistency:** causally related operations are observed in an order consistent with that causality.
+- **CAP theorem:** under its formal model, during a network partition a distributed read/write object cannot guarantee both linearizability and availability for every request.
+- **Circuit breaker:** temporarily stops calls to a failing dependency to limit wasted work and cascading failure.
+- **Concurrency:** tasks are in progress over overlapping periods; they need not execute simultaneously.
+- **Consistency model:** rules defining which values and operation orders clients may observe.
+- **Consensus:** processes agree on a value or ordered decisions despite a specified class of failures.
+- **Durability:** acknowledged committed changes survive the failures covered by the system's contract.
+- **Eventual consistency:** if updates stop and communication/reconciliation continues under the model's assumptions, replicas eventually converge; interim reads are not fully specified by this phrase alone.
+- **Fencing token:** ordered token used to reject stale actors after ownership changes.
+- **Idempotency:** repeating an operation has the same intended effect within a defined scope and key lifetime.
+- **Latency:** elapsed time between defined start and end events.
+- **Linearizability:** each operation appears to take effect atomically between invocation and response, respecting real-time order.
+- **Little's Law:** for a stable system, average work in the system L equals arrival rate λ times average time W: L = λW.
+- **Load shedding:** intentionally rejecting lower-priority work to preserve critical service.
+- **Partitioning:** dividing a dataset or workload into subsets.
+- **Quorum:** set of participants sufficient under a protocol's rules; quorum size alone does not guarantee a consistency level.
+- **RPO:** Recovery Point Objective; acceptable data-loss window expressed in time.
+- **RTO:** Recovery Time Objective; target time to restore service after disruption.
+- **Safety:** nothing forbidden happens, such as two conflicting values both being committed as the unique decision.
+- **SLO:** Service Level Objective; target for a measured service-level indicator over a defined window.
+- **Tail latency:** high-end latency distribution, often described using p95 or p99.
+- **Throughput:** amount of useful work completed per unit time.
+- **Utilization:** fraction of a resource's capacity that is busy; high utilization can sharply increase queueing delay.
+- **Vector clock:** logical-clock structure tracking causal relationships and helping identify concurrent events.
