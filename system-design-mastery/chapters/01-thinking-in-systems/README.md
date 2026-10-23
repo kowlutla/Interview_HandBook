@@ -84,6 +84,23 @@ The dotted relationships matter: security, observability, deployment, and operat
 - [Martin Fowler on microservices](https://martinfowler.com/articles/microservices.html) — trade-offs and organizational implications.
 
 
+
+## Architecture as a feedback loop
+
+Architecture is not a one-time diagram. Requirements and constraints shape candidate designs; the design is validated against realistic workloads and failure modes; production evidence then informs the next decision.
+
+```mermaid
+flowchart TD
+  A[Understand goals and constraints] --> B[Identify invariants and quality targets]
+  B --> C[Compare candidate designs]
+  C --> D[Make trade-offs explicit]
+  D --> E[Build and validate assumptions]
+  E --> F[Operate and measure]
+  F --> G{Assumptions still hold?}
+  G -- Yes --> H[Continue and refine]
+  G -- No --> A
+```
+
 ---
 
 [Back to textbook contents](../../README.md) · [Curriculum](../../CURRICULUM.md) · [Roadmap](../../ROADMAP.md)
