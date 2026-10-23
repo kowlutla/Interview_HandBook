@@ -112,6 +112,78 @@ Configuration changes are also distributed state changes. Define configuration o
 Do not treat configuration and secrets as interchangeable. Configuration may identify a secret reference, but secret material needs stricter access, rotation, redaction and audit controls. Dynamic configuration should have bounded propagation time and observability so operators can determine which version each instance is using.
 
 
+
+## 15.1I Architectural styles and when they fit
+
+An architectural style organizes responsibilities, dependencies, communication and state ownership. A style is not a diagram to copy: the decision depends on invariants, change patterns, team structure, deployment requirements, workload shape and the operational capability available.
+
+### Layered and N-tier architecture
+
+Layered architecture separates responsibilities such as presentation, application/use cases, domain rules and infrastructure. Its value comes from enforcing dependency direction and keeping policy separate from implementation details. If every layer merely forwards calls, or if higher layers reach through lower layers arbitrarily, the structure adds indirection without providing a useful boundary.
+
+N-tier architecture commonly deploys presentation, application and data tiers separately. A deployment boundary adds network latency, identity, independent failure and versioning concerns. Logical layers do not necessarily need separate machines or services.
+
+### Client-server architecture
+
+Clients request capabilities from a server that owns some state or behavior. The client may be a browser, mobile application, desktop application or another service. This style requires a clear trust boundary: clients are untrusted, network calls can fail, and client-side validation cannot replace server-side validation or authorization.
+
+### Monolith and modular monolith
+
+A monolith is deployed as one unit; a modular monolith maintains explicit internal modules within that deployment. A modular monolith can preserve in-process calls, straightforward local transactions and simpler operations while enforcing domain ownership. It is often a good starting point when independent deployment is not yet necessary.
+
+The risk is not that a monolith is inherently bad; it is that internal boundaries decay, shared tables become implicit APIs, or all modules become coupled to the same release. Enforce module dependencies, own data access deliberately, and measure change coupling before extracting services.
+
+### Service-oriented architecture and microservices
+
+SOA groups capabilities behind service contracts and has historically included a variety of enterprise integration approaches. Microservices emphasize independently deployable services with explicit ownership, often including ownership of their data. There is no universal service-size rule.
+
+Microservices can improve independent release, scaling and team autonomy when boundaries are stable. They also make network calls fallible, introduce contract evolution, distributed tracing, duplicated or replicated data, asynchronous consistency, deployment coordination, and higher operational cost. A service boundary is justified by an independent reason—such as ownership, scaling, security or change cadence—not merely because a noun exists in the domain.
+
+If two services frequently require synchronous round trips or distributed transactions to preserve one invariant, reconsider the boundary or explicitly model the workflow and its consistency contract.
+
+### Event-driven architecture
+
+Event-driven systems communicate using events, commonly through a broker or durable log. Producers and consumers can evolve and progress independently, and one event may support multiple consumers. The cost is that effects become asynchronous: delivery can be delayed or duplicated, ordering has a scope, replay may re-trigger side effects, and failures need dead-letter or repair paths.
+
+Distinguish a **command** (request that an owner attempt an action) from an **event** (fact that something happened). Define event ownership, schema evolution, retention, ordering, idempotency and replay behavior. Avoid implicit event cycles where each consumer emits events that trigger one another indefinitely.
+
+### Hexagonal architecture, ports-and-adapters, and clean architecture
+
+These approaches put domain/application policy behind interfaces (ports) and use adapters for databases, HTTP, queues or external providers. The goal is dependency inversion: business rules should not be forced to depend on a framework or vendor SDK. This helps when rules are important and infrastructure changes or testing boundaries matter. It becomes ceremony if every simple function gets a needless interface and abstraction.
+
+### Pipe-and-filter and dataflow architecture
+
+A pipeline sends data through stages that validate, enrich, transform, aggregate or route it. It suits ETL, media processing, batch work and stream processing. Each stage needs a contract for input/output schema, capacity, buffering, retry, poison records, partial progress and observability. Parallel processing can reorder completion; preserve order only where required and at the smallest necessary scope.
+
+### Serverless and function-oriented architecture
+
+Functions or managed event handlers run in response to requests, schedules or events while the provider manages much of the execution environment. This can reduce server administration and scale intermittent workloads, but introduces execution limits, quotas, startup behavior, concurrency limits, event delivery semantics, local-state constraints and provider-specific integrations. Serverless is an execution/deployment model, not a claim that operations or servers no longer exist.
+
+### Space-based, peer-to-peer, and other specialized styles
+
+A space-based architecture distributes processing and state across cooperating units, often using replication or partitioned in-memory data to reduce centralized bottlenecks. It can help particular high-throughput workloads but makes state synchronization, persistence, failover and consistency more demanding.
+
+Peer-to-peer designs let participants act as both clients and servers, avoiding a single central data path in some systems. Discovery, membership, trust, churn, abuse resistance and global consistency become central concerns. These specialized styles should be selected for a workload that benefits from their properties, not used as defaults.
+
+### CQRS and event sourcing are patterns, not synonyms for microservices
+
+CQRS separates command and query models; event sourcing treats a sequence of domain events as authoritative history. Either can be used in a monolith or distributed system. They can support different read models, audit history and replay, but add projection lag, event-schema evolution, migration, replay safety and operational complexity. Use them when those capabilities solve a real problem.
+
+### Architecture style decision table
+
+| Design question | Direction to investigate |
+|---|---|
+| Must a business invariant be updated atomically across related concepts? | Keep ownership and transaction semantics clear; avoid splitting the invariant prematurely. |
+| Do modules need independent release, scaling, security or ownership? | Consider service boundaries after measuring coupling and operational readiness. |
+| Must consumers progress independently or replay history? | Consider events/logs with explicit delivery, ordering and retention contracts. |
+| Is domain policy entangled with infrastructure details? | Consider dependency inversion and ports-and-adapters. |
+| Is work naturally a sequence of transformations? | Consider pipe-and-filter/dataflow with bounded stages and explicit recovery. |
+| Is demand intermittent and event-triggered? | Consider managed functions after checking quotas, cold starts, state and observability. |
+| Is centralized coordination the actual bottleneck? | Evaluate specialized distributed styles only after modeling consistency and failure costs. |
+
+A real system often combines styles: for example, a layered modular monolith may publish events for integration, use a CDN and API gateway at the edge, and deploy selected workloads as functions. Explain the style at each boundary instead of assigning one fashionable label to the entire system.
+
+
 ## Further reading
 - Fowler, [Microservices](https://martinfowler.com/articles/microservices.html).
 - Fowler, [Strangler Fig Application](https://martinfowler.com/bliki/StranglerFigApplication.html).
