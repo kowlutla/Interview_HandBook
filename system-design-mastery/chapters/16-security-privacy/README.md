@@ -109,6 +109,21 @@ Design for credential compromise: revoke or rotate credentials, contain affected
 - Which negative and cross-tenant tests prove the policy?
 
 
+
+## 16.1J OAuth 2.0, OpenID Connect, and token roles in practice
+
+OAuth 2.0 is an authorization framework for delegated access. OpenID Connect (OIDC) adds an authentication layer with an ID token and standardized identity claims. JWT is a token representation that may be used for different purposes; a JWT is not automatically an OAuth access token or an OIDC ID token.
+
+Keep the token roles separate:
+- **Access token:** presented to a resource server; validate the intended audience, issuer, lifetime, permissions/scopes and token type according to the profile.
+- **ID token:** communicates authentication information to the OIDC client; validate it according to OIDC rules and do not use it as a general API access token.
+- **Refresh token:** used with the authorization server to obtain new tokens; protect it as a high-value credential and follow rotation/reuse detection rules supported by the provider.
+
+For browser-based and native public clients, Authorization Code with PKCE is the common modern pattern; the client must validate state and, in OIDC, nonce as appropriate to the flow. Client Credentials is for a confidential client acting as itself, not a substitute for end-user authentication. Avoid legacy flows unless a documented constraint requires them.
+
+Scopes are not a complete authorization decision. The resource server may still need object-level, tenant-level and relationship checks. Token validation also needs key rotation, trusted issuer metadata, algorithm allow-lists, clock-skew policy, and failure behavior when keys cannot be refreshed. Do not log raw tokens.
+
+
 ## Further reading
 - IETF [RFC 9700 — OAuth 2.0 Security BCP](https://www.rfc-editor.org/rfc/rfc9700.html).
 - OpenID Foundation [specifications](https://openid.net/developers/specs/).
