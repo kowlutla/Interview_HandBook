@@ -170,6 +170,45 @@ Progressive delivery can use rolling updates, blue/green environments, or canary
 - Has recovery been tested without relying on replica count as the only redundancy measure?
 
 
+
+## 18.3 Service mesh and east-west traffic
+
+A service mesh commonly provides service-to-service traffic capabilities such as workload identity, mutual TLS, retries/timeouts, routing policy, telemetry and sometimes authorization through proxies and a control plane. Exact features depend on the mesh implementation and configuration; the label does not guarantee that every request is secure or resilient.
+
+### Data plane and control plane
+
+The **data plane** handles application traffic, often through sidecar or node-level proxies. The **control plane** distributes identity material and traffic configuration, manages policy and reports status. A control-plane outage may leave existing data-plane proxies using last-known configuration while new policy or certificate updates fail; this behavior is implementation-specific and should be tested.
+
+A sidecar adds a hop, CPU/memory consumption, configuration and its own failure behavior. A node-level proxy can reduce per-Pod overhead but changes isolation and rollout characteristics. Decide based on workload density, latency budget, operational complexity and required policy enforcement.
+
+### Identity and authorization between services
+
+Mutual TLS can authenticate workloads and protect traffic in transit. A certificate or workload identity identifies the caller, but the receiving service still needs authorization rules for the operation and resource. Define identity issuance, trust roots, rotation, expiry, revocation and behavior when identity infrastructure is unavailable. Do not rely only on a namespace or network location as proof of identity.
+
+### Retries, timeouts and traffic policy
+
+A mesh can centralize traffic policy, but a retry configured at the proxy can multiply retries already implemented in the client or gateway. Establish one end-to-end deadline and a single retry budget; do not blindly retry non-idempotent operations. Outlier ejection can temporarily remove slow or failing endpoints, but aggressive ejection can leave too few targets and overload the remainder.
+
+Canary routing and weighted traffic shifts help with progressive delivery, but request routing must remain compatible with database schema, message contracts and session state while versions coexist. A mesh does not make incompatible application versions compatible.
+
+### Service mesh versus API gateway
+
+An API gateway primarily governs north-south API entry and consumer-facing contracts. A service mesh primarily governs east-west service-to-service traffic. Some products overlap, and ingress gateways may use mesh proxies, but the two responsibilities have different callers, trust boundaries, routing policies and failure domains.
+
+### Mesh adoption checklist
+
+- Which concrete problem requires mesh-level behavior?
+- Can the same requirement be handled more simply in libraries or platform networking?
+- What is the per-request latency and resource overhead?
+- How are service identities issued and rotated?
+- Which authorization is enforced by the proxy and which by the application?
+- Are retries, timeouts and circuit-breaking policies duplicated across layers?
+- What happens when the control plane is unavailable or configuration is invalid?
+- Can a bad policy rollout be paused and rolled back?
+- Are proxy failures and policy rejections observable separately from application errors?
+- Does the team have the operational capacity to run and upgrade the mesh?
+
+
 ## Further reading
 - Docker [container fundamentals](https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-a-container/).
 - Kubernetes [documentation](https://kubernetes.io/docs/home/).
