@@ -152,6 +152,60 @@ Before trusting an estimate, verify:
 - Results are sanity-checked against known physical limits and measured telemetry.
 
 
+
+## 3.16 Worked capacity example: convert a product workload into resources
+
+Assume a service has 20 million active users per day. Each active user generates an average of 15 API requests during the day. This is a hypothetical sizing example; production estimates should use measured request distributions, peak factors, payload sizes and actual service costs.
+
+### Step 1: daily requests and average rate
+
+Daily requests = 20,000,000 × 15 = 300,000,000 requests/day.
+
+Average request rate:
+
+300,000,000 ÷ 86,400 ≈ 3,472 requests/second.
+
+Average rate is not the peak design rate. If a measured or assumed peak-to-average multiplier is 4, peak traffic is about 13,889 requests/second. The multiplier must be justified from real traffic shape; login events, campaigns, batch jobs and geographic time zones can create sharper peaks.
+
+### Step 2: split by request class
+
+Assume 80% reads and 20% writes. At the illustrative peak:
+- Reads: about 11,111 requests/second.
+- Writes: about 2,778 requests/second.
+
+This split is only a starting point. A single API request may trigger multiple database queries, cache misses, downstream RPCs, events or analytics writes. Estimate work amplification separately for each request class.
+
+### Step 3: estimate bandwidth
+
+Assume the average response body is 12 KiB and average request body is 1 KiB. Ignoring protocol overhead and compression for the first estimate, application payload bandwidth is approximately:
+
+13,889 requests/s × 13 KiB ≈ 176,000 KiB/s, or about 172 MiB/s.
+
+This is roughly 1.44 Gbit/s of payload before transport overhead, encryption, retransmission, replication, internal traffic and burst headroom. Measure ingress and egress separately; response sizes and request rates may differ substantially by endpoint.
+
+### Step 4: estimate concurrency using Little's Law
+
+If the average end-to-end latency at peak is 120 ms, average in-flight requests are approximately:
+
+L = λW = 13,889 requests/s × 0.12 s ≈ 1,667 concurrent requests.
+
+This is average concurrency at the assumed arrival rate and average time. It is not a recommended thread count: requests may be asynchronous, latency distributions are not constant, and queueing near saturation can increase service time sharply. Pool sizes should be based on the constrained resource and measured service-time distribution.
+
+### Step 5: account for cache and downstream amplification
+
+If 70% of read requests are served by an eligible cache, the cache miss rate for that read class is 30%. At the illustrative peak, origin read traffic is approximately 11,111 × 0.30 ≈ 3,333 reads/second, before accounting for stampedes, refreshes, retries and non-cacheable endpoints.
+
+If each origin request triggers an average of 2.5 database operations, the database may see roughly 8,333 operations/second from that path alone, plus writes, background jobs, replication, maintenance and other services. A cache hit ratio is therefore a major capacity input, but it must be measured under realistic keys and invalidation patterns.
+
+### Step 6: capacity is not the same as instance count
+
+To estimate instances, benchmark a representative build under realistic request mixes and target latency. If one ready instance sustains 800 requests/second at the required p99 latency, 13,889 / 800 ≈ 17.4 instances are needed before redundancy and headroom. If the design must tolerate losing 25% of instances without violating the SLO, the required fleet size is at least 13,889 / (800 × 0.75) ≈ 23.2, so round up and validate the actual load distribution. This simplified calculation assumes linear scaling; shared dependencies and uneven load often break that assumption.
+
+### Step 7: write down uncertainty
+
+Create low/base/high estimates for peak multiplier, payload size, cache hit ratio, downstream fan-out, request cost and failure headroom. Identify which assumption most affects the result and measure it first. A spreadsheet with precise arithmetic but unvalidated inputs is not a reliable capacity plan.
+
+
 ## Further reading
 - [Google SRE Book: Handling Overload](https://sre.google/sre-book/handling-overload/).
 - [Little's original law is often taught through queueing theory; a practical systems treatment appears in the SRE literature](https://sre.google/sre-book/table-of-contents/).
