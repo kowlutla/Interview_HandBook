@@ -10,7 +10,7 @@ Check items only when the work has actually been performed.
 - [x] Confirmed destination README was absent at the checked path before creation.
 - [x] Established strict write boundary: system-design-mastery/.
 - [x] Designed an independent curriculum around learning dependencies rather than existing numbering.
-- [ ] Inspect the complete repository tree and check for any pre-existing target files not covered by the initial checks.
+- [x] Inspect the complete repository tree: the target contains the six planning/reference documents and 19 chapter README files, with no extra Markdown lesson fragments.
 - [x] Compare commits from the first textbook creation through the latest edit; all 25 changed paths are under system-design-mastery/.
 
 ## Planning artifacts
@@ -19,6 +19,7 @@ Check items only when the work has actually been performed.
 - [x] Curriculum and coverage matrix.
 - [x] Editorial and verification standard.
 - [ ] Independent curriculum completeness and duplication review.
+- [ ] Compare all 19 chapters against the curriculum matrix and identify concepts that are missing or too compressed.
 
 ## Research
 - [x] Identified primary references for HTTP semantics, CAP, consensus, logical clocks, databases, Kafka, SRE, OAuth, cloud and runtime behavior.
@@ -37,10 +38,12 @@ Check items only when the work has actually been performed.
 - [x] Expand chapters 11–19 with deeper protocol mechanics, operational edge cases, security controls, recovery workflows, and review checklists.
 - [x] Deepen chapters 6–10 with additional API contract semantics, relational concurrency/query planning, storage-engine internals, cache correctness, and distributed consistency reasoning.
 - [ ] Cross-chapter terminology and consistency review.
+- [x] Consolidate duplicate deep-dive sections and repeated Further reading headings found in Chapters 10–11.
 - [ ] Expand any chapter whose coverage remains too compressed for textbook-level mastery.
 
 ## Validation
 - [x] Validate relative internal Markdown links in all created Markdown files against the expected file set; no broken internal targets found.
+- [x] Recheck the 26 Markdown paths in the target tree and the relative links in the landing page and all chapter pages.
 - [ ] Validate Mermaid diagrams with a renderer; currently added diagrams have only been manually reviewed.
 - [x] Independently recalculate the chapter's traffic, bandwidth, storage, Little's Law and fan-out examples; results match within rounding.
 - [ ] Review assumptions, caveats and implementation-specific claims.
