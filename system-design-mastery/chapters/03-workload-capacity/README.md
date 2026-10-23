@@ -81,6 +81,77 @@ Ask which assumptions dominate the result:
 
 Check units, orders of magnitude, and implied physical limits. Compare estimates with observed metrics and benchmark realistic workload mixes before committing to capacity or cost.
 
+
+## 3.10 Fan-out and amplification
+
+An incoming request may trigger multiple internal operations. Estimate work at each layer rather than assuming one external request equals one database query or one message.
+
+For example, if 1,000 API requests/s each cause 4 cache lookups and a cache hit rate of 90%, the approximate cache-miss rate is:
+- Cache lookups = 1,000 × 4 = 4,000 lookups/s.
+- Misses = 4,000 × 0.10 = 400 misses/s.
+
+If each miss triggers 2 database operations, the database receives roughly 800 operations/s from this path. This is only a first-order model: retries, coalescing, batching, background work, and uneven key popularity can change the result.
+
+An **amplification factor** is a useful shorthand for how much downstream work one unit of upstream work creates. Measure it per dependency and operation class. A retry storm can make amplification increase precisely when a dependency is unhealthy.
+
+## 3.11 Workload shape and forecasting
+
+Daily totals hide the shape of arrivals. Useful views include:
+- Requests per second at multiple windows (for example, 1-second, 1-minute, and 15-minute).
+- Peak-to-average ratio and burst duration.
+- Day-of-week and seasonal patterns.
+- Correlated traffic caused by cron jobs, synchronized clients, cache expiry, or batch releases.
+- Growth in active users, stored records, payload size, and operation complexity.
+
+A forecast should state its horizon and model. Linear growth, percentage growth, and step changes produce different capacity requirements. A system growing 5% monthly compounds: projected volume after n months is current volume multiplied by 1.05^n, if that growth assumption holds. The calculation is not a substitute for validating the business assumptions behind the rate.
+
+Use ranges for uncertain inputs. If peak rate may be 1,500–2,200 requests/s and average response size may be 20–30 KiB, calculate low, central, and high scenarios instead of presenting one false-precision number.
+
+## 3.12 Capacity, utilization, and headroom
+
+A component's sustainable capacity is workload-dependent. A benchmark reporting 10,000 requests/s is meaningful only with its operation mix, payloads, hardware, error rate, latency distribution, and dependency configuration.
+
+If a worker can sustain 500 operations/s for the target latency and error rate, a rough first estimate for 2,000 operations/s is four such worker-equivalents. This does not prove that four instances suffice: coordination, shared databases, load imbalance, autoscaling delay, failover, and nonlinear contention can change the result.
+
+Headroom is capacity intentionally left unused to absorb bursts, failures, maintenance, and forecast error. There is no universal safe utilization percentage. The correct threshold depends on queueing behavior, burst shape, recovery objectives, and the cost of excess capacity. Size for the required failure scenario as well as normal operation: if one of four equal instances must be lost without violating the target, the remaining three must carry the required load.
+
+## 3.13 Queueing, saturation, and tail latency
+
+A queue forms when work arrives faster than the next stage can complete it, even temporarily. A bounded queue absorbs short bursts; a persistent arrival/completion mismatch causes backlog growth.
+
+Little's Law, L = λW, relates average in-flight work to throughput and time in the system, but it does not by itself predict waiting-time distributions. Queueing delay depends on utilization, service-time variance, arrival burstiness, scheduling, and queue discipline.
+
+As utilization approaches effective capacity, a small increase in arrival rate can cause a disproportionate increase in waiting time. This is why a system can appear healthy at moderate load and suddenly exhibit severe p99 latency near saturation. Monitor queue depth and queue-wait time, not just CPU utilization.
+
+Useful controls include admission limits, bounded queues, deadlines, load shedding, backpressure, and priority classes. Each policy has a cost: rejecting work protects the system but reduces immediate success; queueing preserves work temporarily but increases latency and consumes memory.
+
+## 3.14 Cost and resource-specific models
+
+Capacity is multidimensional:
+- CPU demand depends on operations and their computational complexity.
+- Memory demand depends on resident data, in-flight requests, buffers, runtime overhead, and caches.
+- Storage demand includes logical data, indexes, replicas, compaction/free-space needs, and retained backups.
+- Network demand includes payloads, protocol overhead, retries, replication, and cross-zone or cross-region transfer.
+- Connection demand depends on concurrency, reuse, idle lifetimes, and downstream limits.
+
+Do not assume one resource scales in proportion to another. A cache can reduce database reads while increasing memory and network traffic. Compression can reduce bandwidth while increasing CPU. Replication can improve durability or read capacity while multiplying write traffic and storage.
+
+For cost estimation, map each resource model to a billable unit (instance time, vCPU, memory, requests, stored byte-hours, operations, or transferred bytes), then apply the provider's actual pricing and discount model. Pricing changes and workload commitments must be checked against current provider documentation before making a purchase decision.
+
+## 3.15 Capacity model review checklist
+
+Before trusting an estimate, verify:
+- Every quantity has a unit and time window.
+- Average and peak are not confused.
+- Burst duration is understood, not just peak magnitude.
+- Payload sizes and operation mixes are explicit.
+- Fan-out, retries, replication, indexes, and background work are counted.
+- Resource capacity is based on a comparable workload benchmark.
+- Failure capacity and headroom are included.
+- Uncertainty is shown as ranges or scenarios.
+- Results are sanity-checked against known physical limits and measured telemetry.
+
+
 ## Further reading
 - [Google SRE Book: Handling Overload](https://sre.google/sre-book/handling-overload/).
 - [Little's original law is often taught through queueing theory; a practical systems treatment appears in the SRE literature](https://sre.google/sre-book/table-of-contents/).
