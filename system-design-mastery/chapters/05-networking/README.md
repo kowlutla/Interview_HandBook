@@ -168,6 +168,106 @@ When a request fails, check the path in order:
 Correlate timestamps, request IDs, proxy logs, connection metrics, and application traces. Avoid inferring the root cause from one symptom alone.
 
 
+
+## 5.19 Load balancers in depth
+
+A load balancer selects an eligible backend for a connection or request. Its job is to distribute work while respecting health, capacity, locality, security and the request's semantics. It cannot create capacity that does not exist, and a poor failover policy can overload the backends that remain healthy.
+
+### Layer 4 and Layer 7 balancing
+
+**Layer 4 balancing** routes using transport-level information such as source/destination addresses and ports. It can handle TCP or UDP without interpreting HTTP paths and headers. It is useful when protocol transparency and low per-request processing overhead matter.
+
+**Layer 7 balancing** understands application protocols such as HTTP. It can route by host, path, method, header, cookie, or other request attributes; terminate TLS; apply request-aware policies; and emit HTTP-aware telemetry. Parsing requests and maintaining application-layer state adds processing and policy complexity.
+
+A deployment can combine both: a transport load balancer distributes connections across edge proxies, and those proxies route individual HTTP requests. Do not assume the terms identify mutually exclusive products.
+
+### Balancing algorithms and what they optimize
+
+| Algorithm | Selection idea | Useful when | Main caveat |
+|---|---|---|---|
+| Round robin | Cycle through eligible targets | Targets have similar capacity and request cost | Equal request counts do not mean equal work |
+| Weighted round robin | Allocate by configured weight | Targets differ in known capacity | Static weights may not reflect changing load |
+| Least connections | Prefer fewer active connections | Connection duration roughly reflects work | One connection may be idle or multiplex many requests |
+| Least requests / latency-aware | Prefer targets with less active work or observed delay | Work varies and telemetry is meaningful | Noisy/stale measurements can cause oscillation |
+| Consistent hashing | Map a key to a target | Locality or affinity is valuable | Hot keys and membership changes can skew load |
+| Locality-aware | Prefer nearby zone/region | Latency and transfer costs matter | A local overload can cascade if fallback is too aggressive |
+
+Algorithm selection should be based on measured request cost, target capacity, connection duration, and failure behavior. Adaptive algorithms need smoothing, bounds, and safeguards against sending traffic away from a slow target so aggressively that the remaining targets collapse.
+
+### Health checks, readiness, and draining
+
+A health check is evidence, not a perfect prediction. **Liveness** asks whether restarting a process may help; **readiness** asks whether it should receive new work. A process can be alive but unable to serve because its worker pool is exhausted. Conversely, making readiness depend on every downstream dependency can cause all replicas to disappear when one shared dependency fails.
+
+Active checks periodically probe targets; passive checks infer health from real traffic. Define thresholds, timeouts, recovery hysteresis, and what happens when every target is considered unhealthy. A fail-open policy may preserve partial service but risks sending traffic to broken targets; fail-closed behavior may produce an outage even when some targets could serve.
+
+During rollout or scale-in, **connection draining** stops new assignments while allowing in-flight work to finish within a bounded grace period. Long-lived connections need explicit behavior: WebSockets may need reconnects, streams may need cursor-based resumption, and requests exceeding the drain deadline may be cancelled. Draining is effective only when application deadlines and shutdown hooks cooperate.
+
+### Affinity, TLS, and client identity
+
+Sticky sessions route a client repeatedly to one target, often by cookie or hash. Affinity can improve local-cache reuse but reduces flexibility and makes failover less predictable. If the target disappears, the session may still need to be recovered from shared storage or re-established.
+
+TLS may terminate at the edge, at a gateway, or at the application. Termination centralizes certificate management and enables HTTP routing, but the proxy becomes a trust boundary. If it forwards client IP or identity in headers, it must remove untrusted inbound copies and set trusted values itself. Backend TLS or mutual TLS can protect and authenticate the next hop; validate certificates and service identities rather than merely encrypting bytes.
+
+### Failure domains and global traffic management
+
+A regional load balancer only distributes traffic among targets it can reach. Global traffic management chooses regions or sites using DNS, anycast, a global proxy, or provider-specific routing. DNS-based failover is affected by resolver and client caches, so a changed DNS record does not instantly move every client. Any global failover plan needs explicit health signals, capacity headroom, data-consistency assumptions, and a tested return-to-primary process.
+
+Do not automatically spill all traffic from an unhealthy region into another region. The destination must have spare compute, connection, database and downstream capacity. Otherwise, failover turns one regional incident into a global cascading failure.
+
+### Load-balancer review checklist
+
+- Is balancing per connection, per request, per key, or per region?
+- Which signal selects targets, and can it oscillate?
+- What exactly do health checks prove?
+- What happens if every target is marked unhealthy?
+- Are retries safe, bounded, and counted against one deadline?
+- Are sessions externalized or intentionally sticky?
+- How are client identity headers and TLS handled?
+- How are long-lived connections drained?
+- Is there enough spare capacity for zone/region loss?
+- Are per-target latency, errors, active connections, queue depth, and rejected work observable?
+
+## 5.20 CDNs and edge delivery in depth
+
+A Content Delivery Network (CDN) serves eligible content from edge locations closer to users. This can lower latency and reduce origin traffic. Depending on the product, edge platforms can also terminate TLS, filter requests, absorb some denial-of-service traffic, compress content, and execute edge logic. Those are distinct capabilities; an edge cache is not a replacement for application authorization or origin protection.
+
+### Cache key and response correctness
+
+The CDN cache key commonly includes the URL and may include selected request attributes. If the representation varies by language, encoding, tenant, device class or another input, the effective key must distinguish those variants. Otherwise, one request may receive another request's representation. Personalized or authorization-sensitive responses should not be shared-cacheable unless the policy and key are deliberately designed for that behavior.
+
+HTTP directives such as `Cache-Control`, `ETag`, `Vary`, freshness lifetime, and conditional revalidation define important parts of this contract. See [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html) for normative caching semantics.
+
+### Cache miss, shielding, stale responses, and invalidation
+
+On a cache miss, an edge may fetch from the origin or from an intermediate **origin shield**. A shield can collapse many edge misses into fewer origin requests, but adds another cache layer and possible failure point. Request collapsing can reduce duplicate work for popular objects, while hot objects still need adequate origin and edge capacity.
+
+When the origin is unavailable, serving stale content may be acceptable for public documentation or static assets, but not necessarily for authorization decisions, inventory, or rapidly changing financial data. Define stale-serving policy per content class rather than enabling it globally.
+
+Purge propagation may take time and may not be atomic across every edge. Versioned asset URLs—such as content-hashed filenames—often make static asset updates safer because new content gets a new key. Mutable content requires explicit freshness, validation and invalidation rules.
+
+### CDN, reverse proxy, and load balancer compared
+
+- **CDN:** optimizes geographically distributed delivery and edge caching.
+- **Reverse proxy:** receives requests on behalf of origins and may route, transform, authenticate or filter them.
+- **Load balancer:** selects eligible targets to distribute connections or requests.
+- **API gateway:** governs API-facing contracts and policies.
+- **WAF:** inspects traffic against application-layer security rules.
+
+One service can perform several of these functions. Architecture diagrams should still show the logical responsibilities and trust boundaries separately, so a failure or policy bypass can be reasoned about.
+
+### CDN failure and security checklist
+
+- Can a cache key accidentally mix tenants or authorization contexts?
+- Which responses may be shared, and which must never be stored?
+- How are stale responses handled during origin failure?
+- What is the expected purge and propagation delay?
+- Can a cache miss storm overwhelm the origin?
+- Is the origin reachable directly, bypassing edge protections?
+- Are request size, rate, bot and WAF policies applied consistently?
+- Do logs distinguish edge hits, shield hits and origin fetches?
+- Is the cost of egress, cache fill and invalidation understood?
+
+
 ## Further reading
 - IETF [RFC 9293 — TCP](https://www.rfc-editor.org/rfc/rfc9293.html).
 - IETF [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
