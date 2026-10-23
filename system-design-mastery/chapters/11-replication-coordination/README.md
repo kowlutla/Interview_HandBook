@@ -98,6 +98,51 @@ Before introducing a distributed lock, ask:
 A lock adds a coordination dependency and can become a bottleneck. Prefer the simplest mechanism that preserves the invariant.
 
 
+
+## 11.6 Consensus, leadership and distributed transaction boundaries
+
+### Consensus is agreement on an ordered history
+
+Consensus protocols help a set of participants agree on decisions despite specified failures. Replicated state machine designs commonly use consensus to agree on a command order, then apply that order to replicas. Consensus does not automatically make arbitrary external side effects exactly once: a command handler that sends an email or charges a payment must still handle retries and the boundary between committed log state and external action.
+
+Leader election alone is not consensus over application state. A system needs protocol rules for terms/epochs, votes, log or state replication, commit decisions, membership changes and recovery. The safety property is that conflicting histories are not both committed; liveness depends on timing and a sufficiently available quorum under the protocol's assumptions.
+
+### Leases, epochs and fencing
+
+A lease grants ownership for a time interval under specific clock and coordination assumptions. A client may pause or lose connectivity and continue acting after its lease has expired. Therefore, a lease alone does not necessarily stop a stale owner from modifying an external resource.
+
+A fencing token is a monotonically increasing generation/epoch attached to operations. The resource being protected must reject tokens older than the latest accepted token. If the resource does not validate the token, the fencing mechanism cannot protect it. This is why “we have a distributed lock” is not enough to establish correctness.
+
+### Two-phase commit versus Saga
+
+Two-phase commit (2PC) coordinates participants through a prepare phase and a commit/abort decision. It can provide atomic transaction semantics across participating transactional resources, but participants may hold prepared state while waiting for the coordinator or recovery decision. Coordinator durability, participant recovery, timeouts and operational diagnosis matter.
+
+A Saga decomposes a long workflow into local transactions with compensating actions or forward recovery. It avoids one global database transaction but does not make the workflow instantaneously atomic: intermediate states are visible, compensations can fail, and some actions are not truly reversible. Use an explicit state machine, idempotent steps, deadlines, retry policy, manual intervention paths and audit history.
+
+Choose 2PC when participating resources support the required protocol and atomicity is worth the coupling/availability cost. Choose a Saga when the business process can tolerate intermediate states and has well-defined compensation or forward-recovery semantics. Neither pattern is universally superior.
+
+### Distributed locks are coordination tools, not the final invariant
+
+A lock may prevent cooperating workers from intentionally doing the same work, but correctness can still fail if a client pauses, a lease expires, the lock service partitions, or the protected resource accepts stale operations. Use lock ownership tokens and resource-side fencing when stale writers are dangerous. Prefer database uniqueness constraints or atomic conditional updates when they can enforce the invariant more simply.
+
+### Membership changes and quorum reasoning
+
+A quorum intersection argument depends on the configured membership and protocol. Changing replica membership while writes are in flight can create configurations whose quorums do not intersect safely unless reconfiguration is part of the protocol. Do not treat “majority of current nodes” as a universal algorithm. Joint consensus or equivalent protocol rules are needed for safe transitions in systems that use them.
+
+### Coordination review checklist
+
+- What exact state or decision must participants agree on?
+- What failures and timing assumptions does the protocol tolerate?
+- What durable evidence lets a restarted participant recover its role?
+- Can a stale leader or expired lock holder still write?
+- Does the protected resource validate fencing or generation tokens?
+- What happens if the coordinator fails after prepare but before decision?
+- Can saga steps and compensations be repeated safely?
+- Are intermediate business states visible and documented?
+- Are membership changes protocol-safe?
+- How is recovery tested under pauses, partitions, duplicate messages and restarts?
+
+
 ## Further reading
 - [Raft paper and resources](https://raft.github.io/).
 - Fischer, Lynch and Paterson, [consensus impossibility result](https://doi.org/10.1145/3149.214121).
