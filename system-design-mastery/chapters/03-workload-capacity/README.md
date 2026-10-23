@@ -101,7 +101,6 @@ flowchart TD
 
 The result is a range with explicit assumptions, not a magically precise prediction.
 
-
 ---
 
 [Back to textbook contents](../../README.md) · [Curriculum](../../CURRICULUM.md) · [Roadmap](../../ROADMAP.md)
