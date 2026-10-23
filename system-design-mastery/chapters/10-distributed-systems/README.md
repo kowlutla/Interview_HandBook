@@ -128,6 +128,49 @@ CRDT convergence relies on the data type's algebra and delivery assumptions. Con
 - How is the behavior tested under delay, loss, restart, and partition?
 
 
+
+## 10.17 Multi-region systems: latency, consistency and failover
+
+Multi-region architecture is not one design choice. A system may replicate data to another region for disaster recovery, serve read traffic from multiple regions, accept writes in one home region, or accept writes concurrently in several regions. Each model has different latency, conflict, failover and operational consequences.
+
+### Single-writer and multi-writer models
+
+A **single-writer/home-region** model simplifies write ordering and conflict resolution but can make writes from distant users slower and requires a failover plan if the home region is lost. A **multi-writer** model can reduce write latency and improve regional autonomy, but concurrent updates require coordination, conflict resolution or a data model that safely merges them. Not every business invariant can be merged after the fact.
+
+For example, profile preferences may tolerate a defined last-writer-wins policy. Inventory reservation, unique username allocation or financial balance transfers may require coordination around the invariant. The right model is operation-specific, not just a database-wide label.
+
+### Replication lag and read routing
+
+Routing a user to the nearest region can reduce latency but may return stale data if that region has not applied a recent write. Session guarantees such as read-your-writes can be supported by routing a session to its home region, carrying a version/commit token, or waiting until a replica has applied a required position. These strategies add latency or reduce routing flexibility when the replica is behind.
+
+Define what a successful write acknowledgment means: local durable commit, remote replica acknowledgment, or a quorum/consensus condition. Then explain what data can be lost if a region fails immediately after acknowledgment.
+
+### Clock uncertainty and ordering
+
+Wall-clock timestamps are not a reliable universal total order across machines. Clock synchronization has finite error; clocks can drift, jump or be adjusted. If a system uses physical time to choose winners, it must define timestamp source, error bounds, tie-breaking, and what happens when clocks are outside the expected bounds.
+
+Logical clocks capture ordering relationships rather than exact elapsed time. Lamport clocks preserve the happens-before relation in the sense that if event A causally precedes event B, A's Lamport timestamp is smaller; the reverse implication does not hold. Vector clocks can distinguish some concurrent versions, but their metadata and participant-management costs grow with the system's shape.
+
+### Failover is a state transition, not just a DNS update
+
+A regional failover plan must establish which region is authoritative, fence the former writer, determine the recovery point, promote or restore the target, redirect traffic, and verify correctness. DNS TTLs do not force every client to switch immediately. A returning region may contain divergent or stale data and must not automatically resume writes without reconciliation.
+
+Capacity must be planned for the surviving region to handle the required load. If two regions each normally run at 50% capacity and one fails, the other may be unable to take all traffic. Consider dependency capacity, quotas, cache warm-up, connection storms and the ability to degrade optional features during recovery.
+
+### Multi-region design checklist
+
+- Is the architecture single-writer, home-region, or multi-writer?
+- Which operations require coordination to preserve invariants?
+- What does a successful write acknowledgment guarantee across regions?
+- How are read-your-writes and stale reads handled?
+- What is the conflict-resolution policy for concurrent updates?
+- How are clock uncertainty and ordering represented?
+- How is the former writer fenced during failover?
+- What is the data recovery point and how is divergence reconciled?
+- Can the surviving region serve required load and dependencies?
+- Has failover and failback been tested with real data and clients?
+
+
 ## Further reading
 - Gilbert and Lynch, [CAP paper](https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf).
 - Lamport, [Time, Clocks, and the Ordering of Events](https://lamport.azurewebsites.net/pubs/time-clocks.pdf).
