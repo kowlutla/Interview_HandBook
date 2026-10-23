@@ -94,7 +94,6 @@ flowchart TD
   G -- Yes --> H[Review under realistic load and failures]
 ```
 
-
 ---
 
 [Back to textbook contents](../../README.md) · [Curriculum](../../CURRICULUM.md) · [Roadmap](../../ROADMAP.md)
