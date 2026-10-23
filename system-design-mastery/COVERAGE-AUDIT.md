@@ -16,14 +16,14 @@ Do not infer “Deep” from a heading or keyword match. This is an initial audi
 | Requirements and quality attributes | 02 | Developing | Add concrete measurable scenarios, prioritization, and requirement-to-design examples. |
 | Workload estimation and capacity | 03 | Developing | Add worked end-to-end sizing examples, queueing intuition, uncertainty ranges, and validation. |
 | Execution, concurrency, runtime resources | 04 | Developing | Expand memory/GC, file descriptors, worker models, async/event loops, and resource isolation as needed. |
-| Network fundamentals: IP, routing, TCP/UDP, DNS, TLS, HTTP | 05 — sections 5.1–5.18 | Developing | Expand practical protocols and troubleshooting; validate HTTP/2/3, QUIC, connection reuse, certificates, IPv6 and NAT details. |
+| Network fundamentals: IP, routing, TCP/UDP, DNS, TLS, HTTP | 05 — sections 5.1–5.18 | Developing | Sections 5.22 now add IPv6 coexistence, DNSSEC versus encrypted DNS, TLS/mTLS, HTTP/2 versus HTTP/3, and DDoS/resource-exhaustion distinctions. Still verify protocol details against the cited RFCs and add practical troubleshooting exercises. |
 | Load balancing, reverse proxies, ingress, global traffic management | 05 — 5.19; 13 — Load balancing and consistent hashing, 13.1B; 18 — Cloud primitives | Developing | Dedicated mechanism-level coverage: L4/L7, algorithms, health, draining, affinity, locality, TLS, failure modes, metrics. |
 | CDN, edge delivery, origin shielding and invalidation | 05 — 5.20; 09 — Local, distributed and CDN caches, 9.1F, 9.1G | Developing | Dedicated edge-cache behavior, cache-key correctness, stale content, purge, origin failover, security and cost. |
 | API gateways and API management | 06 — 6.11 API gateways and API management | Developing | Dedicated gateway responsibilities, limits, auth boundary, routing, transformation, high availability and failure policy. |
-| API styles, contracts, retries, idempotency, streaming | 06 | Developing | Compare REST/RPC/gRPC/GraphQL/webhooks/WebSockets/SSE; deepen contract evolution and end-to-end deadlines. |
+| API styles, contracts, retries, idempotency, streaming | 06 | Developing | Section 6.12 now covers webhook signing, replay, idempotency, ordering, schema evolution, and SSRF. Continue verifying provider-specific contract caveats and add a worked OpenAPI/versioning example. |
 | Architectural styles and patterns | 01, 15, 19 | Developing | A systematic comparison of layered/N-tier, client-server, modular monolith, SOA, microservices, event-driven, hexagonal, pipe/filter, serverless, CQRS/event sourcing and hybrids. |
 | Relational modeling, SQL, indexes, transactions | 07 | Developing | Validate examples; deepen query plans, isolation, constraints, migrations, operations and workload-based index selection. |
-| NoSQL models, search, analytics, data lakes | 08, 19 | Mentioned / Developing | Give separate model-by-model comparison and explain search/indexing, analytical versus operational workloads, and selection boundaries. |
+| NoSQL models, search, analytics, data lakes | 08, 19 | Mentioned / Developing | Sections 8.2–8.7 now compare major storage families, derived search indexes, row/columnar and lakehouse workloads, materialized views, and distributed file/object/block semantics. Verify product-specific guarantees and add a comparative access-pattern example. |
 | Storage engines, WAL, B-tree, LSM, compaction | 08 | Developing | Add recovery/write-path examples and compare amplification and workload implications. |
 | Caching at client, CDN, application and data layers | 09, 05 | Developing | Deepen strategies, stampede/penetration/avalanche, coherence, freshness contracts and outage protection. |
 | Distributed failure, consistency, clocks, CAP/PACELC | 10 | Developing | Validate formal distinctions, add timelines/counterexamples, and make assumptions explicit. |
@@ -33,7 +33,7 @@ Do not infer “Deep” from a heading or keyword match. This is an initial audi
 | Reliability, SLOs, redundancy, backup/restore, DR | 14 | Developing | Add quantitative availability/recovery examples, restore testing, multi-region failure modes and incident workflows. |
 | Security, identity, privacy, tenant isolation | 16 | Developing | Threat-model examples, authorization boundaries, secrets/key lifecycle, abuse controls and privacy lifecycle. |
 | Observability and production operations | 17 | Developing | Deepen alert design, cardinality, sampling, tracing limitations, burn-rate alerts and runbooks. |
-| Cloud, containers, Kubernetes, IaC and delivery | 18 | Developing | Expand scheduler/controller behavior, networking/storage, resource limits, deployment rollback and supply-chain security. |
+| Cloud, containers, Kubernetes, IaC and delivery | 18 | Developing | Sections 18.2–18.5 now deepen Kubernetes, service mesh, IaC state/drift, SBOM, provenance, signing and build/deployment trust. Still verify supply-chain guidance against primary standards and test examples. |
 | Cross-cutting patterns, cost, multi-tenancy and multi-region | 19 | Developing | Build a pattern catalog with context, forces, consequences, anti-patterns and interactions. |
 
 
@@ -47,10 +47,10 @@ The following sections are present and are the starting points for the deeper re
 | Measurable quality attributes | Chapter 02: 2.5–2.12, 2.15–2.18 |
 | Workload and capacity | Chapter 03: 3.1–3.15, 3.16 Worked capacity example |
 | Runtime and resource limits | Chapter 04: 4.1–4.14, 4.15 Runtime resource limits |
-| Networking and request path | Chapter 05: 5.1–5.18, 5.19 Load balancers, 5.20 CDNs, 5.21 Network boundaries |
-| API contracts and gateway | Chapter 06: 6.1–6.10H, 6.11 API gateways and API management |
+| Networking and request path | Chapter 05: 5.1–5.18, 5.19 Load balancers, 5.20 CDNs, 5.21 Network boundaries, 5.22 Protocol details and operational edge cases |
+| API contracts and gateway | Chapter 06: 6.1–6.10H, 6.11 API gateways and API management, 6.12 Webhooks |
 | Relational data and transactions | Chapter 07: Isolation anomalies, Optimistic versus pessimistic concurrency, Query planning, Safe schema migration, Relational systems in practice |
-| Storage families and engines | Chapter 08: B-trees and LSM trees, 8.1A–8.1I, 8.2 Choosing among data-system families, 8.3 Search indexes, 8.4 Row stores, columnar stores, lakehouses and warehouses, 8.5 Secondary indexes and materialized views |
+| Storage families and engines | Chapter 08: B-trees and LSM trees, 8.1A–8.1I, 8.2–8.6 data-system families/search/analytics/indexes, 8.7 Distributed file systems and object/block/file interfaces |
 | Cache behavior | Chapter 09: Common patterns, TTL and invalidation, Failure modes, 9.1A–9.1H, 9.2 Cache patterns and failure modes |
 | Distributed consistency | Chapter 10: Consistency models, CAP and PACELC, 10.7–10.17 |
 | Replication and coordination | Chapter 11: Leader election, Leases and fencing tokens, Two-phase commit, Sagas and compensation, 11.5A–11.5G, 11.6 Consensus and transaction boundaries |
@@ -60,7 +60,7 @@ The following sections are present and are the starting points for the deeper re
 | Architectural styles and evolution | Chapter 15: Monolith, modular monolith and microservices, Sidecars and service meshes, 15.1A–15.1H, 15.1I Architectural styles |
 | Security and privacy | Chapter 16: Threat modeling, Authorization models, Tenant isolation, OAuth 2.0 and OpenID Connect, 16.2 Threat modeling a system architecture |
 | Observability and operations | Chapter 17: RED and USE, Percentiles and cardinality, SLO-driven alerting, 17.1A–17.1I, 17.2 Observability in practice |
-| Cloud and Kubernetes | Chapter 18: Containers and Kubernetes, 18.1A–18.1I, 18.2 Kubernetes architecture, 18.3 Service mesh |
+| Cloud and Kubernetes | Chapter 18: Containers and Kubernetes, 18.1A–18.1I, 18.2 Kubernetes architecture, 18.3 Service mesh, 18.4 IaC state and drift, 18.5 software supply-chain security |
 | Patterns and anti-patterns | Chapter 19: Probabilistic data structures, Distributed scheduling, Multi-tenancy, Multi-region consistency and routing, 19.2 Architecture pattern catalog |
 
 ## High-priority missing/depth risks
