@@ -113,6 +113,63 @@ Serverless is an execution and operations model rather than a universal synonym 
 Placement choices include virtual machines, containers on managed orchestration, managed application platforms, functions, and managed data services. Compare them by startup behavior, scaling granularity, isolation, runtime control, operational burden, portability, quotas, network topology, observability, and cost under idle and peak load. The most abstract service is not automatically the cheapest or most reliable for every workload.
 
 
+
+## 18.2 Kubernetes architecture and runtime behavior
+
+Kubernetes is a control system for desired state, not simply a command that starts containers. A workload declares a desired number of replicas and configuration; controllers observe actual state and attempt to reconcile it toward that desired state. Reconciliation is asynchronous, so an API request being accepted does not mean the workload is already ready to serve.
+
+### Control plane and worker-node responsibilities
+
+The API server exposes the cluster API; durable cluster state is stored in the backing data store; the scheduler assigns unscheduled Pods to nodes; controllers reconcile resources; and node agents work with the container runtime to run assigned workloads. Networking and storage are provided by cluster components and plugins, with behavior depending on the distribution and configuration.
+
+The control plane may be healthy while a workload is not schedulable due to resource requests, affinity, taints, quotas, unavailable volumes or image-pull failures. Conversely, existing Pods can sometimes continue running through a temporary control-plane problem, while new scheduling and reconciliation are impaired. Diagnose the failing layer rather than treating “Kubernetes is down” as one failure mode.
+
+### Pods, Deployments, Services and Ingress
+
+A Pod is the scheduling unit and can contain one or more tightly coupled containers sharing network identity and selected volumes. A Deployment manages a replica set and rollout behavior for stateless-style replicated Pods. A Service provides a stable logical endpoint for a set of endpoints; it does not mean the application is ready or that every request will succeed. Ingress or a gateway controller implements external HTTP routing according to its controller and platform.
+
+A Service selector, readiness configuration and endpoint propagation determine which Pods receive traffic. During rollout, old and new versions may coexist; contracts and database schemas must remain compatible. Long-lived connections may delay termination unless graceful shutdown and draining are configured.
+
+### Requests, limits, scheduling and noisy neighbors
+
+Resource requests influence scheduling and are commonly used for capacity accounting. CPU limits can throttle a container; memory-limit breaches can trigger termination by the runtime/kernel. Setting requests too low leads to overpacking and contention; setting them too high wastes cluster capacity or leaves Pods pending. A Pod's declared resources should reflect observed steady-state and burst behavior, not arbitrary round numbers.
+
+CPU, memory, ephemeral storage, file descriptors, connection counts and downstream quotas are all finite. Autoscaling replicas cannot fix a single-threaded bottleneck, a database limit, or a hot key. Resource limits should be evaluated alongside JVM/GC behavior, native memory, thread pools and per-Pod concurrency.
+
+### Liveness, readiness and startup probes
+
+- **Startup probe:** gives slow-starting applications time to initialize before liveness checking takes effect.
+- **Readiness probe:** controls whether a Pod should receive new service traffic.
+- **Liveness probe:** detects a condition where restarting the process may help.
+
+A bad liveness probe can create a restart loop during a dependency outage, removing otherwise useful capacity and worsening the incident. A readiness probe that depends on every downstream system can remove all endpoints simultaneously. Choose each probe based on the action it triggers and test its behavior during partial failure.
+
+### Autoscaling and disruption
+
+Horizontal Pod Autoscaling adjusts replica count based on configured metrics; cluster autoscaling may add or remove nodes. These loops have delays and quotas. Scaling Pods without available node capacity leaves them pending; adding nodes may take time and can itself create image-pull, connection-establishment or cache-warmup spikes.
+
+Pod disruption budgets can limit some voluntary disruptions but do not guarantee application availability during all failures. Spread replicas across failure domains, account for topology and capacity, and ensure the service can survive the loss of a node or zone. Replica count alone does not prove redundancy if every replica depends on one database or one zone.
+
+### Configuration, secrets and delivery safety
+
+ConfigMaps and Secrets have different sensitivity expectations, but neither removes the need for access control and safe handling. Avoid putting secrets in images, logs or source control. Rotation must account for application reload behavior, connection reuse and overlap between old and new credentials.
+
+Progressive delivery can use rolling updates, blue/green environments, or canary traffic. A safe rollback requires more than reverting an image: database changes, messages already emitted, external side effects and configuration may not be reversible. Prefer expand-and-contract schema changes and explicit rollback/forward-fix plans.
+
+### Kubernetes review checklist
+
+- Is the desired state schedulable with current requests, quotas and affinity?
+- Are readiness, liveness and startup probes semantically distinct?
+- Can replicas be placed across independent failure domains?
+- What happens to in-flight requests during termination?
+- Can scale-out overload the database or external dependencies?
+- Are resource limits consistent with runtime/GC and concurrency behavior?
+- Are configuration and secrets versioned, protected and rotatable?
+- Can rollout be paused or rolled back safely?
+- Are Pod pending, restart, throttling, OOM, endpoint and scheduling signals monitored?
+- Has recovery been tested without relying on replica count as the only redundancy measure?
+
+
 ## Further reading
 - Docker [container fundamentals](https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-a-container/).
 - Kubernetes [documentation](https://kubernetes.io/docs/home/).
