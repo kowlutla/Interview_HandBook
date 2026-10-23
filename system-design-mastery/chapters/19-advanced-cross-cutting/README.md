@@ -102,6 +102,77 @@ For every consequential decision, connect:
 Prefer a prototype or load/failure test when the decision depends on uncertain performance. Prefer a proof, documented protocol guarantee, or invariant test when correctness is the central risk. Benchmarks cannot prove distributed correctness; formal reasoning cannot establish production capacity without measurements. Use the right evidence for the claim.
 
 
+
+## 19.2 Architecture pattern catalog: context and consequences
+
+A pattern is a reusable response to a recurring design problem. It is not a universally correct component. Before adopting a pattern, identify the force it addresses, the new failure modes it introduces, and the invariant it must preserve.
+
+### Strangler pattern
+
+The strangler pattern gradually routes selected capabilities from a legacy system to a replacement. It reduces the risk of a one-time rewrite but requires routing control, data ownership, compatibility, observability and a clear retirement plan. During migration, both systems may be live; writes and reads must have an explicit source of truth to avoid divergent state.
+
+### Anti-corruption layer
+
+An anti-corruption layer translates an external or legacy model into the domain's own model. It protects internal concepts from leaking vendor-specific fields and semantics. It should make translation explicit and observable; a layer that silently drops fields or hides incompatible meaning can create data corruption that is hard to diagnose.
+
+### Sidecar and ambassador
+
+A sidecar runs alongside an application to provide a capability such as proxying, telemetry or certificate handling. An ambassador pattern commonly places a proxy in front of a remote service to simplify access or connectivity. Both can standardize cross-cutting behavior, but they add another process, configuration surface, resource consumer and failure mode. Decide whether the added hop and control plane are worth the consistency they provide.
+
+### Competing consumers and work queues
+
+Multiple workers compete to process items from a shared queue or subscription. This improves throughput when tasks are independent, but requires idempotency, visibility/lease expiry behavior, poison-message handling and a bounded retry policy. If task completion can outlive the lease, two workers may process the same task; fencing or idempotent effects may be needed.
+
+### Fan-out/fan-in
+
+A request fans out to parallel subrequests and combines results. Latency is often dominated by the slowest required branch, and each branch consumes concurrency and downstream capacity. Bound fan-out width, use a shared deadline, define partial-result behavior, and avoid retrying every branch indiscriminately. A request that fans out to 100 dependencies can amplify traffic dramatically even if the incoming request rate is modest.
+
+### Claim check
+
+When a message payload is too large or sensitive to copy through a broker, publish a small claim-check message containing a reference to the payload in durable storage. This reduces broker payload pressure but introduces a lifecycle dependency: the referenced object must remain available and authorized for as long as the message may be processed or replayed. Define cleanup, encryption, access control and missing-object recovery.
+
+### Materialized view
+
+A materialized view stores a precomputed representation optimized for a read path. It reduces read cost at the expense of storage, update work and freshness. Define the authoritative source, update mechanism, acceptable lag, rebuild procedure and how readers detect stale or incomplete projections.
+
+### Scheduler and lease-based work ownership
+
+A distributed scheduler assigns due work across workers. Correctness requires clear ownership, clock assumptions, lease expiry, duplicate execution behavior, retry policy, and a strategy for tasks that run longer than their lease. A lease does not stop a paused old worker from acting after expiry; fencing tokens or idempotent effects may be required at the resource boundary.
+
+### Bulkhead, circuit breaker and retry budget
+
+A bulkhead isolates resource pools or concurrency budgets so one dependency or workload cannot consume everything. A circuit breaker suppresses calls when a dependency is failing, allowing recovery or a fallback. A retry budget limits extra attempts so recovery traffic does not dominate original work. These patterns complement each other but are not substitutes: isolation protects capacity, a breaker changes call admission, and a retry budget bounds amplification.
+
+### CQRS, event sourcing and saga: avoid pattern bundles
+
+CQRS separates command and query models; event sourcing makes an event history authoritative; a saga coordinates a business process across multiple local transactions with compensations or forward recovery. They solve different problems and can be combined, but each adds operational cost. CQRS adds projection freshness, event sourcing adds schema/replay/retention complexity, and sagas add workflow state, timeouts, duplicate handling and compensation semantics.
+
+### Common anti-patterns
+
+- **Distributed monolith:** services deploy separately but require synchronized changes and chatty calls to complete one invariant.
+- **God gateway:** business logic and orchestration accumulate in a shared entry point.
+- **Retry everything:** retries amplify overload and repeat unsafe operations.
+- **Unbounded queue:** hides overload until latency, memory or disk becomes catastrophic.
+- **Shared database as integration API:** independent services couple to one schema and can violate each other's assumptions.
+- **Cache as source of truth:** eviction or loss changes correctness unexpectedly.
+- **Global synchronous dependency:** a noncritical remote service becomes required for every user action.
+- **Exactly-once by slogan:** a local broker guarantee is mistaken for an end-to-end business guarantee.
+- **Replica-count theater:** multiple replicas share the same failure domain or authoritative bottleneck.
+- **Big-bang rewrite:** migration risk is concentrated into one release without staged compatibility or rollback.
+
+### Pattern selection checklist
+
+- What specific problem and force is the pattern addressing?
+- Which invariant or guarantee must remain true?
+- What new state, component, network hop or failure mode does it add?
+- Does it improve ownership, latency, throughput, reliability or changeability measurably?
+- What is the operational and cost overhead?
+- How are duplicates, retries, replay, stale state and partial failure handled?
+- What observable evidence would show the pattern is working?
+- Can a simpler design meet the requirement?
+- What is the migration and rollback path?
+
+
 ## Further reading
 - O'Neil et al., [LSM-tree paper](https://doi.org/10.1007/s002360050048).
 - Google SRE [Handling Overload](https://sre.google/sre-book/handling-overload/).
