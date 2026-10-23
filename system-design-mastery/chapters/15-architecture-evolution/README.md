@@ -200,6 +200,7 @@ A real system often combines styles: for example, a layered modular monolith may
 
 
 ## Further reading
+- Microsoft Azure Architecture Center, [Architecture styles](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles) and [Microservices architecture style](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/microservices).
 - Fowler, [Microservices](https://martinfowler.com/articles/microservices.html).
 - Fowler, [Strangler Fig Application](https://martinfowler.com/bliki/StranglerFigApplication.html).
 - Microsoft [Cloud Design Patterns](https://learn.microsoft.com/en-us/azure/architecture/patterns/).
