@@ -100,6 +100,67 @@ A useful autoscaling design includes minimum and maximum bounds, cooldown or sta
 Test at normal load, expected peak, burst, overload, dependency slowdown, instance loss, and recovery. Record throughput, p50/p95/p99 latency, errors, queue wait, backlog age, CPU, memory, network, connection waits and downstream saturation. A test that measures only successful requests can hide requests rejected or timed out during the run.
 
 
+
+## 13.2 Admission control, load shedding, and backpressure in depth
+
+When arrival rate exceeds service capacity, work accumulates in queues. Queueing delays increase, requests time out, clients retry, and the added retries consume still more capacity. The goal of overload control is not to make every request succeed; it is to preserve useful service and protect recovery.
+
+### Admission control versus rate limiting
+
+Rate limiting caps request frequency over a window or token budget. Admission control decides whether the system can accept more work given current capacity, queue depth, deadlines, tenant budgets or operation cost. A fixed rate limit may be too permissive when requests become more expensive, and too restrictive when capacity is idle.
+
+Admission can reject before expensive work begins, return a retry hint where meaningful, or reserve capacity for critical operations. Apply limits at multiple layers when needed: edge protection, per-tenant fairness, per-route concurrency, and dependency-specific budgets solve different problems.
+
+### Token bucket and leaky bucket
+
+A token bucket accrues tokens at a configured rate up to a burst capacity; each request consumes tokens. It permits bounded bursts while constraining long-run average rate. A leaky-bucket-style shaper releases work at a controlled rate, smoothing bursts; a policing variant can reject excess work. Sliding-window counters and approximate distributed limiters offer other trade-offs in accuracy, memory and coordination.
+
+A distributed limiter must define whether limits are globally strict or approximate across instances. Per-instance limits multiply with replica count unless coordinated. Coordination improves aggregate accuracy but adds a dependency and latency; many systems deliberately use local budgets plus a global safety cap.
+
+### Concurrency limits and queue bounds
+
+A concurrency limit bounds active work rather than request arrivals. It is useful when operation cost and service time vary. Queue bounds cap waiting work; once the queue is full, new work is rejected or shed rather than allowed to consume unbounded memory and produce hopelessly late responses.
+
+Set queue and concurrency limits from deadlines and service-time distributions, not only from available RAM. If a request cannot finish before its deadline, admitting it can waste capacity needed by requests that could succeed. Avoid hidden queues in thread pools, connection pools, load balancers and client libraries; the total queueing path matters.
+
+### Backpressure across pipelines
+
+Backpressure communicates that a downstream stage cannot accept work at the current rate. Depending on the architecture, it can slow the producer, reduce fetch/prefetch, pause partitions, bound buffers, spill to durable storage, or reject work. If the producer cannot slow down, the system must choose which work to buffer, persist, sample, drop or reject.
+
+Buffering moves overload in time; it does not remove it. Every buffer needs a size limit, durability expectation, retention policy and overflow behavior. For streaming systems, measure queue age and lag because a large queue may remain technically finite while delivering uselessly stale results.
+
+### Load shedding and graceful degradation
+
+When capacity is insufficient, shed low-priority or optional work before critical operations. Examples include disabling expensive recommendations, reducing result detail, sampling nonessential telemetry, rejecting bulk exports, or serving a permitted stale response. The degradation contract must be explicit so that a partial response is not mistaken for a complete result.
+
+Random rejection can be fair but may damage every user journey; priority-aware shedding can preserve critical work but requires trustworthy priorities and protection against priority abuse. Shed retries as well as first attempts when retries are contributing to overload.
+
+### Autoscaling is delayed feedback control
+
+Autoscalers observe metrics and add/remove capacity after detection, scheduling, image pull, startup and readiness delays. If scaling reacts only to CPU, it may miss queue buildup or an external bottleneck. If it reacts too aggressively, scale-up can create synchronized connection storms and scale-down can remove warm capacity or interrupt long-running work.
+
+Choose signals that represent the constrained resource: queue age, in-flight work, request rate per ready replica, CPU, memory, concurrency or latency. Define stabilization windows, minimum/maximum replicas, warm capacity, scale-down behavior, and what happens when a quota prevents expansion. Autoscaling cannot solve a saturated database, a hot shard or an external provider's fixed limit.
+
+### Retry amplification and cascading failure
+
+Retries should be bounded, use exponential backoff with jitter, share an overall deadline, and occur only when repeating the operation is safe. Avoid retries at every layer: a client, gateway, service and database driver can multiply attempts dramatically. Coordinate one retry budget and record attempts separately from logical requests.
+
+A circuit breaker can temporarily stop calls to a dependency that is failing, but it is not a capacity generator and can produce synchronized recovery bursts if every caller probes at once. Combine it with bounded concurrency, controlled half-open probes, timeouts, and fallback behavior that preserves correctness.
+
+### Overload review checklist
+
+- Where does work queue, and what bounds each queue?
+- What is the maximum useful wait before the deadline expires?
+- Which operations are critical and which can be shed?
+- Are rate limits based on identity, cost and concurrency where needed?
+- Can retries multiply across layers?
+- Does backpressure reach producers or merely move work into another buffer?
+- What happens when durable buffers fill?
+- Does autoscaling observe the true bottleneck and account for startup delay?
+- Can scale-out overload downstream dependencies?
+- How does the system recover gradually after an overload event?
+
+
 ## Further reading
 - Google SRE [Handling Overload](https://sre.google/sre-book/handling-overload/).
 - Google SRE [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/).
