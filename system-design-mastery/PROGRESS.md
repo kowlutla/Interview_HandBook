@@ -5,12 +5,12 @@ Check items only when the work has actually been performed.
 ## Repository audit and scope
 - [x] Repository access and push permission confirmed from GitHub metadata.
 - [x] Read root README.
-- [x] Read existing tutorials index.
+- [x] Read existing tutorials index in read-only mode.
 - [x] Read existing real-world examples index in read-only mode.
-- [x] Confirmed the requested destination README was absent at the checked path.
+- [x] Confirmed destination README was absent at the checked path before creation.
 - [x] Established strict write boundary: system-design-mastery/.
-- [x] Designed an independent curriculum around learning dependencies rather than the existing directory's numbering.
-- [ ] Inspect the complete repository tree and check for pre-existing target files before finalizing.
+- [x] Designed an independent curriculum around learning dependencies rather than existing numbering.
+- [ ] Inspect the complete repository tree and check for any pre-existing target files not covered by the initial checks.
 - [ ] Compare changed paths and verify all writes are confined to the target directory.
 
 ## Planning artifacts
@@ -18,19 +18,20 @@ Check items only when the work has actually been performed.
 - [x] Roadmap and dependency sketch.
 - [x] Curriculum and coverage matrix.
 - [x] Editorial and verification standard.
-- [ ] Independently review curriculum completeness and duplication.
+- [ ] Independent curriculum completeness and duplication review.
 
 ## Research
-- [ ] Verify claims against primary papers, standards and official documentation.
-- [ ] Add chapter-local citations near claims.
+- [x] Identified primary references for HTTP semantics, CAP, consensus, logical clocks, databases, Kafka, SRE, OAuth, cloud and runtime behavior.
+- [ ] Verify chapter claims against primary papers, standards and official documentation in a dedicated pass.
 - [ ] Recheck source links during final audit.
 
 ## Textbook implementation
-- [ ] Complete all 19 substantive chapter drafts.
-- [ ] Complete glossary.
-- [ ] Complete reference library.
+- [x] Draft all 19 chapter files.
+- [x] Create glossary.
+- [x] Create reference library.
 - [ ] Review each module for accuracy, clarity, depth and prerequisite coverage.
 - [ ] Cross-chapter terminology and consistency review.
+- [ ] Expand any chapter whose coverage remains too compressed for textbook-level mastery.
 
 ## Validation
 - [ ] Validate internal Markdown links.
@@ -42,4 +43,4 @@ Check items only when the work has actually been performed.
 - [ ] Report limitations honestly; do not claim the textbook complete until all acceptance checks pass.
 
 ## Current status
-The independent curriculum and editorial blueprint are created. The textbook remains in progress until all chapter drafts and the final audit are complete.
+The independent curriculum and all 19 initial chapter drafts have been committed. This is a substantial first draft, not yet a validated final textbook. Resume with the independent technical, link, diagram, scope and repository-boundary audits.
