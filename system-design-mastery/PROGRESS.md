@@ -34,13 +34,13 @@ Check items only when the work has actually been performed.
 - [ ] Expand any chapter whose coverage remains too compressed for textbook-level mastery.
 
 ## Validation
-- [ ] Validate internal Markdown links.
+- [x] Validate relative internal Markdown links in all created Markdown files against the expected file set; no broken internal targets found.
 - [ ] Validate Mermaid diagrams.
-- [ ] Recalculate quantitative examples independently.
+- [x] Independently recalculate the chapter's traffic, bandwidth, storage, Little's Law and fan-out examples; results match within rounding.
 - [ ] Review assumptions, caveats and implementation-specific claims.
 - [ ] Audit for missing topics, duplication and out-of-scope content.
 - [ ] Verify final repository path boundary.
 - [ ] Report limitations honestly; do not claim the textbook complete until all acceptance checks pass.
 
 ## Current status
-The independent curriculum and all 19 initial chapter drafts have been committed. This is a substantial first draft, not yet a validated final textbook. Resume with the independent technical, link, diagram, scope and repository-boundary audits.
+The independent curriculum and all 19 chapter drafts have been committed, with additional depth added to distributed-systems consistency and consensus. Internal Markdown targets were checked and quantitative examples independently recalculated. This is still a substantial first draft rather than a validated final textbook: Mermaid syntax has only had a manual review, not a dedicated renderer test, and a full claim-by-claim technical and repository-boundary audit remains open.
