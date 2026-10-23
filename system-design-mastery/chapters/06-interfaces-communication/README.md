@@ -199,6 +199,22 @@ The gateway is on the critical path and often has a large blast radius. Run mult
 
 Monitor request rate, status/error class, route latency, upstream latency, rejected requests, throttling, active connections, queueing, configuration version, certificate expiry and dependency health. Distinguish a live process from a gateway able to authenticate, resolve routes and reach required backends. Roll out policy changes progressively and retain a rollback path.
 
+```mermaid
+flowchart TD
+  C[Client request] --> G[API gateway]
+  G --> V[Validate request and limits]
+  V --> I[Authenticate caller]
+  I --> R[Route by API contract]
+  R --> S[Domain service]
+  S --> A[Authorize resource and enforce invariant]
+  A --> D[Read or mutate authoritative data]
+  D --> S
+  S --> G
+  G --> C
+  V -. rejected .-> E[Documented error response]
+  I -. rejected .-> E
+```
+
 ### API gateway design checklist
 
 - Which cross-cutting concerns belong here, and which stay in domain services?
