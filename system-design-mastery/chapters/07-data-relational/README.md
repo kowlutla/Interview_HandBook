@@ -180,6 +180,66 @@ Backfills are production workloads: they can saturate I/O, grow logs, hold locks
 - Which freshness guarantees apply when reads are served from replicas?
 
 
+
+## 7.2 Sharding and resharding: a worked design example
+
+Sharding divides a dataset across multiple independently managed partitions. It can increase storage and write capacity, but adds routing, rebalancing, cross-shard query, transaction and operational complexity. Do not shard simply because the table is large; first establish which resource is constrained and whether indexing, query redesign, archiving, vertical capacity or read replicas can meet the requirement.
+
+### Choose a shard key from access patterns and invariants
+
+Imagine an order service with records identified by order ID and commonly queried by customer ID and creation time. Sharding by a random order ID can distribute writes, but customer history queries may need to scatter across many shards. Sharding by customer ID makes customer history efficient and keeps a customer's orders colocated, but a very large customer can become a hot shard and global time-based queries remain expensive.
+
+A useful shard key should be evaluated against:
+- **Distribution:** does the key spread traffic and storage across shards?
+- **Query locality:** can common queries target one or a small number of shards?
+- **Growth:** can large tenants or hot keys dominate a shard?
+- **Invariant locality:** do transactions that must be atomic remain within one shard?
+- **Operational change:** can the key be changed or data rebalanced without unacceptable downtime?
+
+There is rarely a key that optimizes every query. Record which query paths will scatter and how their fan-out is bounded.
+
+### Hash, range and directory-based placement
+
+**Hash-based placement** can distribute uniformly when keys are well behaved, but makes range scans and ordered locality harder. **Range-based placement** can support range queries but can create hot partitions when new writes cluster at the end of a range. **Directory-based placement** uses a mapping service to locate a tenant or key group, offering flexibility at the cost of directory availability, caching and migration coordination.
+
+Consistent hashing and virtual nodes can reduce how many keys move when membership changes, but they do not by themselves rebalance uneven data volume or hot traffic. A key distribution can be numerically balanced while one shard handles much more work because its keys are more active or queries are more expensive.
+
+### Cross-shard operations
+
+A query that touches multiple shards may need fan-out, merge, global sort, pagination coordination and partial-failure policy. A transaction that writes multiple shards may require a distributed transaction protocol or a redesign that makes the invariant local. Cross-shard uniqueness is difficult if the database cannot enforce a global unique constraint; common alternatives include globally unique IDs, a dedicated uniqueness registry, or a domain model that scopes uniqueness.
+
+Do not silently return partial query results when a shard fails. Either the API contract supports partial results with explicit status, or the operation should fail in a way the caller can understand and safely retry.
+
+### Resharding and migration
+
+Resharding changes data placement or the number of partitions. A safe plan may involve dual routing, copy/backfill, change capture for concurrent writes, validation, a cutover point and cleanup. Every stage needs idempotency and a way to resume after interruption.
+
+A generic migration sequence is:
+1. Define the new placement map and version it.
+2. Begin copying existing records in bounded batches.
+3. Capture and apply concurrent mutations to the destination.
+4. Compare counts and checksums or domain-level invariants.
+5. Route reads to the new placement under a controlled rollout.
+6. Switch writes only when the consistency protocol makes it safe.
+7. Retain rollback/reconciliation capability until confidence is established.
+8. Remove old copies only after validation and a defined retention window.
+
+The hard part is not copying bytes; it is defining the source of truth while writes continue. Dual-writing without a durable reconciliation mechanism can produce silent divergence.
+
+### Sharding review checklist
+
+- Which measured bottleneck requires sharding?
+- Which key gives good distribution and locality for the dominant queries?
+- Can a tenant, range or key become hot?
+- Which transactions or uniqueness rules cross shard boundaries?
+- How are cross-shard queries, pagination and partial failures handled?
+- How are placement metadata and routing versions kept consistent?
+- How will resharding copy concurrent writes and validate correctness?
+- What is the cutover and rollback strategy?
+- Are backup, restore, monitoring and incident procedures shard-aware?
+- What evidence would justify adding another shard rather than optimizing the existing design?
+
+
 ## Further reading
 - PostgreSQL [transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html), [indexes](https://www.postgresql.org/docs/current/indexes.html), [EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html), [point-in-time recovery](https://www.postgresql.org/docs/current/continuous-archiving.html).
 - SQLite [atomic commit](https://www.sqlite.org/atomiccommit.html).
