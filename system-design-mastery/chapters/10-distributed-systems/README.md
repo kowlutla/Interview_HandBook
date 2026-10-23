@@ -132,6 +132,7 @@ CRDT convergence relies on the data type's algebra and delivery assumptions. Con
 - Gilbert and Lynch, [CAP paper](https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf).
 - Lamport, [Time, Clocks, and the Ordering of Events](https://lamport.azurewebsites.net/pubs/time-clocks.pdf).
 - Brewer, [CAP Twelve Years Later](https://doi.org/10.1109/MC.2012.37).
+- [Raft paper and resources](https://raft.github.io/).
 
 
 ## 10.1A Partial failure: a timeout is evidence, not a verdict
@@ -195,12 +196,6 @@ Neither logical nor wall-clock timestamps automatically solve business conflict 
 A CRDT is designed so replicas can merge updates according to mathematical properties that guarantee convergence under its model. State-based CRDTs commonly rely on a join operation with properties such as associativity, commutativity and idempotence; operation-based designs have their own delivery assumptions.
 
 A set that merges independent additions can be a good fit. A bank balance with arbitrary concurrent debits is not automatically safe just because it is stored in a CRDT. The application still needs to preserve invariants such as non-negative balance or unique allocation. Choose the data type and its allowed operations around the invariant, not around the label “eventually consistent.”
-
-## Further reading
-- [CAP paper by Gilbert and Lynch](https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf).
-- Lamport, [Time, Clocks, and the Ordering of Events](https://lamport.azurewebsites.net/pubs/time-clocks.pdf).
-- [Raft paper and resources](https://raft.github.io/).
-
 
 ## From uncertainty to explicit guarantees
 
