@@ -158,6 +158,22 @@ Deleting an item while another device is offline creates a special conflict: the
 
 Define how deletion propagates through search indexes, caches, exports, local replicas and backups, and whether legal retention requirements affect permanent erasure.
 
+```mermaid
+flowchart TD
+  A[User edit] --> B[Persist local operation ID and base version]
+  B --> C[Show pending local state]
+  C --> D[Sync when connectivity permits]
+  D --> E{Server accepts operation?}
+  E -- Yes --> F[Persist authoritative result and checkpoint]
+  E -- Conflict --> G[Fetch current version and resolve conflict]
+  E -- Retryable/unknown --> H[Keep operation pending and retry safely]
+  G --> D
+  H --> D
+  F --> I[Mark operation resolved]
+```
+
+The checkpoint must advance only after the corresponding changes are durably applied locally. If a conflict is unresolved, keep enough information to explain the state to the user rather than silently discarding the operation.
+
 ### Ordering and checkpoints
 
 A synchronization checkpoint must mean something precise: all changes up to a particular server-defined sequence or cursor have been applied, or all local operations up to a defined position have been acknowledged. Avoid relying on client wall-clock time as a globally reliable ordering mechanism.
@@ -197,6 +213,21 @@ Persistent connections consume memory, file descriptors, buffers, heartbeat work
 A reconnect storm after a regional interruption can overload authentication, connection admission and subscription recovery. Use exponential backoff with jitter, bounded retries, connection limits, resume cursors and staged recovery. Heartbeats detect some dead paths but consume resources and do not prove application-level processing.
 
 A connection-serving tier may be separated from business services, but the design then needs subscription ownership, routing between nodes, presence expiration, authorization, and recovery when a connection node fails. Avoid treating an in-memory subscription map as durable truth unless losing it is explicitly acceptable.
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant G as Connection Gateway
+  participant E as Durable Event Source
+  C->>G: Connect with cursor 812
+  G->>E: Resume after cursor 812
+  E-->>G: Replay retained events 813..N
+  G-->>C: Deliver replayed events
+  C->>G: Acknowledge/apply through N
+  G-->>C: Continue live updates
+```
+
+The sequence is illustrative: the actual acknowledgement and cursor protocol must define when the client has durably applied an event. If the cursor has expired, the server should require a snapshot or full resynchronization rather than pretending the client is current.
 
 ### Ordering and backpressure
 
