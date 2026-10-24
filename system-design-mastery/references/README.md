@@ -61,6 +61,7 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 - AWS API Gateway, [HTTP API throttling](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-throttling.html). Treat documented throttles as implementation behavior, not universal API gateway semantics.
 - Cloudflare, [Origin Cache Control](https://developers.cloudflare.com/cache/concepts/cache-control/) and [CDN-Cache-Control](https://developers.cloudflare.com/cache/concepts/cdn-cache-control/). These describe Cloudflare-specific behavior; use RFC 9111 for general HTTP caching semantics.
 - OWASP, [API Security Top 10](https://api-security.owasp.org/editions/2023/en/0x00-header/).
+- OWASP, [Injection Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Injection_Prevention_Cheat_Sheet.html) and [SQL Injection Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet).
 
 
 ## Protocol standards and secure integrations
