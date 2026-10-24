@@ -317,11 +317,6 @@ Store the workload definition, generator configuration, test-data version, servi
 - [ ] Results identify the first bottleneck and include configuration/data assumptions.
 - [ ] The test is repeatable and has a safe abort condition.
 
-## Further reading
-- [Google SRE Book: Handling Overload](https://sre.google/sre-book/handling-overload/).
-- [Little's original law is often taught through queueing theory; a practical systems treatment appears in the SRE literature](https://sre.google/sre-book/table-of-contents/).
-
-
 ## A repeatable capacity-estimation path
 
 ```mermaid
@@ -336,6 +331,12 @@ flowchart TD
 ```
 
 The result is a range with explicit assumptions, not a magically precise prediction.
+
+## Further reading
+- [Google SRE Book: Handling Overload](https://sre.google/sre-book/handling-overload/).
+- [Little's original law is often taught through queueing theory; a practical systems treatment appears in the SRE literature](https://sre.google/sre-book/table-of-contents/).
+
+
 
 ---
 
