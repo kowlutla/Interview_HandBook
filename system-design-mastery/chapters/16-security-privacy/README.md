@@ -255,7 +255,7 @@ A deprecation plan should include consumer identification, communication, migrat
 
 Assume a multi-tenant SaaS application lets a user search documents and request an asynchronous export as a downloadable archive. The export worker reads from a database and object storage, writes a generated file, and notifies the requester when it is ready. The key security invariant is: **a principal may export only documents that the current authorization policy permits them to access in their tenant and resource state**.
 
-### Identify assets, actors and trust boundaries
+### Map the export flow and trust boundaries
 
 | Element | Security significance | Boundary or control question |
 |---|---|---|
