@@ -43,23 +43,23 @@ The following sections are present and are the starting points for the deeper re
 
 | Area | Exact chapter section(s) to review |
 |---|---|
-| Architecture reasoning | Chapter 01: 1.4, 1.6, 1.7, 1.9, 1.13, 1.14, 1.15 architecture views and diagram selection |
+| Architecture reasoning | Chapter 01: 1.4, 1.6, 1.7, 1.9, 1.13, 1.14, 1.15 architecture views and diagram selection, 1.16 worked architecture evaluation |
 | Measurable quality attributes | Chapter 02: 2.5–2.12, 2.15–2.21 including accessibility, usability, internationalization, operability, portability, cost, sustainability and attribute interactions |
-| Workload and capacity | Chapter 03: 3.1–3.15, 3.16 Worked capacity example, 3.17 Workload testing methodology |
+| Workload and capacity | Chapter 03: 3.1–3.15, 3.16 worked capacity example, 3.17 testing methodology, 3.18 worked capacity test plan |
 | Runtime and resource limits | Chapter 04: 4.1–4.14, 4.15 Runtime resource limits, 4.16 Cancellation and structured concurrency |
 | Networking and request path | Chapter 05: 5.1–5.18, 5.19 Load balancers, 5.20 CDNs, 5.21 Network boundaries, 5.22 Protocol details and operational edge cases, 5.23 Practical network troubleshooting |
-| API contracts and gateway | Chapter 06: 6.1–6.10H, 6.11 API gateways and API management, 6.12 Webhooks |
+| API contracts and gateway | Chapter 06: 6.1–6.10H, 6.11 API gateways and API management, 6.12 Webhooks, 6.13 worked OpenAPI evolution |
 | Relational data and transactions | Chapter 07: Isolation anomalies, Optimistic versus pessimistic concurrency, Query planning, Safe schema migration, Relational systems in practice, 7.2 Sharding and resharding, 7.3 Write-skew concurrency lab |
 | Storage families and engines | Chapter 08: B-trees and LSM trees, 8.1A–8.1I, 8.2–8.6 data-system families/search/analytics/indexes, 8.7 Distributed file systems and object/block/file interfaces |
 | Cache behavior | Chapter 09: Common patterns, TTL and invalidation, Failure modes, 9.1A–9.1H, 9.2 Cache patterns and failure modes, 9.3 Cache security/tenant isolation/freshness |
 | Distributed consistency | Chapter 10: Consistency models, CAP and PACELC, 10.7–10.18 including worked consistency timeline |
 | Replication and coordination | Chapter 11: Leader election, Leases and fencing tokens, Two-phase commit, Sagas and compensation, 11.5A–11.5I, 11.6 Worked stale-lease/fencing timeline |
-| Messaging and stream processing | Chapter 12: Queue, pub-sub and event log, Delivery semantics, Outbox, inbox and CDC, 12.1A–12.1H, 12.2 Message brokers and delivery semantics, 12.3 Event sourcing/CQRS/schema governance, 12.4 Consumer crash timeline |
-| Scaling and overload | Chapter 13: Load balancing and consistent hashing, Overload controls, 13.1A–13.1G, 13.2 Admission control/load shedding/backpressure, 13.3 Hedged requests/adaptive concurrency |
-| Reliability and recovery | Chapter 14: SLI, SLO, SLA and error budget, Recovery objectives, Zones, regions and disaster recovery, 14.1A–14.1G, 14.2 Recovery engineering, 14.3 Worked SLO and error-budget example |
+| Messaging and stream processing | Chapter 12: Queue, pub-sub and event log, Delivery semantics, Outbox, inbox and CDC, 12.1A–12.1H, 12.2 Message brokers and delivery semantics, 12.3 Event sourcing/CQRS, schema risk matrix and projection rebuild, 12.4 Consumer crash timeline |
+| Scaling and overload | Chapter 13: Load balancing and consistent hashing, Overload controls, 13.1A–13.1G, 13.2 Admission control/load shedding/backpressure, 13.3 Hedged requests/adaptive concurrency, 13.4 worked concurrency-limit decision |
+| Reliability and recovery | Chapter 14: SLI, SLO, SLA and error budget, Recovery objectives, Zones, regions and disaster recovery, 14.1A–14.1G, 14.2 Recovery engineering, 14.3 worked SLO/error-budget example, 14.4 recovery rehearsal |
 | Architectural styles and evolution | Chapter 15: Monolith, modular monolith and microservices, Sidecars and service meshes, 15.1A–15.1H, 15.1I Architectural styles |
 | Security and privacy | Chapter 16: Threat modeling, Authorization models, Tenant isolation, OAuth 2.0 and OpenID Connect, 16.2 Threat modeling a system architecture, 16.3 API threat patterns |
-| Observability and operations | Chapter 17: RED and USE, Percentiles and cardinality, SLO-driven alerting, 17.1A–17.1I, 17.2 Observability in practice |
+| Observability and operations | Chapter 17: RED and USE, Percentiles and cardinality, SLO-driven alerting, 17.1A–17.1I, 17.2 Observability in practice, 17.3 worked SLO alert design |
 | Cloud and Kubernetes | Chapter 18: Containers and Kubernetes, 18.1A–18.1I, 18.2 Kubernetes architecture, 18.3 Service mesh, 18.4 IaC state and drift, 18.5 software supply-chain security |
 | Patterns and anti-patterns | Chapter 19: Probabilistic data structures including Bloom-filter sizing, Distributed scheduling, Multi-tenancy, Multi-region consistency and routing, 19.2 Architecture pattern catalog |
 
@@ -68,7 +68,7 @@ The following sections are present and are the starting points for the deeper re
 | API threat patterns | Chapter 16, 16.3 | Adds object/function/property-level authorization, sensitive business flows, resource abuse, SSRF, unsafe upstream APIs and API inventory | Build a threat model and verify controls against the OWASP API Security Top 10 |
 | Probabilistic structure sizing | Chapter 19, Bloom filter sizing subsection | Adds standard approximate false-positive and bit-budget formulas plus a million-item worked example | Independently recalculate formula and label assumptions clearly |
 | Cache security and data lifecycle | Chapter 09, 9.3 | Covers tenant-aware cache keys, cache poisoning/deception, stale-while-revalidate/stale-if-error, permission revocation, deletion and privacy propagation | Verify against HTTP caching semantics and add a concrete cross-tenant test matrix |
-| Event sourcing, CQRS and schema governance | Chapter 12, 12.3 | Distinguishes commands/events, event sourcing/notification, CQRS/read-model lag, projection rebuilds, schema compatibility and event-data privacy | Verify broker/registry-specific semantics and add a worked projection rebuild example |
+| Event sourcing, CQRS and schema governance | Chapter 12, 12.3 | Distinguishes commands/events, event sourcing/notification, CQRS/read-model lag, projection rebuild/cutover, schema-change risk and event-data privacy | Verify the schema risk matrix against a chosen serialization format/registry and test the rebuild protocol under live traffic |
 
 | Addition | Location | Why it matters | Remaining verification |
 |---|---|---|---|
