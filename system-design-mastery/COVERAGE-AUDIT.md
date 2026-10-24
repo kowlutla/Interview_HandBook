@@ -473,7 +473,7 @@ This verifies that the expected teaching areas and named sections exist. It does
 
 ### Validation workflow observability
 
-The repository now contains the CI workflow and artifact-extraction script. The available GitHub Actions helper surfaced in this session only returns pull-request-filtered workflow runs and returned an empty result for the workflow-creation commit; it did not expose the latest push-triggered run. Therefore the workflow's actual result is **not yet observed**. Do not record the Mermaid render or OpenAPI validator as passed until the run status and job logs can be inspected.
+The repository contains the CI workflow and artifact-extraction script. The workflow has now been inspected through the Actions REST endpoints rather than relying on the pull-request-only helper. See the later **CI evidence update** below for the verified OpenAPI pass, initial Mermaid sandbox failure, and corrected run status.
 
 
 ## Focused client real-time consistency review — 2026-10-24
