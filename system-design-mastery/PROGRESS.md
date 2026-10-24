@@ -360,3 +360,13 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Added two substantive gaps found during deeper reading: Chapter 08 specialized storage selection (8.2A) and Chapter 12 Kafka exactly-once boundary (12.3A). Rechecked the three changed chapter pages (08, 09, 12): no duplicate headings or unclosed fences; each retains Further reading and the navigation footer.
 - [ ] This section-map pass is not an exhaustive sentence-by-sentence acceptance of all 21 families. The inventory remains Developing until examples, failure modes, source alignment and selection criteria have been independently confirmed for every row.
 - [ ] GitHub Actions validation workflow and extractor are committed. The available Actions tool only returned pull-request-filtered workflow runs and showed none for the workflow-creation commit; the actual run result for the latest push could not be inspected through the available interface. Do not claim the OpenAPI or Mermaid jobs passed until their run and logs are accessible.
+
+
+## Focused client real-time depth correction — 2026-10-24
+
+- [x] Reviewed Chapter 20's synchronization and durable real-time delivery sections at mechanism level.
+- [x] Added a replay-to-live handoff subsection to Chapter 20.6: high-watermark/subscription-position requirements, overlap or buffering, deduplication, durable checkpoints, retention gaps and snapshot recovery.
+- [x] Added concrete boundary tests for publishes during subscription setup, disconnects during replay, duplicate delivery, cursor expiry and a crash between applying an event and persisting the checkpoint.
+- [x] Updated COVERAGE-AUDIT.md to record the correction and preserve the Developing status.
+- [ ] Independently verify the exact handoff against a chosen broker/change-feed API and ordering contract; the generic design guidance does not establish product-specific guarantees.
+- [ ] CI remains unverified: repository helper available in this session only returns pull-request-triggered runs; it returned no run for the workflow commit. A local clone attempt also failed because this environment could not resolve github.com. Do not claim the Mermaid renderer or full OpenAPI validator passed.
