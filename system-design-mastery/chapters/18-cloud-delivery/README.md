@@ -286,6 +286,7 @@ Rollback can be unsafe if the new version has already changed data or emitted in
 - AWS [Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 - NIST, [Secure Software Development Framework (SP 800-218 v1.1)](https://csrc.nist.gov/pubs/sp/800/218/final); check the NIST page for later revisions or drafts before using it as a current compliance baseline.
 - SLSA, [approved specification v1.2](https://slsa.dev/spec/v1.2/), [Build track basics](https://slsa.dev/spec/v1.2/build-track-basics), and [Build provenance](https://slsa.dev/spec/v1.2/build-provenance). Use versioned approved specifications for stable reference; draft pages may change.
+- CISA, [2026 SBOM minimum elements guidance](https://content.govdelivery.com/accounts/USDHSCISA/bulletins/422a7eb); see also [CISA SBOM resources](https://www.cisa.gov/sbom).
 - SPDX, [specifications](https://spdx.dev/use/specifications/) for machine-readable software bill of materials formats.
 
 
