@@ -222,6 +222,23 @@ Deleting a record from the primary database does not automatically remove it fro
 
 Permission revocation is particularly sensitive. If access checks are cached, the system needs a bounded revocation delay or an authoritative check on critical paths. A short TTL may reduce exposure but is not equivalent to immediate revocation. If the product promises immediate revocation, use a mechanism that enforces that promise rather than relying on an assumed cache expiry time.
 
+### Cross-tenant and cache-poisoning test matrix
+
+Run these tests against the actual cache/proxy configuration, not only a mocked cache client. The expected outcome depends on the API's documented authorization and freshness contract, but a cache hit must never bypass it.
+
+| Test setup | Attack or race | Expected result |
+|---|---|---|
+| Tenant A warms a cache entry, then tenant B requests the same logical resource ID | Cross-tenant key collision | B receives only data B is authorized to see; a shared key is used only if the cached representation is truly tenant-independent |
+| User with role X warms a response, then a lower-privilege user requests it | Role/permission variation omitted from cache policy | No privileged representation is served to the lower-privilege user |
+| Request uses a spoofed Host or forwarding header that changes origin output | Cache and origin interpret request dimensions differently | Untrusted values cannot poison a shared response; trusted edge normalization is enforced |
+| Same path is requested with different locale, content negotiation or query filters | A response-varying dimension is missing from the key or Vary policy | Each request receives the correct representation, or the response is not shared-cached |
+| Permission is revoked while a previously authorized response remains cached | Revocation/invalidation race | Revocation takes effect within the documented bound; if immediate revocation is promised, stale cached authorization cannot grant access |
+| Record is deleted while a cache fill is in flight | Stale-fill race repopulates deleted data | The invalidation/version protocol prevents an older read from repopulating a forbidden or deleted value |
+| Attacker requests a dynamic sensitive URL that resembles a static asset path | Cache deception | Sensitive content is not stored or served as a shared static object |
+| Cache is unavailable or invalidation delivery is delayed | Fallback path bypasses authorization or overloads origin | Correct authorization remains enforced; fallback is bounded and stale-serving follows the data-class policy |
+
+Record the cache key/policy decision, response status and cache status for each case without logging raw credentials or sensitive payloads. Include the tests in release validation whenever proxy rules, authorization, URL normalization or response variation changes.
+
 ### Cache-security review checklist
 
 - Does the key include tenant, identity scope and every response-varying dimension that matters?
