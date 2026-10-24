@@ -101,6 +101,7 @@ Check items only when the work has actually been performed.
 - [x] Expand chapters 11–19 with deeper protocol mechanics, operational edge cases, security controls, recovery workflows, IaC state/drift, SBOM and build provenance, and review checklists.
 - [x] Deepen chapters 6–10 with additional API contract semantics, secure webhook delivery, relational concurrency/query planning, storage-engine internals including distributed file/object/block storage, cache correctness, and distributed consistency reasoning.
 - [ ] Cross-chapter terminology and consistency review.
+- [x] Perform a targeted conceptual consistency review of Chapters 10–15: consistency/isolation terminology, quorum assumptions, stale-writer fencing, 2PC versus saga boundaries, messaging offset/effect crash windows, RTO/RPO arithmetic, retry/hedge amplification, delayed autoscaling, and architecture-style selection. Record only scoped findings; full claim-by-claim verification remains open.
 - [x] Fix Chapter 11 supplemental consensus sections appearing after the Further reading heading.
 - [x] Reorder Chapter 11's consensus, fencing, transaction and review sections into a coherent reading sequence.
 - [x] Consolidate duplicate deep-dive sections and repeated Further reading headings found in Chapters 10–11.
