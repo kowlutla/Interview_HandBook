@@ -73,4 +73,4 @@ This curriculum was cross-checked against broad, vendor-neutral architecture gui
 - [x] Internal links resolve.
 - [ ] Glossary terms match chapter usage.
 - [x] No interview Q&A bank or complete end-to-end HLD case studies have been introduced.
-- [ ] A final path audit confirms all changes are inside this directory.
+- [x] A final path audit against the original textbook baseline confirms all changed paths are inside this directory.
