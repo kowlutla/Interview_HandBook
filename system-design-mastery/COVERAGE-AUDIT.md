@@ -25,10 +25,10 @@ Do not infer “Deep” from a heading or keyword match. This is an initial audi
 | Relational modeling, SQL, indexes, transactions | 07 | Developing | Sections 7.2 now adds shard-key trade-offs, cross-shard operations and a safe resharding sequence. Continue validating isolation/query-plan examples and database-specific guarantees. |
 | NoSQL models, search, analytics, data lakes | 08, 19 | Mentioned / Developing | Sections 8.2–8.7 now compare major storage families, derived search indexes, row/columnar and lakehouse workloads, materialized views, and distributed file/object/block semantics. Verify product-specific guarantees and add a comparative access-pattern example. |
 | Storage engines, WAL, B-tree, LSM, compaction | 08 | Developing | Add recovery/write-path examples and compare amplification and workload implications. |
-| Caching at client, CDN, application and data layers | 09, 05 | Developing | Deepen strategies, stampede/penetration/avalanche, coherence, freshness contracts and outage protection. |
+| Caching at client, CDN, application and data layers | 09 — 9.1A–9.1H, 9.2, 9.3 cache security/tenant isolation/freshness | Developing | Verify HTTP cache directives and provider-specific behavior; add a worked cache-key and invalidation scenario across user/tenant boundaries. |
 | Distributed failure, consistency, clocks, CAP/PACELC | 10 | Developing | Section 10.18 now adds a write-timeout/read-replica timeline and explains why quorum arithmetic alone does not prove linearizability. Verify the consistency claims against primary literature and implementation contracts. |
 | Replication, consensus, leases, locks, fencing, transactions | 11 | Developing | Compare Raft/Paxos concepts, failover safety, 2PC/Saga and distributed lock limits with examples. |
-| Queues, pub/sub, logs, Kafka, CDC and stream processing | 12 | Developing | Expand ordering, delivery, consumer recovery, event time, retention, schema evolution and replay examples. |
+| Queues, pub/sub, logs, Kafka, CDC and stream processing | 12 — 12.1A–12.1H, 12.2, 12.3 event sourcing/CQRS/schema governance | Developing | Verify broker-specific delivery/transaction guarantees; add a worked projection rebuild/replay example and schema compatibility matrix for a chosen format. |
 | Scaling, hashing, partitioning, hotspots, overload | 13 | Developing | Add worked algorithms, failure-domain capacity, admission control, load shedding and autoscaling pitfalls. |
 | Reliability, SLOs, redundancy, backup/restore, DR | 14 | Developing | Sections 14.2–14.3 now include availability composition, RTO/RPO, restore validation, and a worked request-based SLO/error-budget/burn-rate example. Continue checking measurement definitions and recovery assumptions. |
 | Security, identity, privacy, tenant isolation | 16 | Developing | Threat-model examples, authorization boundaries, secrets/key lifecycle, abuse controls and privacy lifecycle. |
@@ -51,10 +51,10 @@ The following sections are present and are the starting points for the deeper re
 | API contracts and gateway | Chapter 06: 6.1–6.10H, 6.11 API gateways and API management, 6.12 Webhooks |
 | Relational data and transactions | Chapter 07: Isolation anomalies, Optimistic versus pessimistic concurrency, Query planning, Safe schema migration, Relational systems in practice, 7.2 Sharding and resharding |
 | Storage families and engines | Chapter 08: B-trees and LSM trees, 8.1A–8.1I, 8.2–8.6 data-system families/search/analytics/indexes, 8.7 Distributed file systems and object/block/file interfaces |
-| Cache behavior | Chapter 09: Common patterns, TTL and invalidation, Failure modes, 9.1A–9.1H, 9.2 Cache patterns and failure modes |
+| Cache behavior | Chapter 09: Common patterns, TTL and invalidation, Failure modes, 9.1A–9.1H, 9.2 Cache patterns and failure modes, 9.3 Cache security/tenant isolation/freshness |
 | Distributed consistency | Chapter 10: Consistency models, CAP and PACELC, 10.7–10.18 including worked consistency timeline |
 | Replication and coordination | Chapter 11: Leader election, Leases and fencing tokens, Two-phase commit, Sagas and compensation, 11.5A–11.5G, 11.6 Consensus and transaction boundaries |
-| Messaging and stream processing | Chapter 12: Queue, pub-sub and event log, Delivery semantics, Outbox, inbox and CDC, 12.1A–12.1H, 12.2 Message brokers and delivery semantics |
+| Messaging and stream processing | Chapter 12: Queue, pub-sub and event log, Delivery semantics, Outbox, inbox and CDC, 12.1A–12.1H, 12.2 Message brokers and delivery semantics, 12.3 Event sourcing/CQRS/schema governance |
 | Scaling and overload | Chapter 13: Load balancing and consistent hashing, Overload controls, 13.1A–13.1G, 13.2 Admission control, load shedding, and backpressure |
 | Reliability and recovery | Chapter 14: SLI, SLO, SLA and error budget, Recovery objectives, Zones, regions and disaster recovery, 14.1A–14.1G, 14.2 Recovery engineering, 14.3 Worked SLO and error-budget example |
 | Architectural styles and evolution | Chapter 15: Monolith, modular monolith and microservices, Sidecars and service meshes, 15.1A–15.1H, 15.1I Architectural styles |
@@ -64,6 +64,8 @@ The following sections are present and are the starting points for the deeper re
 | Patterns and anti-patterns | Chapter 19: Probabilistic data structures, Distributed scheduling, Multi-tenancy, Multi-region consistency and routing, 19.2 Architecture pattern catalog |
 
 ## New additions in the current review pass
+| Cache security and data lifecycle | Chapter 09, 9.3 | Covers tenant-aware cache keys, cache poisoning/deception, stale-while-revalidate/stale-if-error, permission revocation, deletion and privacy propagation | Verify against HTTP caching semantics and add a concrete cross-tenant test matrix |
+| Event sourcing, CQRS and schema governance | Chapter 12, 12.3 | Distinguishes commands/events, event sourcing/notification, CQRS/read-model lag, projection rebuilds, schema compatibility and event-data privacy | Verify broker/registry-specific semantics and add a worked projection rebuild example |
 
 | Addition | Location | Why it matters | Remaining verification |
 |---|---|---|---|
