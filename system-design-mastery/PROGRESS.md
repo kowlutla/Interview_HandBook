@@ -30,6 +30,7 @@ Check items only when the work has actually been performed.
 - [x] Identified primary references for HTTP semantics, CAP, consensus, logical clocks, databases, Kafka, SRE, OAuth, cloud and runtime behavior.
 - [x] Cross-checked the expanded topic inventory against current official architecture guidance from Azure, AWS, Google SRE, OWASP, and CNCF.
 - [ ] Verify chapter claims against primary papers, standards and official documentation in a dedicated pass.
+- [x] Add an evidence log for targeted checks of PostgreSQL isolation/write-skew claims, Kafka 4.3 delivery boundaries, OWASP injection guidance, SLSA v1.2, SPDX version wording, OpenAPI 3.1.0 syntax, NIST SSDF publication status, and core network RFC references.
 - [x] Expand the reference library with official architecture-style, load-balancing, API-gateway throttling, CDN-cache-control, and API-security guidance.
 - [ ] Recheck all source links during final audit.
 - [x] Spot-check newly added protocol references against RFC Editor records and correct the RFC 9000 reference to the stable RFC information page; broader source-link verification remains open.
