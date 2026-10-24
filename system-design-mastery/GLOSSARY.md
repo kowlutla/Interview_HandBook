@@ -9,6 +9,7 @@
 - **Connection draining:** stops assigning new work to a target while allowing eligible in-flight work to complete within a bounded period.
 - **Control plane:** components that configure, coordinate or observe a system's behavior rather than directly handling its main application traffic.
 - **Data plane:** components that process the system's primary traffic or data operations under the active configuration.
+- **Feature flag:** runtime-controlled switch that changes feature exposure independently of deploying code; it needs safe defaults, ownership, testing and removal discipline.
 - **Fencing token:** ordered token used to reject stale actors after ownership changes.
 - **Load balancer:** component that selects eligible targets for connections or requests according to routing, health, capacity and policy.
 - **Microservices:** independently deployable services organized around capabilities and explicit contracts; they add network, data consistency and operational costs.
@@ -38,11 +39,14 @@
 - **Idempotency:** repeating an operation has the same intended effect within a defined scope and key lifetime.
 - **Idempotent receiver:** a message/command handler that detects or safely absorbs duplicate deliveries, typically using a stable operation ID and an atomic local effect.
 - **Inbox pattern:** a consumer records a stable message or operation identifier in the same transaction as its local business effect, so duplicate deliveries can be detected safely.
+- **Last-write-wins (LWW):** conflict-resolution rule that keeps the update judged newest by a chosen ordering rule; clock ties/skew and discarded concurrent intent make its semantics important.
 - **Latency:** elapsed time between defined start and end events.
 - **Linearizability:** each operation appears to take effect atomically between invocation and response, respecting real-time order.
 - **Little's Law:** for a stable system, average work in the system L equals arrival rate λ times average time W: L = λW.
 - **Load shedding:** intentionally rejecting lower-priority work to preserve critical service.
+- **Point-in-time recovery (PITR):** restoring a data system to a chosen point in time using a base backup and the required transaction logs or change history, subject to retention and recovery guarantees.
 - **Partitioning:** dividing a dataset or workload into subsets.
+- **QUIC:** secure, UDP-based transport protocol providing streams, connection migration and transport features used by HTTP/3; it does not eliminate loss, congestion or capacity limits.
 - **Quorum:** set of participants sufficient under a protocol's rules; quorum size alone does not guarantee a consistency level.
 - **RPO:** Recovery Point Objective; acceptable data-loss window expressed in time.
 - **RTO:** Recovery Time Objective; target time to restore service after disruption.
@@ -52,6 +56,7 @@
 - **Throughput:** amount of useful work completed per unit time.
 - **Utilization:** fraction of a resource's capacity that is busy; high utilization can sharply increase queueing delay.
 - **Vector clock:** logical-clock structure tracking causal relationships and helping identify concurrent events.
+- **Watermark (stream processing):** estimate or policy boundary indicating how far event time is believed to have progressed; it influences when a window may be considered complete while late events may still require handling.
 
 - **Client-side prediction:** client-side simulation of a likely result before authoritative server confirmation, later reconciled with authoritative state.
 - **Conflict-free Replicated Data Type (CRDT):** a data type with defined merge/update properties that permit replicas to converge under stated assumptions; convergence alone does not preserve arbitrary business invariants.
