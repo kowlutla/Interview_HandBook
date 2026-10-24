@@ -388,7 +388,7 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Confirmed the `openapi-spec-validator` step completed successfully against the extracted OpenAPI document. This is a verified full validator run for that embedded specification, not a claim that every API design in the textbook has been audited.
 - [x] Diagnosed the Mermaid job failure from its logs: Mermaid CLI installed, but Chromium failed to launch with `No usable sandbox`; rendering stopped on the first diagram and produced no rendered artifact.
 - [x] Updated the workflow at commit `4d868540e7913b027acd3f43c58304586d80cb61` to pass Puppeteer a config enabling `--no-sandbox` and `--disable-setuid-sandbox`, and made the render artifact upload fail if no files are found.
-- [ ] Re-run of the corrected workflow is queued as run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824) at the time this entry was written; its outcome has not yet been inspected. Do not mark Mermaid rendering passed until all 29 SVGs are generated and the job completes successfully.
+- [x] Corrected run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824) subsequently completed successfully; see the **CI acceptance confirmation** entry below for exact job and artifact evidence.
 - [ ] The full 21-family depth/source acceptance, whole-book contradiction review and all chapter-local source verification remain open; statuses must remain provisional.
 
 
