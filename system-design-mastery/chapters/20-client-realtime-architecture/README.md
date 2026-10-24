@@ -245,7 +245,7 @@ Security and operational requirements include:
 - Validate who may publish, subscribe, record or moderate.
 - Treat signaling payloads as untrusted input.
 - Decide whether media is peer-to-peer, relayed, recorded or processed server-side.
-- Understand transport encryption versus end-to-end encryption; a relay or media server may be able to access media unless the design adds appropriate end-to-end protections.
+- Distinguish transport encryption from end-to-end encryption: a TURN server normally relays encrypted packets and does not itself terminate/decrypt the media session, while an SFU or MCU commonly terminates participant transport security and may access media unless an additional end-to-end media-encryption design prevents it.
 - Measure connection establishment time, failed ICE negotiations, packet loss, jitter, round-trip time, relay usage and user-perceived quality.
 - Define behavior during network handoff, device sleep, camera/microphone permission changes and regional service failure.
 
