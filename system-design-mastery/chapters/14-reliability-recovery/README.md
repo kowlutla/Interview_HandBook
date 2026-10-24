@@ -245,12 +245,6 @@ In this example, service is restored 35 minutes after declaration, within the 60
 - [ ] Test capacity and dependencies in the recovery environment.
 - [ ] Record achieved RTO/RPO, data discrepancies, runbook gaps and corrective owners.
 
-## Further reading
-- Google [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
-- Google [SRE Workbook: Error Budget Policy](https://sre.google/workbook/error-budget-policy/).
-- AWS [Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
-
-
 ## Recovery is a chain, not a single failover switch
 
 ```mermaid
@@ -266,6 +260,12 @@ flowchart TD
 ```
 
 A service is not recovered merely because a health endpoint turns green. Verify that data is sufficiently current, critical operations work, dependencies are healthy, and the system can sustain expected traffic.
+
+## Further reading
+- Google [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
+- Google [SRE Workbook: Error Budget Policy](https://sre.google/workbook/error-budget-policy/).
+- AWS [Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
+
 
 
 ---
