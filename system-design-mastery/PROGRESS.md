@@ -434,3 +434,10 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Updated COVERAGE-AUDIT.md to record the scenario while retaining Developing status.
 - [ ] Validate cache behavior against the chosen CDN/proxy/cache product and execute skewed-load, invalidation-loss and cross-tenant tests in a representative environment.
 - [ ] Continue the 21-family acceptance review; current changes are focused corrections, not full-book sign-off.
+
+
+## Repository-wide chapter structure recheck — 2026-10-24
+
+- [x] Re-fetched all 20 current chapter pages from the default branch after the latest edits.
+- [x] Checked every chapter for balanced fenced-code markers, duplicate heading text, and the expected navigation footer. All 20 pages passed these specific structural checks.
+- [ ] This is not a Markdown renderer, link resolver, Mermaid renderer, or technical claim audit; those checks remain distinct. The prior green OpenAPI/Mermaid workflow predates the latest content commits, and a post-edit workflow run has not been verified.
