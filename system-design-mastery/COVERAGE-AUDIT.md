@@ -191,3 +191,13 @@ A whole-book heading-order pass found supplemental worked diagrams/guidance posi
 - **Chapter 07, section 7.3:** the write-skew interleaving is logically consistent: two snapshot transactions read the same aggregate condition and update different rows, so row-level write conflicts need not protect the global invariant. The section appropriately qualifies serializable retries and warns against blind retries. Engine-specific isolation and constraint behavior still require source/configuration checks.
 - **Chapter 11, section 11.6:** the stale-lease timeline correctly demonstrates why a worker-side lease belief is insufficient and why fencing must be enforced atomically at the protected resource. The token ordering, resource scope and recovery assumptions are called out. Implementation-specific token durability and coordination semantics remain open.
 - **Evidence boundary:** no additional content correction was justified by these excerpts. This is a scoped inspection, not certification of the full chapters or their external references. Maintain **Developing** statuses until the complete acceptance checks pass.
+
+
+### Additional scoped review — 2026-10-24
+
+- Chapter 13 section 13.4: recalculated throughput changes in the illustrative table. The 40-to-60 concurrency step is about +14.3%; 60-to-80 is about +2.7%. The interpretation is consistent with the worsening p99, error rate, and queue behavior shown.
+- Chapter 14 sections 14.3–14.4: recalculated the request-based error budget (0.1% of 50 million = 50,000 bad requests) and the recovery example (35 minutes elapsed; eight minutes of data-point lag in the stated example). The prose appropriately qualifies conclusions by the SLI and RTO/RPO definitions.
+- Chapter 17 section 17.3: the 99.9% SLO permits a 0.1% bad-event fraction; 10 million eligible requests imply a 10,000-event budget; 2% bad events is 20x the allowed fraction for the same window. The text correctly treats burn rate as a ratio rather than a guaranteed forecast.
+- Chapter 19 Bloom-filter example: recalculation confirms approximately 9.59 million bits, 1.20 MB decimal (about 1.14 MiB), and 6.64 optimal hash functions for one million items at a 1% target false-positive rate. The chapter appropriately qualifies this as an approximation.
+- Chapter 16's tenant-scoped export example remains subject to full claim/source verification. Chapter 18's Kubernetes, IaC, delivery and supply-chain claims also remain open for version-specific verification.
+- These focused checks do not complete the full technical review, source-link audit, or Mermaid renderer validation. Keep the relevant inventory rows at Developing.
