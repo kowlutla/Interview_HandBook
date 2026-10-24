@@ -249,7 +249,7 @@ During shutdown, stop admitting new work, signal cancellation, allow a bounded d
 ## Further reading
 - [Linux man-pages: pthreads](https://man7.org/linux/man-pages/man7/pthreads.7.html).
 - [Java concurrency package documentation](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html).
-- [Java 21 Structured Concurrency API (preview)](https://docs.oracle.com/en/java/javase/21/docs/api/jdk.incubator.concurrent/jdk/incubator/concurrent/StructuredTaskScope.html) — an implementation-specific API example; preview status and API details vary by JDK version.
+- [Java 21 Structured Concurrency guide (preview API)](https://docs.oracle.com/en/java/javase/21/core/structured-concurrency.html) — an implementation-specific API example; preview status and API details vary by JDK version.
 
 
 ## A bounded worker-pool model
