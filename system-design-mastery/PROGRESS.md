@@ -33,6 +33,7 @@ Check items only when the work has actually been performed.
 - [x] Add an evidence log for targeted checks of PostgreSQL isolation/write-skew claims, Kafka 4.3 delivery boundaries, OWASP injection guidance, SLSA v1.2, SPDX version wording, OpenAPI 3.1.0 syntax, NIST SSDF publication status, and core network RFC references.
 - [x] Add a targeted evidence entry for Chapter 10's formal CAP framing and Lamport-clock causality distinction using the primary paper sources; full distributed-consistency claim review remains open.
 - [x] Recalculate Chapter 17's request-based SLO example: a 99.9% target permits a 0.1% bad-event fraction, 10 million eligible requests imply 10,000 bad events of budget, and a 2% observed error rate is a 20× burn rate for that window.
+- [x] Add the official OpenTelemetry documentation to the targeted evidence log for observability signals, context propagation and sampling; implementation-specific behavior remains version/language dependent.
 - [x] Expand the reference library with official architecture-style, load-balancing, API-gateway throttling, CDN-cache-control, and API-security guidance.
 - [ ] Recheck all source links during final audit.
 - [x] Spot-check newly added protocol references against RFC Editor records and correct the RFC 9000 reference to the stable RFC information page; broader source-link verification remains open.
