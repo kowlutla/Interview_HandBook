@@ -98,6 +98,7 @@ Check items only when the work has actually been performed.
 - [x] Validate relative internal Markdown links in all created Markdown files against the expected file set; no broken internal targets found.
 - [x] Recheck all 27 Markdown paths in the target tree and the relative links in the landing page and all chapter pages.
 - [ ] Validate Mermaid diagrams with a renderer; currently added diagrams have only been manually reviewed.
+- [x] Perform a static Mermaid inventory check across all 19 chapters: 24 non-empty Mermaid blocks have recognized diagram declarations; actual Mermaid rendering remains unverified because no renderer is available.
 - [x] Check all 19 chapter pages for balanced fenced code blocks and exact duplicate Markdown headings; none were found.
 - [x] Re-run structural and relative-link checks across all 19 chapter pages after the latest content edits; no broken relative file targets, unbalanced code fences, or duplicate headings were found.
 - [x] Recheck all 19 chapter pages and the textbook landing page after the latest worked labs; relative Markdown links resolve, fenced blocks are balanced, and no duplicate headings were found.
