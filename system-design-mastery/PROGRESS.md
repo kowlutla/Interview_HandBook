@@ -426,3 +426,11 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Updated COVERAGE-AUDIT.md to record the additional search-index depth while retaining Developing status.
 - [ ] Verify the snapshot/CDC handoff and deletion semantics against the actual database, connector, and search product selected for any concrete design; this chapter intentionally states the generic mechanism, not vendor guarantees.
 - [ ] Re-run the full repository validation workflow after the recent Chapter 08/16/18 edits; the last verified green run predates these commits and the current Actions helper does not expose push-triggered runs.
+
+
+## Focused cache correctness correction — 2026-10-24
+
+- [x] Added a worked tenant-safe cache-key and authorization-revocation scenario to Chapter 09, including representation dimensions, current-policy enforcement, invalidation loss, and CDN/proxy/pagination/ETag test cases.
+- [x] Updated COVERAGE-AUDIT.md to record the scenario while retaining Developing status.
+- [ ] Validate cache behavior against the chosen CDN/proxy/cache product and execute skewed-load, invalidation-loss and cross-tenant tests in a representative environment.
+- [ ] Continue the 21-family acceptance review; current changes are focused corrections, not full-book sign-off.
