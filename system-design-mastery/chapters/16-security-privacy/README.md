@@ -179,10 +179,84 @@ Privacy requires data minimization, purpose limitation, retention, deletion, exp
 - Is there a tested response for credential compromise or tenant-isolation failure?
 
 
+
+## 16.3 API threat patterns: object access, business flows and resource exhaustion
+
+API security is not only about validating tokens or encrypting transport. Many serious API failures occur after a caller has authenticated: the application may authorize the wrong object, expose fields the caller should not see, permit a privileged action, or allow a valid operation to consume unlimited resources.
+
+The OWASP API Security Top 10 (2023) is a useful awareness taxonomy. It is not a complete threat model and should not be treated as a substitute for analyzing the product's own assets, abuse cases and business rules.
+
+### Object-level and function-level authorization
+
+**Broken Object Level Authorization (BOLA)** occurs when a caller can access or modify an object merely by changing an identifier, without a correct permission check for that object. Every endpoint that reads, updates, deletes, exports or triggers actions on a resource ID must check the caller's permission against the actual resource and tenant.
+
+**Broken Function Level Authorization** occurs when a caller can invoke an operation reserved for a different role or privilege level, such as an administrative endpoint. Hiding a button in the UI or using an obscure URL does not enforce authorization. The server must enforce the policy for every route and method.
+
+### Property-level authorization and mass assignment
+
+A caller may be allowed to update a profile but not fields such as role, tenant ID, account status, billing plan or verification state. Binding an arbitrary request object directly to an internal domain/entity object can let untrusted fields mutate properties the user should not control.
+
+Use explicit request DTOs or allow-lists, validate writable fields by operation and role, and construct responses from an explicit output model. Do not rely on hiding sensitive fields in the UI. Test both unauthorized reads of response properties and unauthorized writes to protected properties.
+
+### Sensitive business flows and resource consumption
+
+Some abuse is not a conventional permission failure. An attacker may legitimately authenticate and call a public flow—ticket purchase, trial creation, password reset, bulk export, SMS delivery or expensive search—at a rate that harms the business or exhausts a paid dependency.
+
+Apply controls based on the business risk and resource cost:
+- Bound request body, page size, query complexity, upload size, fan-out and execution time.
+- Rate-limit by suitable identities and business objects, not only source IP.
+- Apply concurrency limits and quotas to expensive operations and paid downstream APIs.
+- Add anti-automation or abuse detection where the threat requires it.
+- Preserve fairness across tenants and avoid a global budget that lets one tenant starve others.
+- Record rejection and abuse signals without logging credentials or sensitive payloads.
+
+Rate limiting is not always sufficient. A low-frequency request can still be expensive, and automated abuse can distribute traffic across many accounts. Model the cost and intended business behavior of the flow.
+
+### Server-side request forgery and unsafe upstream APIs
+
+SSRF occurs when an application makes a network request using attacker-influenced destination data and can be induced to reach resources the attacker cannot access directly. URL validation must account for schemes, DNS resolution, redirects, IP address forms, private/link-local ranges and changes between validation and connection. A simple string prefix check is not a robust defense.
+
+Prefer explicit destination allow-lists where possible, restrict egress at the network layer, revalidate redirect targets, and prevent the fetcher from reaching metadata endpoints or internal control planes unless required. The webhook publisher has the same risk when it calls customer-supplied URLs.
+
+External API responses are also untrusted input. Validate response schemas, sizes, redirects, timeouts and content types; treat external error bodies and URLs as untrusted; and avoid forwarding credentials to a different origin. A trusted provider can still return malformed, delayed or unexpectedly large responses.
+
+### API inventory and compatibility as security controls
+
+Old, undocumented or shadow endpoints can remain reachable after a new version launches. Maintain an inventory of public, partner and internal APIs, their owners, authentication requirements, data sensitivity, supported versions and retirement dates. Use traffic logs and deployment metadata to find unused endpoints, while ensuring that discovery itself does not expose secrets.
+
+A deprecation plan should include consumer identification, communication, migration time, monitoring and a removal test. Keeping every historical endpoint indefinitely expands the attack surface and makes security policy inconsistent.
+
+### API security test matrix
+
+| Test | Expected invariant |
+|---|---|
+| Change a resource ID to another tenant's ID | No unauthorized data access or side effect |
+| Add protected fields to a valid update request | Server ignores or rejects fields the caller cannot modify |
+| Invoke an administrative operation with a normal user token | Operation is denied and safely audited |
+| Request huge pages, deeply nested queries or large payloads | Resource limits are enforced before unbounded work |
+| Repeat a costly business action from many accounts | Abuse controls protect the business flow and shared dependencies |
+| Supply an internal/private destination to a URL-fetching feature | Request is blocked according to the egress policy |
+| Return malformed or oversized data from an upstream API | Consumer validates and fails safely within bounded resources |
+| Call an obsolete or undocumented API version | Access and retirement policy remains enforced |
+
+### API threat review checklist
+
+- Is authorization checked for the specific object, property and function?
+- Can request binding modify fields outside the caller's authority?
+- Are expensive business flows protected against automated abuse?
+- Are payload size, query complexity, concurrency and paid downstream calls bounded?
+- Are user-controlled URLs protected against SSRF and redirect/DNS tricks?
+- Are external API responses treated as untrusted?
+- Is the API inventory owned, monitored and periodically pruned?
+- Do negative authorization tests cover multiple tenants and roles?
+- Are errors and audit events useful without exposing sensitive data?
+
+
 ## Further reading
 - IETF [RFC 9700 — OAuth 2.0 Security BCP](https://www.rfc-editor.org/rfc/rfc9700.html).
 - OpenID Foundation [specifications](https://openid.net/developers/specs/).
 - NIST [Cybersecurity Framework](https://www.nist.gov/cyberframework).
+- OWASP [API Security Top 10 (2023)](https://api-security.owasp.org/editions/2023/en/0x00-header/) — object/function/property authorization, resource consumption, SSRF, inventory and unsafe upstream API risks.
 
 
 ## A request crosses trust boundaries
