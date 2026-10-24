@@ -216,3 +216,15 @@ The user emphasized that the textbook must read like a human-written, readable e
 - [ ] Complete source-to-claim verification, external-link audit, independent mandatory-inventory review, and cross-chapter consistency review.
 
 The sprint improves confidence in repository structure but does not certify technical correctness or complete the textbook. The acceptance criteria above remain open until executed and recorded.
+
+
+## Targeted technical verification sprint — 2026-10-24
+
+- [x] Independently recalculate Chapter 03 worked capacity example: 300 million requests/day = 3,472.22 average requests/s; 4x peak = 13,888.89 requests/s; 13 KiB combined request/response payload ≈ 176.32 MiB/s (before overhead); Little's Law at 120 ms ≈ 1,667 average in-flight requests; instance estimate under the stated 25% loss assumption = 23.15, rounded up to 24 before further validation.
+- [x] Recalculate Chapter 19 Bloom-filter approximation for one million items at 1% target false-positive probability: approximately 9.585 million bits, 1.20 MB decimal / 1.14 MiB, and 6.64 optimal hash functions (about 7 in an implementation). The chapter correctly labels the result as approximate and states the assumptions.
+- [x] Recheck Chapter 14 request-based SLO arithmetic: 99.9% SLO gives a 0.1% budget; 50 million eligible requests imply 50,000 bad events; 1% observed failures imply a 10x burn rate against a 0.1% target. Confirm the chapter distinguishes request-based from time-based SLOs.
+- [x] Review scoped consistency claims in Chapters 10–11: quorum intersection is explicitly not presented as a complete linearizability proof; CAP availability is qualified; saga compensation is distinguished from atomic rollback; fencing is enforced at the protected resource; membership changes are qualified by protocol.
+- [x] Parse the Chapter 06 OpenAPI YAML example with PyYAML and verify key invariants: OpenAPI 3.1.0 declaration, templated path parameter, required path parameter, response, and required schema fields. Cross-check path templating and required: true against the official OpenAPI 3.1.0 specification. This is a YAML parse plus targeted invariant check, not a full OpenAPI validator/linter.
+- [x] Cross-check the Chapter 14 error-budget definition against Google's SRE Workbook: error budget is 1 minus the SLO, with request-count budgets dependent on the request-based SLI definition.
+- [ ] Run a full OpenAPI 3.1 parser/linter. Attempting to launch the Mermaid CLI with npx timed out before the package could be obtained; no renderer result is claimed.
+- [ ] Continue claim-by-claim source review, exhaustive external-link validation, independent verification of all 21 inventory rows, and cross-chapter consistency review. The scoped checks above do not complete these book-wide acceptance criteria.
