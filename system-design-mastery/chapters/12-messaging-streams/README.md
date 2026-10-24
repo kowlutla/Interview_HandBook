@@ -1,387 +1,142 @@
 # 12. Messaging, Streams, and Asynchronous Workflows
 
-## Queue, pub-sub and event log
-A queue distributes work among consumers, often with one consumer in a group handling each message. Publish-subscribe delivers an event to multiple subscribers. An event log retains an ordered sequence within a partition and permits consumers to read at their own pace or replay history. Products may combine these models but differ in retention, ordering and acknowledgment semantics.
+Messaging lets one part of a system hand work or information to another without requiring both to complete the same request together. This reduces temporal coupling and can absorb bursts, but it changes when failures appear: a request may be accepted now and fail later, messages may be delivered more than once, and consumers may fall behind.
 
-Asynchrony reduces temporal coupling: producers need not wait for consumers to finish. It does not remove dependency; it changes when errors appear and how progress is observed.
+The key is to understand the contract the messaging system provides—and the parts your application must still handle.
 
-## Kafka concepts
-Kafka organizes records into topics and partitions. Offsets identify positions within a partition; order is defined within a partition, not globally across all partitions. A consumer group distributes partitions among members, and reassignment can cause pauses or duplicate processing depending on offset and effect coordination. Replication protects partitions according to configured policies. Consumer lag is a gap in progress, but a lag count alone does not show age or business impact. See the versioned [Kafka 4.3 design documentation](https://kafka.apache.org/43/design/design/) and its [message delivery semantics](https://kafka.apache.org/43/design/design/#message-delivery-semantics); check the documentation matching the deployed broker/client version.
+## 12.1 Queue, pub/sub, and event log
 
-## Delivery semantics
-- **At-most-once:** messages may be lost but are not redelivered under the stated semantics.
-- **At-least-once:** retries/recovery avoid loss under assumptions but can create duplicates.
-- **Exactly-once:** a scoped guarantee that a logical effect is reflected once within a defined protocol boundary.
+These models solve related but different problems:
 
-A consumer that commits a database update then crashes before committing its offset will see replay. Committing the offset first can lose the effect. Correctness requires coordination or idempotent effects.
+- A **work queue** distributes tasks among workers. A task is generally handled by one worker in the relevant consumer group.
+- **Publish-subscribe** lets multiple independent subscribers receive an event.
+- A **durable event log** retains records in an ordered sequence within each partition. Consumers track their own positions and may replay retained history.
 
-## Retry, poison events and replay
-Retries help transient faults but can block progress or amplify load. Use bounded retry, backoff, jitter and a dead-letter/quarantine path for repeatedly failing events. A dead-letter queue needs monitoring, ownership, correction and replay procedures. Replay can repeat side effects, so event identity must be distinct from delivery attempt.
+Products can combine these models, so compare their actual persistence, routing, acknowledgement, retention, ordering, and recovery behavior rather than relying on the product category.
 
-## Outbox, inbox and CDC
-A service that updates a database and publishes an event faces a dual-write problem: the database can commit while publication fails, or publication can happen while the transaction rolls back. A transactional outbox writes business state and an outbox row in one local transaction; a relay publishes later. The relay may publish duplicates, so consumers still need idempotency.
+Use a queue when work needs to be completed, pub/sub when independent components need the same notification, and a durable log when replay and consumer-controlled progress matter. None of these choices automatically makes a business operation happen exactly once.
 
-An inbox/deduplication record can be committed atomically with local state changes. Change Data Capture (CDC) captures database changes, often from transaction logs, but introduces connector lag, schema evolution, snapshot and recovery considerations.
+## 12.2 Partitions, ordering, and consumer progress
 
-## Schema evolution and event sourcing
-Event schemas need compatibility rules. Additive optional fields are often easier to evolve than changing a field's meaning or type. A schema registry supports governance but cannot ensure consumers interpret events correctly.
+Kafka organizes records into topics and partitions. Order is defined within a partition, not across every partition in a topic. A consumer group distributes partitions among its members; adding consumers helps only when enough partitions and downstream capacity allow more parallel work.
 
-Event sourcing stores domain events as authoritative state history; current state is derived by replay or projections. It can support audit and rebuilds but adds event versioning, replay, retention, privacy deletion and debugging challenges. An event log is not automatically event sourcing.
+Choose the partition key around the entity whose events must remain ordered—for example, an order or account. A poor key can concentrate traffic on a small number of partitions. Adding partitions may also change key-to-partition mapping for some partitioning strategies, so consider how that affects ordering and stateful consumers.
 
-CQRS separates command handling from query models. It can support asymmetric workloads but introduces projection lag and duplicated models. Use it when that trade-off is justified.
+A consumer's committed offset records its progress through a partition. Be precise about what the offset represents: a record has an offset, while the committed consumer position typically points to the next record to read. Consumer restarts and group rebalances can cause records to be processed again if the external side effect and progress update are not coordinated.
 
-## Stream processing and backpressure
-Stream processors handle continuous records, often using event time, processing time, windows, state and checkpoints. Late events complicate windows; watermarks estimate event-time progress and do not prove no earlier event can arrive. Recovery must coordinate input positions and operator state.
+**Consumer lag** is the gap between the latest available data and a consumer's progress. Count alone is not enough: a thousand expensive events may take longer than a million tiny ones. Monitor lag age, arrival and processing rates, failures, batch size, and estimated drain time. If events arrive faster than the system can process them for a sustained period, the backlog will keep growing.
 
-If producers outpace consumers, backlog grows. Define retention, admission control, prioritization and behavior when backlog age exceeds business usefulness.
+See the versioned [Kafka 4.3 design documentation](https://kafka.apache.org/43/design/design/) and [message delivery semantics](https://kafka.apache.org/43/design/design/#message-delivery-semantics) for Kafka-specific behavior; verify details against the broker and client versions actually deployed.
 
+## 12.3 Delivery guarantees and idempotent effects
 
-## 12.1A Delivery, acknowledgement, and offset boundaries
+Messaging systems commonly describe delivery as at-most-once, at-least-once, or exactly-once within a defined boundary.
 
-A message broker's delivery guarantee must be read together with its acknowledgement and retention rules. A message can be delivered to a consumer before the broker knows the consumer's work is durable. Acknowledging too early can lose the effect; acknowledging after the effect can cause redelivery if the consumer crashes in between.
+- **At-most-once** avoids redelivery under the chosen acknowledgement contract, but a failure may lose work.
+- **At-least-once** retries or redelivers work under the system's assumptions, so duplicates are possible.
+- **Exactly-once** is a scoped guarantee, not a blanket promise that every downstream side effect happens once.
 
-For a Kafka consumer writing to an external database, a common failure window is:
-1. Read record at offset n.
-2. Commit the database transaction.
-3. Crash before committing offset n.
-4. Restart and read offset n again.
+The central question is: *what happens if the consumer performs the work but crashes before recording its progress?*
 
-The second processing attempt must be harmless or deduplicated. If the offset is committed before the database transaction, a crash can skip the effect. Kafka transactions can coordinate Kafka input offsets and Kafka output records within their supported boundary, but arbitrary external database writes need a separate strategy.
+If a consumer writes to a database and then acknowledges the message, a crash between those actions may cause the write to be repeated. If it acknowledges first and crashes before the write, the work may be lost.
 
-## 12.1B Partition ordering and consumer groups
+~~~mermaid
+sequenceDiagram
+  participant B as Broker
+  participant C as Consumer
+  participant D as Database
+  B->>C: Deliver event
+  C->>D: Commit business change
+  D-->>C: Commit succeeds
+  Note over C,B: Consumer crashes before acknowledging
+  B->>C: Redeliver event after restart
+  C->>D: Process same event again
+~~~
 
-Ordering is normally guaranteed only within a partition. Records with the same key are often routed to the same partition, which can preserve per-key order under the producer and partitioning contract. Expanding partition count can change key-to-partition mapping for some partitioners, so ordering assumptions and state ownership must be reviewed during topology changes.
+A robust consumer makes repeated delivery safe. Common approaches include a stable event or operation ID, a deduplication record committed in the same transaction as the business change, conditional updates, or an idempotent state transition. The deduplication record must be retained for the relevant replay/redelivery horizon, and concurrent deliveries must not race past the check.
 
-A consumer group assigns partitions to members; a partition is not ordinarily processed concurrently by multiple members of the same group at one moment, but rebalances, retries, and application-level parallelism can still create duplicate or out-of-order business effects. If a consumer dispatches records to a worker pool and commits offsets before those workers finish in order, completion order can differ from partition order.
+Broker-level transactions can coordinate particular broker operations, such as consuming records and producing new records. They do not automatically include an external payment provider, email system, or arbitrary database transaction. Always name the boundary of an exactly-once claim.
 
-Decide whether order is required globally, per tenant, per entity, or not at all. Global order is expensive and often unnecessary. A partition key is part of the domain design because it determines both locality and the unit of ordered processing.
+## 12.4 Retries, poison messages, and backpressure
 
-## 12.1C Consumer lag: count, age, and drain time
+Retries help with transient problems such as temporary network failures or rate limits. They do not fix invalid data or a permanently impossible business state. Use bounded attempts, exponential backoff and jitter, and distinguish retryable from terminal errors.
 
-Lag is often measured as the difference between the latest available offset and a consumer's committed or processed offset. The exact metric depends on the monitoring system. Offset lag is not the same as elapsed time: a million records may represent seconds for a high-throughput topic or hours for a low-volume topic.
+A message that repeatedly fails is often called a poison message. A dead-letter queue or quarantine store can preserve it for investigation, but it is not a repair strategy by itself. Someone must own the failure, understand the cause, correct the data or code, and decide whether replay is safe. Replaying a message may repeat external side effects.
 
-Track:
-- Lag by partition and consumer group.
-- Age of the oldest unprocessed record where available.
-- Ingress and processing rates.
-- Retry and dead-letter rates.
-- Rebalance frequency and duration.
-- Time required to drain backlog at current net processing capacity.
+Backpressure and concurrency limits protect consumers and their dependencies. Bound in-flight messages, batch size, database connections, and worker concurrency. A larger prefetch window may improve throughput, but it consumes more memory and can increase the amount of work repeated after a crash.
 
-If arrivals continue at rate λ and consumers process at rate μ, backlog shrinks only when μ exceeds λ. If the backlog is B records and net drain rate is μ−λ, a rough drain-time estimate is B/(μ−λ), assuming rates remain stable and no partition bottleneck dominates.
+If arrival rate remains above processing capacity, adding a queue only delays the overload. Track backlog age and drain time, then increase safe capacity, limit producers, shed nonessential work, or change the processing design.
 
-## 12.1D Poison messages, retry topics, and dead-letter queues
+## 12.5 The dual-write problem: outbox, inbox, and CDC
 
-A poison message consistently fails because of invalid data, incompatible schema, a deterministic code defect, or an unavailable dependency. Repeatedly retrying it in place can block later records or consume resources indefinitely.
+A service may need to update its database and publish an event. These are two separate operations, so either can succeed while the other fails. Publishing before the database commit can announce a change that never happened; committing the database first can leave other services unaware of the change.
 
-A retry strategy should distinguish transient failures from permanent failures. Delayed retry topics or queues can allow later records to progress, but they may change ordering. A dead-letter queue is not a disposal bin: it needs alerting, an owner, retention, access controls, root-cause correction, and a safe replay procedure.
+The **transactional outbox** pattern records the business change and an outbox row in the same local database transaction. A relay or Change Data Capture (CDC) connector publishes the outbox event later. If the relay publishes successfully but crashes before marking the row complete, it may publish the event again. Consumers still need idempotency.
 
-When replaying, preserve the original event identity and record the replay attempt separately. Otherwise deduplication may either fail to protect side effects or incorrectly suppress an intentional repair operation.
-
-## 12.1E Event time, processing time, and watermarks
-
-**Event time** is when the event is said to have occurred in the source domain. **Processing time** is when the stream processor handles it. Network delay, offline clients, retries, and backfills can make these differ substantially.
-
-A window based on processing time answers a different question from a window based on event time. A **watermark** estimates how far event time has progressed and helps the engine decide when a window can be finalized. It is not proof that no older event will ever arrive; late-event handling and allowed lateness must be specified.
-
-Stream state must be checkpointed or reconstructed consistently with input progress. If operator state advances but input offsets do not, replay may duplicate state updates; if offsets advance without state being durable, records can be lost from the computation. Exactly-once stream-processing claims depend on the engine's checkpoint and sink integration boundaries.
-
-## 12.1F Schema evolution, retention, and replay
-
-An event can remain in a log longer than the producer or consumer version that created it. Schema compatibility must therefore consider old retained records as well as live producers. Consumers should define behavior for unknown fields, missing optional fields, unknown enum values, and versioned semantics.
-
-Retention is a correctness decision. If required events expire before a slow consumer recovers, replay may be impossible without an archive or source-of-truth rebuild. Compaction retains selected records according to a key-based policy and is not equivalent to retaining every historical event.
-
-Privacy and deletion requirements need special attention in append-only logs. Possible strategies include minimizing personal data in events, storing references to erasable records, using explicit tombstones where appropriate, or controlling encryption keys, subject to applicable law and the system's audit needs.
-
-## 12.1G Transactional outbox and inbox pattern
-
-The outbox solves a local dual-write problem: the business row and an outbox record are committed in one database transaction. A relay publishes outbox records later and tracks progress. A crash after publication but before marking the record sent can cause a duplicate publication; consumers must still be idempotent.
-
-An inbox stores processed message identifiers and the local effect in one transaction. A unique constraint on the message identity can prevent concurrent duplicate processing from applying the effect twice. The deduplication key must include the correct producer/tenant/domain scope to avoid collisions, and its retention must cover the redelivery and replay horizon.
-
-## 12.1H Message-system design checklist
-
-- What is the unit of ordering?
-- What does producer acknowledgement guarantee?
-- When is consumer progress considered committed?
-- Can a message be delivered more than once?
-- How are poison records handled without silently losing them?
-- What is the retention and replay horizon?
-- How are schema changes rolled out?
-- How is consumer lag measured in age and drain time?
-- Are side effects atomic with deduplication?
-- How are partition expansion and consumer rebalances handled?
-- Who owns dead-letter records and operational recovery?
-
-
-
-## 12.1I Batch and stream processing compared
-
-**Batch processing** works on a bounded collection—such as a time partition, file set, or captured snapshot—and produces results after a job or stage completes. It suits periodic aggregates, historical backfills, reconciliation, and large transformations where minutes of latency may be acceptable. Its design concerns include input completeness, checkpoint/restart, bounded resource use, deterministic reruns, and idempotent or versioned output.
-
-**Stream processing** continuously consumes records and updates state as events arrive. It suits low-latency reactions, live aggregates, event-driven decisions and continuously maintained projections. It adds questions about event time versus processing time, out-of-order and late events, window finalization, state checkpointing, source-position coordination and recovery from replay.
-
-**Micro-batch** systems process small bounded groups on a recurring schedule, trading some latency for efficient batch execution. The labels do not determine delivery or correctness guarantees: a batch can partially publish output, and a streaming job can duplicate external effects after recovery unless its source offsets, operator state and sink commit are coordinated or the output is idempotent.
-
-A common hybrid is to stream provisional updates quickly and periodically reconcile or rebuild results from durable historical data. Define which result is authoritative, how late corrections are applied, how consumers observe freshness, and how batch output is reconciled with live writes. Choose based on freshness objective, event volume, late-data behavior, replay needs, cost and operational complexity—not because one model is universally more modern.
-
-## 12.2 Message brokers and delivery semantics in depth
-
-A broker is not merely a network buffer. It defines persistence, routing, acknowledgement, redelivery, ordering scope, retention, consumer coordination, and operational recovery. When choosing a broker or log, ask what is persisted before acknowledgement, how ownership changes, what a consumer can replay, and which failures may duplicate or delay work.
-
-### Queue, pub/sub, and durable log compared
-
-A work queue commonly distributes each message to one competing worker in a consumer group. Pub/sub delivers a publication to multiple independent subscriptions. A durable log retains an ordered sequence within each partition so consumers can track offsets and replay retained history. Products often combine these models, but the delivery and retention contract still matters.
-
-A queue is useful when work should be claimed and completed; pub/sub when independent subscribers need their own delivery; a log when replay and consumer-controlled position are central. None automatically makes business effects exactly once.
-
-### At-most-once, at-least-once, and effectively-once effects
-
-- **At-most-once:** a message may be lost, but the broker/consumer contract avoids redelivery after the chosen acknowledgement point.
-- **At-least-once:** a message is retried until acknowledged under the system's delivery policy; duplicates are possible.
-- **Effectively-once business outcome:** duplicates are made harmless through idempotency, deduplication, transactions or a protocol that atomically couples progress with effects.
-
-“Exactly once” is always scoped. A broker may atomically commit consumed offsets and produced records inside its own transaction model, while an external payment provider or database update remains outside that transaction. Explain the boundary instead of using “exactly once” as an end-to-end guarantee.
-
-### Acknowledgement boundaries and the dual-write problem
-
-If a consumer writes to a database and then acknowledges the message, a crash between those steps may cause the database effect to happen twice. If it acknowledges first and then crashes before the database write, the effect may be lost. Common solutions include idempotent database updates, a deduplication/inbox record in the same transaction as the effect, or an outbox for publishing after a local transaction.
-
-The deduplication key must identify the logical operation and be retained for at least the relevant replay/redelivery horizon. Deduplication storage itself needs capacity, cleanup and concurrency semantics.
-
-### Ordering and partitions
-
-A partitioned log usually preserves order within one partition, not across the entire topic. Partition keys should group events whose relative order matters, such as all events for one account or order. A hot key can concentrate traffic on one partition and defeat horizontal scaling.
-
-Increasing partition count can change key-to-partition mapping in some partitioners and may affect ordering expectations. Consumer-group rebalances temporarily move partition ownership; consumers should handle revoked partitions, commit progress carefully, and avoid overlapping side effects when ownership changes.
-
-### Retry topics, dead-letter queues, and poison messages
-
-A retry policy should distinguish transient failures (temporary network error, rate limit, unavailable dependency) from permanent failures (invalid schema, impossible domain state). Use bounded attempts, exponential backoff with jitter, and a defined terminal path. Immediate requeue can create a hot loop that starves healthy messages.
-
-A dead-letter queue is not a repair strategy by itself. It needs an owner, alerting, reason metadata, retention, inspection, replay tooling and safe reprocessing rules. Replaying a message can repeat an external side effect; require idempotency or an explicit compensating action.
-
-### Backpressure and consumer lag
-
-Lag count alone can be misleading: one million tiny messages may be easier than one thousand large or expensive messages. Track lag age, incoming rate, successful processing rate, retry rate, batch size, processing latency, and estimated drain time. If arrival rate remains above service rate, lag grows without bound unless admission or production is controlled.
-
-Bound consumer concurrency, database connection use, batch size, and in-flight messages. A larger prefetch window may improve throughput but increases memory use and the amount of work that may be repeated after a crash.
-
-### Event time and stream processing
-
-Stream processors distinguish event time (when the event happened) from processing time (when the processor handled it). Events can arrive late or out of order due to retries, network delays and source behavior. Windows aggregate events over a time interval; watermarks express the processor's estimate of how far event time has progressed, not proof that no older event can ever arrive.
-
-Late-event policy may update a result, emit corrections, or drop events after a configured horizon. Stateful operators need checkpointing, state recovery, replay-safe sinks, and a plan for schema changes. “Streaming” does not mean every event is processed instantly or in strict global order.
-
-### Messaging architecture checklist
-
-- What is the durability point for producer acknowledgement?
-- What does acknowledgement mean for consumer progress?
-- Can duplicate delivery repeat a business effect?
-- What is the ordering scope and partition-key strategy?
-- How are retries bounded and classified?
-- Who repairs dead-lettered or poison messages?
-- What happens during consumer rebalance or restart?
-- Is lag measured by age and drain time as well as count?
-- Can a slow consumer apply backpressure safely?
-- What are the event-time, late-data, replay and schema-evolution rules?
-
-
-
-## 12.3 Event sourcing, CQRS and schema governance
-
-Event-driven architecture, event sourcing and Command Query Responsibility Segregation (CQRS) are related but distinct concepts. A system can publish domain events without storing its full state as an event log; it can use CQRS without event sourcing; and it can use an event log as infrastructure without making every message a domain event.
-
-### Events, commands and state changes
-
-A **command** requests that something happen and may be rejected by business rules. An **event** records that something happened. Commands are usually directed to a responsible handler; events may be consumed by multiple interested subscribers. Treating a command as an event can obscure whether it is a request, a fact, or a failed attempt.
-
-A domain event should represent a meaningful fact in the business domain, such as OrderPlaced or PaymentCaptured, rather than exposing every internal method call. It should carry a stable event identity, event type, schema/version information, occurrence metadata, and the domain identifiers needed for safe processing. Avoid including sensitive fields unless consumers need them and policy permits their distribution.
-
-### Event sourcing versus event notification
-
-With **event sourcing**, the append-only event history is the authoritative record from which current state can be rebuilt or derived. This requires explicit event evolution, deterministic or version-aware replay, snapshots or projections for performance, and controls for correcting historical mistakes.
-
-With **event notification**, an event tells other components that something changed, while the producer's database remains the authoritative current state. Consumers may fetch the current state from the producer or use the event payload as a projection input. The event log is not necessarily sufficient to reconstruct the producer's full state.
-
-Do not adopt event sourcing merely because the architecture already uses a broker. Event sourcing changes data modeling, debugging, migration, privacy/deletion, replay and operational responsibilities. It can be valuable when the event history is itself a domain requirement, but it can be unnecessary complexity for ordinary CRUD state.
-
-### CQRS: separate models only when the trade-off is justified
-
-CQRS separates command handling from query handling, often using different models or stores optimized for each. The command side protects invariants and accepts changes; the query side exposes read-optimized projections. A separate read model can improve query flexibility and scale, but introduces asynchronous propagation, projection lag, rebuild procedures and operational complexity.
-
-If the command side commits a change before the projection is updated, a subsequent read may return old data. The system must define whether it needs read-your-writes, how clients learn projection status, and whether a command response returns the authoritative result or only acceptance. A correlation ID or committed version can help a read path wait for the relevant projection state when needed.
-
-### Projection rebuilds and replay
-
-A projection is derived state. Rebuilding it requires a known source of truth, a reproducible transformation, bounded processing capacity and a cutover strategy. If events are replayed while new events arrive, the rebuild process must define how it catches up without missing or double-applying changes.
-
-A safe approach may build a new projection separately, record the source offset/version at the start, replay a consistent range, catch up to the live stream, validate counts and invariants, then switch readers. The exact protocol depends on broker and database capabilities. Replaying into the live projection without idempotency or version checks can duplicate effects.
-
-### Schema registry and compatibility policy
-
-A schema registry can store and validate event/message schemas and enforce configured compatibility rules. It does not automatically make every producer and consumer compatible: compatibility depends on the chosen policy, serialization format, default values, reader/writer behavior and deployment order.
-
-Common compatibility goals include:
-- **Backward compatibility:** a newer consumer can read data written with an older schema, under the selected format and policy.
-- **Forward compatibility:** an older consumer can read data written with a newer schema, under the selected format and policy.
-- **Full compatibility:** both directions hold for the selected schema versions.
-- **Transitive compatibility:** compatibility is checked against a broader history of versions, not only the immediately previous schema.
-
-These labels are defined differently by some tools and formats; state the registry's exact policy. Additive optional fields are often easier to evolve than renaming/removing fields or changing types, but defaults, required fields, enums and semantic changes can still break consumers.
-
-### Schema-change risk matrix for producers and consumers
-
-The table is a design heuristic, not a substitute for the selected serialization format and registry's compatibility rules. “Old reader” and “new reader” refer to consumer code/schema versions; the result also depends on whether a field is required, has a default, or is ignored when unknown.
-
-| Change | Typical compatibility risk | Safer rollout guidance |
-|---|---|---|
-| Add an optional field with a safe default | Often easier for old readers, but format and unknown-field behavior matter | Deploy tolerant consumers first, then begin producing the field; verify defaults have correct business meaning |
-| Add a required field without a default | Old messages may not contain it; old consumers may not understand it | Use an optional/defaulted transition, backfill or versioned event type, and only tighten requirements after old data and consumers are handled |
-| Remove a field | Old consumers may still require it; historical events may still contain it | Stop depending on it first, observe consumer versions, retain compatibility through the replay horizon, then remove only under a documented policy |
-| Rename a field | Often behaves like remove-plus-add rather than a harmless rename | Temporarily support both representations or publish a new version; define precedence and conflict behavior |
-| Change a field type or units | Parsing may fail or values may be silently misinterpreted | Prefer a new field or event version; explicitly convert units and test boundary values |
-| Add an enum value | Consumers with exhaustive switches may fail or reject the event | Make consumers tolerate unknown values where safe, or coordinate version rollout before production begins emitting the new value |
-| Change field meaning without changing its type | Syntactically valid data can become semantically wrong | Treat semantic changes as contract changes; document and test meaning, often with a new field or event version |
-
-Producer-first versus consumer-first deployment depends on the change and the compatibility contract. A robust rollout usually ensures every active consumer can tolerate the next producer output before that output is emitted. Historical replay matters too: a consumer may need to read events written by many schema versions, not only the latest one.
-
-Before approving a schema change, test representative old and new payloads against old and new consumer versions, including unknown fields/enum values, missing fields, defaults, malformed data and replay from retained history. Validate both syntax and domain semantics.
-### Worked projection rebuild: replay without losing live updates
-
-Assume an OrderReadModel is stale after a projection bug is fixed. The event log is authoritative and retained events can rebuild the projection. The existing projection continues serving reads while a replacement is built.
-
-1. **Define the rebuild contract.** Record the projection code/schema version, source topic/partitions, event retention horizon, transformation version and required invariants. Confirm all required source events still exist.
-2. **Create an isolated replacement.** Build OrderReadModel-v2 in a separate table/index/namespace. Do not overwrite the live projection while replay is incomplete.
-3. **Capture the replay boundary.** Record a high-watermark for every source partition at the start of the rebuild, or establish a consistent source snapshot/version if the source requires one. Use this boundary to separate historical replay from events that arrive during the rebuild. Offsets are partition-scoped; a single scalar offset is not a global order across partitions.
-4. **Replay deterministically.** Process the required history into v2 with bounded concurrency. Make projection writes idempotent or guard them with aggregate versions/event IDs so duplicate deliveries do not double-count.
-5. **Catch up with live events.** Continue consuming events after the replay boundary and measure per-partition lag. Do not switch merely because the historical replay job finished; the replacement must reach the chosen cutover position.
-6. **Validate before cutover.** Compare counts where meaningful, key aggregates, representative records, invariant checks and sampled results against the authoritative source or trusted projection. Explain expected differences caused by filtering, retention or eventual processing.
-7. **Establish a cutover barrier.** Define the exact offsets/versions that v2 has applied and ensure all events up to that boundary are included. Depending on the architecture, pause writes briefly, coordinate a barrier, or use a version-aware dual-read/dual-write protocol. Avoid an informal “looks caught up” decision.
-8. **Switch readers and observe.** Atomically change the read alias/configuration where supported, or use a controlled rollout. Watch errors, latency, mismatch signals and consumer lag. Keep the old projection available for a bounded rollback window if its data remains trustworthy.
-9. **Retire deliberately.** Remove the old projection only after the rollback window, retention and operational evidence requirements are satisfied.
-
-### Common rebuild mistakes
-
-- Replaying into the live projection while users and consumers are updating it, causing duplicate counts or overwriting newer values.
-- Assuming offsets from different partitions form one global sequence.
-- Changing projection logic without versioning the transformation or recording how the new result differs.
-- Treating consumer lag count as sufficient evidence of catch-up while event age or processing rate is unknown.
-- Switching readers before the replacement has applied the cutover boundary.
-- Deleting the old projection before validating the replacement or completing the rollback window.
-- Replaying external side effects (emails, charges, notifications) as though a projection rebuild were an ordinary consumer restart.
-
-### Projection rebuild acceptance checks
-
-- [ ] Source retention covers the required rebuild interval, or a validated snapshot exists.
-- [ ] The rebuild records source positions and projection code/schema version.
-- [ ] Reprocessing the same event does not corrupt the projection.
-- [ ] Live events arriving during rebuild are included through a defined barrier.
-- [ ] Counts, domain invariants and sampled query results pass documented checks.
-- [ ] Cutover is atomic or has a defined consistency/rollback protocol.
-- [ ] Rebuild load does not starve production consumers or overload dependencies.
-- [ ] The old projection is retained until rollback criteria are met.
-### Event-data privacy and retention
-
-Events are replicated data. Once a sensitive value is copied into a durable log, it may remain in broker retention, consumer databases, backups, analytics, dead-letter queues and exported files. Minimize payloads, prefer references to sensitive data where appropriate, restrict consumer access, define retention and deletion behavior, and avoid putting secrets or unnecessary personal information in immutable event histories.
-
-If a business requirement demands erasure or correction, determine whether the event log can be legally/technically amended, whether payloads can be cryptographically erased, or whether events must avoid containing the sensitive data in the first place. These are architectural choices that must be made before the event becomes widely replicated.
-
-### Event architecture review checklist
-
-- Are commands distinguished from facts/events?
-- Is the authoritative source of state explicit?
-- Is event sourcing genuinely required, or is event notification enough?
-- If CQRS is used, what consistency and read-your-writes behavior does the query side provide?
-- Can projections be rebuilt and switched without losing or duplicating updates?
-- Are events versioned and validated under an explicit compatibility policy?
-- Can replay cause duplicate external side effects?
-- Are event IDs, aggregate versions and correlation metadata sufficient for diagnosis?
-- Are sensitive fields minimized across logs, retries, DLQs and projections?
-- Are retention, deletion and schema deprecation policies defined?
-
-## 12.4 Worked failure timeline: a consumer crashes around a database commit
-
-Assume a consumer receives OrderPaid(order-481) at log offset 812 and must update an order database. The broker offset and the database transaction are separate durable state unless the architecture explicitly coordinates them. In Kafka, the committed consumer position is conventionally the **next offset to consume**; after successfully processing record 812, the stored position is typically 813. The timeline below uses “commit progress through offset 812” to avoid confusing the processed record's offset with the next position.
-
-### Timeline A: database commit happens before offset commit
-
-| Time | Consumer / database | Broker |
-|---|---|---|
-| T1 | Reads event at offset 812 | Offset 812 is delivered |
-| T2 | Applies the order update and commits | Progress through offset 812 remains uncommitted |
-| T3 | Process crashes before committing progress through offset 812 | |
-| T4 | A replacement consumer resumes from the last committed position | Delivers offset 812 again |
-| T5 | Handler runs again | Duplicate delivery is possible |
-
-Without protection, the business effect may be applied twice. A successful database commit does not atomically advance the broker offset.
-
-### Timeline B: offset commit happens before database commit
-
-| Time | Consumer / database | Broker |
-|---|---|---|
-| T1 | Reads event at offset 812 | Offset 812 is delivered |
-| T2 | Commits progress through offset 812 (typically stores next position 813) | Broker records progress |
-| T3 | Process crashes before the database effect commits | |
-| T4 | Replacement consumer resumes from the committed position after offset 812 | Event may never be processed again |
-
-This ordering can lose the business effect. Moving the acknowledgement earlier trades duplicates for loss; it does not eliminate the atomicity gap.
-
-### Safer patterns
-
-**Pattern 1 — Inbox/deduplication record in the same database transaction**
-
-Use a stable event or operation ID with a unique constraint. In one local database transaction, insert the inbox record and apply the business mutation. If the ID already exists, treat the delivery as a duplicate and avoid repeating the effect. Commit the broker offset only after the database transaction commits. A crash may cause redelivery, but the database transaction makes the duplicate harmless.
-
-**Pattern 2 — Make the business mutation intrinsically idempotent**
-
-If the update represents a set-to-state operation or a conditional transition, a repeated application may naturally have the same result. Verify that all side effects—including emails, payments, counters and downstream publications—are also safe; a database update that is idempotent does not make external effects idempotent.
-
-**Pattern 3 — Keep processing and output inside one supported transactional boundary**
-
-Some broker ecosystems can atomically commit consumed offsets and produced records within the broker's own transaction model. This can provide strong guarantees for broker-to-broker processing when configured and consumed correctly. It does not automatically include an arbitrary external database or payment provider.
-
-**Pattern 4 — Transactional outbox for downstream publication**
-
-When a service changes database state and must publish an event, write the state change and an outbox row in the same local transaction. A separate publisher delivers the outbox event and records progress. Publication may be repeated after a crash, so consumers still need idempotency or deduplication.
-
-### Exactly-once is a boundary claim
-
-Always state exactly what is made atomic: producer retries, broker log records, consumer offsets, database effects, or an external business action. A broker's exactly-once feature is not proof of exactly-once effects across every external system. The end-to-end outcome depends on the participating systems and the protocol that joins their durable state.
-
-### Validation checklist
-
-- [ ] Identify the event ID and the business-operation ID; know whether they are the same.
-- [ ] Inject a crash after the database commit but before offset commit.
-- [ ] Inject a crash before the database commit after the message has been fetched.
-- [ ] Verify inbox deduplication and the business mutation share one transaction.
-- [ ] Test concurrent duplicate deliveries and consumer rebalances.
-- [ ] Set deduplication retention to cover the real replay/redelivery horizon.
-- [ ] Observe retry rate, duplicate detections, processing lag and stuck outbox rows.
-- [ ] Document the exact transactional boundary and any external effects outside it.
-
-## Reliable publication with a transactional outbox
-
-```mermaid
+~~~mermaid
 flowchart LR
-  A[Business command] --> B[One local DB transaction]
+  A[Business command] --> B[One local database transaction]
   B --> C[Update business state]
-  B --> D[Insert outbox record]
+  B --> D[Insert outbox row]
   D --> E[Relay or CDC connector]
   E --> F[Message broker]
-  F --> G[Consumer with deduplication]
-  G --> H[Local state change]
-```
+  F --> G[Idempotent consumer]
+  G --> H[Consumer state change]
+~~~
 
-The outbox closes the gap between the local database commit and recording the intent to publish. The relay can still publish more than once, so consumers must make the business effect idempotent or deduplicate it within the same transaction as the effect.
+An **inbox** or deduplication record can be committed atomically with the consumer's local state change. CDC can also capture changes from database logs, but brings its own considerations: connector lag, initial snapshots, schema evolution, restart behavior, and recovery from retained log positions.
+
+These patterns reduce gaps between database state and event publication; they do not remove the need to define retries, event identity, retention, and recovery.
+
+## 12.6 Event time, stream processing, and batch work
+
+Stream processors distinguish **event time** (when an event happened) from **processing time** (when the processor handled it). Events may arrive late or out of order because of retries, network delays, or source behavior.
+
+Windows aggregate events over a time interval. A watermark represents the processor's estimate of how far event time has progressed; it is not proof that no older event can ever arrive. The design must define what happens to late events: update an earlier result, emit a correction, or drop events after a stated horizon.
+
+Stateful stream processors need checkpoints and a recovery plan for both operator state and input positions. Their sinks must also tolerate replay or coordinate writes with progress. “Streaming” does not mean every event is processed instantly or in a strict global order.
+
+Batch processing handles a bounded collection of data, while stream processing handles ongoing input. Batch is often simpler for periodic jobs and large historical computations; streams are useful when results must update continuously. Many architectures combine them, but the two paths need consistent definitions and a way to compare or reconcile results.
+
+## 12.7 Schema evolution, event sourcing, and CQRS
+
+A schema registry can store message schemas and enforce configured compatibility rules, but it cannot guarantee that a consumer interprets the data correctly. Compatibility depends on the serialization format, reader/writer behavior, defaults, deployment order, and the registry policy.
+
+Additive optional fields are often easier to introduce than removing fields, changing types, or changing a field's meaning. Before a rollout, test old and new payloads against old and new consumers—including missing fields, unknown enum values, defaults, malformed records, and replay from retained history. Make sure active consumers can tolerate the next producer output before the producer starts emitting it.
+
+Keep three related ideas distinct:
+
+- **Event notification** tells other components that something changed. The producer's database usually remains the source of truth.
+- **Event sourcing** makes the event history the authoritative record from which current state is derived. It requires version-aware replay, correction procedures, retention and privacy decisions, and often snapshots or projections.
+- **CQRS** separates command handling from query handling, sometimes with a read-optimized projection. It can help when reads and writes have different needs, but it introduces projection lag, rebuilds, and additional operational work.
+
+Do not adopt event sourcing simply because a broker is already present. It is most useful when the business history itself matters. Similarly, CQRS should solve a real read/write or ownership problem rather than exist as a default pattern.
+
+### A safe projection rebuild
+
+Suppose a bug corrupted an order read model, while the retained event log still contains the events needed to rebuild it. Keep the current projection serving reads while you build a replacement separately.
+
+1. **Define the source and invariants.** Record the source topic/partitions, retention horizon, projection version, and the business checks that the new projection must satisfy.
+2. **Create an isolated replacement.** Write to a new table, index, or namespace so incomplete replay cannot corrupt the live view.
+3. **Capture the replay boundary.** Record a high-watermark per source partition or establish an appropriate consistent snapshot. A single offset is not a global ordering across partitions.
+4. **Replay safely.** Make projection writes idempotent or guard them with event IDs or aggregate versions.
+5. **Catch up with live events.** Continue processing events after the replay boundary and measure lag per partition.
+6. **Validate and cut over.** Compare meaningful counts, aggregates, representative records, and invariants. Define the exact applied offsets or versions that form the cutover barrier; do not switch merely because the replay job has ended.
+7. **Keep a rollback path.** Switch readers in a controlled way and retain the old projection for a bounded period if it remains trustworthy.
+
+The precise procedure depends on the broker, database, and deployment model. The important properties are a known replay boundary, safe reprocessing, an explicit catch-up barrier, validation, and a reversible cutover.
+
+## 12.8 Event data is replicated data
+
+Once a sensitive value enters an event log, it may be copied into consumer databases, analytics, dead-letter queues, backups, and exports. Minimize event payloads, restrict consumer access, define retention, and avoid including secrets or personal information that downstream consumers do not need.
+
+If a system must support deletion or correction, decide in advance how that requirement applies to retained events and derived data. Immutable history, backups, legal retention, and erasure requirements can conflict; this is an architectural decision, not a cleanup detail to postpone.
 
 ## Further reading
+
 - Apache Kafka 4.3 [design](https://kafka.apache.org/43/design/design/) and [message delivery semantics](https://kafka.apache.org/43/design/design/#message-delivery-semantics).
 - Debezium [outbox event router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html).
 - [CloudEvents specification](https://cloudevents.io/).
-
-
 
 ---
 
