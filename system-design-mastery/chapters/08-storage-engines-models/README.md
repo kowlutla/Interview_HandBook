@@ -18,26 +18,6 @@ A logical data model describes how applications represent and query information.
 
 These are broad families; verify the selected product's actual behavior.
 
-## B-trees and LSM trees
-B-trees maintain a balanced ordered structure, supporting lookup and range scans. Updates can require page writes and splits. Log-structured merge trees buffer writes, flush sorted runs and merge them through compaction. This can make ingestion efficient, but reads may consult multiple structures and compaction creates background I/O. Bloom filters can reduce unnecessary reads.
-
-- **Write amplification:** physical bytes written divided by logical bytes written.
-- **Read amplification:** storage work per logical read.
-- **Space amplification:** physical storage relative to live logical data.
-- **Compaction:** merging/reorganizing files to control read cost and reclaim obsolete versions.
-
-These costs interact. Compaction can compete with foreground traffic; a write-heavy workload may benefit from an LSM design, while read-heavy range scans may favor another structure. Benchmark representative data sizes and distributions.
-
-## Object, block and file storage
-Object storage exposes objects through identifiers and APIs; it suits media, backups, archives and data lakes. Block storage exposes addressable blocks. File storage exposes paths and filesystem operations. Object durability does not ensure the application wrote the correct object, retained the right version, or preserved encryption keys.
-
-## Integrity and lifecycle
-Replication can protect against some hardware failures; checksums detect corruption; versioning and immutable retention can help recover from deletion or malicious changes. None replaces a tested restore process. Lifecycle rules may tier, expire, archive or compact data; they must respect query requirements, retention obligations, deletion policy and recovery objectives.
-
-## Choose with workload evidence
-Ask about dominant access patterns, atomic invariants, joins, distribution key, skew, freshness, growth, retention, restoration, operational ownership and migration cost. Do not choose by a universal SQL-versus-NoSQL ranking.
-
-
 ## 8.1A Storage-model selection starts with access patterns
 
 Describe operations before choosing a database family:
