@@ -68,6 +68,7 @@ Different workflows may have different objectives. A profile read, a payment sub
 | Throughput | Useful work completed per unit time | High throughput does not imply low latency |
 | Availability | Fraction of time or requests meeting a defined success criterion | A running process may still fail user requests |
 | Reliability | Ability to perform correctly over time and under stated conditions | Availability alone does not prove correctness |
+| Correctness | Results preserve domain rules and promised semantics | A fast, successful HTTP response can still contain stale or invalid data |
 | Durability | Persistence of acknowledged committed state under a defined failure model | A successful response does not automatically imply durable commit |
 | Scalability | Ability to handle workload growth while preserving targets | Adding nodes does not guarantee linear scaling |
 | Elasticity | Ability to adjust resources as demand changes | Scaling may lag behind sudden bursts |
@@ -209,7 +210,7 @@ A practical method is to distinguish:
 - **Optimize:** desirable improvements when cost and risk permit.
 - **Defer or exclude:** capabilities intentionally outside current scope.
 
-Then test the proposed design against competing scenarios. For example, synchronous fraud checks may improve risk control but increase latency and dependency coupling. The decision depends on risk, acceptable false outcomes, user impact, and fallback policy—not on a generic rule that synchronous or asynchronous is always better.
+Then test the proposed design against competing scenarios. For example, synchronous fraud checks may improve risk control but increase latency and dependency coupling. Caching may improve response time while allowing stale data; synchronous replication may narrow the write-loss window while increasing latency or reducing progress during a replica failure. The decision depends on user impact, acceptable degraded behavior, and the consequences of each failure—not on a generic rule that one attribute always wins.
 
 ## 2.13 Questions that expose ambiguity
 
@@ -249,38 +250,7 @@ A quality scenario should identify:
 
 The exact numbers must come from business needs, workload estimates and operational capability—not from a generic “industry standard.”
 
-## 2.16 Distinguish availability, reliability, durability and correctness
-
-These qualities answer different questions:
-- **Availability:** can the system successfully serve the required operation now?
-- **Reliability:** does it continue to behave as required over time and under expected conditions?
-- **Durability:** once data is acknowledged under the stated contract, how likely is it to survive specified failures?
-- **Correctness:** does the result preserve the domain rules and promised semantics?
-
-A service can be available but return stale or incorrect data. A database can be durable but unavailable during failover. A system can meet a latency SLO while silently dropping events. Define the user-visible success condition so a fast error or stale response is not counted as success unless the product contract allows it.
-
-## 2.17 Requirement conflicts and prioritization
-
-Quality attributes can conflict. Stronger consistency may add coordination latency or reduce availability during a partition; additional replicas can improve fault tolerance but increase cost and operational complexity; caching can improve latency while weakening freshness; richer synchronous fan-out can improve completeness while worsening tail latency.
-
-Prioritize by identifying non-negotiable invariants, measurable user outcomes, acceptable degraded behavior, and budget constraints. Do not resolve a conflict with a vague phrase like “highly available and strongly consistent everywhere.” State the failure scenario and the operation's required guarantee.
-
-## 2.18 Requirement review checklist
-
-- Are functional outcomes and explicit non-goals stated?
-- Are peak, burst, geographic and tenant workload assumptions visible?
-- Are latency targets percentiles measured at a user-visible boundary?
-- Does success mean a correct result, not merely an HTTP response?
-- Are freshness and consistency expectations defined per operation?
-- Are durability, RPO and RTO specified for important data?
-- What behavior is acceptable during overload or dependency failure?
-- Which security, privacy and retention constraints are mandatory?
-- How will each requirement be tested and observed?
-- Which assumptions would force an architectural redesign if wrong?
-
-
-
-## 2.19 Accessibility, usability and internationalization are system requirements
+## 2.16 Accessibility, usability and internationalization are system requirements
 
 Accessibility and usability are not merely front-end polish. They influence API and workflow design, identity recovery, error handling, document formats, notification channels, support processes and the ability to complete critical tasks during disruption.
 
@@ -297,7 +267,7 @@ Usability asks whether intended users can complete tasks accurately, efficiently
 
 Internationalization prepares a system to support different languages, scripts, time zones, calendars, number formats, currencies and cultural conventions. Store timestamps with a clearly defined time model (commonly UTC instants plus relevant zone/context where needed); do not treat a local wall-clock time as a globally unique instant. Keep user-visible text separate from business logic, use locale-aware formatting, and test sorting/searching for supported scripts and languages. Localization is more than translating labels: it may change layouts, validation, legal notices, payment methods and user expectations.
 
-## 2.20 Operability, portability, cost and sustainability
+## 2.17 Operability, portability, cost and sustainability
 
 Quality attributes must cover the lifecycle after the first successful deployment. A system that meets its latency target but cannot be safely upgraded, diagnosed or restored is not a complete design.
 
@@ -337,7 +307,7 @@ AWS and Google Cloud publish sustainability architecture guidance, but their rec
 
 These scenarios must be adapted to the product. The target numbers, exclusions and verification method should be explicit rather than borrowed from an unrelated architecture.
 
-## 2.21 Quality attributes interact across the lifecycle
+## 2.18 Quality attributes interact across the lifecycle
 
 Quality attributes are not independent checkboxes. A decision can improve one dimension while making another harder:
 - Caching may reduce latency and database cost while increasing freshness complexity and invalidation risk.
