@@ -35,11 +35,11 @@ Each chapter is a folder with a single, full-length Markdown chapter page (READM
 17. [Observability and operating production systems](chapters/17-observability-operations/README.md)
 18. [Cloud infrastructure and delivery](chapters/18-cloud-delivery/README.md)
 19. [Cross-cutting advanced reasoning](chapters/19-advanced-cross-cutting/README.md)
-
+20. [Client-side, offline-first, and real-time architecture](chapters/20-client-realtime-architecture/README.md)
 
 ## Core building blocks covered
 
-The curriculum explicitly covers the path from user to data and back: DNS, TLS, firewalls/WAF, reverse proxies, L4/L7 load balancers, API gateways, ingress, CDNs and edge caches; application runtimes and architecture styles; synchronous APIs and asynchronous messaging; relational and non-relational data stores; storage engines, caches, search and analytics; service discovery and configuration; service meshes; identity and authorization; observability; deployment, scaling, failover and disaster recovery.
+The curriculum explicitly covers the path from user to data and back: browser rendering and delivery, client/server state ownership, offline-first persistence and synchronization, conflict resolution, WebSockets/SSE/WebRTC, DNS, TLS, firewalls/WAF, reverse proxies, L4/L7 load balancers, API gateways, ingress, CDNs and edge caches; application runtimes and architecture styles; synchronous APIs and asynchronous messaging; relational and non-relational data stores; storage engines, caches, search and analytics; service discovery and configuration; service meshes; identity and authorization; observability; deployment, scaling, failover and disaster recovery.
 
 A component's name appearing in a chapter is not considered sufficient coverage. Each important building block must be explained through its purpose, how it works, variants, when to use it, trade-offs, failure modes, security boundaries, metrics, and interactions with neighboring components. See the [mandatory topic inventory](CURRICULUM.md#mandatory-topic-inventory-coverage-audit).
 
