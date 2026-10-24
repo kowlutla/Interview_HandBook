@@ -32,6 +32,7 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 - [CloudEvents specification](https://cloudevents.io/).
 
 ## Reliability and operations
+- Dean and Barroso, [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) — tail-latency variability, fan-out and hedged requests.
 - Google, [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
 - Google, [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) and [Service Best Practices / Error Budgets](https://sre.google/sre-book/service-best-practices/).
 - Google, [SRE Workbook: Error Budget Policy](https://sre.google/workbook/error-budget-policy/).
@@ -59,7 +60,7 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 - AWS, [Elastic Load Balancing documentation](https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/what-is-load-balancing.html).
 - AWS API Gateway, [HTTP API throttling](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-throttling.html). Treat documented throttles as implementation behavior, not universal API gateway semantics.
 - Cloudflare, [Origin Cache Control](https://developers.cloudflare.com/cache/concepts/cache-control/) and [CDN-Cache-Control](https://developers.cloudflare.com/cache/concepts/cdn-cache-control/). These describe Cloudflare-specific behavior; use RFC 9111 for general HTTP caching semantics.
-- OWASP, [API Security Top 10](https://owasp.org/API-Security/editions/2023/en/0x00-header/).
+- OWASP, [API Security Top 10](https://api-security.owasp.org/editions/2023/en/0x00-header/).
 
 
 ## Protocol standards and secure integrations
