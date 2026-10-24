@@ -366,7 +366,9 @@ Before adopting a client-side or real-time mechanism, document:
 
 - MDN, [WebSockets API](https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API) and [Server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events).
 - MDN, [WebRTC API](https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API).
+- Cloudflare, [TURN FAQ](https://developers.cloudflare.com/realtime/turn/faq/) — provider-specific explanation of encrypted WebRTC media relay and connection metadata.
 - W3C, [Service Workers](https://www.w3.org/TR/service-workers/) and [Indexed Database API](https://www.w3.org/TR/IndexedDB-3/).
+- MDN, [Storage quotas and eviction criteria](https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria) and [IndexedDB API](https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API).
 - web.dev, [Rendering on the Web](https://web.dev/articles/rendering-on-the-web).
 - Martin Fowler, [Micro Frontends](https://martinfowler.com/articles/micro-frontends.html).
 - Kleppmann et al., [Local-first software: You own your data, in spite of the cloud](https://www.inkandswitch.com/local-first/).
