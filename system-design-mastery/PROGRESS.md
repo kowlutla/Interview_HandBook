@@ -250,3 +250,13 @@ The sprint improves confidence in repository structure but does not certify tech
 - [ ] Complete the full repository-wide external-link audit and source-to-claim review. A subset of Chapter 20 links and several foundational standards have been opened; this is not exhaustive.
 - [ ] Run a Mermaid renderer and full OpenAPI 3.1 validator. Package retrieval failed in the current execution environment, so only static Mermaid checks and YAML parsing/targeted OpenAPI checks are confirmed.
 - [ ] Complete the independent 21-family coverage acceptance and cross-chapter consistency review. Do not label the textbook fully technically accepted until these checks are performed.
+
+
+## Additional validation pass — 2026-10-24
+
+- [x] Re-parse the Chapter 06 Orders API example with PyYAML and rerun targeted OpenAPI invariants: OpenAPI version, non-empty paths, path-template/path-parameter correspondence, required path parameter, operationId, and response definition all pass.
+- [x] Re-open foundational primary references used by the textbook: RFC 9110 (HTTP semantics), RFC 9293 (TCP), RFC 8446 (TLS 1.3), RFC 9114 (HTTP/3), OpenAPI 3.1.0, Google's SRE Workbook error-budget policy, WCAG 2.2, MDN browser storage guidance, MDN WebRTC protocols, and the W3C IndexedDB 3.0 publication.
+- [x] Confirm the current source pages resolve in the web retrieval environment and confirm the published status of WCAG 2.2 (Recommendation) versus IndexedDB 3.0 (Working Draft).
+- [ ] Full OpenAPI 3.1 validation remains pending: the local environment does not have openapi-spec-validator installed and cannot resolve external package hosts. Targeted checks are not equivalent to full specification validation.
+- [ ] Mermaid render validation remains pending: the local environment has no Mermaid CLI or standalone Mermaid parser; package retrieval is blocked by network/DNS restrictions. Static fence/declaration checks are not a substitute for rendering.
+- [ ] This reference spot-check does not validate every external URL in all chapters or prove every claim is supported by its cited source. Complete the remaining claim-by-claim and inventory acceptance review before declaring technical acceptance.
