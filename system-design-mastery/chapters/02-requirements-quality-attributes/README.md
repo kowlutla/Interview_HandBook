@@ -79,6 +79,12 @@ Different workflows may have different objectives. A profile read, a payment sub
 | Privacy | Appropriate collection, use, access, retention, and deletion of personal data | Encryption alone does not satisfy privacy obligations |
 | Observability | Ability to infer internal behavior from emitted signals | More logs do not necessarily make a system diagnosable |
 | Portability | Ability to move or operate across environments | Portability can conflict with use of provider-specific capabilities |
+| Accessibility | Ability for people with varied sensory, motor, cognitive and assistive-technology needs to use the system | A visually usable interface can still fail keyboard, screen-reader or focus requirements |
+| Usability | Ability for intended users to complete tasks accurately and efficiently | Fewer clicks do not necessarily mean fewer errors or lower cognitive load |
+| Interoperability | Ability to exchange and correctly interpret data across systems | Syntactically valid payloads can still have incompatible meanings |
+| Operability | Ability to deploy, observe, diagnose, maintain and recover the system | Automation without safe rollback or clear ownership can increase operational risk |
+| Cost efficiency | Ability to meet required outcomes within a defined cost envelope | Lower unit cost may come at the expense of reliability, latency or engineering effort |
+| Sustainability | Ability to deliver the required workload while considering resource and environmental impacts | Lower compute use alone may not represent the full lifecycle or data-transfer impact |
 
 These terms need operational definitions in each project. A database may be durable but temporarily unavailable. A service can be available while returning stale results. A system can have high throughput but poor tail latency.
 
@@ -273,12 +279,98 @@ Prioritize by identifying non-negotiable invariants, measurable user outcomes, a
 - Which assumptions would force an architectural redesign if wrong?
 
 
+
+## 2.19 Accessibility, usability and internationalization are system requirements
+
+Accessibility and usability are not merely front-end polish. They influence API and workflow design, identity recovery, error handling, document formats, notification channels, support processes and the ability to complete critical tasks during disruption.
+
+An accessibility requirement should name the user journey, context, applicable standard or policy, and verification method. For web content, the W3C Web Content Accessibility Guidelines (WCAG) 2.2 defines testable success criteria across perceivable, operable, understandable and robust content. The appropriate conformance target depends on legal, contractual and product requirements; do not claim conformance solely because an automated scanner reports no findings.
+
+Examples of measurable or testable requirements include:
+- A critical checkout flow can be completed using keyboard-only interaction, with visible focus and no keyboard trap.
+- Validation errors are programmatically associated with their fields and communicated to assistive technology.
+- Authentication recovery does not depend exclusively on one sensory channel when an accessible alternative is required.
+- Time-limited actions provide a compliant way to extend or avoid the limit where appropriate.
+- The product is tested with the target browser/assistive-technology combinations and representative user workflows.
+
+Usability asks whether intended users can complete tasks accurately, efficiently and with reasonable effort. Useful evidence includes task completion rate, error rate, abandonment, time-on-task and support contacts, segmented by meaningful user journeys rather than reduced to one universal score.
+
+Internationalization prepares a system to support different languages, scripts, time zones, calendars, number formats, currencies and cultural conventions. Store timestamps with a clearly defined time model (commonly UTC instants plus relevant zone/context where needed); do not treat a local wall-clock time as a globally unique instant. Keep user-visible text separate from business logic, use locale-aware formatting, and test sorting/searching for supported scripts and languages. Localization is more than translating labels: it may change layouts, validation, legal notices, payment methods and user expectations.
+
+## 2.20 Operability, portability, cost and sustainability
+
+Quality attributes must cover the lifecycle after the first successful deployment. A system that meets its latency target but cannot be safely upgraded, diagnosed or restored is not a complete design.
+
+### Operability and maintainability
+
+Define requirements for deployment safety, configuration changes, observability, incident diagnosis, access review, backup restoration, capacity management and decommissioning. For example: “A failed release can be halted and the previous compatible version restored within ten minutes without losing acknowledged writes.” The exact target must be derived from the system's risk and operational capability.
+
+Maintainability is affected by clear ownership, bounded dependencies, understandable state transitions, testability, schema and API compatibility, and the cost of operating each component. A service count or code metric is not a direct measure of maintainability.
+
+### Portability and interoperability
+
+Portability can mean moving between environments, regions, cloud providers, runtime versions or deployment platforms. It has a cost: avoiding all provider-specific capabilities may sacrifice managed reliability, performance or developer productivity. Define the portability boundary and the actual exit scenario instead of demanding abstract “cloud agnosticism.”
+
+Interoperability concerns whether systems can exchange data and preserve its meaning. Define protocol versions, schema evolution, encoding, time/currency units, identity semantics, error behavior and compatibility expectations. Successful parsing does not prove semantic compatibility.
+
+### Cost efficiency
+
+A cost target should identify the workload, time window, cost boundary and what is included. Possible measures include cost per successful transaction, cost per million requests, cost per retained GB-month, or monthly cost at a defined peak and steady-state profile. Include relevant compute, storage, database I/O, network transfer, logs/metrics, backups, support, and operational labor when they materially affect the decision.
+
+Cost estimates should distinguish fixed from usage-dependent cost and normal from failure-mode cost. Redundancy, cross-region replication, high-cardinality telemetry, cache misses, retries and data egress can change the bill. Optimizing cost per request while allowing retries to multiply or users to receive incorrect responses is not a valid improvement.
+
+### Sustainability and resource efficiency
+
+Environmental impact is influenced by resource utilization, idle capacity, data retention and movement, hardware/service choices, workload timing and the lifecycle of the system. Consider efficient algorithms and data representations, right-sized capacity, demand-aligned scaling, retention policies, cache effectiveness, and whether a workload genuinely needs always-on resources. Do not equate one metric—such as CPU utilization—with total environmental impact; measurement methods and available provider data vary.
+
+AWS and Google Cloud publish sustainability architecture guidance, but their recommendations are provider-specific implementations of broader goals. Use the AWS Sustainability Pillar and Google Cloud Sustainability pillar as examples, not universal measurement standards.
+
+### Quality-attribute scenario examples
+
+| Attribute | Example stimulus and context | Observable response criterion |
+|---|---|---|
+| Accessibility | A user completes account recovery using keyboard navigation and a screen reader | The required journey is operable and its errors/status changes are programmatically exposed under the chosen accessibility standard |
+| Operability | A deployment introduces elevated errors | The rollout is automatically halted at a defined threshold and the on-call owner receives actionable evidence |
+| Portability | A region or hosting environment must be changed | Data, identity, dependencies and deployment configuration can be moved within an agreed time/cost budget |
+| Cost efficiency | Traffic increases from steady state to a defined peak | The service meets its latency/error objectives within a stated cost envelope |
+| Sustainability | Demand drops substantially overnight | Resources and background work reduce safely without violating latency, recovery or data-retention requirements |
+
+These scenarios must be adapted to the product. The target numbers, exclusions and verification method should be explicit rather than borrowed from an unrelated architecture.
+
+## 2.21 Quality attributes interact across the lifecycle
+
+Quality attributes are not independent checkboxes. A decision can improve one dimension while making another harder:
+- Caching may reduce latency and database cost while increasing freshness complexity and invalidation risk.
+- Synchronous replication may reduce the acknowledged-write loss window while increasing write latency or reducing progress when a replica is unreachable.
+- Multi-region active-active deployment may improve regional serving availability while adding conflict handling, operational cost and data-governance complexity.
+- Aggressive autoscaling may reduce steady-state cost while increasing cold-start latency and control-plane churn.
+- Long retention can support audit and recovery while increasing storage expense, exposure and deletion obligations.
+- Strong portability requirements may reduce provider lock-in while increasing engineering effort or giving up managed capabilities.
+
+For each important trade-off, identify the affected user outcome, the failure scenario, the measurement, the owner, and the trigger for revisiting the decision. Avoid optimizing a local metric if it makes the end-to-end user journey worse.
+
+### Quality-attribute review checklist
+
+- Are accessibility and usability requirements defined for critical journeys?
+- Are supported languages, time zones, currencies and formats explicit?
+- Can the service be deployed, diagnosed, restored and decommissioned safely?
+- Does portability name a realistic migration boundary and acceptable cost?
+- Is interoperability semantic as well as syntactic?
+- Is cost measured for a defined workload and successful outcome?
+- Are failure-mode costs such as retries, egress, backups and telemetry considered?
+- Are sustainability claims based on an explicit scope and available evidence?
+- Are trade-offs between freshness, availability, cost, performance and operability documented?
+- Does each target have an owner and a way to validate it continuously?
+
+
 ## Further reading
 
 - [Google SRE Book](https://sre.google/sre-book/table-of-contents/) — reliability objectives and operational practice.
 - [Google SRE: Service Level Objectives](https://sre.google/sre-book/service-level-objectives/) — SLI/SLO reasoning.
 - [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) — quality attribute trade-offs.
 - [NIST Privacy Framework](https://www.nist.gov/privacy-framework) — privacy risk management.
+- [W3C Web Content Accessibility Guidelines (WCAG) 2.2](https://www.w3.org/TR/wcag/) — testable accessibility success criteria.
+- [AWS Sustainability Pillar](https://docs.aws.amazon.com/wellarchitected/latest/sustainability-pillar/sustainability-pillar.html) and [Google Cloud Sustainability](https://docs.cloud.google.com/architecture/framework/sustainability) — provider-specific examples of resource-efficient design.
 
 ---
 
