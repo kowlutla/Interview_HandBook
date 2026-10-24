@@ -28,6 +28,7 @@
 - **Durability:** acknowledged committed changes survive the failures covered by the system's contract.
 - **Eventual consistency:** if updates stop and communication/reconciliation continues under the model's assumptions, replicas eventually converge; interim reads are not fully specified by this phrase alone.
 - **Idempotency:** repeating an operation has the same intended effect within a defined scope and key lifetime.
+- **Idempotent receiver:** a message/command handler that detects or safely absorbs duplicate deliveries, typically using a stable operation ID and an atomic local effect.
 - **Inbox pattern:** a consumer records a stable message or operation identifier in the same transaction as its local business effect, so duplicate deliveries can be detected safely.
 - **Latency:** elapsed time between defined start and end events.
 - **Linearizability:** each operation appears to take effect atomically between invocation and response, respecting real-time order.
