@@ -223,27 +223,6 @@ Record the cache key/policy decision, response status and cache status for each 
 - Are cross-tenant and cache-poisoning tests part of release validation?
 
 
-## Cache-aside read path
-
-```mermaid
-sequenceDiagram
-  participant App
-  participant Cache
-  participant DB as Source of truth
-  App->>Cache: Read key
-  alt Cache hit
-    Cache-->>App: Cached value
-  else Cache miss
-    Cache-->>App: Miss
-    App->>DB: Read authoritative value
-    DB-->>App: Value and version
-    App->>Cache: Populate with TTL
-    App-->>App: Return value
-  end
-```
-
-A production design must also handle concurrent misses, stale-fill races, invalidation, and a cache outage. Caching changes where work happens; it does not remove the need to define freshness and correctness.
-
 ## Further reading
 - [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html).
 - [Redis eviction documentation](https://redis.io/docs/latest/develop/reference/eviction/).
