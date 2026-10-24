@@ -33,6 +33,8 @@ Process-local caches avoid network latency but each instance has separate entrie
 
 CDNs cache near users. Keys must include every dimension that changes the representation, such as locale or authorization context; missing a dimension can serve incorrect or private content. HTTP caching behavior is defined by [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html); stale response extensions are described in [RFC 5861](https://www.rfc-editor.org/rfc/rfc5861.html).
 
+Database engines also cache data and index pages in an internal buffer pool or page cache. That improves reuse at the storage-page level, but it is different from caching an application-level business object: query plans, row visibility, locks, invalidation and transaction semantics still apply. Measure database cache behavior alongside physical reads, buffer hits, query latency and memory pressure rather than assuming a high buffer hit ratio makes every query cheap.
+
 ## Quantifying benefit
 If 90% of 2,000 lookups/s hit cache, about 200 lookups/s reach the source for that lookup class. If each miss causes three database queries, the source sees about 600 queries/s. Average hit ratio can hide correlated expiration bursts.
 
