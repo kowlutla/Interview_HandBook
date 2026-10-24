@@ -239,6 +239,42 @@ Run a representative baseline with all three tenants, then raise A's offered loa
 - [ ] Are noisy-neighbor tests run both in healthy topology and after replica/zone loss?
 - [ ] Are per-tenant metrics useful without creating unbounded metric cardinality?
 - [ ] Are security isolation and resource fairness tested as separate properties?
+## 19.4 Pattern interactions: combinations can amplify failure
+
+Architecture patterns rarely operate alone. A retry policy changes the load seen by a circuit breaker; autoscaling changes the aggregate connection budget; caching changes freshness and authorization behavior; asynchronous replication changes disaster-recovery guarantees. Review the combined system rather than approving each pattern in isolation.
+
+| Pattern combination | Interaction or failure risk | Design rule |
+|---|---|---|
+| Retries + hedged requests | Both create additional attempts; together they can multiply work during a slow dependency incident | Count every attempt in the budget, restrict hedging to safe operations, and avoid stacking independent retry policies at multiple layers |
+| Retries + circuit breaker + bulkhead | Retries can consume isolated capacity; breakers can open broadly; recovery probes can synchronize | Use bounded retries/deadlines, per-dependency concurrency isolation, controlled half-open probes and a clear fallback contract |
+| Autoscaling + database connection pools | More application replicas multiply local pool sizes and can overload a database that does not scale at the same rate | Budget aggregate connections across maximum replicas and reserve capacity for operations/recovery |
+| Cache + read replica | Cache staleness and replica lag can compound; a cache refill may store an already stale value | Define a freshness contract, use versions or authoritative reads when required, and prevent stale fills from overwriting newer values |
+| Cache + authorization/tenant isolation | A response can be served to the wrong tenant or remain available after permission revocation | Include all response-varying authorization scope in the policy/key, enforce access rules on cache hits, and test revocation/deletion paths |
+| Outbox + at-least-once broker delivery | Outbox publication and consumer delivery may both repeat after uncertain acknowledgements | Use stable event IDs, idempotent publication/progress handling and consumer inbox/deduplication where effects require it |
+| Async replication + regional failover | A promoted replica may lack recently acknowledged writes; the former primary may still accept writes | State the RPO/acknowledgement contract, fence the old writer, reconcile divergence and test failover/failback |
+| Service mesh retries + application retries | Two layers may retry the same request, multiply attempts and obscure the actual deadline | Assign retry ownership deliberately, propagate a shared deadline, and inspect effective attempts across all layers |
+| Load shedding + autoscaling | Shedding may hide demand from autoscalers; autoscaling may arrive too late to prevent queue growth | Scale from a suitable offered-load/saturation signal and keep bounded queues and explicit rejection behavior |
+| Event replay + external side effects | Rebuilding a projection may resend emails, trigger payments or repeat other irreversible actions | Separate pure projection rebuilds from effectful workflows; use idempotency keys and explicit replay modes |
+
+### Interaction review procedure
+
+1. Identify the primary pattern and every neighboring policy that can change its input, output, timing or resource use.
+2. Draw the combined request/event path, including retries, queues, caches, replicas and external effects.
+3. Calculate aggregate limits across replicas and layers; local limits are not automatically global limits.
+4. Trace crash, timeout, restart, partition and recovery cases—not just the healthy path.
+5. State which component owns each guarantee and which telemetry proves it is being met.
+6. Test at least one combined failure where two mechanisms interact, such as replica loss during retry traffic or permission revocation during cache refill.
+
+### Cross-pattern review checklist
+
+- [ ] Do retries, hedges and redelivery share a bounded work budget?
+- [ ] Can scaling multiply downstream connections, queue consumers or provider requests beyond capacity?
+- [ ] Can cache and replica staleness compound beyond the permitted freshness window?
+- [ ] Are authorization, revocation and deletion guarantees preserved across derived copies?
+- [ ] Are durable progress markers atomic with the effects they represent?
+- [ ] Are old leaders/writers fenced during failover and recovery?
+- [ ] Can an operational mitigation create a second failure, such as a retry storm or connection storm?
+- [ ] Does the test plan cover combinations of mechanisms as well as each mechanism individually?
 
 ## Further reading
 - O'Neil et al., [LSM-tree paper](https://doi.org/10.1007/s002360050048).
