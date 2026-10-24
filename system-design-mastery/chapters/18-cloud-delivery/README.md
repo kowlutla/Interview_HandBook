@@ -24,6 +24,8 @@ Infrastructure as code makes desired infrastructure reviewable and repeatable. S
 
 Rollback is not always a code-only operation. Database migrations, emitted events and external side effects may not be reversible. Design backward-compatible deployment steps and define what metrics stop rollout.
 
+A **CI/CD pipeline** automates some or all of the path from reviewed source changes through build, tests, security/policy checks, artifact creation, staged deployment and post-deployment verification. Continuous delivery typically keeps production promotion under an explicit release decision; continuous deployment automates that promotion after required gates. The pipeline itself is privileged production infrastructure: isolate build jobs, scope credentials to the minimum needed, protect workflow changes, prevent untrusted contributions from accessing deployment secrets, preserve artifact identity/provenance, and audit who or what can promote a release. A green pipeline proves only the checks it actually ran.
+
 ## Cost as a design dimension
 Costs include compute, storage, data transfer, managed-service requests, replication, observability, backups, idle capacity and engineering operations. Cross-region transfer and chatty service boundaries can dominate. Optimize for cost per useful successful operation while preserving reliability and security objectives.
 
