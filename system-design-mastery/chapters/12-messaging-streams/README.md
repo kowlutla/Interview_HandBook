@@ -57,6 +57,24 @@ A robust consumer makes repeated delivery safe. Common approaches include a stab
 
 Broker-level transactions can coordinate particular broker operations, such as consuming records and producing new records. They do not automatically include an external payment provider, email system, or arbitrary database transaction. Always name the boundary of an exactly-once claim.
 
+## 12.3A Kafka's exactly-once boundary
+
+Kafka-specific delivery claims need to name both the producer/consumer settings and the boundary of the effect. Kafka provides an idempotent producer mode that uses producer identity and sequence information to suppress duplicate writes caused by producer retries within the protocol's supported scope. This does not mean an application can retry an entire business command indefinitely without creating a second logical event: the application still needs stable command/event identity and a policy for uncertain outcomes.
+
+Kafka transactions can atomically commit records across multiple Kafka partitions and coordinate consumed offsets with produced Kafka records. A downstream consumer that must hide aborted transactional output needs a compatible read-committed isolation setting. This supports Kafka-to-Kafka processing patterns, but an arbitrary SQL transaction, payment API call, email send or third-party side effect is not automatically part of the Kafka transaction.
+
+Consider a consumer that reads an order event, writes a payment row to PostgreSQL, and then commits the Kafka offset. If the database commit succeeds and the process crashes before the offset is committed, Kafka can deliver the event again. A Kafka transaction cannot roll back that already committed PostgreSQL row. Use a database transaction with a unique event/operation key, a conditional state transition, an inbox/deduplication record, or a purpose-built connector/sink that explicitly coordinates the supported boundary.
+
+Before describing a pipeline as exactly-once, write down:
+1. Which records and offsets participate in the atomic transaction.
+2. Which consumer isolation level exposes transactional output.
+3. How application-level retries are assigned stable identities.
+4. Which external effects occur outside the broker transaction.
+5. How a crash after an external commit but before offset progress is recovered.
+6. Which broker/client versions and settings the guarantee assumes.
+
+See the versioned [Kafka 4.3 message delivery semantics](https://kafka.apache.org/43/design/design/#message-delivery-semantics) and [transaction design](https://kafka.apache.org/43/design/design/#using-transactions); verify the behavior against the deployed client and broker configuration.
+
 ## 12.4 Retries, poison messages, and backpressure
 
 Retries help with transient problems such as temporary network failures or rate limits. They do not fix invalid data or a permanently impossible business state. Use bounded attempts, exponential backoff and jitter, and distinguish retryable from terminal errors.
