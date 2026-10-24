@@ -40,6 +40,7 @@ Check items only when the work has actually been performed.
 - [x] During the source spot-check, identify that SLSA v1.0 pages are retired and update chapter/reference links to the approved v1.2 specification and versioned build-provenance pages.
 - [x] Replace generic Kafka documentation redirects with versioned Kafka 4.3 design and message-delivery-semantics links after checking the current official documentation.
 - [x] Verify the OpenAPI example's declared 3.1.0 version against the official versioned specification and add matching reference links; a full OpenAPI parser/linter run remains open.
+- [x] Parse the Chapter 6 OpenAPI YAML excerpt and manually verify its version field, path parameter, response and required schema fields; a dedicated OpenAPI validator/linter run remains open.
 
 ## Textbook implementation
 - [x] Draft all 19 chapter files.
