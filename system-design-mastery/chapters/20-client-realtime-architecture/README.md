@@ -206,6 +206,22 @@ A WebSocket or SSE connection tells the client that a transport path exists now.
 
 For example, a live dashboard can tolerate coalescing intermediate values if it can fetch a current snapshot. An audit or financial workflow generally cannot treat a transient socket as its only durable record.
 
+### Close the replay-to-live race
+
+A replay API and a live subscription can each be correct in isolation while their handoff loses events. Suppose the server replays through sequence 900, but event 901 is published after replay reads its high-water mark and before the live subscription becomes active. If the live stream starts after that publication, the client misses 901. Starting live delivery first can instead produce overlap, so duplicates must be expected and handled.
+
+A safe protocol needs a defined handoff, not just “replay, then subscribe”:
+
+1. Establish a durable high-water mark or subscription position using the event source's ordering model.
+2. Ensure the live subscription is active from a position that overlaps the replay boundary, or buffer live events while replay catches up.
+3. Replay a bounded range and then merge buffered/live events by stable sequence or event identity.
+4. Deduplicate repeated events and advance the client checkpoint only after the corresponding state change is durably applied.
+5. Detect retention gaps or sequence discontinuities and fall back to a snapshot plus a new cursor.
+
+The exact mechanism depends on the broker or change-feed API; a timestamp alone is not a reliable cursor unless the source explicitly guarantees the needed ordering and uniqueness. If the application cannot provide a gap-free handoff, state that limitation and make snapshot reconciliation part of the contract.
+
+Test the boundary deliberately: publish events immediately before, during and after subscription setup; disconnect during replay; deliver duplicates; expire the cursor; and crash the client after applying an event but before checkpointing it. The expected outcome is no silent loss, with duplicates handled according to the documented semantics.
+
 ### Connection lifecycle and fan-out
 
 Persistent connections consume memory, file descriptors, buffers, heartbeat work and routing state. Capacity planning must estimate active connections, messages per second, average and tail message sizes, fan-out recipients, reconnect rate and slow-consumer behavior—not just HTTP request rate.
