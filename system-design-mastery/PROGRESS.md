@@ -296,3 +296,19 @@ This checkpoint separates checks supported by evidence from validation that coul
 
 - [x] Static diagram declaration check: reviewed all 29 Mermaid blocks in the 20 chapter pages. Each begins with a recognized flowchart or sequence-diagram declaration; rendering is still unverified.
 - [x] Checked the numbered section endpoints listed in the 21-row mandatory inventory against current chapter headings. All referenced endpoints exist after correcting the stale Chapter 11 mapping. This validates the map, not the depth or technical accuracy of each section.
+
+
+
+## Independent depth review and final structural recheck — 2026-10-24
+
+- [x] Re-fetched all 20 current chapter pages and reviewed the chapter structure against the 21-family curriculum, with focused mechanism-level reads in storage-model selection, cache correctness/security, consistency/quorums, consensus/fencing/transactions, messaging/replay/schema evolution, IAM/injection/tenant isolation, Kubernetes/cloud delivery, and offline/realtime/WebRTC architecture.
+- [x] Found and closed a specific depth gap in Chapter 09: hot keys were mentioned in checklists but lacked a standalone explanation of diagnosis and safe mitigation. Added a dedicated section distinguishing read-hotspot remedies from write-hotspot correctness, including local caches, coalescing, replication, safe partitioning, quotas/admission control, and a skew-focused validation test.
+- [x] Added AWS caching best practices and OWASP Web Cache Security Cheat Sheet as further reading for cache stampedes/TTL behavior and shared-cache security/tenant isolation. The official pages were opened during this pass.
+- [x] Re-ran the structural check across all 20 chapter pages, correctly accounting for both backtick and tilde Markdown fences: all fenced blocks are balanced; all exact headings are unique; each chapter has Further reading; navigation footer placement is correct; no instructional headings appear after Further reading.
+- [x] Re-inventoried Mermaid blocks using both supported fence styles: **29 blocks** across the 20 chapter pages. All first non-comment lines use recognized Mermaid diagram declarations. This is a static syntax-screen only; no renderer result is claimed.
+- [ ] Full independent mechanism/example/trade-off/failure-mode acceptance for each of the 21 mandatory topic families remains open. The focused review found and corrected a real gap, but a sampled/targeted read is not a substitute for a complete claim-by-claim review.
+- [ ] Full external-link liveness and claim-to-source audit remains open. Newly added Chapter 09 sources were checked; that does not establish that every URL across the book resolves or supports the adjacent claim.
+- [ ] Mermaid rendering and full OpenAPI 3.1 validation remain blocked by the current execution environment's package/network constraints. Static declarations and YAML parsing are not equivalent to those checks.
+- [ ] Whole-book contradiction/prerequisite review remains open beyond the targeted consistency checks already recorded.
+
+**Acceptance state:** Structural checks are passing and the identified Chapter 09 hot-key gap is closed. The textbook remains review-ready, not formally technically accepted, until the remaining source, renderer, schema and full-depth checks are completed.
