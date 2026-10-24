@@ -177,6 +177,45 @@ A quorum intersection argument depends on the configured membership and protocol
 - How is recovery tested under pauses, partitions, duplicate messages and restarts?
 
 
+## 11.6 Worked failure timeline: why a lease needs fencing
+
+Assume worker A acquires a lease to update a shared resource. A pauses for a long garbage-collection event or loses network connectivity. Its lease expires, worker B acquires a new lease, and then A resumes. A local belief that its lease is valid is not proof that it still owns the resource.
+
+### The stale-owner failure
+
+| Time | Worker A | Lease coordinator | Worker B / protected resource |
+|---|---|---|---|
+| T1 | Acquires lease | Grants lease to A | Resource accepts A's work |
+| T2 | Pauses before sending a write | Lease expires | |
+| T3 | Still paused | Grants a new lease to B | B begins work |
+| T4 | Resumes and sends its delayed write | | Without fencing, resource may accept stale A's write after B's newer write |
+
+The lease service can correctly grant ownership to B and still fail to stop A from acting. The dangerous boundary is the protected resource: it must reject operations from an obsolete owner.
+
+### Use a monotonically increasing fencing token
+
+Each ownership grant receives a strictly increasing token, such as 41 for A and 42 for B. The protected resource atomically records the greatest accepted token and rejects any operation carrying a smaller token. Once it has accepted token 42, a delayed operation with token 41 is rejected even if worker A has resumed and believes it still owns the lease.
+
+```text
+A receives token 41 -> pauses
+B receives token 42 -> resource accepts token 42
+A resumes with token 41 -> resource rejects stale operation
+```
+
+Fencing works only when the protected resource validates the token at the same atomic boundary as the mutation. Merely attaching a token to a log message, checking it in a separate service call, or relying on worker-side timers does not protect the final write. Tokens must be ordered, bound to the correct resource scope, and persisted or enforced according to the resource's failure model.
+
+### When fencing is unavailable
+
+If the downstream resource cannot validate fencing tokens, prefer a native conditional update/version check, a single-writer protocol enforced at the resource, or a design where duplicate work is harmless. A distributed lock may still reduce duplicate effort, but do not claim it guarantees correctness against paused or partitioned owners without a downstream enforcement mechanism.
+
+### Validation checklist
+
+- [ ] Pause a lease holder beyond lease expiry, then resume it after another holder takes over.
+- [ ] Verify the protected resource rejects stale-token mutations atomically.
+- [ ] Test coordinator restart, delayed messages, clock skew and duplicate retries.
+- [ ] Confirm tokens cannot be reused across unrelated resources or reset during recovery.
+- [ ] Verify that failover and operational tooling cannot bypass the fencing check.
+- [ ] Record rejected stale operations and test that legitimate new-owner work still succeeds.
 
 ## Further reading
 - [Raft paper and resources](https://raft.github.io/).
