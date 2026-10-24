@@ -57,6 +57,8 @@ A safe migration commonly uses expand-and-contract:
 
 Rollback criteria should include error rate, latency, business correctness, resource saturation, and dependency health. If the new version emitted irreversible external effects or changed persisted data, rolling back the binary may not restore the prior state. Plan compensating actions or forward-fix options.
 
+Feature flags can separate code deployment from feature exposure and allow a controlled rollout or rapid disablement. They also create a configuration and testing dimension: define an owner, intended lifetime, default/failure behavior, targeting rules, audit trail and removal date. A flag is not a substitute for backward-compatible data changes or safe authorization. Test both enabled and disabled paths, prevent client-controlled flags from granting privileges, and remove stale flags so temporary rollout logic does not become permanent complexity.
+
 ## 18.1G Cost, quotas, and cloud failure modes
 
 Cloud cost includes idle reservations, cross-zone and cross-region transfer, managed requests, logs and traces, backup retention, replication, egress, support, and engineering operations. A chatty architecture may have modest compute use but high network or managed-service request charges.
