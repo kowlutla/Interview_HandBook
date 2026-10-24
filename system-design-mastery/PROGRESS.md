@@ -204,3 +204,15 @@ The user emphasized that the textbook must read like a human-written, readable e
 - [x] Rechecked the edited chapter pages (01, 03, 04, 06–11, 13–18) and Chapter 20 for balanced code fences, duplicate headings, instructional headings after Further reading, and navigation footer placement; all checks passed.
 - [x] Run a fresh repository-wide relative-link check after these edits across all 28 Markdown files; no missing local relative targets found.
 - [ ] Continue technical/source verification, Mermaid rendering and OpenAPI validation; readability completion does not imply technical certification.
+
+
+## Rapid verification sprint — 2026-10-24
+
+- [x] Fetch the current default-branch version of all 20 chapter README files and run a fresh structural sweep: all 20 have balanced fenced blocks, unique exact Markdown headings, a Further reading section, and the expected textbook navigation footer.
+- [x] Inventory chapter Mermaid declarations: 22 Mermaid blocks across the 20 chapter pages. This is a static inventory only; it does not establish that the diagrams render successfully.
+- [x] Confirm the current chapter file paths and current blob SHAs before recording this pass; no chapter content changes were needed from the structural scan alone.
+- [ ] Render Mermaid diagrams using an actual Mermaid renderer.
+- [ ] Validate the Chapter 06 OpenAPI 3.1.0 example using a parser/linter.
+- [ ] Complete source-to-claim verification, external-link audit, independent mandatory-inventory review, and cross-chapter consistency review.
+
+The sprint improves confidence in repository structure but does not certify technical correctness or complete the textbook. The acceptance criteria above remain open until executed and recorded.
