@@ -36,6 +36,7 @@ Check items only when the work has actually been performed.
 - [x] Add the official OpenTelemetry documentation to the targeted evidence log for observability signals, context propagation and sampling; implementation-specific behavior remains version/language dependent.
 - [x] Expand the reference library with official architecture-style, load-balancing, API-gateway throttling, CDN-cache-control, and API-security guidance.
 - [x] Scan all 19 chapter Further reading blocks for duplicate URLs; remove duplicated RFC references in Chapter 05 and add an explicit RFC 9111 HTTP-caching link. The scan found no duplicate URLs in the other 18 chapter blocks; external link liveness and claim alignment remain open.
+- [x] Scan the 73 URL occurrences in the reference catalog for duplicate destinations; all 73 were unique. Link liveness, redirect behavior, and claim-to-source alignment remain open.
 - [ ] Recheck all source links during final audit.
 - [x] Spot-check newly added protocol references against RFC Editor records and correct the RFC 9000 reference to the stable RFC information page; broader source-link verification remains open.
 - [x] Validate the W3C WCAG 2.2 and C4 model references against their official pages, confirm AWS/Google sustainability guidance is provider-specific, and replace an inaccessible Java 21 structured-concurrency API URL with the official guide.
