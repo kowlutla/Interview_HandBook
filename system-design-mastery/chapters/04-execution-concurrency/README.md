@@ -20,11 +20,11 @@ These terms are related but not identical: non-blocking describes an operation's
 
 ## 4.4 Pools are queues with limits
 
-Thread pools, connection pools, and worker pools bound concurrent use of expensive resources. They also create queues. When a pool is exhausted, requests may wait, time out, or fail fast.
+Thread pools, worker pools and connection pools restrict how much work can use a resource at once. When a limit is reached, additional work waits, times out or is rejected. That makes the pool both a resource guardrail and a queueing boundary.
 
-Example: if a database pool allows 40 concurrent connections, that is not proof that 40 is optimal. Too many connections can increase database contention and context switching; too few can create application-side waiting. Measure active connections, wait time, database CPU, query duration, and queue length together.
+For example, a database pool configured for 40 connections is not automatically well-sized. The right limit depends on query duration, database capacity and the number of application replicas. The detailed sizing method appears in Section 4.12; the wider runtime limits that interact with pools are covered in Section 4.15.
 
-Avoid unbounded queues and unbounded task creation. They can convert overload into memory exhaustion and extremely long tail latency.
+Unbounded task creation or waiting queues can turn overload into memory exhaustion and extreme tail latency. Every queue needs a limit and an explicit saturation policy.
 
 ## 4.5 Race conditions and synchronization
 
@@ -149,19 +149,9 @@ A thread-per-request model is often straightforward for blocking code, but each 
 
 Choose an execution model based on the libraries, workload, concurrency, latency target and team ability to diagnose it. A nonblocking API wrapped around a blocking database driver may simply move the queue to a different place.
 
-### Pool sizing is a queueing and bottleneck decision
+### Pool limits must match the protected resource
 
-A worker pool, HTTP connection pool and database connection pool are queues and concurrency limits at different layers. If every layer allows large queues, requests can wait multiple times and exceed their deadline before the final operation begins. If every layer is unbounded, overload can consume memory and starve healthy work.
-
-A practical pool-size process is:
-1. Identify the resource the pool protects.
-2. Measure service time and sustainable concurrency for that resource.
-3. Set a bounded maximum active count and bounded wait queue.
-4. Define acquisition timeout and rejection behavior.
-5. Observe active, idle, queued, timed-out and rejected work.
-6. Test under saturation and downstream slowdown.
-
-Do not copy a generic pool-size formula without measuring the workload. For a database, more simultaneous connections can reduce throughput when lock contention and I/O become the bottleneck.
+Pool sizing and queue boundaries are discussed in Section 4.12. At the runtime level, remember that limits multiply across replicas and layers: a locally reasonable connection count can exceed a database's safe concurrency when dozens of service instances use the same pool configuration. Diagnose the constrained resource before increasing a limit, and make sure waiting work cannot outlive its request deadline.
 
 ### Garbage collection and memory pressure
 
