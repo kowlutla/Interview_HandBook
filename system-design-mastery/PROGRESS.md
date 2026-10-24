@@ -67,6 +67,7 @@ Check items only when the work has actually been performed.
 - [x] Add a Chapter 14 recovery rehearsal with timed restore, RTO/RPO measurement, data-integrity validation, stale-writer fencing and backlog drain.
 - [x] Add a Chapter 12 producer/consumer schema-change risk matrix with compatibility caveats, deployment order and historical replay considerations.
 - [x] Add a Chapter 12 projection rebuild/catch-up/cutover protocol with replay idempotency, partition offsets, validation and rollback criteria.
+- [x] Clarify the Chapter 12 projection-rebuild boundary as a per-partition high-watermark/cutover point captured before historical replay, so live-event catch-up has an explicit boundary.
 - [x] Add a Chapter 3 worked capacity-test plan with an illustrative workload mix, explicit acceptance thresholds, ramp/steady/spike/failure/soak phases and reproducibility requirements.
 - [x] Add a Chapter 1 worked architecture evaluation comparing modular monolith, microservices and serverless using invariants, team constraints, validation evidence and revisit triggers.
 - [x] Pair quality-attribute scenario examples in Chapter 2 with verification evidence and accountable roles.
