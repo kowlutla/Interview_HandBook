@@ -327,13 +327,13 @@ AWS and Google Cloud publish sustainability architecture guidance, but their rec
 
 ### Quality-attribute scenario examples
 
-| Attribute | Example stimulus and context | Observable response criterion |
-|---|---|---|
-| Accessibility | A user completes account recovery using keyboard navigation and a screen reader | The required journey is operable and its errors/status changes are programmatically exposed under the chosen accessibility standard |
-| Operability | A deployment introduces elevated errors | The rollout is automatically halted at a defined threshold and the on-call owner receives actionable evidence |
-| Portability | A region or hosting environment must be changed | Data, identity, dependencies and deployment configuration can be moved within an agreed time/cost budget |
-| Cost efficiency | Traffic increases from steady state to a defined peak | The service meets its latency/error objectives within a stated cost envelope |
-| Sustainability | Demand drops substantially overnight | Resources and background work reduce safely without violating latency, recovery or data-retention requirements |
+| Attribute | Example stimulus and context | Observable response criterion | Verification evidence / accountable role |
+|---|---|---|---|
+| Accessibility | A user completes account recovery using keyboard navigation and a screen reader | The required journey is operable and its errors/status changes are programmatically exposed under the chosen accessibility standard | Automated checks plus manual keyboard/screen-reader testing; product/design and QA share verification ownership |
+| Operability | A deployment introduces elevated errors | The rollout is automatically halted at a defined threshold and the on-call owner receives actionable evidence | Staging fault injection and rollout telemetry; service owner and on-call team |
+| Portability | A region or hosting environment must be changed | Data, identity, dependencies and deployment configuration can be moved within an agreed time/cost budget | Timed migration/restore rehearsal with dependency inventory; platform owner and service owner |
+| Cost efficiency | Traffic increases from steady state to a defined peak | The service meets its latency/error objectives within a stated cost envelope | Load-test cost report including egress, telemetry and failure headroom; service owner with finance/platform partners |
+| Sustainability | Demand drops substantially overnight | Resources and background work reduce safely without violating latency, recovery or data-retention requirements | Measure resource consumption before/after scaling and check SLOs; platform owner and workload owner |
 
 These scenarios must be adapted to the product. The target numbers, exclusions and verification method should be explicit rather than borrowed from an unrelated architecture.
 
