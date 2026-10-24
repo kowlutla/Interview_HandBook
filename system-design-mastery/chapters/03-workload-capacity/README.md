@@ -67,11 +67,11 @@ If a service completes 800 requests/s and average time in the system is 0.15 s, 
 
 Little's Law applies to stable averages over a consistent boundary. If arrivals persistently exceed completions, backlog grows and the system is not in steady state.
 
-## 3.8 Latency budgets and queueing
+## 3.8 Latency budgets
 
-End-to-end latency includes network, queueing, application work, downstream calls, and response transfer. A budget might allocate 30 ms to edge/network, 40 ms to application work, 80 ms to data access, and 20 ms to serialization and response: total 170 ms. These are allocations, not guaranteed additive percentiles; correlated distributions and parallel branches make percentile composition subtle.
+End-to-end latency includes network transfer, queueing, application work, downstream calls, and response serialization. A hypothetical 170 ms budget might allocate 30 ms to the edge/network, 40 ms to application work, 80 ms to data access, and 20 ms to serialization and response transfer. These are planning allocations, not guaranteed additive percentiles: parallel branches and correlated delays make end-to-end percentile behavior more complicated than simply adding each component's p99.
 
-As utilization approaches a resource's effective capacity, queueing delay can rise sharply. Adding a queue does not create capacity; it can turn immediate rejection into delayed failure. Bound queues and deadlines, then decide which work to reject or shed.
+The budget should identify where time may be spent and where it must be measured. Queueing deserves special attention because it grows as a constrained resource approaches saturation; Chapter 3.13 explains that relationship and the controls used to keep overload bounded.
 
 ## 3.9 Sensitivity and sanity checks
 
