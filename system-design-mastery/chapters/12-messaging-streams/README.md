@@ -351,12 +351,6 @@ Always state exactly what is made atomic: producer retries, broker log records, 
 - [ ] Observe retry rate, duplicate detections, processing lag and stuck outbox rows.
 - [ ] Document the exact transactional boundary and any external effects outside it.
 
-## Further reading
-- Apache Kafka [design](https://kafka.apache.org/documentation/#design) and [delivery semantics](https://kafka.apache.org/documentation/#semantics).
-- Debezium [outbox event router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html).
-- [CloudEvents specification](https://cloudevents.io/).
-
-
 ## Reliable publication with a transactional outbox
 
 ```mermaid
@@ -371,6 +365,12 @@ flowchart LR
 ```
 
 The outbox closes the gap between the local database commit and recording the intent to publish. The relay can still publish more than once, so consumers must make the business effect idempotent or deduplicate it within the same transaction as the effect.
+
+## Further reading
+- Apache Kafka 4.3 [design](https://kafka.apache.org/43/design/design/) and [message delivery semantics](https://kafka.apache.org/43/design/design/#message-delivery-semantics).
+- Debezium [outbox event router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html).
+- [CloudEvents specification](https://cloudevents.io/).
+
 
 
 ---
