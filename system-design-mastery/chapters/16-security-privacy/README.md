@@ -295,13 +295,6 @@ Carry the minimum context needed to execute the job, bind it to an authenticated
 - [ ] Audit records capture requester, tenant, decision, resource scope and job outcome without exposing document contents or credentials.
 - [ ] Data retention and deletion cover source records, generated archives, replicas, backups and logs according to the applicable policy.
 
-## Further reading
-- IETF [RFC 9700 — OAuth 2.0 Security BCP](https://www.rfc-editor.org/rfc/rfc9700.html).
-- OpenID Foundation [specifications](https://openid.net/developers/specs/).
-- NIST [Cybersecurity Framework](https://www.nist.gov/cyberframework).
-- OWASP [API Security Top 10 (2023)](https://api-security.owasp.org/editions/2023/en/0x00-header/) — object/function/property authorization, resource consumption, SSRF, inventory and unsafe upstream API risks.
-
-
 ## A request crosses trust boundaries
 
 ```mermaid
@@ -317,6 +310,13 @@ flowchart LR
 ```
 
 Authentication, token validation, authorization and tenant isolation are separate checks. Passing one must not imply the others. Audit records should capture enough for investigation without logging credentials or unnecessary sensitive payloads.
+
+## Further reading
+- IETF [RFC 9700 — OAuth 2.0 Security BCP](https://www.rfc-editor.org/rfc/rfc9700.html).
+- OpenID Foundation [specifications](https://openid.net/developers/specs/).
+- NIST [Cybersecurity Framework](https://www.nist.gov/cyberframework).
+- OWASP [API Security Top 10 (2023)](https://api-security.owasp.org/editions/2023/en/0x00-header/) — object/function/property authorization, resource consumption, SSRF, inventory and unsafe upstream API risks.
+
 
 
 ---
