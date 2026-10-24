@@ -238,6 +238,40 @@ The table is a design heuristic, not a substitute for the selected serialization
 Producer-first versus consumer-first deployment depends on the change and the compatibility contract. A robust rollout usually ensures every active consumer can tolerate the next producer output before that output is emitted. Historical replay matters too: a consumer may need to read events written by many schema versions, not only the latest one.
 
 Before approving a schema change, test representative old and new payloads against old and new consumer versions, including unknown fields/enum values, missing fields, defaults, malformed data and replay from retained history. Validate both syntax and domain semantics.
+### Worked projection rebuild: replay without losing live updates
+
+Assume an OrderReadModel is stale after a projection bug is fixed. The event log is authoritative and retained events can rebuild the projection. The existing projection continues serving reads while a replacement is built.
+
+1. **Define the rebuild contract.** Record the projection code/schema version, source topic/partitions, event retention horizon, transformation version and required invariants. Confirm all required source events still exist.
+2. **Create an isolated replacement.** Build OrderReadModel-v2 in a separate table/index/namespace. Do not overwrite the live projection while replay is incomplete.
+3. **Capture a starting position.** Record a start offset for every source partition, or a consistent source snapshot/version if the event source requires one. Offsets are partition-scoped; a single scalar offset is not a global order across partitions.
+4. **Replay deterministically.** Process the required history into v2 with bounded concurrency. Make projection writes idempotent or guard them with aggregate versions/event IDs so duplicate deliveries do not double-count.
+5. **Catch up with live events.** Continue consuming events after the replay boundary and measure per-partition lag. Do not switch merely because the historical replay job finished; the replacement must reach the chosen cutover position.
+6. **Validate before cutover.** Compare counts where meaningful, key aggregates, representative records, invariant checks and sampled results against the authoritative source or trusted projection. Explain expected differences caused by filtering, retention or eventual processing.
+7. **Establish a cutover barrier.** Define the exact offsets/versions that v2 has applied and ensure all events up to that boundary are included. Depending on the architecture, pause writes briefly, coordinate a barrier, or use a version-aware dual-read/dual-write protocol. Avoid an informal “looks caught up” decision.
+8. **Switch readers and observe.** Atomically change the read alias/configuration where supported, or use a controlled rollout. Watch errors, latency, mismatch signals and consumer lag. Keep the old projection available for a bounded rollback window if its data remains trustworthy.
+9. **Retire deliberately.** Remove the old projection only after the rollback window, retention and operational evidence requirements are satisfied.
+
+### Common rebuild mistakes
+
+- Replaying into the live projection while users and consumers are updating it, causing duplicate counts or overwriting newer values.
+- Assuming offsets from different partitions form one global sequence.
+- Changing projection logic without versioning the transformation or recording how the new result differs.
+- Treating consumer lag count as sufficient evidence of catch-up while event age or processing rate is unknown.
+- Switching readers before the replacement has applied the cutover boundary.
+- Deleting the old projection before validating the replacement or completing the rollback window.
+- Replaying external side effects (emails, charges, notifications) as though a projection rebuild were an ordinary consumer restart.
+
+### Projection rebuild acceptance checks
+
+- [ ] Source retention covers the required rebuild interval, or a validated snapshot exists.
+- [ ] The rebuild records source positions and projection code/schema version.
+- [ ] Reprocessing the same event does not corrupt the projection.
+- [ ] Live events arriving during rebuild are included through a defined barrier.
+- [ ] Counts, domain invariants and sampled query results pass documented checks.
+- [ ] Cutover is atomic or has a defined consistency/rollback protocol.
+- [ ] Rebuild load does not starve production consumers or overload dependencies.
+- [ ] The old projection is retained until rollback criteria are met.
 ### Event-data privacy and retention
 
 Events are replicated data. Once a sensitive value is copied into a durable log, it may remain in broker retention, consumer databases, backups, analytics, dead-letter queues and exported files. Minimize payloads, prefer references to sensitive data where appropriate, restrict consumer access, define retention and deletion behavior, and avoid putting secrets or unnecessary personal information in immutable event histories.
