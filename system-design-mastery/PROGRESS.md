@@ -171,7 +171,7 @@ The user emphasized that the textbook must read like a human-written, readable e
 
 - [x] Add explicit human-written readability criteria to EDITORIAL-STANDARD.md.
 - [x] Consolidate Chapter 05 (Networking): remove repeated introductory/deep-dive treatment and combine related protocol, edge, security, timeout and troubleshooting guidance into a coherent request-journey explanation. Word count reduced from approximately 6,133 to 2,423 while retaining the main networking fundamentals.
-- [x] Consolidate Chapter 12 (Messaging): merge repeated summaries and detailed sections into one learning path covering delivery semantics, partitions, retries, outbox/inbox, stream processing, schema evolution, CQRS/event sourcing, projection rebuilds, and privacy. Word count reduced from approximately 5,334 to 1,932.
+- [x] Consolidate Chapter 12 (Messaging): merge repeated summaries and detailed sections into one learning path covering delivery semantics, partitions, retries, outbox/inbox, stream processing, schema evolution, CQRS/event sourcing, projection rebuilds, and privacy. Word count reduced from approximately 5,334 to 2,139 after retaining a compact schema-compatibility matrix and event-identity guidance.
 - [x] Recheck relative Markdown targets across all 28 Markdown files in system-design-mastery/ after these edits; no missing local targets found.
 - [x] Run static structure checks across all 28 Markdown files: balanced fenced blocks, no exact duplicate headings, and no instructional headings after Further reading.
 - [ ] Continue human-readability and duplication review for the remaining chapters, prioritizing chapters with overlapping sections or dense lists/tables.
