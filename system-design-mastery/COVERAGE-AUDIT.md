@@ -331,3 +331,14 @@ This establishes that these selected references resolve and that their document 
 - Mermaid rendering of all 21 chapter diagrams is still unverified. No local Mermaid CLI/standalone parser is available, and external package retrieval fails due network/DNS restrictions.
 - Full OpenAPI 3.1 schema/spec validation is still unverified for the same package-access constraint.
 - The full source-to-claim audit, repository-wide external-link audit, independent review of all 21 mandatory topic families, and cross-chapter consistency pass remain incomplete. Do not promote provisional coverage statuses to Deep based on these targeted checks.
+
+
+## Curriculum-gap corrections from independent spot review — 2026-10-24
+
+A focused comparison of curriculum requirements, Chapter 05/18 content, and glossary entries found several concepts that deserved explicit teaching rather than relying on implication.
+
+- **Chapter 05:** added a concise OSI/TCP-IP mental model tied to concrete architecture responsibilities; expanded global traffic-management and session-affinity behavior, including caching/connection delay, failover capacity, and stickiness trade-offs.
+- **Chapter 18:** added feature-flag design guidance covering deploy/exposure separation, safe defaults, ownership and expiry, enabled/disabled-path testing, authorization, and flag cleanup.
+- **Glossary:** added definitions for feature flags, LWW, PITR, QUIC and stream-processing watermarks.
+
+These are genuine coverage improvements. They are not enough to promote the associated inventory families to Deep: the full chapter-by-chapter mechanism/failure-mode review and standards/source verification still need completion.
