@@ -178,6 +178,69 @@ Late-event policy may update a result, emit corrections, or drop events after a 
 - What are the event-time, late-data, replay and schema-evolution rules?
 
 
+
+## 12.3 Event sourcing, CQRS and schema governance
+
+Event-driven architecture, event sourcing and Command Query Responsibility Segregation (CQRS) are related but distinct concepts. A system can publish domain events without storing its full state as an event log; it can use CQRS without event sourcing; and it can use an event log as infrastructure without making every message a domain event.
+
+### Events, commands and state changes
+
+A **command** requests that something happen and may be rejected by business rules. An **event** records that something happened. Commands are usually directed to a responsible handler; events may be consumed by multiple interested subscribers. Treating a command as an event can obscure whether it is a request, a fact, or a failed attempt.
+
+A domain event should represent a meaningful fact in the business domain, such as OrderPlaced or PaymentCaptured, rather than exposing every internal method call. It should carry a stable event identity, event type, schema/version information, occurrence metadata, and the domain identifiers needed for safe processing. Avoid including sensitive fields unless consumers need them and policy permits their distribution.
+
+### Event sourcing versus event notification
+
+With **event sourcing**, the append-only event history is the authoritative record from which current state can be rebuilt or derived. This requires explicit event evolution, deterministic or version-aware replay, snapshots or projections for performance, and controls for correcting historical mistakes.
+
+With **event notification**, an event tells other components that something changed, while the producer's database remains the authoritative current state. Consumers may fetch the current state from the producer or use the event payload as a projection input. The event log is not necessarily sufficient to reconstruct the producer's full state.
+
+Do not adopt event sourcing merely because the architecture already uses a broker. Event sourcing changes data modeling, debugging, migration, privacy/deletion, replay and operational responsibilities. It can be valuable when the event history is itself a domain requirement, but it can be unnecessary complexity for ordinary CRUD state.
+
+### CQRS: separate models only when the trade-off is justified
+
+CQRS separates command handling from query handling, often using different models or stores optimized for each. The command side protects invariants and accepts changes; the query side exposes read-optimized projections. A separate read model can improve query flexibility and scale, but introduces asynchronous propagation, projection lag, rebuild procedures and operational complexity.
+
+If the command side commits a change before the projection is updated, a subsequent read may return old data. The system must define whether it needs read-your-writes, how clients learn projection status, and whether a command response returns the authoritative result or only acceptance. A correlation ID or committed version can help a read path wait for the relevant projection state when needed.
+
+### Projection rebuilds and replay
+
+A projection is derived state. Rebuilding it requires a known source of truth, a reproducible transformation, bounded processing capacity and a cutover strategy. If events are replayed while new events arrive, the rebuild process must define how it catches up without missing or double-applying changes.
+
+A safe approach may build a new projection separately, record the source offset/version at the start, replay a consistent range, catch up to the live stream, validate counts and invariants, then switch readers. The exact protocol depends on broker and database capabilities. Replaying into the live projection without idempotency or version checks can duplicate effects.
+
+### Schema registry and compatibility policy
+
+A schema registry can store and validate event/message schemas and enforce configured compatibility rules. It does not automatically make every producer and consumer compatible: compatibility depends on the chosen policy, serialization format, default values, reader/writer behavior and deployment order.
+
+Common compatibility goals include:
+- **Backward compatibility:** a newer consumer can read data written with an older schema, under the selected format and policy.
+- **Forward compatibility:** an older consumer can read data written with a newer schema, under the selected format and policy.
+- **Full compatibility:** both directions hold for the selected schema versions.
+- **Transitive compatibility:** compatibility is checked against a broader history of versions, not only the immediately previous schema.
+
+These labels are defined differently by some tools and formats; state the registry's exact policy. Additive optional fields are often easier to evolve than renaming/removing fields or changing types, but defaults, required fields, enums and semantic changes can still break consumers.
+
+### Event-data privacy and retention
+
+Events are replicated data. Once a sensitive value is copied into a durable log, it may remain in broker retention, consumer databases, backups, analytics, dead-letter queues and exported files. Minimize payloads, prefer references to sensitive data where appropriate, restrict consumer access, define retention and deletion behavior, and avoid putting secrets or unnecessary personal information in immutable event histories.
+
+If a business requirement demands erasure or correction, determine whether the event log can be legally/technically amended, whether payloads can be cryptographically erased, or whether events must avoid containing the sensitive data in the first place. These are architectural choices that must be made before the event becomes widely replicated.
+
+### Event architecture review checklist
+
+- Are commands distinguished from facts/events?
+- Is the authoritative source of state explicit?
+- Is event sourcing genuinely required, or is event notification enough?
+- If CQRS is used, what consistency and read-your-writes behavior does the query side provide?
+- Can projections be rebuilt and switched without losing or duplicating updates?
+- Are events versioned and validated under an explicit compatibility policy?
+- Can replay cause duplicate external side effects?
+- Are event IDs, aggregate versions and correlation metadata sufficient for diagnosis?
+- Are sensitive fields minimized across logs, retries, DLQs and projections?
+- Are retention, deletion and schema deprecation policies defined?
+
+
 ## Further reading
 - Apache Kafka [design](https://kafka.apache.org/documentation/#design) and [delivery semantics](https://kafka.apache.org/documentation/#semantics).
 - Debezium [outbox event router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html).
