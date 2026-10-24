@@ -370,3 +370,12 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Updated COVERAGE-AUDIT.md to record the correction and preserve the Developing status.
 - [ ] Independently verify the exact handoff against a chosen broker/change-feed API and ordering contract; the generic design guidance does not establish product-specific guarantees.
 - [ ] CI remains unverified: repository helper available in this session only returns pull-request-triggered runs; it returned no run for the workflow commit. A local clone attempt also failed because this environment could not resolve github.com. Do not claim the Mermaid renderer or full OpenAPI validator passed.
+
+
+## Tracker and change verification — 2026-10-24
+
+- [x] Re-fetched the updated Chapter 20, progress tracker, coverage audit, artifact extractor and CI workflow from the default branch after the latest commits.
+- [x] Rechecked Chapter 20's changed page for duplicate headings, balanced fenced blocks, Further reading and navigation footer; these structural checks passed for that page.
+- [x] Found and disambiguated a duplicate “Remaining acceptance blockers” heading in COVERAGE-AUDIT.md so Markdown section anchors are unique for that pair of sections.
+- [ ] Repository-wide structural validation after the latest edits has not been rerun as a single automated suite. The CI workflow remains the intended route, but its completed run cannot be inspected through the available Actions helper in this session.
+- [ ] Full acceptance remains open: no inventory family has been promoted to Deep; no claim-to-source audit or real Mermaid/OpenAPI validation is being represented as complete.
