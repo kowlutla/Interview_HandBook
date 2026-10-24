@@ -186,9 +186,9 @@ An alert policy should connect a measurable user-impact signal to a response. Th
 
 Assume an API has a request-based SLO of **99.9% successful eligible requests over a rolling 30-day window**. Define a good event precisely—for example, an eligible request that returns the expected successful outcome within the agreed latency threshold. Exclude only traffic that the SLO definition explicitly excludes; do not silently remove failures because they are inconvenient.
 
-- Allowed bad-event fraction: (1 - 0.999 = 0.001 = 0.1\%\).
-- If the window contains 10,000,000 eligible requests, the illustrative error budget is (10{,}000{,}000 \times 0.001 = 10{,}000) bad requests.
-- If 2% of eligible requests are bad during a recent window, the observed error rate is 20 times the allowed rate: (0.02 / 0.001 = 20\) times burn rate for that window.
+- Allowed bad-event fraction: `1 - 0.999 = 0.001 = 0.1%`.
+- If the window contains 10,000,000 eligible requests, the illustrative error budget is `10,000,000 × 0.001 = 10,000` bad requests.
+- If 2% of eligible requests are bad during a recent window, the observed error rate is 20 times the allowed rate: `0.02 / 0.001 = 20` times burn rate for that window.
 
 A burn rate is a ratio, not a prediction that the monthly budget will definitely be exhausted. Its meaning depends on the window, traffic mix, and whether the recent rate persists.
 
