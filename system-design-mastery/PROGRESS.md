@@ -120,6 +120,7 @@ Check items only when the work has actually been performed.
 - [x] Recheck every chapter modified during the latest coverage-gap pass (03, 09, 12, 16, 17, 18, 19): balanced fences, no exact duplicate headings, no instructional headings after Further reading, and footer at end.
 - [x] Validate relative internal Markdown links in all created Markdown files against the expected file set; no broken internal targets found.
 - [x] Recheck all 27 Markdown paths in the target tree and the relative links in the landing page and all chapter pages.
+- [x] Re-run relative-link validation across all 27 Markdown files after the latest Chapter 05 and Chapter 12 edits; no broken local targets were found.
 - [ ] Validate Mermaid diagrams with a renderer; currently added diagrams have only been manually reviewed.
 - [x] Perform a static Mermaid inventory check across all 19 chapters: 24 non-empty Mermaid blocks have recognized diagram declarations; actual Mermaid rendering remains unverified because no renderer is available.
 - [x] Check all 19 chapter pages for balanced fenced code blocks and exact duplicate Markdown headings; none were found.
