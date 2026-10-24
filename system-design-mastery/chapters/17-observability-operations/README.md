@@ -79,6 +79,8 @@ A growing queue can indicate the system is accepting more work than it can compl
 
 ## 17.1G Incident diagnosis and runbooks
 
+For a significant or multi-team incident, establish explicit incident command rather than letting every responder coordinate informally. The incident commander tracks priorities and decisions; an operations lead coordinates technical mitigation; a communications lead keeps stakeholders informed; and a scribe records the timeline and decisions. One person may hold multiple roles for a small incident, but ownership and handoffs should remain clear. Separate coordination from hands-on debugging so the team retains a shared view of impact, risks and next actions.
+
 A practical incident sequence is:
 1. Establish customer impact, scope, and start time.
 2. Check traffic, success rate, latency percentiles, and saturation.
@@ -123,6 +125,21 @@ These methods complement rather than replace domain-specific indicators. A datab
 Avoid dashboards that show only averages. Pair rates with p95/p99 duration, queue depth and queue age, and annotate deployments or configuration changes. Use bounded metric labels for service, route template, status class and dependency; put high-cardinality identifiers in controlled logs or traces instead.
 
 
+
+## 17.1J Synthetic checks, deployment markers and external perspective
+
+Metrics from inside a service can miss failures that occur before instrumentation starts or between the service and its users. **Synthetic checks** execute a small, controlled user journey from a known vantage point—for example, resolving the public hostname, establishing TLS, authenticating with a dedicated test identity, and reading a non-destructive health resource. Use synthetic checks to test the actual public path, but keep them bounded, isolated from real customer data, and safe to repeat.
+
+A synthetic check is not a substitute for real-user SLIs. It samples a narrow path at a scheduled interval, may miss failures affecting only some users or tenants, and can itself fail because its runner or credentials are broken. Alert on sustained or critical failures, monitor the check infrastructure, and distinguish “the check could not run” from “the user journey failed.”
+
+Annotate dashboards and incident timelines with **deployment and configuration markers**: artifact version, rollout start/end, feature-flag changes, routing shifts and relevant infrastructure changes. Markers help correlate a change with a symptom; correlation is a hypothesis to test, not proof that the deployment caused the incident. Keep marker data consistent across services and avoid exposing secrets or customer identifiers.
+
+Review checklist:
+- Does the synthetic check traverse the real public path and use a dedicated, least-privilege identity?
+- Is the journey safe, deterministic and non-destructive?
+- Can the team distinguish check-runner failure from application failure?
+- Are synthetic signals compared with real-user SLIs and regional/tenant dimensions?
+- Are releases, configuration changes and traffic shifts visible on the same timeline?
 
 ## 17.2 Observability in practice: from symptom to cause
 
