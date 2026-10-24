@@ -48,6 +48,12 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 - Google, [Cloud Architecture Framework](https://cloud.google.com/architecture/framework).
 
 
+## Architecture documentation, accessibility and sustainability
+- C4 model, [Diagrams](https://c4model.com/diagrams), [Introduction](https://c4model.com/introduction), and [Abstractions](https://c4model.com/abstractions). Use the model to communicate different levels of static structure; add dynamic and deployment views when those questions matter.
+- W3C, [Web Content Accessibility Guidelines (WCAG) 2.2](https://www.w3.org/TR/wcag/).
+- AWS, [Sustainability Pillar](https://docs.aws.amazon.com/wellarchitected/latest/sustainability-pillar/sustainability-pillar.html).
+- Google Cloud, [Sustainability pillar](https://docs.cloud.google.com/architecture/framework/sustainability). These cloud sources are provider guidance, not universal environmental accounting standards.
+
 ## Architecture styles, traffic management and security
 - Microsoft Azure Architecture Center, [Architecture styles](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles) and [Microservices architecture style](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/microservices).
 - AWS, [Elastic Load Balancing documentation](https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/what-is-load-balancing.html).
