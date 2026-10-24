@@ -56,7 +56,8 @@
 - **Client-side prediction:** client-side simulation of a likely result before authoritative server confirmation, later reconciled with authoritative state.
 - **Conflict-free Replicated Data Type (CRDT):** a data type with defined merge/update properties that permit replicas to converge under stated assumptions; convergence alone does not preserve arbitrary business invariants.
 - **Hydration:** attaching client-side behavior to server-rendered HTML, requiring compatible initial state and rendering assumptions.
-- **Local-first/offline-first:** design approach that allows useful work against durable local state and later synchronizes it with shared authoritative state under an explicit conflict policy.
+- **Local-first software:** design approach that treats the user's local copy and ability to work with it as primary, with synchronization to other replicas as a coordinated concern.
+- **Offline-first:** design approach that preserves useful application behavior during disconnection through local state and an explicit synchronization/reconciliation protocol; it does not imply that every operation can be finalized offline.
 - **Micro-frontend:** independently owned or delivered UI module integrated into a larger application, adding runtime, interface, security and performance concerns.
 - **Optimistic UI:** presenting a proposed state change before the authoritative service confirms it; pending, rejected and unknown outcomes still need explicit handling.
 - **Operational Transformation (OT):** method for transforming concurrent editing operations so they can be applied consistently under a defined collaboration protocol.
