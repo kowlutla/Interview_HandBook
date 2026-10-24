@@ -72,3 +72,9 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 
 ## Evidence labels
 In chapter prose, distinguish formal specification/research, implementation documentation, practitioner guidance, and illustrative assumptions. Avoid copying source wording; synthesize it into an original explanation.
+
+
+## Software supply-chain security
+- NIST, [Secure Software Development Framework SP 800-218 v1.1](https://csrc.nist.gov/pubs/sp/800/218/final); the NIST page also lists later draft/revision status.
+- SLSA, [Build track basics](https://slsa.dev/spec/v1.0/), [build provenance](https://slsa.dev/spec/v1.0/provenance), and [current provenance specification](https://slsa.dev/spec/build-provenance).
+- SPDX, [specifications](https://spdx.dev/use/specifications/) and the [SPDX 3.0.1 specification](https://spdx.github.io/spdx-spec/).
