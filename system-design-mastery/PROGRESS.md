@@ -76,6 +76,7 @@ Check items only when the work has actually been performed.
 - [x] Make powers-of-two binary capacity units explicit in Chapter 3 and map the concept to the capacity/performance inventory.
 - [x] Make the CI/CD lifecycle and pipeline trust boundary explicit in Chapter 18, with guidance on isolated builds, least-privilege credentials, untrusted contributions, artifact provenance and release promotion; add the OWASP CI/CD security source.
 - [x] Add Chapter 17 coverage for synthetic user-journey checks, deployment/configuration markers, and explicit incident-command roles; document the limits of synthetic checks versus real-user SLIs.
+- [x] Clarify database buffer/page caches versus application-level object caches in Chapter 9, including the operational signals needed to evaluate each layer.
 - [x] Add a Chapter 9 cross-tenant/cache-poisoning test matrix covering tenant and role variation, header/key poisoning, revocation, stale-fill races and cache failure.
 - [x] Add a Chapter 19 cross-pattern review of retry/hedge/breaker interactions, aggregate pool limits, cache/replica freshness, outbox/inbox, failover fencing and replay side effects.
 - [x] Add a Chapter 6 worked OpenAPI evolution example covering additive fields, breaking changes, contract tests and deprecation gates.
