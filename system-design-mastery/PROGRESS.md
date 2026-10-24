@@ -124,6 +124,7 @@ Check items only when the work has actually been performed.
 - [ ] Review assumptions, caveats and implementation-specific claims.
 - [ ] Audit for missing topics, duplication and out-of-scope content.
 - [x] Verify final repository path boundary against the original textbook baseline; the checked comparison contains no paths outside system-design-mastery/.
+- [x] Final baseline comparison after the latest edits: 45 changed paths, all under `system-design-mastery/`; the target tree contains 27 Markdown files and 19 chapter README pages.
 - [ ] Report limitations honestly; do not claim the textbook complete until all acceptance checks pass.
 
 ## Current status
