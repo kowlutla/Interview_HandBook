@@ -452,7 +452,7 @@ To avoid leaving renderer/spec validation as a purely environmental blocker, a r
 - One CI job installs `openapi-spec-validator` and validates the extracted specification.
 - A separate CI job installs the official Mermaid CLI, renders each diagram to SVG, checks that all 29 outputs exist, and uploads the rendered files as an artifact.
 
-**Current status: configured, not yet proven passing.** The files were re-fetched after creation and the chapter-root path in the extraction script was corrected. A completed workflow result has not yet been retrieved; therefore neither real Mermaid rendering nor full OpenAPI validation is marked passed. Once the Actions run completes, inspect both job results and repair any failures before acceptance. If Mermaid CLI cannot install its browser/runtime on the hosted runner, use its documented container alternative or pin a compatible CLI/browser combination and rerun. If OpenAPI validation flags an issue, confirm against the versioned OpenAPI 3.1 specification and fix the actual contract rather than suppressing the error.
+**Status at this historical checkpoint:** the workflow and extractor had been committed but no completed run had yet been inspected. Subsequent inspection found and fixed the runner's Chromium sandbox issue; run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824) then passed both jobs: `openapi-spec-validator` succeeded for the embedded Chapter 06 document and all 29 Mermaid diagrams rendered to SVG. See **Confirmed CI run** below for the evidence. Content-depth, source alignment, and manual visual review remain separate acceptance work.
 
 
 ## Additional depth corrections — storage and Kafka guarantees — 2026-10-24
