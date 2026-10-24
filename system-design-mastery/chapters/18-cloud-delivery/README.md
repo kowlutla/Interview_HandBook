@@ -262,15 +262,6 @@ A secure pipeline needs an exception process: findings must have owners, severit
 - Can a compromised artifact be traced, blocked and replaced through a tested response?
 
 
-## Further reading
-- Docker [container fundamentals](https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-a-container/).
-- Kubernetes [documentation](https://kubernetes.io/docs/home/).
-- AWS [Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
-- NIST, [Secure Software Development Framework (SP 800-218 v1.1)](https://csrc.nist.gov/pubs/sp/800/218/final); check the NIST page for later revisions or drafts before using it as a current compliance baseline.
-- SLSA, [approved specification v1.2](https://slsa.dev/spec/v1.2/), [Build track basics](https://slsa.dev/spec/v1.2/build-track-basics), and [Build provenance](https://slsa.dev/spec/v1.2/build-provenance). Use versioned approved specifications for stable reference; draft pages may change.
-- SPDX, [specifications](https://spdx.dev/use/specifications/) for machine-readable software bill of materials formats.
-
-
 ## Safe delivery through compatible states
 
 ```mermaid
@@ -286,6 +277,15 @@ flowchart TD
 ```
 
 Rollback can be unsafe if the new version has already changed data or emitted incompatible events. Prefer expand-and-contract migrations and make rollback criteria explicit before deployment.
+
+## Further reading
+- Docker [container fundamentals](https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-a-container/).
+- Kubernetes [documentation](https://kubernetes.io/docs/home/).
+- AWS [Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
+- NIST, [Secure Software Development Framework (SP 800-218 v1.1)](https://csrc.nist.gov/pubs/sp/800/218/final); check the NIST page for later revisions or drafts before using it as a current compliance baseline.
+- SLSA, [approved specification v1.2](https://slsa.dev/spec/v1.2/), [Build track basics](https://slsa.dev/spec/v1.2/build-track-basics), and [Build provenance](https://slsa.dev/spec/v1.2/build-provenance). Use versioned approved specifications for stable reference; draft pages may change.
+- SPDX, [specifications](https://spdx.dev/use/specifications/) for machine-readable software bill of materials formats.
+
 
 
 ---
