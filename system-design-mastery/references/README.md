@@ -70,7 +70,7 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 - IETF, [RFC 4033 — DNS Security Introduction and Requirements](https://www.rfc-editor.org/rfc/rfc4033.html).
 - IETF, [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
 - OWASP, [Webhook Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Webhook_Security_Cheat_Sheet.html).
-- CISA and international partners, [Software Bill of Materials (SBOM) guidance](https://www.cisa.gov/sbom).
+- CISA and international partners, [2026 Minimum Elements for a Software Bill of Materials (July 2026)](https://content.govdelivery.com/accounts/USDHSCISA/bulletins/422a7eb) and [CISA SBOM resources](https://www.cisa.gov/sbom); check current guidance for the intended software and regulatory context.
 
 ## Evidence labels
 In chapter prose, distinguish formal specification/research, implementation documentation, practitioner guidance, and illustrative assumptions. Avoid copying source wording; synthesize it into an original explanation.
