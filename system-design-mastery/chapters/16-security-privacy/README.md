@@ -251,6 +251,49 @@ A deprecation plan should include consumer identification, communication, migrat
 - Do negative authorization tests cover multiple tenants and roles?
 - Are errors and audit events useful without exposing sensitive data?
 
+## 16.4 Worked threat model: tenant-scoped document export
+
+Assume a multi-tenant SaaS application lets a user search documents and request an asynchronous export as a downloadable archive. The export worker reads from a database and object storage, writes a generated file, and notifies the requester when it is ready. The key security invariant is: **a principal may export only documents that the current authorization policy permits them to access in their tenant and resource state**.
+
+### Identify assets, actors and trust boundaries
+
+| Element | Security significance | Boundary or control question |
+|---|---|---|
+| Browser/client | Untrusted request parameters, document IDs and forwarded headers | Is identity authenticated, and is tenant scope derived from trusted identity/policy rather than accepted from a client field? |
+| API gateway/edge | Authentication integration, request limits and routing | Which identity claims are validated here, and which authorization checks must still occur in the service? |
+| Document API and database | Authoritative metadata and access policy | Does every search, list, direct-ID read and export-selection query enforce object-level and tenant-level authorization? |
+| Queue and export worker | Delayed execution may outlive the user's original session or permissions | Is tenant and requester context authenticated and integrity-protected, and is authorization rechecked when the job runs? |
+| Object storage and download link | Generated archive can expose many records at once | Is the object path tenant-scoped, access-controlled and short-lived where a signed URL is used? |
+| Logs, audit and support tools | May expose metadata or allow privileged access | Are access decisions auditable without logging document contents, credentials or unnecessary personal data? |
+
+### Abuse cases and controls
+
+| Abuse case | Preventive control | Detection and recovery evidence |
+|---|---|---|
+| User changes a document ID to another tenant's ID | Object-level authorization at each read/export path; deny by default | Negative cross-tenant tests and audit event for denied access |
+| User submits another tenant ID in the request body | Derive authorized tenant scope from identity and policy; treat client tenant ID only as a requested scope to validate | Tests spoofed tenant IDs across list, search and export APIs |
+| User is authorized when creating a job but loses access before execution | Recheck current policy at execution time or explicitly document a justified snapshot-of-authorization contract | Test permission revocation between enqueue and worker execution |
+| Queue message is forged or altered | Authenticate producer/consumer identities, restrict queue ACLs, validate message schema and tenant/resource references | Alerts for invalid producer identity, malformed payloads and unexpected tenant context |
+| Download URL is leaked or remains valid too long | Short expiry, narrow object scope, least-privilege access and safe response headers | Audit downloads, test expiration and revoke/delete objects according to policy |
+| Export request exhausts CPU, storage or queue capacity | Per-tenant quotas, bounded concurrency, maximum export size and rate/cost limits | Per-tenant rejected work, queue age, export duration and storage growth |
+| Logs or support tooling reveal other tenants' data | Minimize logged fields, enforce operator access, audit privileged reads and redact sensitive content | Periodic access review and tested incident response for exposure |
+
+### Authorization is checked at each boundary
+
+Passing gateway authentication does not prove permission to export a particular document. A valid tenant ID does not prove membership. A queue message does not become trusted merely because it came from an internal network. A generated object is still protected data even after it leaves the database.
+
+Carry the minimum context needed to execute the job, bind it to an authenticated producer and a stable job ID, and validate every resource reference against the authorized scope. Define whether permission changes cancel queued jobs, prevent new export generation, revoke existing downloads, or trigger deletion of previously generated artifacts. These are policy decisions that need explicit semantics.
+
+### Verification matrix
+
+- [ ] User from tenant A cannot read, search, export or download tenant B's documents by changing IDs or filters.
+- [ ] Authorization is enforced consistently across synchronous API, queue consumer, object storage and support/admin tools.
+- [ ] Revoking access after enqueue has the documented effect when the worker later executes.
+- [ ] Duplicate queue deliveries do not create inconsistent export state or bypass authorization.
+- [ ] Export size, concurrency and tenant budgets prevent one tenant from exhausting shared capacity.
+- [ ] Signed URLs cannot access a different object and expire within the defined policy.
+- [ ] Audit records capture requester, tenant, decision, resource scope and job outcome without exposing document contents or credentials.
+- [ ] Data retention and deletion cover source records, generated archives, replicas, backups and logs according to the applicable policy.
 
 ## Further reading
 - IETF [RFC 9700 — OAuth 2.0 Security BCP](https://www.rfc-editor.org/rfc/rfc9700.html).
