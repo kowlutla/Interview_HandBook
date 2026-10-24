@@ -37,6 +37,7 @@ Check items only when the work has actually been performed.
 - [x] Add C4 model, WCAG 2.2 and provider sustainability references to support the latest chapter expansions.
 - [x] Add The Tail at Scale as a primary reference and update the OWASP API Security Top 10 link to its canonical current domain.
 - [x] Add NIST SSDF, SLSA provenance and SPDX specification references to support cloud software-supply-chain guidance; check that SP 800-218 v1.1 is labeled as a final publication while later revision status is checked separately.
+- [x] During the source spot-check, identify that SLSA v1.0 pages are retired and update chapter/reference links to the approved v1.2 specification and versioned build-provenance pages.
 
 ## Textbook implementation
 - [x] Draft all 19 chapter files.
