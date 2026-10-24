@@ -266,3 +266,18 @@ The first human-readable consolidation pass now covers all 20 chapters. Earlier 
 ## Rapid verification sprint — 2026-10-24
 
 A fresh fetch and structural scan of the current default-branch versions of all 20 chapter pages found balanced fenced blocks, no exact duplicate Markdown headings, a Further reading section, and the expected navigation footer in every chapter. The scan counted 22 Mermaid declarations in chapter pages. These results support structural integrity only; they do not prove that Mermaid renders, that the OpenAPI example passes a parser, or that the technical claims and source links are fully verified. All 21 mandatory inventory rows therefore remain provisional, and no row is promoted to Deep on the basis of this scan.
+
+
+## Targeted technical verification sprint — 2026-10-24
+
+The following scoped checks were completed during the rapid closeout pass; they do not upgrade the corresponding inventory rows from Developing to Deep.
+
+- **Chapter 03 capacity arithmetic:** recalculated average and peak request rates, payload bandwidth, Little's Law concurrency, and the simplified 25%-capacity-loss instance estimate. The arithmetic matches the stated assumptions and rounding.
+- **Chapter 10 distributed consistency:** reviewed quorum-intersection caveats, the distinction between formal CAP availability and business usefulness, session consistency, and the statement that quorum arithmetic alone does not prove linearizability.
+- **Chapter 11 coordination:** reviewed the distinction between saga compensation and atomic rollback, the scope limits of exactly-once claims, fencing at the protected resource, and protocol-safe membership changes.
+- **Chapter 14 reliability:** recalculated the request-based 99.9% SLO example (50 million eligible requests yields 50,000 bad events of budget; a 1% observed error rate is a 10x burn rate against a 0.1% target). The chapter explicitly distinguishes request-based from time-based SLOs.
+- **Chapter 19 Bloom filter:** recalculated the standard sizing approximation for one million items and a 1% target false-positive rate (about 9.585 million bits, 1.20 MB decimal / 1.14 MiB, and roughly seven hash functions). The text appropriately treats this as an estimate under stated assumptions.
+- **Chapter 06 OpenAPI example:** parsed the YAML with PyYAML and checked core invariants; the path-template and required path-parameter rules were cross-checked against the official [OpenAPI 3.1.0 specification](https://spec.openapis.org/oas/v3.1.0.html). This is not a full specification validator.
+- **SLO evidence:** checked Google's [SRE Workbook error-budget policy](https://sre.google/workbook/error-budget-policy/) for the definition of error budget as 1 minus the SLO and the dependence of request budgets on the chosen SLI.
+
+**Still open:** no Mermaid renderer was obtained because the npx attempt timed out; no full OpenAPI linter was run. These checks are targeted, not a claim-by-claim source audit. All 21 curriculum inventory statuses remain provisional; the independent coverage, external-link, source alignment and cross-chapter consistency reviews are not complete.
