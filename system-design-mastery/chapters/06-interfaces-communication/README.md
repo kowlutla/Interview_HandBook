@@ -352,25 +352,6 @@ Safer sequence:
 - [ ] Can old and new server/client versions coexist during rollout?
 - [ ] Is deprecation based on measured usage and a communicated support policy?
 
-## Retry safely when the outcome is uncertain
-
-```mermaid
-sequenceDiagram
-  participant Client
-  participant API
-  participant Store as Durable state
-  Client->>API: Command + idempotency key
-  API->>Store: Atomically claim key and perform effect
-  Store-->>API: Stored result
-  API--xClient: Response lost or timed out
-  Client->>API: Retry same key
-  API->>Store: Look up key and prior result
-  Store-->>API: Original result
-  API-->>Client: Return original result
-```
-
-The key must be scoped, retained for a defined period, and bound to a request fingerprint so a different command cannot accidentally reuse the same key. The state change and the deduplication record must share a reliable transactional boundary.
-
 ## Further reading
 - OWASP, [Webhook Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Webhook_Security_Cheat_Sheet.html), covering signatures, replay protection, duplicate processing and SSRF risks.
 - AWS API Gateway, [HTTP API throttling](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-throttling.html) as an implementation-specific token-bucket example.
