@@ -365,9 +365,9 @@ Before adopting a client-side or real-time mechanism, document:
 ## Further reading
 
 - MDN, [WebSockets API](https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API) and [Server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events).
-- MDN, [WebRTC API](https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API).
+- MDN, [WebRTC API](https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API) and [WebRTC protocols](https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Protocols) for ICE, STUN, TURN and SFU concepts.
 - Cloudflare, [TURN FAQ](https://developers.cloudflare.com/realtime/turn/faq/) — provider-specific explanation of encrypted WebRTC media relay and connection metadata.
-- W3C, [Service Workers](https://www.w3.org/TR/service-workers/) and [Indexed Database API](https://www.w3.org/TR/IndexedDB-3/).
+- W3C, [Service Workers](https://www.w3.org/TR/service-workers/) (a living Candidate Recommendation Draft at the time of review) and [Indexed Database API 3.0](https://www.w3.org/TR/IndexedDB-3/) (a Working Draft at the time of review); treat these as evolving specifications, not finalized Recommendations.
 - MDN, [Storage quotas and eviction criteria](https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria) and [IndexedDB API](https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API).
 - web.dev, [Rendering on the Web](https://web.dev/articles/rendering-on-the-web).
 - Martin Fowler, [Micro Frontends](https://martinfowler.com/articles/micro-frontends.html).
