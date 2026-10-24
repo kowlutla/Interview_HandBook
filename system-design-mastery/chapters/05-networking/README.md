@@ -447,20 +447,6 @@ Assume client requests time out after two seconds. The service logs show some su
 - [ ] Does the mitigation reduce user impact without amplifying retries or moving overload downstream?
 
 
-## Further reading
-- IETF, [RFC 8200 — IPv6 Specification](https://www.rfc-editor.org/rfc/rfc8200.html).
-- IETF, [RFC 4033 — DNS Security Introduction and Requirements](https://www.rfc-editor.org/rfc/rfc4033.html).
-- IETF, [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
-- IETF, [RFC 9000 — QUIC Transport](https://www.rfc-editor.org/info/rfc9000/).
-- IETF, [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html) and [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html).
-- AWS, [Elastic Load Balancing overview](https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/what-is-load-balancing.html) for product-specific load-balancer behavior.
-- Cloudflare, [Origin Cache Control](https://developers.cloudflare.com/cache/concepts/cache-control/) and [CDN-Cache-Control](https://developers.cloudflare.com/cache/concepts/cdn-cache-control/) for CDN-specific cache behavior; use RFC 9111 for general HTTP semantics.
-- IETF [RFC 9293 — TCP](https://www.rfc-editor.org/rfc/rfc9293.html).
-- IETF [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
-- IETF [RFC 9000 — QUIC](https://www.rfc-editor.org/info/rfc9000/).
-- IETF [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html).
-
-
 ## Follow one request through the network
 
 This simplified sequence highlights the logical stages. Implementations reuse connections and caches, so DNS, TCP, and TLS may not run for every request.
@@ -483,6 +469,20 @@ sequenceDiagram
 ```
 
 Transport acknowledgment proves delivery of bytes at a transport boundary, not completion of the application operation. See the timeout and idempotency discussion in [Interfaces and Communication](../06-interfaces-communication/README.md).
+
+## Further reading
+- IETF, [RFC 8200 — IPv6 Specification](https://www.rfc-editor.org/rfc/rfc8200.html).
+- IETF, [RFC 4033 — DNS Security Introduction and Requirements](https://www.rfc-editor.org/rfc/rfc4033.html).
+- IETF, [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
+- IETF, [RFC 9000 — QUIC Transport](https://www.rfc-editor.org/info/rfc9000/).
+- IETF, [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html) and [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html).
+- AWS, [Elastic Load Balancing overview](https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/what-is-load-balancing.html) for product-specific load-balancer behavior.
+- Cloudflare, [Origin Cache Control](https://developers.cloudflare.com/cache/concepts/cache-control/) and [CDN-Cache-Control](https://developers.cloudflare.com/cache/concepts/cdn-cache-control/) for CDN-specific cache behavior; use RFC 9111 for general HTTP semantics.
+- IETF [RFC 9293 — TCP](https://www.rfc-editor.org/rfc/rfc9293.html).
+- IETF [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
+- IETF [RFC 9000 — QUIC](https://www.rfc-editor.org/info/rfc9000/).
+- IETF [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html).
+
 
 
 ---
