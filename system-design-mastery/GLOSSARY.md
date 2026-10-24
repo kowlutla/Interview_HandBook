@@ -1,6 +1,7 @@
 # Glossary
 
 - **Admission control:** deciding whether to accept work based on capacity or policy.
+- **Anti-corruption layer:** an adapter boundary that translates an external or legacy model into local domain concepts without leaking the upstream model into the core.
 - **API gateway:** API-facing entry point that routes requests and may enforce shared authentication integration, quotas, validation, transformation and telemetry; it does not replace domain-level authorization.
 - **Backpressure:** mechanism that slows upstream production when downstream capacity is insufficient.
 - **CDN (Content Delivery Network):** geographically distributed edge infrastructure that can cache and deliver eligible content closer to users.
@@ -31,6 +32,7 @@
 - **Concurrency:** tasks are in progress over overlapping periods; they need not execute simultaneously.
 - **Consistency model:** rules defining which values and operation orders clients may observe.
 - **Consensus:** processes agree on a value or ordered decisions despite a specified class of failures.
+- **Database-per-service:** each service owns its authoritative data boundary; it need not imply a separate physical database server for every service.
 - **Durability:** acknowledged committed changes survive the failures covered by the system's contract.
 - **Eventual consistency:** if updates stop and communication/reconciliation continues under the model's assumptions, replicas eventually converge; interim reads are not fully specified by this phrase alone.
 - **Idempotency:** repeating an operation has the same intended effect within a defined scope and key lifetime.
