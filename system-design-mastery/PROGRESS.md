@@ -10,7 +10,7 @@ Check items only when the work has actually been performed.
 - [x] Confirmed destination README was absent at the checked path before creation.
 - [x] Established strict write boundary: system-design-mastery/.
 - [x] Designed an independent curriculum around learning dependencies rather than existing numbering.
-- [x] Inspect the complete repository tree: the target contains eight planning/reference Markdown files and 19 chapter README files, with no extra Markdown lesson fragments.
+- [x] Inspect the complete repository tree: the target now contains eight planning/reference Markdown files and 20 chapter README files, with no extra Markdown lesson fragments.
 - [x] Compare commits from the first textbook creation through the latest edit; all paths in the checked comparison are under system-design-mastery/.
 
 ## Planning artifacts
@@ -51,8 +51,8 @@ Check items only when the work has actually been performed.
 - [x] Parse the Chapter 6 OpenAPI YAML excerpt and manually verify its version field, path parameter, response and required schema fields; a dedicated OpenAPI validator/linter run remains open.
 
 ## Textbook implementation
-- [x] Draft all 19 chapter files.
-- [x] Reorganize the textbook into 19 chapter folders, each with one coherent README.md chapter page.
+- [x] Draft all 20 chapter files, including the new client-side/offline-first/real-time architecture chapter.
+- [x] Reorganize the textbook into 20 chapter folders, each with one coherent README.md chapter page.
 - [x] Avoid over-fragmentation: consolidate chapters into a single reading file per folder rather than many tiny lesson files.
 - [x] Add Mermaid diagrams where request flows, data paths, decision loops, or recovery sequences benefit from visualization.
 - [x] Create glossary.
@@ -61,6 +61,12 @@ Check items only when the work has actually been performed.
 - [x] Perform a scoped review of Chapter 03 capacity arithmetic, Chapter 04 deadline/cancellation semantics, Chapter 10 consistency claims, and Chapter 12 consumer-offset crash timelines; correct Kafka's record-offset versus next-position wording and record the review limits in COVERAGE-AUDIT.md.
 - [x] Perform a scoped review of Chapter 05 timeout troubleshooting, Chapter 06 OpenAPI evolution, Chapter 07 write-skew reasoning, and Chapter 11 fencing; record inspected claims and remaining implementation/source-verification limits in COVERAGE-AUDIT.md.
 - [x] Recalculate Chapter 13 concurrency-limit deltas, Chapter 14 SLO/recovery arithmetic, Chapter 17 error-budget math, and Chapter 19 Bloom-filter sizing; record remaining technical/source-review boundaries in COVERAGE-AUDIT.md.
+- [x] Expand the curriculum from 19 to 20 chapters after the independent gap scan identified missing client-side, offline-first and real-time architecture coverage.
+- [x] Add Chapter 20 covering rendering/delivery, client/server state ownership, offline persistence, synchronization/conflict resolution, realtime transports, WebRTC, collaboration, micro-frontends, interactive sessions, security and operations.
+- [x] Add Chapter 20 to the textbook index, learning roadmap, curriculum matrix, mandatory inventory, coverage audit and glossary.
+- [ ] Review Chapter 20's technical claims against primary/official sources; verify rendering/security details and all external references.
+- [ ] Perform a current structural and relative-link check across all 28 Markdown files after adding Chapter 20.
+- [ ] Validate the two new Mermaid diagrams with a renderer; currently they have only been manually inspected.
 - [ ] Review each module for accuracy, clarity, depth and prerequisite coverage.
 - [x] Expand chapters 1–5 with additional first-principles explanations, mechanisms, edge cases, failure modes, operational checklists, and worked reasoning where appropriate.
 - [x] Add a Chapter 5 protocol deep dive covering IPv6, DNSSEC versus encrypted DNS, TLS/mTLS, HTTP/2 versus HTTP/3, and DDoS/resource exhaustion, with relevant RFC references.
@@ -146,3 +152,7 @@ The independent curriculum and all 19 chapter drafts have been reorganized into 
 
 
 Latest editorial correction and verification: a whole-book heading-order audit found supplemental worked diagrams/guidance placed after Further reading in multiple chapters. Those sections were moved into the instructional body before Further reading. A fresh check of all 19 chapter pages then confirmed balanced fenced blocks, no exact duplicate headings, no instructional headings after Further reading, and navigation footers at the end. Relative Markdown targets were also checked across all 27 Markdown files in the target tree; no missing local targets were found. This structural pass does not validate Mermaid rendering or prove technical claims; the full claim-by-claim and source-link audits remain open.
+
+
+## Scope extension — 2026-10-24
+The independent curriculum review found that the 19-chapter draft did not meaningfully cover client-side rendering/delivery, offline-first persistence, synchronization and conflict resolution, persistent real-time transports, WebRTC, collaborative editing, or micro-frontends. Rather than mark those topics as covered by passing mentions in API/network chapters, a dedicated Chapter 20 was added and linked from the landing page, roadmap, curriculum, coverage audit and glossary. The mandatory inventory now contains 21 topic families (the original 20 plus client-side/real-time architecture). Chapter 20 is substantive but remains **Developing** until its sources, assumptions, examples and diagrams receive the same independent verification as the other chapters.
