@@ -1,38 +1,8 @@
 # 7. Data Modeling and Relational Systems
 
-## Model the domain before optimizing storage
-A data model expresses entities, relationships, constraints, and facts the system must preserve. Start with the questions the system must answer and changes it must make. A schema designed only around an ORM object graph may perform poorly for high-volume filtering, aggregation, or transactional updates.
+A relational database is more than a place to store rows: its schema, constraints, transactions and query planner help preserve business invariants while serving real workloads. Start from the facts the product must represent and the operations it must support, then choose constraints, indexes and transaction boundaries that make those operations correct and affordable.
 
-Relational systems represent data as relations with defined attributes and constraints. SQL is declarative: it describes the desired result, while the optimizer chooses a physical plan.
-
-## Keys, constraints, normalization
-A primary key identifies a row. Foreign keys enforce relationships. Unique, check and not-null constraints encode invariants near the data, protecting against multiple application instances and alternate write paths. Surrogate keys simplify identity; natural keys express domain meaning. Key choice can affect index size, locality, distribution and migration.
-
-Normalization reduces duplication and update anomalies. Denormalization deliberately duplicates or precomputes information to reduce joins or make reads cheaper. It moves work from reads to writes and creates a freshness or reconciliation obligation. Duplicated values need a source of truth and a repair strategy.
-
-## Indexes and query plans
-An index helps locate rows without scanning a full table. B-trees support ordered traversal and range queries; hash indexes target equality lookups where supported. Other index types serve specialized operations such as spatial or full-text search. Indexes cost storage, memory and write work.
-
-Composite index column order matters. An index on tenant identifier then creation time may support filtering by tenant and ordering by time better than the reverse, depending on the query and engine. Inspect actual plans and statistics. An optimizer can choose a sequential scan when it estimates that cheaper, and skew or stale statistics can make estimates wrong. See [PostgreSQL indexes](https://www.postgresql.org/docs/current/indexes.html) and [EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html).
-
-## Transactions and ACID
-- **Atomicity:** changes apply as a unit or are not applied.
-- **Consistency:** correctly defined transactions preserve declared invariants.
-- **Isolation:** concurrent transactions interact according to an isolation model.
-- **Durability:** committed changes survive failures covered by the system contract.
-
-ACID does not imply every transaction is serializable or that acknowledged data survives every imaginable disaster. Durability depends on configuration, replication, storage and the failure model.
-
-Isolation anomalies include dirty reads, non-repeatable reads, phantoms, lost updates and write skew. Their definitions and guarantees vary by engine and isolation level. Locks can block, deadlock and reduce concurrency. MVCC supports concurrent reads and writes through versions but still needs conflict handling and storage maintenance. Optimistic version checks detect stale updates; they do not eliminate conflicts.
-
-## Replicas, shards and migrations
-Read replicas can distribute load but asynchronous replication introduces lag. A read immediately after a successful write may return an older value. Read-your-writes requires an explicit mechanism such as routing, waiting for a version, or session affinity.
-
-Sharding adds capacity but complicates routing, rebalancing, cross-shard queries and transactions. A shard key should distribute storage and dominant workload; high cardinality alone does not prevent skew if a few values dominate traffic.
-
-Schema changes must support old and new application versions during rollout. Expand-and-contract migrations add compatible structures, deploy compatible code, backfill safely, verify, then remove obsolete structures. Backfills need throttling and observability.
-
-A backup is useful only if it can be restored within objectives. Test restore, integrity, schema, logs, keys and configuration. Retention and deletion must account for replicas, backups and derived data.
+The sections below develop the main decisions in depth: modeling and constraints, concurrency and isolation, query plans, maintenance, replicas, migrations and sharding. The worked examples return to the same principle: correctness must hold under concurrent requests and operational change, not only in a single successful request.
 
 
 ## 7.1A Functional dependencies and normalization reasoning
@@ -136,50 +106,11 @@ The invariant is that available inventory must never become negative and each su
 
 A unique constraint can prevent duplicate reservation identifiers; it does not by itself enforce the aggregate inventory invariant. Correctness often needs both database constraints and a transaction protocol.
 
-### Isolation levels do not replace invariant analysis
-
-Read committed, repeatable read, snapshot isolation and serializable execution have different semantics across database engines. A transaction can read a consistent snapshot yet still participate in write skew when two transactions update different rows after checking a shared predicate. For example, two doctors may each check that another doctor is on call and independently mark themselves off call; each transaction's local row update succeeds, but the global “at least one doctor on call” invariant is violated.
-
-Possible solutions include a declarative constraint when the invariant can be expressed, locking a shared coordination row, using serializable transactions with retry, or redesigning state so the invariant is enforced by one atomic operation. Choose based on actual database guarantees and test the conflict behavior.
-
-### Query plans: cardinality before syntax
-
-A query's cost is driven by rows read and processed, data distribution, memory, I/O and network round trips—not merely by SQL length. The optimizer estimates cardinalities and selects scans, joins, sort operations and index access. A bad estimate can choose an expensive join order or underestimate memory needs. Compare estimated and actual row counts, index selectivity, rows removed by filters, sort spills and buffer reads.
-
-An index should support a real predicate/order pattern. Composite index order matters: an index on (tenant_id, created_at, id) can support tenant-scoped chronological pagination and the tie-breaker, while it may not be equally useful for a query filtering only on created_at. Every index adds storage and write work, and an index with low selectivity may not beat a table scan.
-
 ### Connection pools are admission control
 
 A database connection pool bounds concurrent database work and reuses expensive connections. Too-small pools can create application-side queueing; too-large pools can overwhelm the database with concurrent queries, memory use, lock contention and context switching. Across many application replicas, pool sizes multiply. If 40 replicas each allow 50 active database connections, the database may face 2,000 connections before administrative and other workloads are counted.
 
 Set pool limits from database capacity, query cost, service concurrency and the total replica count. Observe acquisition wait separately from query execution latency. Use bounded acquisition timeouts and fail predictably rather than building an invisible unbounded queue in the application.
-
-### Safe schema evolution across mixed application versions
-
-During rolling deployment, old and new application versions coexist. A safe expand-and-contract migration generally:
-1. Adds new nullable/compatible structures without removing the old contract.
-2. Deploys code that can read/write in a backward-compatible way.
-3. Backfills existing data in bounded, restartable batches.
-4. Validates counts and invariants, then switches reads/writes.
-5. Waits until old application versions and consumers are gone.
-6. Removes obsolete schema only in a later safe step.
-
-Backfills are production workloads: they can saturate I/O, grow logs, hold locks, lag replicas and compete with customer queries. Use checkpoints, rate limits, idempotent batches, observability, and pause/rollback criteria.
-
-### Relational design checklist
-
-- What invariant must always hold, and where is it enforced atomically?
-- Which constraints protect against concurrent duplicate or invalid writes?
-- Which isolation anomalies could violate a multi-row rule?
-- Are actual query plans consistent with the workload assumptions?
-- Does the composite index match the leading predicates and sort order?
-- Is connection-pool concurrency safe across all service replicas?
-- Can a migration run while old and new application versions coexist?
-- Can backfills pause, resume, and be validated without blocking production?
-- What is the backup and point-in-time restore procedure?
-- Which freshness guarantees apply when reads are served from replicas?
-
-
 
 ## 7.2 Sharding and resharding: a worked design example
 
