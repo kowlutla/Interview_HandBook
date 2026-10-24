@@ -23,7 +23,7 @@ Check items only when the work has actually been performed.
 - [x] Editorial and verification standard.
 - [ ] Independent curriculum completeness and duplication review.
 - [ ] Independently verify each mapped mandatory inventory row's coverage status and evidence; promote to Deep only after its acceptance criteria pass.
-- [x] Draft a row-by-row map for all 20 mandatory curriculum topic families to exact teaching sections, with provisional statuses and explicit verification gaps; independent status verification remains open.
+- [x] Draft a row-by-row map for all 21 mandatory curriculum topic families to exact teaching sections, with provisional statuses and explicit verification gaps; independent status verification remains open.
 - [x] Add targeted curriculum-gap sections for service discovery/configuration (Chapter 15), OAuth/OIDC token roles (Chapter 16), RED/USE observability methods (Chapter 17), and cloud service models (Chapter 18).
 
 ## Research
@@ -35,7 +35,7 @@ Check items only when the work has actually been performed.
 - [x] Recalculate Chapter 17's request-based SLO example: a 99.9% target permits a 0.1% bad-event fraction, 10 million eligible requests imply 10,000 bad events of budget, and a 2% observed error rate is a 20× burn rate for that window.
 - [x] Add the official OpenTelemetry documentation to the targeted evidence log for observability signals, context propagation and sampling; implementation-specific behavior remains version/language dependent.
 - [x] Expand the reference library with official architecture-style, load-balancing, API-gateway throttling, CDN-cache-control, and API-security guidance.
-- [x] Scan all 19 chapter Further reading blocks for duplicate URLs; remove duplicated RFC references in Chapter 05 and add an explicit RFC 9111 HTTP-caching link. The scan found no duplicate URLs in the other 18 chapter blocks; external link liveness and claim alignment remain open.
+- [x] At the original 19-chapter checkpoint, scan all Further reading blocks for duplicate URLs; remove duplicated RFC references in Chapter 05 and add an explicit RFC 9111 HTTP-caching link. Chapter 20 was added later and needs its own full source-link audit.
 - [x] Scan the 73 URL occurrences in the reference catalog for duplicate destinations; all 73 were unique. Link liveness, redirect behavior, and claim-to-source alignment remain open.
 - [ ] Recheck all source links during final audit.
 - [x] Spot-check newly added protocol references against RFC Editor records and correct the RFC 9000 reference to the stable RFC information page; broader source-link verification remains open.
@@ -93,7 +93,7 @@ Check items only when the work has actually been performed.
 - [x] Add the OWASP Injection Prevention and SQL Injection Prevention Cheat Sheets to the reference library and link them from Chapter 16.
 - [x] Spot-check OWASP injection-prevention URLs against the live Cheat Sheet pages; correct the SQL injection link to the verified HTML endpoint and make the SPDX reference version-neutral where the official index and spec redirect differ.
 - [x] Spot-check the current OWASP Webhook Security Cheat Sheet and Debezium stable Outbox Event Router pages; implementation-specific validation remains required.
-- [x] Inventory external URLs in all 19 chapter pages and the reference catalog; standardize the remaining Chapter 6 OWASP API Security link and replace the dated AWS Well-Architected curriculum link with the current framework entry point.
+- [x] At the original 19-chapter checkpoint, inventory external URLs in the chapter pages and reference catalog; standardize the remaining Chapter 6 OWASP API Security link and replace the dated AWS Well-Architected curriculum link with the current framework entry point. Chapter 20 received a targeted source check, not a full link audit.
 - [x] Add an explicit idempotent-receiver pattern explanation in Chapter 19 and define it in the glossary to match the mandatory cross-cutting pattern inventory.
 - [x] Make powers-of-two binary capacity units explicit in Chapter 3 and map the concept to the capacity/performance inventory.
 - [x] Make the CI/CD lifecycle and pipeline trust boundary explicit in Chapter 18, with guidance on isolated builds, least-privilege credentials, untrusted contributions, artifact provenance and release promotion; add the OWASP CI/CD security source.
@@ -148,7 +148,7 @@ Check items only when the work has actually been performed.
 - [ ] Review assumptions, caveats and implementation-specific claims.
 - [ ] Audit for missing topics, duplication and out-of-scope content.
 - [x] Verify final repository path boundary against the original textbook baseline; the checked comparison contains no paths outside system-design-mastery/.
-- [x] Final baseline comparison after the latest edits: 45 changed paths, all under `system-design-mastery/`; the target tree contains 27 Markdown files and 19 chapter README pages.
+- [x] Original 19-chapter baseline comparison: 45 changed paths, all under `system-design-mastery/`; the target then contained 27 Markdown files and 19 chapter README pages. This is historical; the expanded current tree contains 28 Markdown files and 20 chapter README pages.
 - [ ] Report limitations honestly; do not claim the textbook complete until all acceptance checks pass.
 
 ## Current status
