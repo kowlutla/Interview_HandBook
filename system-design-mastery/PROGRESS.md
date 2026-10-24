@@ -72,6 +72,7 @@ Check items only when the work has actually been performed.
 - [x] Spot-check OWASP injection-prevention URLs against the live Cheat Sheet pages; correct the SQL injection link to the verified HTML endpoint and make the SPDX reference version-neutral where the official index and spec redirect differ.
 - [x] Inventory external URLs in all 19 chapter pages and the reference catalog; standardize the remaining Chapter 6 OWASP API Security link and replace the dated AWS Well-Architected curriculum link with the current framework entry point.
 - [x] Add an explicit idempotent-receiver pattern explanation in Chapter 19 and define it in the glossary to match the mandatory cross-cutting pattern inventory.
+- [x] Make powers-of-two binary capacity units explicit in Chapter 3 and map the concept to the capacity/performance inventory.
 - [x] Add a Chapter 9 cross-tenant/cache-poisoning test matrix covering tenant and role variation, header/key poisoning, revocation, stale-fill races and cache failure.
 - [x] Add a Chapter 19 cross-pattern review of retry/hedge/breaker interactions, aggregate pool limits, cache/replica freshness, outbox/inbox, failover fencing and replay side effects.
 - [x] Add a Chapter 6 worked OpenAPI evolution example covering additive fields, breaking changes, contract tests and deprecation gates.
