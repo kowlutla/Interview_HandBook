@@ -34,7 +34,7 @@ Do not infer “Deep” from a heading or keyword match. This is an initial audi
 | Security, identity, privacy, tenant isolation | 16 — 16.1A–16.1J, 16.2, 16.3 API threat patterns | Developing | Validate controls against OWASP guidance and add a worked multi-tenant authorization threat model with explicit trust boundaries. |
 | Observability and production operations | 17 — including 17.2 practical observability and 17.3 worked SLO alert design | Developing | Section 17.3 now derives a request-based error budget and burn-rate example, then maps signals to response policies and validation steps. Still verify alert behavior against historical traffic/incidents and review sampling/cardinality trade-offs across the full chapter. |
 | Cloud, containers, Kubernetes, IaC and delivery | 18 | Developing | Sections 18.2–18.5 now deepen Kubernetes, service mesh, IaC state/drift, SBOM, provenance, signing and build/deployment trust. Still verify supply-chain guidance against primary standards and test examples. |
-| Cross-cutting patterns, cost, multi-tenancy and multi-region | 19 — 19.1A–19.1F, 19.2 pattern catalog, Bloom-filter sizing example | Developing | Verify approximation assumptions, add a worked multi-tenant fairness scenario, and review pattern interactions across chapters. |
+| Cross-cutting patterns, cost, multi-tenancy and multi-region | 19 — 19.1A–19.1F, 19.2 pattern catalog, 19.3 worked multi-tenant fairness scenario | Developing | Section 19.3 tests tenant-aware admission, replica-multiplied local limits, reserved capacity and noisy-neighbor behavior. Verify approximation assumptions and review pattern interactions across chapters. |
 
 
 ## Exact section map for the current expansion pass
@@ -61,7 +61,7 @@ The following sections are present and are the starting points for the deeper re
 | Security and privacy | Chapter 16: Threat modeling, Authorization models, Tenant isolation, OAuth 2.0 and OpenID Connect, 16.2 Threat modeling a system architecture, 16.3 API threat patterns |
 | Observability and operations | Chapter 17: RED and USE, Percentiles and cardinality, SLO-driven alerting, 17.1A–17.1I, 17.2 Observability in practice, 17.3 worked SLO alert design |
 | Cloud and Kubernetes | Chapter 18: Containers and Kubernetes, 18.1A–18.1I, 18.2 Kubernetes architecture, 18.3 Service mesh, 18.4 IaC state and drift, 18.5 software supply-chain security |
-| Patterns and anti-patterns | Chapter 19: Probabilistic data structures including Bloom-filter sizing, Distributed scheduling, Multi-tenancy, Multi-region consistency and routing, 19.2 Architecture pattern catalog |
+| Patterns and anti-patterns | Chapter 19: Probabilistic data structures including Bloom-filter sizing, Distributed scheduling, Multi-tenancy, Multi-region consistency and routing, 19.2 Architecture pattern catalog, 19.3 worked multi-tenant fairness scenario |
 
 ## New additions in the current review pass
 | Tail latency and duplicate work | Chapter 13, 13.3 | Explains hedged requests, cancellation, idempotency, shared bottlenecks and adaptive concurrency feedback | Validate against The Tail at Scale and verify workload-specific trade-offs |
