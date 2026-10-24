@@ -273,6 +273,84 @@ On the subscriber side, enforce payload-size limits, method and content-type exp
 - Are publisher callback URLs protected against SSRF and redirect bypasses?
 - Can operators inspect delivery history and replay safely?
 
+## 6.13 Worked API evolution example: change a contract without surprising clients
+
+Assume an existing GET /v1/orders/{orderId} response contains order ID and status. Several clients deploy independently, and one client may not be updated for months. The API owner wants to add an estimated-delivery timestamp.
+
+### Current contract excerpt
+
+```yaml
+openapi: 3.1.0
+info:
+  title: Orders API
+  version: 1.0.0
+paths:
+  /v1/orders/{orderId}:
+    get:
+      operationId: getOrder
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Order found
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, status]
+                properties:
+                  id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [PENDING, CONFIRMED, CANCELLED]
+```
+
+The contract describes more than the URL: it specifies parameter requirements, response shape, required fields and the allowed status values. A client may generate code from this schema, so changes that look harmless to a human can break generated clients.
+
+### Proposed change: add an optional timestamp
+
+Adding an optional field such as estimatedDeliveryAt is often a compatible evolution if old clients tolerate unknown response fields and new clients handle its absence. But compatibility is a property of the whole producer/consumer set, serializer, generated code and validation policy—not merely of the word optional.
+
+Safer sequence:
+
+1. Update the contract and compatibility tests to define the field's format, timezone semantics, nullability and absence behavior.
+2. Deploy server code that can return the field without requiring clients to send it.
+3. Verify old clients tolerate the additional field and new clients handle responses where it is absent.
+4. Begin populating the field only when the value is known; do not invent a timestamp or silently change its meaning.
+5. Monitor parsing errors, client failures and adoption before depending on the field in a critical workflow.
+
+### Changes that need more caution
+
+| Change | Why it can break clients | Safer strategy |
+|---|---|---|
+| Rename or remove a response field | Existing clients may require the old name | Add replacement, migrate clients, observe usage, then deprecate and remove after a defined window |
+| Make an optional field required | Old requests or historical responses may omit it | Introduce a default/transition period and validate every active client version |
+| Add a new enum value | Generated clients may use exhaustive switches or reject unknown values | Define unknown-value behavior or coordinate a new version/compatibility window before emitting it |
+| Change units or meaning while keeping the same type | Payload remains syntactically valid but business interpretation changes | Use explicit documentation and usually a new field or version; test semantic compatibility |
+| Change pagination or ordering behavior | Clients may skip or repeat records even if the schema is unchanged | Preserve stable traversal semantics or introduce an explicit cursor/contract version |
+
+### Contract testing and rollout gates
+
+- Validate the OpenAPI document with the team's chosen parser/linter and keep it under version control.
+- Compare proposed schemas against the supported compatibility policy; static schema checks cannot prove all runtime behavior.
+- Run provider tests for required fields, status codes, error bodies, pagination, authentication and documented side effects.
+- Run consumer contract tests for clients that depend on the response shape and semantics.
+- Test old and new client/server combinations during rolling deployment.
+- Define deprecation communication, usage telemetry, support window and removal criteria before removing a public contract.
+
+### Review checklist
+
+- [ ] Is the change syntactically and semantically compatible with supported clients?
+- [ ] Are null, missing, empty and unknown values distinguished?
+- [ ] Are enum expansion, generated code and strict deserializers considered?
+- [ ] Are pagination, idempotency, errors and authorization semantics unchanged or explicitly versioned?
+- [ ] Can old and new server/client versions coexist during rollout?
+- [ ] Is deprecation based on measured usage and a communicated support policy?
 
 ## Further reading
 - OWASP, [Webhook Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Webhook_Security_Cheat_Sheet.html), covering signatures, replay protection, duplicate processing and SSRF risks.
