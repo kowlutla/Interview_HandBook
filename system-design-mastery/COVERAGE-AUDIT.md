@@ -405,8 +405,8 @@ A new check was run against all 20 current chapter pages, recognizing both backt
 - Selected Chapter 09 source pages: **opened and checked**.
 - All 21 topic-family depth acceptance: **still open**; targeted inspection must not be presented as exhaustive independent acceptance.
 - Repository-wide external-link liveness and claim-to-source alignment: **still open**; selected official references are verified, not every link/claim.
-- Mermaid rendering: **still open**; the environment could not acquire the required renderer.
-- Full OpenAPI 3.1 validation: **still open**; prior YAML parse and targeted invariants passed, but no full validator/linter ran.
+- Mermaid rendering: **passed in subsequent CI run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824)**; the earlier local-environment note records the state at this historical checkpoint. All 29 diagrams rendered to SVG. Human visual review of layout/readability remains open.
+- Full OpenAPI 3.1 validation: **passed in subsequent CI run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824)** for the embedded Chapter 06 specification using `openapi-spec-validator`; chapter-wide API semantics and consumer compatibility review remain open.
 - Whole-book contradictions, prerequisite flow and residual duplication: **still open beyond prior scoped checks**.
 
 The textbook is structurally clean and review-ready, but formal technical acceptance is not yet justified. Do not promote coverage rows to Deep or label the book fully validated until the remaining checks have evidence.
