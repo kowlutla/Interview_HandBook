@@ -214,13 +214,6 @@ These guarantees answer different questions. State which operations receive whic
 - Can tests demonstrate the guarantee under delay, duplicate requests and replica lag?
 
 
-## Further reading
-- Gilbert and Lynch, [CAP paper](https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf).
-- Lamport, [Time, Clocks, and the Ordering of Events](https://lamport.azurewebsites.net/pubs/time-clocks.pdf).
-- Brewer, [CAP Twelve Years Later](https://doi.org/10.1109/MC.2012.37).
-- [Raft paper and resources](https://raft.github.io/).
-
-
 ## From uncertainty to explicit guarantees
 
 ```mermaid
@@ -234,6 +227,13 @@ flowchart TD
 ```
 
 The absence of a response is an observation about the communication path, not proof that the remote operation did not commit. This distinction is foundational to retry-safe distributed systems.
+
+## Further reading
+- Gilbert and Lynch, [CAP paper](https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf).
+- Lamport, [Time, Clocks, and the Ordering of Events](https://lamport.azurewebsites.net/pubs/time-clocks.pdf).
+- Brewer, [CAP Twelve Years Later](https://doi.org/10.1109/MC.2012.37).
+- [Raft paper and resources](https://raft.github.io/).
+
 
 
 ---
