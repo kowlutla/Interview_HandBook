@@ -221,6 +221,23 @@ Common compatibility goals include:
 
 These labels are defined differently by some tools and formats; state the registry's exact policy. Additive optional fields are often easier to evolve than renaming/removing fields or changing types, but defaults, required fields, enums and semantic changes can still break consumers.
 
+### Schema-change risk matrix for producers and consumers
+
+The table is a design heuristic, not a substitute for the selected serialization format and registry's compatibility rules. “Old reader” and “new reader” refer to consumer code/schema versions; the result also depends on whether a field is required, has a default, or is ignored when unknown.
+
+| Change | Typical compatibility risk | Safer rollout guidance |
+|---|---|---|
+| Add an optional field with a safe default | Often easier for old readers, but format and unknown-field behavior matter | Deploy tolerant consumers first, then begin producing the field; verify defaults have correct business meaning |
+| Add a required field without a default | Old messages may not contain it; old consumers may not understand it | Use an optional/defaulted transition, backfill or versioned event type, and only tighten requirements after old data and consumers are handled |
+| Remove a field | Old consumers may still require it; historical events may still contain it | Stop depending on it first, observe consumer versions, retain compatibility through the replay horizon, then remove only under a documented policy |
+| Rename a field | Often behaves like remove-plus-add rather than a harmless rename | Temporarily support both representations or publish a new version; define precedence and conflict behavior |
+| Change a field type or units | Parsing may fail or values may be silently misinterpreted | Prefer a new field or event version; explicitly convert units and test boundary values |
+| Add an enum value | Consumers with exhaustive switches may fail or reject the event | Make consumers tolerate unknown values where safe, or coordinate version rollout before production begins emitting the new value |
+| Change field meaning without changing its type | Syntactically valid data can become semantically wrong | Treat semantic changes as contract changes; document and test meaning, often with a new field or event version |
+
+Producer-first versus consumer-first deployment depends on the change and the compatibility contract. A robust rollout usually ensures every active consumer can tolerate the next producer output before that output is emitted. Historical replay matters too: a consumer may need to read events written by many schema versions, not only the latest one.
+
+Before approving a schema change, test representative old and new payloads against old and new consumer versions, including unknown fields/enum values, missing fields, defaults, malformed data and replay from retained history. Validate both syntax and domain semantics.
 ### Event-data privacy and retention
 
 Events are replicated data. Once a sensitive value is copied into a durable log, it may remain in broker retention, consumer databases, backups, analytics, dead-letter queues and exported files. Minimize payloads, prefer references to sensitive data where appropriate, restrict consumer access, define retention and deletion behavior, and avoid putting secrets or unnecessary personal information in immutable event histories.
