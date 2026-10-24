@@ -18,6 +18,12 @@
 - **Write skew:** concurrent transactions read overlapping state and update different rows, jointly violating an invariant even though each local update succeeds.
 - **Availability:** proportion of time or requests meeting a defined success criterion.
 - **Bandwidth:** transfer rate; distinguish bit/s from byte/s.
+- **Batch processing:** processing a bounded collection of input data as a job or stage, usually with results available after that work completes.
+- **CI/CD:** continuous integration and continuous delivery/deployment; automated build, test, validation and release-promotion processes whose exact production-approval model should be explicit.
+- **IAM (Identity and Access Management):** policies and lifecycle processes for human/workload identities, authenticators, entitlements, revocation and audit.
+- **Micro-batch processing:** stream-like processing that groups incoming records into small bounded batches on a recurring schedule.
+- **Stream processing:** continuous processing of event records, often with state, event-time windows, checkpoints and late-event handling.
+- **Synthetic check:** an automated probe that executes a controlled user journey from a known vantage point to test a defined service path.
 - **Bulkhead:** isolation limiting the impact one failure or workload can have on another.
 - **Cache hit ratio:** fraction of lookups served by cache; define denominator and measurement window.
 - **Causal consistency:** causally related operations are observed in an order consistent with that causality.
