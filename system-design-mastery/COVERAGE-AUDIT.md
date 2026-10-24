@@ -481,3 +481,12 @@ The repository now contains the CI workflow and artifact-extraction script. The 
 A mechanism-level review of Chapter 20 found a concrete missing edge case in the already-described replayable real-time stream: a replay endpoint and a live subscription can each work correctly yet lose an event at the handoff boundary. Section 20.6 now describes the high-watermark/subscription-position requirement, overlap or buffering, merge and deduplication, durable checkpoint advancement, retention-gap detection and snapshot fallback. It also proposes boundary tests for publishes during subscription setup, disconnects during replay, duplicate delivery, cursor expiry and crashes between applying an event and persisting the checkpoint.
 
 This is a substantive correction, not proof that all client/realtime topics are accepted. The exact handoff must be verified against the selected broker/change-feed API and its ordering/retention contract. The mandatory inventory row remains **Developing** until source alignment, operational assumptions and diagram rendering are independently verified.
+
+
+## CI evidence update — 2026-10-24
+
+The initial workflow run has now been inspected directly. Run [40103087271](https://github.com/kowlutla/System-Design/actions/runs/40103087271) extracted the expected 29 Mermaid diagrams and one OpenAPI 3.1 document. Its Structural and OpenAPI validation job **passed**, including the `openapi-spec-validator` command. Its Mermaid renderer job **failed before rendering the first SVG** because Chromium could not start under the runner's default sandbox policy (`No usable sandbox`). That failure indicates a CI browser-launch configuration problem, not a demonstrated syntax error in the diagrams.
+
+The workflow was updated at commit `4d868540e7913b027acd3f43c58304586d80cb61` to pass Puppeteer a no-sandbox configuration and to treat missing rendered files as an upload failure. Corrected run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824) was still in progress at the last inspection: the OpenAPI job had passed and the Mermaid job was installing Mermaid CLI. Mermaid rendering remains **pending**, not passed, until that run finishes and the logs/artifact establish that all 29 diagrams rendered.
+
+This does not change the overall acceptance decision: all 21 inventory families remain Developing/provisional, source-to-claim review remains incomplete, and whole-book technical acceptance is open.
