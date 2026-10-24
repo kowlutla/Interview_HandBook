@@ -106,6 +106,33 @@ A storage model should follow the shape of the data, access patterns, correctnes
 
 These are common tendencies, not guarantees for every product. Verify each candidate's transaction, consistency, partitioning, indexing, backup, restore and operational model.
 
+## 8.2A Choosing specialized data systems by query shape
+
+The family names in a comparison table are only a starting point. The more useful question is which operation must remain cheap and predictable as data grows, and what new work that choice moves elsewhere.
+
+| System family | Example workload | What the model makes efficient | Cost or invariant to examine |
+|---|---|---|---|
+| Wide-column / partitioned record store | Read all events for one customer ordered by time; append telemetry by device and time bucket | Partition-local reads and writes designed around known access patterns | Partition-key skew, hot partitions, query fan-out, clustering order, and whether a query can be answered without an unbounded scan |
+| Graph database | Find short paths between users, devices, accounts or dependencies | Traversal across explicit relationships and neighborhood expansion | High-degree vertices, traversal depth, cross-partition hops, authorization during traversal, and how relationship updates remain consistent |
+| Time-series system | Ingest metrics or sensor samples and aggregate by time window | Time-oriented ingestion, retention, downsampling and range aggregation | Series cardinality, tag combinations, late/out-of-order samples, retention tiers, rollups and the difference between event time and ingestion time |
+| Inverted-index search engine | Find documents matching terms, phrases, filters and relevance ranking | Term-to-document postings, analyzers, scoring and search-oriented filtering | Index refresh lag, tokenization/language behavior, ranking quality, index size, reindex cost, and whether stale/deleted documents can appear |
+| Columnar warehouse or lakehouse table | Scan months of events to group revenue by region and product | Column pruning, compression, scan parallelism and analytical execution | Small-file overhead, partition pruning, schema evolution, compaction, late data, catalog/table metadata, and concurrency between writers |
+| Relational database with indexes | Enforce uniqueness and update a customer's account state while serving selective queries | Constraints, transactions, joins and secondary indexes within a defined database contract | Lock contention, index write amplification, isolation anomalies, query-plan stability, and the point at which distribution changes the transaction model |
+
+These models are not interchangeable merely because they can store the same fields. A graph traversal encoded as repeated relational lookups may work at small scale but become expensive when each hop adds a remote round trip. A search index can rank and filter documents well but usually should not be the authority for a financial balance or permission revocation. A time-series database can retain and aggregate telemetry efficiently, but a high-cardinality tag design may turn each unique label combination into expensive metadata or series state. A lakehouse can serve analytical scans but is not automatically a low-latency transactional record store.
+
+### Example: one product, four different read paths
+
+Suppose a commerce platform needs to:
+- Read the current price and inventory before accepting a purchase.
+- Search product descriptions by phrase, category and relevance.
+- Recommend related products using relationships and co-purchase signals.
+- Analyze regional sales over the last 18 months.
+
+Keep the authoritative price/inventory update behind a transactional contract. Project searchable product fields into an inverted index, build relationship data for recommendation queries, and publish durable sales facts into an analytical store. Each derived system needs an explicit freshness target, replay/rebuild path, deletion propagation and access-control policy. A single logical product can therefore have multiple physical representations without pretending that they share one consistency model.
+
+Before adding a specialized store, compare it with a simpler alternative using representative query shapes and realistic data skew. Include the cost of operating another system, synchronizing it, restoring it, securing it, and explaining its freshness to callers. Specialization is justified when it buys a measurable access-path or operational benefit that outweighs those costs.
+
 ## 8.3 Search indexes are usually derived data
 
 A search engine often indexes data from an authoritative database through change data capture, an outbox/event stream, periodic bulk indexing or application dual writes. Direct dual writes create a partial-failure problem: the database update may succeed while the search update fails, or vice versa. Prefer a durable change path and an idempotent indexer where correctness matters.
