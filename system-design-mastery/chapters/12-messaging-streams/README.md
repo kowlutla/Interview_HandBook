@@ -240,6 +240,65 @@ If a business requirement demands erasure or correction, determine whether the e
 - Are sensitive fields minimized across logs, retries, DLQs and projections?
 - Are retention, deletion and schema deprecation policies defined?
 
+## 12.4 Worked failure timeline: a consumer crashes around a database commit
+
+Assume a consumer receives OrderPaid(order-481) and must update an order database. The broker offset and the database transaction are separate durable state unless the architecture explicitly coordinates them.
+
+### Timeline A: database commit happens before offset commit
+
+| Time | Consumer / database | Broker |
+|---|---|---|
+| T1 | Reads event at offset 812 | Offset 812 is delivered |
+| T2 | Applies the order update and commits | Offset 812 remains uncommitted |
+| T3 | Process crashes before committing its offset | |
+| T4 | A replacement consumer resumes from the last committed offset | Delivers offset 812 again |
+| T5 | Handler runs again | Duplicate delivery is possible |
+
+Without protection, the business effect may be applied twice. A successful database commit does not atomically advance the broker offset.
+
+### Timeline B: offset commit happens before database commit
+
+| Time | Consumer / database | Broker |
+|---|---|---|
+| T1 | Reads event at offset 812 | Offset 812 is delivered |
+| T2 | Commits offset 812 | Broker records progress |
+| T3 | Process crashes before the database effect commits | |
+| T4 | Replacement consumer resumes after offset 812 | Event may never be processed again |
+
+This ordering can lose the business effect. Moving the acknowledgement earlier trades duplicates for loss; it does not eliminate the atomicity gap.
+
+### Safer patterns
+
+**Pattern 1 — Inbox/deduplication record in the same database transaction**
+
+Use a stable event or operation ID with a unique constraint. In one local database transaction, insert the inbox record and apply the business mutation. If the ID already exists, treat the delivery as a duplicate and avoid repeating the effect. Commit the broker offset only after the database transaction commits. A crash may cause redelivery, but the database transaction makes the duplicate harmless.
+
+**Pattern 2 — Make the business mutation intrinsically idempotent**
+
+If the update represents a set-to-state operation or a conditional transition, a repeated application may naturally have the same result. Verify that all side effects—including emails, payments, counters and downstream publications—are also safe; a database update that is idempotent does not make external effects idempotent.
+
+**Pattern 3 — Keep processing and output inside one supported transactional boundary**
+
+Some broker ecosystems can atomically commit consumed offsets and produced records within the broker's own transaction model. This can provide strong guarantees for broker-to-broker processing when configured and consumed correctly. It does not automatically include an arbitrary external database or payment provider.
+
+**Pattern 4 — Transactional outbox for downstream publication**
+
+When a service changes database state and must publish an event, write the state change and an outbox row in the same local transaction. A separate publisher delivers the outbox event and records progress. Publication may be repeated after a crash, so consumers still need idempotency or deduplication.
+
+### Exactly-once is a boundary claim
+
+Always state exactly what is made atomic: producer retries, broker log records, consumer offsets, database effects, or an external business action. A broker's exactly-once feature is not proof of exactly-once effects across every external system. The end-to-end outcome depends on the participating systems and the protocol that joins their durable state.
+
+### Validation checklist
+
+- [ ] Identify the event ID and the business-operation ID; know whether they are the same.
+- [ ] Inject a crash after the database commit but before offset commit.
+- [ ] Inject a crash before the database commit after the message has been fetched.
+- [ ] Verify inbox deduplication and the business mutation share one transaction.
+- [ ] Test concurrent duplicate deliveries and consumer rebalances.
+- [ ] Set deduplication retention to cover the real replay/redelivery horizon.
+- [ ] Observe retry rate, duplicate detections, processing lag and stuck outbox rows.
+- [ ] Document the exact transactional boundary and any external effects outside it.
 
 ## Further reading
 - Apache Kafka [design](https://kafka.apache.org/documentation/#design) and [delivery semantics](https://kafka.apache.org/documentation/#semantics).
