@@ -49,6 +49,33 @@ The design trade-off depends on expected item count, memory budget, target false
 
 Cardinality sketches estimate the number of distinct elements; quantile sketches estimate distribution summaries; count-min sketches estimate frequencies with overestimation error under their assumptions. Approximate structures should state error bounds, mergeability, update semantics, and acceptable decision risk.
 
+
+### Bloom filter sizing: a worked approximation
+
+For a standard Bloom filter with m bits, n inserted items and k hash functions, the approximate false-positive probability under the usual uniform-hash assumptions is:
+
+`p ≈ (1 − e^(−kn/m))^k`
+
+The near-optimal number of hash functions for a chosen m and n is:
+
+`k ≈ (m/n) ln 2`
+
+Solving for a target false-positive probability p gives the common sizing approximation:
+
+`m ≈ −n ln(p) / (ln 2)^2`
+
+Example: to represent about one million items with a target false-positive rate near 1%:
+
+- n = 1,000,000 and p = 0.01.
+- m ≈ −1,000,000 × ln(0.01) / (ln 2)^2 ≈ 9.59 million bits.
+- Raw bit storage ≈ 9.59 million / 8 ≈ 1.20 MB decimal, or about 1.14 MiB.
+- k ≈ (m/n) × ln 2 ≈ 6.64, so about 7 hash functions is a practical integer choice.
+
+This is a planning approximation, not a guarantee that a concrete implementation will achieve exactly 1% false positives. Hash quality, implementation details, capacity overshoot and the actual inserted-item count affect the observed rate. Monitor occupancy and rebuild or resize before the filter becomes overfull.
+
+A standard Bloom filter does not support safe arbitrary deletion because clearing a bit may cause false negatives for another item that set the same bit. Counting Bloom filters or rebuilding are alternatives, each with additional memory or operational cost. Bloom filters should reduce expensive authoritative lookups, not replace the source of truth.
+
+
 ## 19.1B Distributed scheduling and logical execution
 
 Schedulers must define what happens when a job is delayed, missed, duplicated, retried, or running longer than its interval. A lease can coordinate ownership but does not alone prevent a stale worker from committing effects after lease expiry. Use idempotent effects, fencing/version checks, unique execution records, and explicit catch-up policy as appropriate.
