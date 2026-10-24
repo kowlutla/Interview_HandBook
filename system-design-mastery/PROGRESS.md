@@ -79,6 +79,7 @@ Check items only when the work has actually been performed.
 - [x] Clarify database buffer/page caches versus application-level object caches in Chapter 9, including the operational signals needed to evaluate each layer.
 - [x] Add an explicit batch-versus-stream processing comparison in Chapter 12, including micro-batch, replay/output correctness and hybrid reconciliation trade-offs.
 - [x] Explicitly define identity and access management (IAM) as a lifecycle and dependency boundary in Chapter 16, covering human/workload identities, revocation, audit and identity-provider availability.
+- [x] Extend the glossary with batch processing, micro-batch, stream processing, CI/CD, IAM and synthetic-check definitions introduced or deepened during the coverage pass.
 - [x] Add a Chapter 9 cross-tenant/cache-poisoning test matrix covering tenant and role variation, header/key poisoning, revocation, stale-fill races and cache failure.
 - [x] Add a Chapter 19 cross-pattern review of retry/hedge/breaker interactions, aggregate pool limits, cache/replica freshness, outbox/inbox, failover fencing and replay side effects.
 - [x] Add a Chapter 6 worked OpenAPI evolution example covering additive fields, breaking changes, contract tests and deprecation gates.
