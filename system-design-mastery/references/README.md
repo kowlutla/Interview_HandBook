@@ -64,6 +64,7 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 
 
 ## Protocol standards and secure integrations
+- OpenAPI Initiative, [current OpenAPI Specification](https://spec.openapis.org/oas/latest.html) and [OpenAPI 3.1.0 specification](https://spec.openapis.org/oas/v3.1.0.html).
 - IETF, [RFC 8200 — IPv6 Specification](https://www.rfc-editor.org/rfc/rfc8200.html).
 - IETF, [RFC 4033 — DNS Security Introduction and Requirements](https://www.rfc-editor.org/rfc/rfc4033.html).
 - IETF, [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html).
