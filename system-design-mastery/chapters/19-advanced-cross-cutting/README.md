@@ -276,12 +276,6 @@ Architecture patterns rarely operate alone. A retry policy changes the load seen
 - [ ] Can an operational mitigation create a second failure, such as a retry storm or connection storm?
 - [ ] Does the test plan cover combinations of mechanisms as well as each mechanism individually?
 
-## Further reading
-- O'Neil et al., [LSM-tree paper](https://doi.org/10.1007/s002360050048).
-- Google SRE [Handling Overload](https://sre.google/sre-book/handling-overload/).
-- [Raft resources](https://raft.github.io/) for replicated coordination.
-
-
 ## An architecture decision review loop
 
 ```mermaid
@@ -300,6 +294,12 @@ flowchart TD
 ```
 
 The best architecture is not the one with the most patterns. It is the simplest design that satisfies the actual invariants and service objectives under the expected workload and failure model.
+
+## Further reading
+- O'Neil et al., [LSM-tree paper](https://doi.org/10.1007/s002360050048).
+- Google SRE [Handling Overload](https://sre.google/sre-book/handling-overload/).
+- [Raft resources](https://raft.github.io/) for replicated coordination.
+
 
 
 ---
