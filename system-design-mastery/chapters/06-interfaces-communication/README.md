@@ -336,7 +336,7 @@ Safer sequence:
 
 ### Contract testing and rollout gates
 
-- Validate the OpenAPI document with the team's chosen parser/linter and keep it under version control.
+- The embedded OpenAPI 3.1 example in this chapter has passed `openapi-spec-validator` in CI run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824). Keep the specification under version control and rerun the validator after each contract change; generated-client compatibility and consumer/provider contract tests are separate checks.
 - Compare proposed schemas against the supported compatibility policy; static schema checks cannot prove all runtime behavior.
 - Run provider tests for required fields, status codes, error bodies, pagination, authentication and documented side effects.
 - Run consumer contract tests for clients that depend on the response shape and semantics.
