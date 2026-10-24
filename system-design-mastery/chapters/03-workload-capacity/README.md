@@ -206,6 +206,69 @@ To estimate instances, benchmark a representative build under realistic request 
 Create low/base/high estimates for peak multiplier, payload size, cache hit ratio, downstream fan-out, request cost and failure headroom. Identify which assumption most affects the result and measure it first. A spreadsheet with precise arithmetic but unvalidated inputs is not a reliable capacity plan.
 
 
+
+## 3.17 Validate the model with load, stress, spike and soak tests
+
+A capacity estimate is a hypothesis. Testing checks whether the implementation and its dependencies behave as predicted under a representative workload. A benchmark is useful only when its workload, environment, correctness criteria and measurement method resemble the system's intended use.
+
+### Different tests answer different questions
+
+| Test type | Question | Important limitation |
+|---|---|---|
+| Load test | Does the system meet targets at expected and peak workload? | A short steady test may miss memory leaks, cache churn or delayed bottlenecks |
+| Stress test | How does behavior degrade beyond the expected operating range? | The goal is to learn the failure boundary, not claim normal performance |
+| Spike test | What happens when demand rises or falls abruptly? | Autoscaling and warm-up delays can dominate the result |
+| Soak/endurance test | Does the system remain healthy over an extended period? | Requires observing leaks, gradual drift, compaction, queues and periodic jobs |
+| Scalability test | How does throughput/latency change as resources or workload increase? | Shared dependencies can prevent linear scaling |
+| Capacity test | What sustainable workload meets the required latency and error targets? | The result is specific to configuration, workload mix and failure assumptions |
+| Failover/load test | Can the surviving topology meet targets after a component or zone is lost? | Normal-state capacity does not prove failure-state capacity |
+
+### Build a representative workload
+
+Include the distribution of operations, payload sizes, tenant/key popularity, read/write mix, cache hit rate, data volume, connection reuse, think time, background jobs and dependency fan-out. A test that sends only tiny cacheable reads can make a system appear far more capable than a production mix containing writes, large responses, cold keys and expensive queries.
+
+Test realistic data volume and cardinality. Empty tables, tiny indexes, uniformly random keys and warm caches often hide query-plan changes, hot keys, lock contention, disk I/O, cache churn and storage-engine compaction. Test both warm and cold paths when both occur in production.
+
+### Open-loop and closed-loop traffic generation
+
+A **closed-loop** generator sends a new request when a previous request completes. As the system slows, the generator naturally sends fewer requests; this can hide overload because offered load falls precisely when latency rises.
+
+An **open-loop** generator schedules arrivals independently of response completion, approximating an externally imposed arrival rate. It can reveal queue growth and latency under a fixed offered load, but the generator must be able to sustain the planned rate and record requests that were delayed or dropped before reaching the system.
+
+A common measurement trap is **coordinated omission**: a load generator waits for a slow response and therefore fails to record the requests that would have arrived during that wait. The reported latency distribution can look healthier than the user experience under the intended arrival process. Choose a generator and histogram method that represent the actual arrival model, and record offered, admitted, completed, rejected and timed-out requests separately.
+
+### Measure more than requests per second
+
+For every test, record:
+- Offered and admitted request rates, completed throughput, error/rejection rate and timeout rate.
+- Latency distributions at the user-visible boundary, including queue wait where possible.
+- CPU, memory, allocation/GC, network, disk, connection pools and downstream utilization.
+- Queue depth, age of oldest queued item, retry rate, cache hit/miss rate and dependency fan-out.
+- Correctness: duplicate side effects, lost events, stale reads, partial results and invariant violations.
+- Cost-relevant resource usage and the duration required to reach steady state.
+
+A high completed request rate is not a pass if errors are rising, data is incorrect, the queue grows without bound, or p99 latency violates the target.
+
+### Test the operating boundary and recovery behavior
+
+Increase offered load in controlled steps until a required target is missed, then test recovery after load falls. Identify whether the first bottleneck is CPU, memory, database connections, lock contention, disk I/O, network, a downstream quota, or queueing. Change one important variable at a time where practical.
+
+Repeat the test with the required failure scenario: one replica unavailable, a dependency slow, cache unavailable, or a zone removed. Validate that load shedding, deadlines and retry policies prevent cascading failure. Ensure the generator and monitoring stack are not the bottleneck.
+
+### Capacity validation checklist
+
+- Does the test match realistic request mix, data volume and key distribution?
+- Are offered, admitted, completed and rejected rates measured separately?
+- Is the arrival model open-loop or closed-loop, and does it match the question?
+- Could coordinated omission understate tail latency?
+- Are cold paths, cache churn, background work and periodic jobs represented?
+- Are latency percentiles, correctness and error rate evaluated together?
+- Is the first saturated resource identified from evidence?
+- Is recovery after overload tested?
+- Is capacity re-tested with the required failure-domain loss?
+- Are the test environment, configuration, assumptions and results reproducible?
+
+
 ## Further reading
 - [Google SRE Book: Handling Overload](https://sre.google/sre-book/handling-overload/).
 - [Little's original law is often taught through queueing theory; a practical systems treatment appears in the SRE literature](https://sre.google/sre-book/table-of-contents/).
