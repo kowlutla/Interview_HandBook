@@ -234,43 +234,21 @@ You should be able to explain, in your own words:
 7. What evidence would cause you to revisit an architecture decision.
 
 
-## 1.13 Architecture decisions as explicit hypotheses
+## 1.13 Reversible decisions and costly commitments
 
-An architecture decision should be treated as a hypothesis about the workload and constraints, not as a permanent truth. For example, “we need microservices to scale” contains several testable assumptions: one part of the system is a bottleneck, that part can be scaled independently, the boundary is stable, and independent deployment is worth the distributed-systems cost.
+Some architecture choices are cheap to change; others create obligations that are difficult to unwind. A library behind a stable interface may be replaceable with modest effort. A public API, data ownership boundary, shard key, event schema, cryptographic format, or client-visible consistency guarantee can become expensive to change once data, integrations, and operating procedures depend on it.
 
-Record the decision, context, options considered, reason for selection, expected consequences, evidence to collect, and conditions that would trigger reconsideration. A decision record is not a substitute for measurement; it makes the assumptions visible so future evidence can update the design.
+When uncertainty is high, prefer a reversible choice or a small experiment if it can answer the important question. For a costly commitment, make the assumptions and migration path explicit before adoption. This does not mean waiting until uncertainty disappears: identify the assumptions with the greatest consequences, test them where practical, and limit the damage if they prove false.
 
-### Reversible and irreversible decisions
+An architecture decision is therefore a hypothesis about the workload, constraints, and team—not a permanent truth. Define the evidence that would invalidate it, such as sustained queue growth, an independent scaling need, a new regulatory boundary, or repeated operational failures. Revisit the decision when that evidence appears rather than because a particular architecture style has become fashionable.
 
-Some decisions are relatively easy to change, such as a library choice behind a stable interface. Others are expensive to reverse: public API contracts, data ownership, shard keys, event schemas, cryptographic formats, or externally visible consistency guarantees. Prefer experiments and reversible choices when uncertainty is high, while investing more review in decisions that create long-lived data or compatibility obligations.
+## 1.14 Coupling can hide outside the code
 
-Do not delay every decision until all uncertainty disappears. Instead, identify which assumptions are most consequential, test them cheaply where possible, and choose a design that limits the cost of being wrong.
+Coupling is not only a code-import relationship. Two services may be **data-coupled** if they write the same tables, **temporally coupled** if every request requires both to be available, **operationally coupled** if they must deploy or recover together, or **semantically coupled** if a field change silently changes another service's interpretation.
 
-## 1.14 Decomposition: cohesion, coupling and ownership
+These forms matter because a boundary that looks clean on a component diagram may still force teams to coordinate every release or keep several services on the same critical path. When evaluating a proposed split, trace the data, timing, meaning, deployment and recovery dependencies—not just the API between components.
 
-A component should group responsibilities that change together and keep unrelated change separate. **Cohesion** describes how strongly the responsibilities within a component belong together. **Coupling** describes how much one component depends on another's structure, timing, state or release process.
-
-**Separation of concerns** means keeping distinct responsibilities or reasons for change understandable and independently evolvable where useful. It does not mean every concern deserves a separate service: modules inside one process can provide strong separation without adding network, deployment and data-consistency costs.
-
-Coupling is not only a code-import relationship. Two services may be operationally coupled if they must deploy together, data-coupled if they share tables, temporal-coupled if every request requires both to be available, or semantically coupled if a field change silently changes another service's interpretation.
-
-A useful boundary gives one owner clear responsibility for an invariant and exposes a contract to others. If multiple components can independently change the same authoritative state, ownership is ambiguous. If a simple user action requires many synchronous calls, the decomposition may create a fragile critical path.
-
-### A decomposition test
-
-For each proposed component, ask:
-1. What capability or invariant does it own?
-2. What state is authoritative inside this boundary?
-3. Which changes should be possible without coordinating with neighbors?
-4. What calls/events cross the boundary and what do they cost?
-5. What happens if a neighbor is slow, unavailable or returns an incompatible response?
-6. How will this component be deployed, scaled, secured, observed and recovered?
-7. Is the boundary worth the operational cost compared with a module in one process?
-
-### Architecture quality is multidimensional
-
-There is rarely one design that maximizes every quality attribute. A design may reduce latency but increase cost, improve availability but permit stale reads, or increase independent deployment while making debugging more difficult. State the chosen objective and the cost being accepted. A trade-off is meaningful only when the relevant constraints and failure behavior are explicit.
-
+A useful boundary lets an owner change its implementation while preserving a stable contract. If the split creates frequent cross-service writes, synchronous fan-out, or unclear responsibility for an invariant, the new boundary may increase coupling rather than reduce it.
 
 
 ## 1.15 Architecture views: one system, several useful models
