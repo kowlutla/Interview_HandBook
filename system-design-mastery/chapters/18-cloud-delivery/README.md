@@ -5,31 +5,6 @@ Cloud service models are commonly described as IaaS, PaaS and SaaS, but provider
 
 Regions and availability zones represent infrastructure failure domains, but their exact independence and connectivity are provider-specific. Deploying across zones helps only if traffic routing, state replication, capacity and failover behavior are designed accordingly.
 
-## Containers and Kubernetes
-Containers package a process with its dependencies and use operating-system isolation primitives; they are not virtual machines with a separate kernel in the usual container model. Kubernetes coordinates workloads through API objects and controllers. It can restart and reschedule containers, but it cannot make an application stateless, fix a broken database query, or guarantee that a replacement is instantly ready.
-
-Resource requests influence scheduling; limits constrain resource use according to resource-specific behavior. CPU throttling can increase latency; memory limit breaches may terminate a container. Readiness, liveness and startup probes have different purposes. An overly aggressive liveness probe can turn a slow dependency into repeated restarts. See [Kubernetes architecture](https://kubernetes.io/docs/concepts/architecture/), [resource management](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/), and [probe guidance](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/).
-
-## Managed versus self-hosted
-Managed services can reduce operational burden and provide integrated recovery features, but introduce provider-specific APIs, quotas, pricing and portability constraints. Self-hosting offers control but requires staffing, patching, upgrades, monitoring, backup, capacity planning and incident response. Compare total operational cost, not just service price.
-
-## Infrastructure as code and configuration
-Infrastructure as code makes desired infrastructure reviewable and repeatable. State drift, secrets, destructive plans and dependency ordering remain risks. Separate configuration from immutable artifacts, validate changes, use least-privilege deployment identities, and preserve rollback paths.
-
-## Delivery strategies
-- **Rolling deployment:** gradually replaces instances; old and new versions coexist.
-- **Blue-green:** maintains two environments and switches traffic, requiring compatible data and capacity.
-- **Canary:** exposes a small traffic cohort to a change and evaluates signals before expanding.
-- **Feature flags:** decouple code deployment from behavior activation, but stale flags create complexity and security risk.
-
-Rollback is not always a code-only operation. Database migrations, emitted events and external side effects may not be reversible. Design backward-compatible deployment steps and define what metrics stop rollout.
-
-A **CI/CD pipeline** automates some or all of the path from reviewed source changes through build, tests, security/policy checks, artifact creation, staged deployment and post-deployment verification. Continuous delivery typically keeps production promotion under an explicit release decision; continuous deployment automates that promotion after required gates. The pipeline itself is privileged production infrastructure: isolate build jobs, scope credentials to the minimum needed, protect workflow changes, prevent untrusted contributions from accessing deployment secrets, preserve artifact identity/provenance, and audit who or what can promote a release. A green pipeline proves only the checks it actually ran.
-
-## Cost as a design dimension
-Costs include compute, storage, data transfer, managed-service requests, replication, observability, backups, idle capacity and engineering operations. Cross-region transfer and chatty service boundaries can dominate. Optimize for cost per useful successful operation while preserving reliability and security objectives.
-
-
 ## 18.1A Cloud responsibility boundaries
 
 Cloud service models distribute operational responsibility differently, but responsibility is never simply “the provider handles everything.” Clarify who patches the guest OS or runtime, configures identity, rotates secrets, protects data, defines network rules, tests restore, monitors quotas, and responds to incidents.
