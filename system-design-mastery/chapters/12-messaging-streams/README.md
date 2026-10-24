@@ -28,6 +28,23 @@ A consumer's committed offset records its progress through a partition. Be preci
 
 See the versioned [Kafka 4.3 design documentation](https://kafka.apache.org/43/design/design/) and [message delivery semantics](https://kafka.apache.org/43/design/design/#message-delivery-semantics) for Kafka-specific behavior; verify details against the broker and client versions actually deployed.
 
+### Consumer-group rebalances, lag and offset correctness
+
+A partitioned log assigns each partition to a consumer within a consumer group, so one partition is normally processed by only one active member of that group at a time. Membership changes, slow processing, session timeouts and deployments can trigger a rebalance. Rebalances are not merely a throughput event: they change which worker is allowed to advance progress for a partition and can expose duplicate work or stalled partitions if application processing is not designed for ownership changes.
+
+Treat the committed offset as a recovery checkpoint, not as proof that a business effect happened exactly once. If a worker commits an offset before the corresponding effect is durable, a crash can skip the effect on restart. If it commits after the effect, a crash between the effect and offset commit can repeat the effect. The downstream operation must therefore be idempotent or transactionally coupled to the checkpoint where the chosen platform supports that coupling.
+
+Operationally, distinguish **consumer lag** (how far behind the group is) from **time to drain** (how long the current backlog will take to process at sustainable net throughput). Lag alone does not identify whether the cause is a traffic spike, a hot partition, slow dependency, repeated failures, an oversized batch, or insufficient partition-level parallelism. Alert on lag age and growth, processing latency, rebalance frequency, failed/retried records, and estimated drain time—not only one absolute lag threshold.
+
+A safe consumer should:
+- stop accepting new work when partition ownership is being revoked, and finish or safely abandon in-flight work within a bounded shutdown budget;
+- commit only progress that matches the application's durable processing boundary;
+- tolerate replay after process loss, rebalance, timeout, or uncertain commit response;
+- bound work per poll/batch so slow downstream calls do not cause avoidable membership churn;
+- test rolling deployment, long processing pauses, partition reassignment, consumer crash after effect-before-commit, and commit-response loss.
+
+These are general design principles; exact rebalance protocols, offset APIs, and timeout interactions vary by broker and client version. Verify them against the deployed client documentation instead of assuming all Kafka clients behave identically.
+
 ## 12.3 Delivery guarantees and idempotent effects
 
 Messaging systems commonly describe delivery as at-most-once, at-least-once, or exactly-once within a defined boundary.
