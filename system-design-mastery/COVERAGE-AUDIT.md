@@ -231,3 +231,8 @@ The editorial standard was extended to make the desired voice explicit: the text
 The chapter previously repeated several concepts after the main explanation: availability/reliability/durability/correctness were defined in the quality-attribute table and then reintroduced; requirement prioritization appeared in multiple sections; and a second review checklist repeated the earlier self-check. These were consolidated into the main definitions, prioritization explanation and self-check. The distinct quality-scenario section and the later accessibility, operability, portability, cost, sustainability and lifecycle-interaction material remain.
 
 Approximate word count decreased from 3,939 to 3,684. This was an editorial pass, not a complete technical/source certification. Section numbering was updated; the inventory now refers to Chapter 02 sections 2.15–2.18 for quality scenarios and lifecycle attributes.
+
+
+### Chapter 19 — readability consolidation (2026-10-24)
+
+The chapter opened with several short overview sections for topics that were then explained again in detail later in the same chapter or in their dedicated chapters. Those summaries and a repeated synthesis checklist were removed. Queueing and tail behavior was retained as a connected explanation because it contributes directly to cross-cutting reasoning; the introduction now points readers to Chapters 03, 08 and 12 for the underlying capacity, storage and messaging mechanics. Approximate word count decreased from 3,890 to 3,499. This is an editorial pass only; the chapter's technical/source review remains open.
