@@ -27,7 +27,7 @@ Prefer primary sources for formal guarantees. Product documentation describes a 
 - O'Neil et al., *The Log-Structured Merge-Tree (LSM-Tree)* (1996): [DOI](https://doi.org/10.1007/s002360050048).
 
 ## Messaging and events
-- Apache Kafka, [design](https://kafka.apache.org/documentation/#design), [delivery semantics](https://kafka.apache.org/documentation/#semantics), and [documentation](https://kafka.apache.org/documentation/).
+- Apache Kafka 4.3 documentation, [design](https://kafka.apache.org/43/design/design/), [message delivery semantics](https://kafka.apache.org/43/design/design/#message-delivery-semantics), and [versioned documentation home](https://kafka.apache.org/43/). Versioned links make implementation-specific claims reproducible; check the release docs matching the deployed broker/client.
 - Debezium, [outbox event router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html).
 - [CloudEvents specification](https://cloudevents.io/).
 
