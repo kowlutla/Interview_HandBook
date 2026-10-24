@@ -287,12 +287,6 @@ Parallel calls can reduce latency, but the deadline includes scheduling, queue w
 - [ ] Verify accepted durable jobs continue independently and expose a stable status.
 - [ ] Restart the service during shutdown and confirm queued/in-flight durable work is not silently lost.
 
-## Further reading
-- [Linux man-pages: pthreads](https://man7.org/linux/man-pages/man7/pthreads.7.html).
-- [Java concurrency package documentation](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html).
-- [Java 21 Structured Concurrency guide (preview API)](https://docs.oracle.com/en/java/javase/21/core/structured-concurrency.html) — an implementation-specific API example; preview status and API details vary by JDK version.
-
-
 ## A bounded worker-pool model
 
 A worker pool is a concurrency limit plus a queueing policy. It prevents unbounded task creation only if the queue is also bounded and admission behavior is explicit.
@@ -306,6 +300,13 @@ flowchart LR
   E --> F[CPU, disk, network, or dependency]
   F --> G[Result or failure]
 ```
+
+## Further reading
+- [Linux man-pages: pthreads](https://man7.org/linux/man-pages/man7/pthreads.7.html).
+- [Java concurrency package documentation](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html).
+- [Java 21 Structured Concurrency guide (preview API)](https://docs.oracle.com/en/java/javase/21/core/structured-concurrency.html) — an implementation-specific API example; preview status and API details vary by JDK version.
+
+
 
 ---
 
