@@ -294,11 +294,6 @@ Do not blindly retry every database error. Constraint violations may represent a
 - [ ] Record serialization/deadlock retries, transaction duration, lock waits and invariant violations.
 - [ ] Repeat the test against the actual database engine and configured isolation level; do not infer behavior from the isolation-level name alone.
 
-## Further reading
-- PostgreSQL [transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html), [indexes](https://www.postgresql.org/docs/current/indexes.html), [EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html), [point-in-time recovery](https://www.postgresql.org/docs/current/continuous-archiving.html).
-- SQLite [atomic commit](https://www.sqlite.org/atomiccommit.html).
-
-
 ## How a relational query travels
 
 ```mermaid
@@ -312,6 +307,11 @@ flowchart LR
 ```
 
 The planner uses schema, indexes, statistics and cost estimates. A logically simple query can still be expensive when estimates are wrong, selectivity is poor, or a suitable index is absent. Inspect real execution plans with representative data.
+
+## Further reading
+- PostgreSQL [transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html), [indexes](https://www.postgresql.org/docs/current/indexes.html), [EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html), [point-in-time recovery](https://www.postgresql.org/docs/current/continuous-archiving.html).
+- SQLite [atomic commit](https://www.sqlite.org/atomiccommit.html).
+
 
 
 ---
