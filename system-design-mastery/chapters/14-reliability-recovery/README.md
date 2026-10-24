@@ -197,6 +197,53 @@ An error budget is useful only when the team has agreed how to act on it. Possib
 - Are exclusions documented and resistant to gaming?
 - Is the SLO reviewed when user expectations or architecture changes?
 
+## 14.4 Worked recovery rehearsal: restore, validate, and resume traffic
+
+Assume an order service has a recovery time objective (RTO) of 60 minutes and a recovery point objective (RPO) of 15 minutes. At 10:00, an incident makes the primary database unusable. A recovery runbook restores a backup and replays available transaction logs, but traffic must not resume until the restored state and dependencies are validated.
+
+### Example timeline and objective check
+
+| Time | Recovery activity | Evidence to record |
+|---|---|---|
+| 10:00 | Incident declared; writes stopped or fenced | Detection time, affected operations, last known healthy state |
+| 10:05 | Recovery owner selects the approved restore point | Backup identity, log range, expected data-loss boundary |
+| 10:20 | Database restore and log replay complete | Restore completion time, errors, database recovery position |
+| 10:28 | Integrity and application checks complete | Key invariants, record counts where meaningful, critical queries, schema version |
+| 10:35 | Controlled traffic resumes | Error rate, latency, queue backlog, duplicate/reconciliation signals |
+
+In this example, service is restored 35 minutes after declaration, within the 60-minute RTO. If the latest recoverable state corresponds to 09:52, the recovery point is eight minutes before the 10:00 incident, within the 15-minute RPO. These conclusions depend on the actual start/end definitions and on proving that the restored data is usable—not merely that the database process started.
+
+### The recovery sequence
+
+1. **Declare and contain.** Establish incident command, stop unsafe writes, and fence any old or split-brain writer so it cannot modify state after recovery begins.
+2. **Choose a recovery point.** Identify the latest valid backup and transaction-log position that satisfy the RPO. Confirm backup integrity and that required encryption keys, credentials and schema artifacts are available.
+3. **Restore into an isolated target.** Avoid exposing partially restored data to normal traffic. Record the exact backup, logs replayed, and any gaps.
+4. **Validate correctness.** Check database recovery state, critical invariants, required tables/indexes, application compatibility, permissions, and representative reads/writes. Reconcile in-flight operations whose outcome was uncertain.
+5. **Restore dependencies and traffic safely.** Verify secrets, network routes, service identity, queues, external dependencies and capacity. Redirect a small or controlled share first when the architecture permits.
+6. **Drain and reconcile backlog.** Resume consumers with bounded concurrency, watch lag age and drain time, and ensure replayed events cannot duplicate business effects.
+7. **Confirm recovery and preserve evidence.** Verify user-facing SLI, RTO/RPO achieved, data-loss scope, alerts and runbook effectiveness. Capture gaps as engineering actions.
+
+### Failure modes that a successful backup job does not prove away
+
+- A backup exists but cannot be decrypted because key material or access policy is missing.
+- Transaction logs do not cover the intended recovery point or are stored in the same failed domain.
+- A database is online but has incompatible schema, missing dependencies, or invalid business invariants.
+- The replacement region lacks enough compute, connection, quota or downstream capacity for the required traffic.
+- A stale former primary continues accepting writes after promotion.
+- Queued events replay after restoration and repeat effects that were already applied before the incident.
+- A recovery exercise measures database startup time but omits validation, traffic cutover and backlog drain.
+
+### Recovery rehearsal checklist
+
+- [ ] Define exactly when the RTO clock starts and what counts as service restored.
+- [ ] Define the data-loss measurement used for RPO and prove the recovered point.
+- [ ] Test backup restoration and point-in-time log replay in an isolated environment.
+- [ ] Verify that keys, credentials, network policies, schemas and deployment artifacts are recoverable.
+- [ ] Test stale-writer fencing and prevent split-brain writes.
+- [ ] Reconcile uncertain operations and replay messages idempotently.
+- [ ] Measure restore, validation, cutover and backlog-drain time separately.
+- [ ] Test capacity and dependencies in the recovery environment.
+- [ ] Record achieved RTO/RPO, data discrepancies, runbook gaps and corrective owners.
 
 ## Further reading
 - Google [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
