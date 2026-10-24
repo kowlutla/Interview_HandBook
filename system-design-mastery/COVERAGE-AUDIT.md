@@ -328,7 +328,7 @@ This establishes that these selected references resolve and that their document 
 
 ### Remaining acceptance blockers — reference and tooling pass
 
-- Mermaid rendering of all 29 chapter-page diagrams is still unverified. No local Mermaid CLI/standalone parser is available, and external package retrieval fails due network/DNS restrictions.
+- Mermaid rendering of all 29 chapter-page diagrams was unverified at this checkpoint because the local environment could not obtain the renderer. It has since passed in CI run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824), which generated and uploaded 29 SVGs; manual visual review remains open.
 - Full OpenAPI 3.1 schema/spec validation was still unverified at this checkpoint; it has subsequently passed in CI run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824).
 - The full source-to-claim audit, repository-wide external-link audit, independent review of all 21 mandatory topic families, and cross-chapter consistency pass remain incomplete. Do not promote provisional coverage statuses to Deep based on these targeted checks.
 
