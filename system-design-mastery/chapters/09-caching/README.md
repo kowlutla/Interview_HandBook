@@ -177,6 +177,65 @@ A high hit ratio can coexist with poor user latency if misses are extremely slow
 - Is there a repair path when invalidation messages are lost?
 
 
+
+## 9.3 Cache security, tenant isolation and freshness strategies
+
+Caching changes where data is served from and which checks run on each request. A cache hit can bypass database work, but it must not bypass authorization, tenant isolation, privacy policy, or correctness checks that are required for the response. Cache correctness is therefore both a performance concern and a security boundary.
+
+### Cache-key correctness and tenant isolation
+
+A cache key must include every input that can change the response's meaning or the caller's permission to see it. Depending on the endpoint, that may include tenant ID, resource ID, locale, representation version, relevant query parameters, authorization scope, or content-negotiation headers. Omitting a relevant dimension can cause one user's or tenant's response to be served to another.
+
+Do not blindly include a raw bearer token in a cache key: it can leak credentials into cache metadata, logs or metrics and creates poor reuse. Instead, design a safe authorization-aware caching policy. For sensitive or user-specific responses, private/no-store behavior or a cache partition keyed by a stable, non-secret identity/scope may be more appropriate. Authorization must still be enforced according to the application's contract; possession of a cache key is not authorization.
+
+### Cache poisoning and untrusted input
+
+A cache-poisoning vulnerability occurs when an attacker can influence the response stored under a key that other users will later request. Risks include inconsistent interpretation of Host or forwarding headers, unkeyed request headers that affect origin output, unsafe URL normalization, and differences between the cache and origin's parsing rules.
+
+Defenses include:
+- Make cache-key inputs explicit and align them with every request attribute that can alter the response.
+- Normalize URLs and headers consistently across the edge and origin.
+- Do not let untrusted forwarding headers determine security-sensitive output unless they are overwritten by a trusted proxy.
+- Avoid caching responses whose variation or authorization behavior is not understood.
+- Test cache behavior with different tenants, roles, locales, encodings and query parameters.
+- Monitor unexpected cache-key cardinality, cache status changes and suspicious response variation.
+
+A related cache-deception problem occurs when an attacker tricks a cache into storing sensitive dynamic content under a URL it treats as static. Cache policy should be based on response semantics and explicit rules, not only file extensions or superficial path patterns.
+
+### Freshness policies: TTL, stale-while-revalidate and stale-if-error
+
+A TTL defines when an entry becomes stale according to a particular cache's clock and policy; it does not guarantee immediate invalidation at the source. Freshness windows should be derived from the business meaning of the data. A product description may tolerate minutes of staleness; an authorization decision or account balance may require stronger controls or no shared caching.
+
+**Stale-while-revalidate** allows a cache to serve a stale response while refreshing it asynchronously for a bounded interval. This can reduce latency and origin load during refresh, but users may temporarily see old content. **Stale-if-error** can allow stale content to be served during an origin failure under a defined policy. Neither is universally safe: a stale public article differs from a revoked credential, current inventory count or permission check.
+
+Document:
+- Maximum permitted staleness by data class.
+- Whether stale responses are allowed during origin failure.
+- How invalidation and refresh interact with in-flight requests.
+- What happens when refresh fails repeatedly.
+- Whether the caller can identify a stale response when that matters.
+- Which data must never be served stale for security or business reasons.
+
+### Deletion, revocation and privacy
+
+Deleting a record from the primary database does not automatically remove it from local caches, distributed caches, CDN edges, search indexes, replicas, snapshots or backups. Define which copies are in scope, how invalidation propagates, how long stale copies may remain, and how deletion interacts with legal retention or backup recovery.
+
+Permission revocation is particularly sensitive. If access checks are cached, the system needs a bounded revocation delay or an authoritative check on critical paths. A short TTL may reduce exposure but is not equivalent to immediate revocation. If the product promises immediate revocation, use a mechanism that enforces that promise rather than relying on an assumed cache expiry time.
+
+### Cache-security review checklist
+
+- Does the key include tenant, identity scope and every response-varying dimension that matters?
+- Can an attacker influence a shared cached response through headers, URL parsing or origin behavior?
+- Are authorization and tenant checks preserved on cache hits?
+- Are sensitive responses marked and partitioned appropriately?
+- Is the stale-data window explicit for each data class?
+- Can stale content be served during an origin error, and is that safe?
+- How quickly must permission revocation take effect?
+- How do deletion and invalidation reach every relevant cache layer?
+- Are cache keys, values and logs free of secrets and unnecessary personal data?
+- Are cross-tenant and cache-poisoning tests part of release validation?
+
+
 ## Further reading
 - [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html).
 - [Redis eviction documentation](https://redis.io/docs/latest/develop/reference/eviction/).
