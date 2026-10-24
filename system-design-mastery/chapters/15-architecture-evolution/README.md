@@ -122,6 +122,10 @@ Event-driven systems communicate using events, commonly through a broker or dura
 
 Distinguish a **command** (request that an owner attempt an action) from an **event** (fact that something happened). Define event ownership, schema evolution, retention, ordering, idempotency and replay behavior. Avoid implicit event cycles where each consumer emits events that trigger one another indefinitely.
 
+### Workflow orchestration and choreography
+
+**Orchestration** centralizes workflow progression in a coordinator, making transitions and recovery policy easier to inspect but potentially concentrating complexity in that coordinator. **Choreography** lets services react to events, reducing central control but making end-to-end behavior harder to follow. Both approaches need explicit timeouts, retry and duplicate handling, terminal states, compensation where appropriate, and observability. Choose based on workflow complexity and ownership rather than assuming one is inherently more scalable.
+
 ### Hexagonal architecture, ports-and-adapters, and clean architecture
 
 These approaches put domain/application policy behind interfaces (ports) and use adapters for databases, HTTP, queues or external providers. The goal is dependency inversion: business rules should not be forced to depend on a framework or vendor SDK. This helps when rules are important and infrastructure changes or testing boundaries matter. It becomes ceremony if every simple function gets a needless interface and abstraction.
