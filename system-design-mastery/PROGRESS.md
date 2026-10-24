@@ -228,3 +228,13 @@ The sprint improves confidence in repository structure but does not certify tech
 - [x] Cross-check the Chapter 14 error-budget definition against Google's SRE Workbook: error budget is 1 minus the SLO, with request-count budgets dependent on the request-based SLI definition.
 - [ ] Run a full OpenAPI 3.1 parser/linter. Attempting to launch the Mermaid CLI with npx timed out before the package could be obtained; no renderer result is claimed.
 - [ ] Continue claim-by-claim source review, exhaustive external-link validation, independent verification of all 21 inventory rows, and cross-chapter consistency review. The scoped checks above do not complete these book-wide acceptance criteria.
+
+
+## Chapter 20 source verification — 2026-10-24
+
+- [x] Opened the current MDN browser-storage guidance and confirmed that browser-origin storage is best-effort by default, quota/eviction behavior varies by browser, and persistent-storage requests have browser-specific approval behavior.
+- [x] Opened MDN's WebRTC protocol guidance and Cloudflare's TURN FAQ; checked the ICE/STUN/TURN distinction, TURN relay role, and the difference between point-to-point relay and SFU fan-out. The chapter's wording remains qualified and explicitly identifies Cloudflare's description as provider-specific.
+- [x] Opened the W3C Indexed Database API 3.0 and Service Workers publications; updated Chapter 20's Further reading notes to identify the IndexedDB 3.0 document as a Working Draft and the Service Workers page as an evolving Candidate Recommendation Draft, rather than implying both are finalized Recommendations.
+- [x] Added MDN's WebRTC protocol reference for ICE/STUN/TURN/SFU context.
+- [ ] Continue checking all Chapter 20 references and source-to-claim alignment; the opened subset is not an exhaustive external-link audit.
+- [ ] Validate Mermaid diagrams using a real renderer and run a full OpenAPI validator. Network/package retrieval is not available in the current execution environment; do not report these checks as passed.
