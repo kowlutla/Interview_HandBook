@@ -26,9 +26,26 @@ Most topics use this structure, adapting it when a section would add no value:
 - **Interview questions** — direct questions with explanatory answers.
 - **Quick revision** — a compact recap.
 
-## Core curriculum
+## Chapters
 
-See [Curriculum](CURRICULUM.md) for the planned learning path and scope.
+1. [System Design Foundations](chapters/01-foundations/README.md)
+2. [Capacity Estimation](chapters/02-capacity-estimation/README.md)
+3. [APIs and System Boundaries](chapters/03-apis-and-boundaries/README.md)
+4. [Data Modeling and Databases](chapters/04-data-modeling-and-databases/README.md)
+5. [Caching](chapters/05-caching/README.md)
+6. [Scaling Traffic](chapters/06-scaling-traffic/README.md)
+7. [Replication and Partitioning](chapters/07-replication-and-partitioning/README.md)
+8. [Consistency and Transactions](chapters/08-consistency-and-transactions/README.md)
+9. [Asynchronous Processing](chapters/09-asynchronous-processing/README.md)
+10. [Reliability and Resilience](chapters/10-reliability-and-resilience/README.md)
+11. [Security and Multi-Tenancy](chapters/11-security-and-multi-tenancy/README.md)
+12. [Observability and Design Trade-offs](chapters/12-observability-and-trade-offs/README.md)
+
+## Supporting documents
+
+- [Curriculum](CURRICULUM.md)
+- [Editorial Standard](EDITORIAL-STANDARD.md)
+- [Progress Tracker](PROGRESS.md)
 
 ## Scope boundaries
 
@@ -36,4 +53,4 @@ This guide focuses on HLD fundamentals. Deep implementation tutorials, exhaustiv
 
 ## Status
 
-This is a new, separate guide. The existing `system-design-mastery/` folder is intentionally left unchanged. Chapters will be marked complete only after their content and links have been reviewed.
+The initial twelve chapter drafts now exist. Focused technical and link reviews are still required before calling the guide complete. The existing `system-design-mastery/` folder is intentionally left unchanged.
