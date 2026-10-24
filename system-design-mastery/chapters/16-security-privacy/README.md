@@ -198,6 +198,14 @@ A caller may be allowed to update a profile but not fields such as role, tenant 
 
 Use explicit request DTOs or allow-lists, validate writable fields by operation and role, and construct responses from an explicit output model. Do not rely on hiding sensitive fields in the UI. Test both unauthorized reads of response properties and unauthorized writes to protected properties.
 
+### Injection and unsafe interpretation
+
+Injection occurs when untrusted data is interpreted as instructions in a language or execution context rather than treated as data. Examples include SQL/NoSQL query injection, operating-system command injection, template injection and unsafe expression evaluation. The root cause is usually a boundary that mixes code or query structure with untrusted values.
+
+Use parameterized queries or prepared statements for data values. When a query must vary by identifier or sort direction, use a strict allow-list because many query APIs cannot parameterize identifiers as ordinary values. Avoid constructing shell commands from user input; prefer APIs that pass arguments without a shell. Keep template auto-escaping enabled and apply context-appropriate output encoding. Input validation is useful for business constraints, but it is not a substitute for separating data from executable syntax.
+
+Test injection at each interpreter boundary, including filters, search expressions, report generation, webhook processing, administrative tools and background jobs. Also review stored data when it is later interpreted by a different component: data accepted safely by one layer can become dangerous when passed to a shell, template engine or query builder downstream.
+
 ### Sensitive business flows and resource consumption
 
 Some abuse is not a conventional permission failure. An attacker may legitimately authenticate and call a public flow—ticket purchase, trial creation, password reset, bulk export, SMS delivery or expensive search—at a rate that harms the business or exhausts a paid dependency.
@@ -237,6 +245,7 @@ A deprecation plan should include consumer identification, communication, migrat
 | Repeat a costly business action from many accounts | Abuse controls protect the business flow and shared dependencies |
 | Supply an internal/private destination to a URL-fetching feature | Request is blocked according to the egress policy |
 | Return malformed or oversized data from an upstream API | Consumer validates and fails safely within bounded resources |
+| Supply query syntax or shell metacharacters in untrusted fields | Values remain data; no unauthorized query or command executes |
 | Call an obsolete or undocumented API version | Access and retirement policy remains enforced |
 
 ### API threat review checklist
