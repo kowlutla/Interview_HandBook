@@ -293,3 +293,12 @@ A focused source spot-check was completed against the live official/vendor pages
 - MDN WebRTC protocol guidance has been added alongside the existing general WebRTC API reference.
 
 This is a targeted source spot-check, not a complete Chapter 20 claim-by-claim review. The chapter's full external-link audit and all other chapters' source verification remain open. Mermaid rendering and full OpenAPI validation also remain unverified.
+
+
+## Final structural and focused source pass — 2026-10-24
+
+- **Chapter 09 duplication correction:** removed a second cache-aside sequence diagram that repeated the read path already illustrated near the chapter's opening. The chapter now has one cache-aside read-path diagram.
+- **Fresh structural check:** all 20 chapter pages still have balanced code fences, no exact duplicate Markdown headings, a Further reading section, and the navigation footer at the end. The chapter-page Mermaid inventory is now 21 blocks; static declaration checks pass, but rendering is not validated.
+- **Chapter 20 source qualification:** checked current MDN browser-storage and WebRTC protocol guidance, Cloudflare's provider-specific TURN FAQ, and W3C publication statuses. The chapter now identifies the Service Workers publication as an evolving Candidate Recommendation Draft and Indexed Database API 3.0 as a Working Draft, and includes the MDN WebRTC protocols guide. These are targeted checks, not exhaustive claim/source verification.
+
+The book-wide technical acceptance remains open: no Mermaid renderer or full OpenAPI validator was successfully run; external-link liveness and source-to-claim alignment are not exhaustive; and the 21 curriculum inventory families have not all received independent depth verification. Do not mark them Deep or claim the entire textbook technically certified until those checks are completed.
