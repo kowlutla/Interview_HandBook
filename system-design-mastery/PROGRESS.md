@@ -390,3 +390,13 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Updated the workflow at commit `4d868540e7913b027acd3f43c58304586d80cb61` to pass Puppeteer a config enabling `--no-sandbox` and `--disable-setuid-sandbox`, and made the render artifact upload fail if no files are found.
 - [ ] Re-run of the corrected workflow is queued as run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824) at the time this entry was written; its outcome has not yet been inspected. Do not mark Mermaid rendering passed until all 29 SVGs are generated and the job completes successfully.
 - [ ] The full 21-family depth/source acceptance, whole-book contradiction review and all chapter-local source verification remain open; statuses must remain provisional.
+
+
+## CI acceptance confirmation — 2026-10-24
+
+- [x] Verified corrected GitHub Actions run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824): both jobs completed successfully.
+- [x] OpenAPI job: extractor produced exactly one embedded OpenAPI 3.1 specification; `openapi-spec-validator` completed successfully.
+- [x] Mermaid job: extracted 29 diagrams, rendered each to SVG after applying the Puppeteer no-sandbox configuration, verified the expected output count, and uploaded artifact [system-design-mermaid-rendered](https://github.com/kowlutla/System-Design/actions/runs/40104445824/artifacts/12563862191) containing 29 files.
+- [x] Inspected the Mermaid job log; it names all 29 rendering inputs and confirms that 29 files were uploaded. This confirms renderer execution, not a human visual inspection of every resulting diagram.
+- [ ] Full 21-family mechanism/example/trade-off/failure-mode and source acceptance remains open. No row is promoted to Deep.
+- [ ] Whole-book contradiction/prerequisite/duplication review and exhaustive chapter-local claim-to-source audit remain open. The textbook is not yet formally accepted solely because structural/render/schema validation passed.
