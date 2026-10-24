@@ -243,7 +243,7 @@ The sprint improves confidence in repository structure but does not certify tech
 ## Final structural and focused source pass — 2026-10-24
 
 - [x] Re-run the structural sweep across all 20 chapter pages after the Chapter 09 and Chapter 20 edits: all have balanced fences, no exact duplicate headings, a Further reading section, and the textbook navigation footer at the end.
-- [x] Re-inventory chapter Mermaid blocks after removing a second, redundant Cache-aside read-path diagram from Chapter 09. Current chapter-page inventory is 21 non-empty Mermaid blocks with recognized diagram declarations; actual rendering remains unverified.
+- [x] Re-inventory chapter Mermaid blocks after removing a second, redundant Cache-aside read-path diagram from Chapter 09. Current chapter-page inventory is 29 non-empty Mermaid blocks with recognized diagram declarations across the 20 chapter pages; actual rendering remains unverified.
 - [x] Remove the duplicate Chapter 09 cache-aside sequence diagram because the same read path is already explained and illustrated near the start of the chapter.
 - [x] Add explicit draft-status qualifiers for the W3C Service Workers and IndexedDB 3.0 references in Chapter 20 and add MDN's WebRTC protocol guide.
 - [x] Spot-check the current official MDN browser-storage and WebRTC protocol pages, Cloudflare's provider-specific TURN FAQ, and the W3C publication status pages. Results and limits are recorded in COVERAGE-AUDIT.md.
@@ -281,8 +281,15 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Confirmed earlier recorded structural checks, targeted arithmetic checks, and Chapter 06 OpenAPI YAML checks are scoped as targeted checks rather than full standards validation.
 - [ ] Full independent mechanism/example/trade-off/failure-mode review of all 21 curriculum families remains open.
 - [ ] Repository-wide external-link liveness and claim-to-source audit remains open.
-- [ ] Mermaid rendering remains unverified; package acquisition is blocked by the current environment's network/DNS restrictions. Static checks do not establish successful rendering.
+- [ ] Mermaid rendering remains unverified for all 29 chapter-page diagrams; package acquisition is blocked by the current environment's network/DNS restrictions. Static checks do not establish successful rendering.
 - [ ] Full OpenAPI 3.1 validator/linter run remains unverified; package acquisition is blocked by the current environment's network/DNS restrictions. Targeted YAML checks do not establish full conformance.
 - [ ] Final whole-book contradiction, duplication, terminology, and prerequisite review remains open.
 
 **Closure decision:** The content-build/readability pass is in a review-ready state, but formal technical acceptance is not complete. Keep this distinction visible; do not describe the textbook as fully validated until the remaining checks are performed in an environment with the required validators and the full coverage/source reviews are completed.
+
+
+## Inventory reconciliation — 2026-10-24
+
+- [x] Re-fetched all 20 current chapter pages and counted Mermaid opening declarations directly from their Markdown content. The current total is **29 chapter-page Mermaid blocks** (16 across Chapters 01–10 and 13 across Chapters 11–20). This supersedes older checkpoint counts of 21/22; the diagrams have not been rendered.
+- [x] Compared the Chapter 11 section headings with the coverage-audit row and found a stale reference to section 11.2A, which does not exist in the current chapter. Correct the audit mapping to the sections actually present.
+- [ ] Mermaid rendering remains a blocker; declaration counts do not establish syntactic or visual validity.
