@@ -178,6 +178,52 @@ Actions should change the system or its operating environment: add a guardrail, 
 - Is telemetry itself bounded, available and protected?
 
 
+## 17.3 Worked alert design: from an SLO to an actionable page
+
+An alert policy should connect a measurable user-impact signal to a response. The numerical values below illustrate the calculation; they are not universal paging thresholds.
+
+### Define the SLI and budget
+
+Assume an API has a request-based SLO of **99.9% successful eligible requests over a rolling 30-day window**. Define a good event precisely—for example, an eligible request that returns the expected successful outcome within the agreed latency threshold. Exclude only traffic that the SLO definition explicitly excludes; do not silently remove failures because they are inconvenient.
+
+- Allowed bad-event fraction: (1 - 0.999 = 0.001 = 0.1\%\).
+- If the window contains 10,000,000 eligible requests, the illustrative error budget is (10{,}000{,}000 \times 0.001 = 10{,}000) bad requests.
+- If 2% of eligible requests are bad during a recent window, the observed error rate is 20 times the allowed rate: (0.02 / 0.001 = 20\) times burn rate for that window.
+
+A burn rate is a ratio, not a prediction that the monthly budget will definitely be exhausted. Its meaning depends on the window, traffic mix, and whether the recent rate persists.
+
+### Turn the calculation into a response policy
+
+| Signal | Possible response | Why it exists |
+|---|---|---|
+| Severe user-visible failure and rapid budget burn sustained across short windows | Page the on-call owner; show affected routes/regions and the top diagnostic signals | Detect an outage quickly while requiring enough evidence to reduce transient noise |
+| Moderate degradation sustained across longer windows | Page or create an urgent ticket according to service criticality and response expectations | Catch slow budget erosion without paging on every brief fluctuation |
+| A component metric is abnormal but the user SLI remains healthy | Dashboard, ticket, or diagnostic alert unless the metric implies imminent risk | Internal anomalies are often useful for diagnosis but are not automatically user incidents |
+| Queue age, saturation or dependency latency is rising before SLI failure | Capacity or early-warning alert with a documented action | Allow mitigation before user-visible failures occur |
+
+For production use, select the short and long windows, burn thresholds, minimum traffic requirements and notification route based on the SLO period, incident response objectives, traffic volume and observed noise. Use multi-window confirmation where appropriate; do not copy a threshold from another service without validating its behavior.
+
+### Make the page actionable
+
+A page should answer, or link directly to evidence answering:
+
+1. What user journey or API is affected, and which regions or tenant cohorts are involved?
+2. What changed in the SLI, over which windows, and how quickly is the budget being consumed?
+3. Which recent deployment, dependency, queue, pool or saturation signals are the strongest diagnostic leads?
+4. What safe mitigation is available, who owns it, and how will recovery be verified?
+
+Keep metric dimensions bounded (for example, service, route template, region and result class). Do not create a unique time series for every user or request. Put request identifiers in controlled logs or traces, and ensure the alert does not expose sensitive data.
+
+### Validation checklist
+
+- [ ] The good-event definition and denominator are explicit and stable.
+- [ ] Low-traffic behavior and minimum sample sizes are addressed.
+- [ ] Alert windows and thresholds are replayed against historical incidents and quiet periods.
+- [ ] Every page has an owner, an expected action, and a runbook.
+- [ ] The alert is tested end-to-end, including notification delivery and escalation.
+- [ ] Recovery is confirmed using the user-facing SLI, not merely a green process or dependency health check.
+
+
 ## Further reading
 - [OpenTelemetry documentation](https://opentelemetry.io/docs/).
 - Google [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
