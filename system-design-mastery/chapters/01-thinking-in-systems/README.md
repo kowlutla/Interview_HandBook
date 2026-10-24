@@ -356,7 +356,7 @@ Consider an illustrative event-registration application used by one product team
 
 Under the stated assumptions, start with a **modular monolith**: separate event, registration, payment-workflow and notification modules behind explicit interfaces, but keep seat allocation and registration persistence in one authoritative transaction boundary. Write a durable state transition and an outbox record together; publish confirmation work asynchronously. Use a stable payment idempotency key and a reconciliation path for uncertain provider outcomes.
 
-This is not a claim that modular monoliths are universally better. It is the simplest candidate that appears to satisfy the current invariants and team constraints without introducing distributed coordination prematurely.
+This is not a claim that modular monoliths are universally better. It is the simplest candidate that appears to satisfy the current invariants and team constraints without introducing distributed coordination prematurely. The payment idempotency key must identify the logical payment operation and remain stable across retries; persist the association with the registration/workflow state. Confirm the provider's key scope, retention window, and behavior for the same key with a different request payload. If retries may occur after the provider forgets the key, do not assume the key alone prevents a duplicate charge: reconcile against the provider's durable transaction reference or provide an explicit exception/manual-recovery path.
 
 ### Step 4: define evidence that would change the decision
 
