@@ -69,6 +69,7 @@ Check items only when the work has actually been performed.
 - [x] Add a Chapter 16 tenant-scoped document-export threat model covering API, queue, worker, database, object-storage and operational trust boundaries.
 - [x] Add explicit Chapter 16 injection guidance (parameterized queries, allow-listed identifiers, safe command execution, context-aware template/output handling) and a verification case; update the inventory map.
 - [x] Add the OWASP Injection Prevention and SQL Injection Prevention Cheat Sheets to the reference library and link them from Chapter 16.
+- [x] Add an explicit idempotent-receiver pattern explanation in Chapter 19 and define it in the glossary to match the mandatory cross-cutting pattern inventory.
 - [x] Add a Chapter 9 cross-tenant/cache-poisoning test matrix covering tenant and role variation, header/key poisoning, revocation, stale-fill races and cache failure.
 - [x] Add a Chapter 19 cross-pattern review of retry/hedge/breaker interactions, aggregate pool limits, cache/replica freshness, outbox/inbox, failover fencing and replay side effects.
 - [x] Add a Chapter 6 worked OpenAPI evolution example covering additive fields, breaking changes, contract tests and deprecation gates.
