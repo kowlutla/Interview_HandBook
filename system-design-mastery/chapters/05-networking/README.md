@@ -399,6 +399,54 @@ Design graceful overload behavior for legitimate flash crowds as well as hostile
 - Are emergency traffic controls observable and reversible?
 
 
+## 5.23 Practical network troubleshooting: symptoms, evidence, and hypotheses
+
+Troubleshooting should narrow the failure boundary using evidence rather than immediately changing infrastructure. A timeout is an observation, not a root cause: it can arise from name resolution, connection establishment, TLS negotiation, request processing, a downstream dependency, or a response path.
+
+### Start by classifying the failed phase
+
+| Symptom or phase | Evidence to collect | Common hypotheses | Important caveat |
+|---|---|---|---|
+| Name resolution fails | Resolver response code, queried record/type, authoritative answer, TTL, resolver path | NXDOMAIN, SERVFAIL, stale cache, split-horizon configuration, DNSSEC validation failure | A successful lookup from one resolver does not prove every client sees the same answer |
+| Connection cannot be established | Destination IP/port, route, SYN/SYN-ACK/RST observations where available, connection errors | Wrong address, firewall/security-group rule, listener absent, route failure, exhausted connection state | A client-side timeout alone cannot distinguish a dropped packet from a silent or unreachable server |
+| TLS handshake fails | Client/server error, SNI hostname, certificate SAN/chain/expiry, negotiated protocol, trust store | Hostname mismatch, missing intermediate, expired certificate, incompatible protocol/cipher, incorrect SNI, mTLS identity failure | Do not disable certificate validation as a production fix |
+| Request reaches edge but not service | Proxy/LB access logs, target health, routing rule, upstream connection metrics | Incorrect route, no healthy targets, policy rejection, upstream connection exhaustion | Edge health and application readiness are different signals |
+| Request reaches service but is slow | Per-hop spans, queue wait, pool wait, CPU, downstream latency, saturation | Queueing, slow dependency, lock contention, overloaded connection pool, expensive query | The slowest visible span may be a symptom of queueing earlier in the path |
+| Client times out but server logs success | Request/trace ID, server completion time, response-write errors, retry history | Response delayed/lost, deadline too short, proxy timeout, caller abandoned work after commit | The operation may have committed; retry safety depends on idempotency and outcome reconciliation |
+| Intermittent failures after DNS/LB changes | DNS TTLs, client-side caches, persistent connections, endpoint draining, health transitions | Long-lived connections to old endpoints, uneven propagation, premature target removal | DNS changes do not forcibly migrate existing TCP connections |
+| Failures only for large or expensive requests | Payload size, response size, route, request duration, rate-limit and resource metrics | Body-size limits, proxy buffering, slow-client behavior, request-cost imbalance, resource exhaustion | Limits can differ at CDN, gateway, ingress, application and downstream layers |
+
+### A disciplined investigation sequence
+
+1. **Define the scope.** Identify affected clients, regions, endpoints, tenants, protocol versions and start time. Separate total outage from elevated latency or a small failure cohort.
+2. **Check the exact destination and name path.** Confirm the hostname, resolved addresses, address family, port and whether a proxy or service mesh changes the route.
+3. **Separate connection setup from application time.** Where telemetry permits, distinguish DNS, connect, TLS, time-to-first-byte and response-transfer durations.
+4. **Follow one request across boundaries.** Use a correlation or trace identifier; compare client, edge, service and dependency timestamps. Account for clock skew before interpreting cross-host event order.
+5. **Check saturation and limits.** Inspect connection counts, queue depth, pool waits, CPU/memory, file descriptors, ephemeral ports, request limits and throttling—not only CPU utilization.
+6. **Form and test one hypothesis at a time.** Prefer a narrow, reversible change and define what evidence would confirm or reject it.
+7. **Verify recovery and side effects.** Check error rate, latency, retries, duplicate operations, backlog and whether the mitigation moved overload to another layer.
+
+### Worked example: “The API started timing out after deployment”
+
+Assume client requests time out after two seconds. The service logs show some successful writes at 2.4 seconds, while the load balancer reports upstream timeouts around two seconds.
+
+- **Observation:** client and edge deadlines expire before some server operations finish.
+- **First checks:** compare the configured timeout at each hop; inspect trace spans for connection-pool wait, database time and response-write duration; check whether the deployment changed query shape, pool sizing or dependency latency.
+- **Unsafe shortcut:** simply increase every timeout. This can increase in-flight work and queueing during overload.
+- **Safer response:** establish a coherent end-to-end deadline, bound queues and concurrency, optimize the demonstrated bottleneck, and make retries conditional on operation semantics. For writes, use an idempotency key or status-reconciliation path where appropriate.
+- **Acceptance evidence:** the targeted latency percentile is within its objective under representative load, timed-out operations have understood outcomes, retry volume is bounded, and downstream saturation does not worsen.
+
+### Troubleshooting review checklist
+
+- [ ] Is the failure phase identified, or are we treating every timeout as a network problem?
+- [ ] Do client, edge and server timings share a correlation identifier and compatible time interpretation?
+- [ ] Have IPv4 and IPv6, proxy paths, TLS identity and DNS cache behavior been considered?
+- [ ] Are health, readiness, routing and connection-draining signals distinguished?
+- [ ] Have queueing, connection-pool wait and downstream latency been measured?
+- [ ] Could the request have committed even though the caller timed out?
+- [ ] Does the mitigation reduce user impact without amplifying retries or moving overload downstream?
+
+
 ## Further reading
 - IETF, [RFC 8200 — IPv6 Specification](https://www.rfc-editor.org/rfc/rfc8200.html).
 - IETF, [RFC 4033 — DNS Security Introduction and Requirements](https://www.rfc-editor.org/rfc/rfc4033.html).
