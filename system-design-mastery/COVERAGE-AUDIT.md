@@ -236,3 +236,13 @@ Approximate word count decreased from 3,939 to 3,684. This was an editorial pass
 ### Chapter 19 — readability consolidation (2026-10-24)
 
 The chapter opened with several short overview sections for topics that were then explained again in detail later in the same chapter or in their dedicated chapters. Those summaries and a repeated synthesis checklist were removed. Queueing and tail behavior was retained as a connected explanation because it contributes directly to cross-cutting reasoning; the introduction now points readers to Chapters 03, 08 and 12 for the underlying capacity, storage and messaging mechanics. Approximate word count decreased from 3,890 to 3,499. This is an editorial pass only; the chapter's technical/source review remains open.
+
+
+### Source spot-check after readability edits — 2026-10-24
+
+Opened the canonical source pages linked from the revised networking and messaging chapters and the existing accessibility discussion:
+- IETF RFC 9293 (TCP), RFC 8446 (TLS 1.3), RFC 9110 (HTTP semantics), and RFC 9114 (HTTP/3) resolve to their official RFC Editor pages.
+- Apache Kafka 4.3 design documentation resolves to the versioned official documentation.
+- W3C WCAG 2.2 resolves to the W3C Recommendation.
+
+This confirms the checked URLs are reachable and point to the intended authoritative documents. It does not complete a claim-by-claim verification of every protocol statement, all external links, or provider-specific details. Those checks remain open.
