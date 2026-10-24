@@ -514,3 +514,8 @@ Chapter 08 section 8.3A now treats search indexes as derived, potentially stale 
 ## Focused cache correctness correction — 2026-10-24
 
 Chapter 09 now includes a worked tenant-safe cache-key and authorization-revocation scenario. It explicitly separates current authorization from representation reuse, explains why adding tenant/user dimensions to a key is not itself an authorization check, and identifies tests for duplicate IDs across tenants, different roles, lost invalidation, and CDN/proxy behavior. The cache family remains **Developing** pending broader mechanism/source validation and workload testing.
+
+
+## Repository-wide structure recheck — 2026-10-24
+
+All 20 current chapter pages were fetched again after the latest edits. Each page had balanced fenced-code markers, no duplicate heading text, and the expected navigation footer. This confirms those specific structural properties only; it does not replace Markdown rendering, link resolution, post-edit Mermaid/OpenAPI CI, or mechanism/source acceptance. The inventory statuses remain provisional.
