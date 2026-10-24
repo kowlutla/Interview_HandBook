@@ -64,7 +64,9 @@ Check items only when the work has actually been performed.
 - [x] Expand the curriculum from 19 to 20 chapters after the independent gap scan identified missing client-side, offline-first and real-time architecture coverage.
 - [x] Add Chapter 20 covering rendering/delivery, client/server state ownership, offline persistence, synchronization/conflict resolution, realtime transports, WebRTC, collaboration, micro-frontends, interactive sessions, security and operations.
 - [x] Add Chapter 20 to the textbook index, learning roadmap, curriculum matrix, mandatory inventory, coverage audit and glossary.
+- [x] Perform a targeted source review of Chapter 20 browser-storage durability and WebRTC TURN/SFU encryption boundaries; record the official/provider references and remaining verification scope in COVERAGE-AUDIT.md.
 - [ ] Review Chapter 20's technical claims against primary/official sources; verify rendering/security details and all external references.
+- [x] Perform a targeted structural check of Chapter 20: balanced fences, no duplicate headings, Further reading order, two recognized Mermaid declarations, and valid textbook footer links.
 - [ ] Perform a current structural and relative-link check across all 28 Markdown files after adding Chapter 20.
 - [ ] Validate the two new Mermaid diagrams with a renderer; currently they have only been manually inspected.
 - [ ] Review each module for accuracy, clarity, depth and prerequisite coverage.
