@@ -293,3 +293,6 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Re-fetched all 20 current chapter pages and counted Mermaid opening declarations directly from their Markdown content. The current total is **29 chapter-page Mermaid blocks** (16 across Chapters 01–10 and 13 across Chapters 11–20). This supersedes older checkpoint counts of 21/22; the diagrams have not been rendered.
 - [x] Compared the Chapter 11 section headings with the coverage-audit row and found a stale reference to section 11.2A, which does not exist in the current chapter. Correct the audit mapping to the sections actually present.
 - [ ] Mermaid rendering remains a blocker; declaration counts do not establish syntactic or visual validity.
+
+- [x] Static diagram declaration check: reviewed all 29 Mermaid blocks in the 20 chapter pages. Each begins with a recognized flowchart or sequence-diagram declaration; rendering is still unverified.
+- [x] Checked the numbered section endpoints listed in the 21-row mandatory inventory against current chapter headings. All referenced endpoints exist after correcting the stale Chapter 11 mapping. This validates the map, not the depth or technical accuracy of each section.
