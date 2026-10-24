@@ -463,3 +463,14 @@ Two more targeted review gaps were found and corrected:
 - **Chapter 12, new section 12.3A:** explains Kafka idempotent producer scope, transactional records/offsets and `read_committed` visibility, and demonstrates why a Kafka transaction does not automatically include a PostgreSQL commit or external payment/email side effect. It adds a six-question checklist for auditing an exactly-once claim and links to the versioned Kafka 4.3 delivery and transaction design docs.
 
 Both changes are substantive depth corrections, not grounds to mark the inventory rows Deep. They require independent review and the CI validation pipeline's completed run. The repository validation workflow now has two artifact jobs configured, but actual Mermaid rendering and OpenAPI validation remain unconfirmed until a completed Actions run is inspected.
+
+
+## All-chapter section map recheck — 2026-10-24
+
+A fresh heading-level review re-fetched the current section structures for all 20 chapters. Chapters 01–07 and 13–19 have dedicated sections for the major curriculum areas shown in the mandatory inventory, including measurable quality attributes, capacity-test plans, concurrency/cancellation, networking layers, API contract/security/gateway semantics, relational anomalies and resharding, scaling/overload, SLO/recovery rehearsal, architecture styles, IAM/threat modeling, observability cardinality/incident response, Kubernetes/IaC/supply-chain security, and multi-tenant fairness/pattern interactions. Chapters 08, 09 and 12 were additionally checked after substantive edits; their fences/headings/footer structure remains intact.
+
+This verifies that the expected teaching areas and named sections exist. It does **not** prove that every explanation in each area meets the Deep bar. In particular, the full 21-row acceptance still requires examples, selection criteria, trade-offs, failure modes, and source alignment to be independently checked row by row. The two newest additions (Chapter 08 section 8.2A and Chapter 12 section 12.3A) remain provisional improvements until that deeper review and automated validation finish.
+
+### Validation workflow observability
+
+The repository now contains the CI workflow and artifact-extraction script. The available GitHub Actions helper surfaced in this session only returns pull-request-filtered workflow runs and returned an empty result for the workflow-creation commit; it did not expose the latest push-triggered run. Therefore the workflow's actual result is **not yet observed**. Do not record the Mermaid render or OpenAPI validator as passed until the run status and job logs can be inspected.
