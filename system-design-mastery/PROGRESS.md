@@ -408,3 +408,13 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Updated the mandatory messaging/data-movement audit row to reflect the new material and retain the explicit remaining verification work.
 - [ ] The messaging family remains Developing: this addition is not evidence that all Kafka version/configuration claims, schema-registry choices, replay semantics, or external side-effect boundaries have passed independent source review.
 - [ ] Continue the remaining 21-family depth/source review and whole-book consistency review; do not mark the textbook accepted on the strength of this focused correction.
+
+
+## Focused security and cloud rollback corrections — 2026-10-24
+
+- [x] Added Chapter 16 guidance distinguishing cached authorization decisions from cached HTTP responses, including decision-context dimensions, bounded revocation delay, invalidation failure, fail-open trade-offs, and targeted revocation/cache-path tests.
+- [x] Cited OWASP Authorization and Web Cache Security Cheat Sheets for the new Chapter 16 material.
+- [x] Added Chapter 18 guidance that Kubernetes Deployment rollback restores the Pod template and does not undo database migrations, emitted events, external side effects, or every related resource; cited official Kubernetes Deployment documentation.
+- [x] Updated COVERAGE-AUDIT.md with both focused changes while retaining Developing statuses.
+- [ ] Recheck changed chapters structurally and verify the latest CI result after these commits; the earlier green run predates these edits.
+- [ ] Continue full 21-family depth review, whole-book contradiction/prerequisite/duplication review, and claim-to-source verification. These focused additions do not constitute final acceptance.
