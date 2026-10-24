@@ -99,6 +99,22 @@ For every saga step, define:
 
 Compensation is a new domain action, not necessarily a rollback. A cancellation may incur fees; a refund may happen after a charge; a reservation may expire rather than be directly undone. Sagas therefore need explicit business states such as Pending, Reserved, PaymentAuthorized, Confirmed, Compensating, Failed, and Completed, with valid transitions enforced.
 
+### Two-phase commit or saga?
+
+| Concern | Two-phase commit | Saga |
+|---|---|---|
+| Atomicity model | Coordinates one transaction across participating resources | Sequences local commits and compensating actions |
+| Failure behavior | Participants may wait for coordinator recovery | Workflow may remain partially complete while retry or compensation runs |
+| Visibility | Presents one atomic outcome when the protocol completes | Intermediate business states may be visible |
+| Main requirement | Participants support a common transaction protocol | The business process can define valid intermediate states and compensations |
+| Typical fit | A bounded transaction where atomic commit is required and supported | A longer workflow across independently owned services |
+
+A saga is not equivalent to a global transaction: other requests may observe intermediate state, so domain transitions still need concurrency controls.
+
+### Idempotency and deduplication boundaries
+
+At-least-once delivery can repeat a step. Store a message or operation identity with the business effect in the same transactional boundary, or use an equivalent durable protocol that closes the crash window. A broker's exactly-once feature applies only to its documented scope; it does not automatically make arbitrary database writes, emails, payments, or external API calls happen exactly once. Name the boundary and define reconciliation for uncertain outcomes.
+
 ## 11.5G Distributed lock decision checklist
 
 Before introducing a distributed lock, ask:
