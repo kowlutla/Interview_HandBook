@@ -22,6 +22,10 @@ Name the fault model and timing assumptions. Separate safety (nothing forbidden 
 ## Diagrams
 Use Mermaid when it clarifies relationships, sequence, state or failure. Keep nodes and edges readable, explain what the diagram shows, and do not treat a diagram as proof of correctness.
 
+## Client-side, offline-first, and real-time systems
+
+For client-facing systems, distinguish authoritative server state, client-local state, cached/replicated state, and pending operations. Do not equate optimistic presentation with commit, transport delivery with durable processing, or browser storage with unconditional durability. State retry identity, synchronization checkpoints, conflict/deletion policy, cursor expiry and resynchronization behavior. For persistent connections and WebRTC, define reconnect/replay, ordering, backpressure, authorization revocation, privacy metadata, and relay/media-server trust boundaries. Treat implementation and browser behavior as version/platform dependent where appropriate.
+
 ## Scope
 Focused examples are encouraged. Complete end-to-end system architectures and interview question collections are excluded from this phase.
 
