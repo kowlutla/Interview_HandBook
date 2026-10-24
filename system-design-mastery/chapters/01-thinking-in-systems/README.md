@@ -270,8 +270,66 @@ For each proposed component, ask:
 There is rarely one design that maximizes every quality attribute. A design may reduce latency but increase cost, improve availability but permit stale reads, or increase independent deployment while making debugging more difficult. State the chosen objective and the cost being accepted. A trade-off is meaningful only when the relevant constraints and failure behavior are explicit.
 
 
+
+## 1.15 Architecture views: one system, several useful models
+
+An architecture diagram is a model built to answer a particular question. No single diagram can clearly communicate system scope, internal responsibilities, runtime interactions, data ownership, deployment topology, security boundaries and recovery behavior at the same time. Trying to place all of them on one page usually creates an unreadable picture that hides rather than reduces complexity.
+
+Choose the view based on the question:
+
+| View | Main question | Typical elements |
+|---|---|---|
+| System context | Who uses the system, and which external systems interact with it? | People, system boundary, external systems and major relationships |
+| Container / high-level structure | What applications and data stores make up the system, and how do they communicate? | Web/mobile apps, services, databases, queues and external dependencies |
+| Component | What responsibilities live inside one application or service? | Modules, adapters, domain components and their dependencies |
+| Code / implementation | How is one component implemented? | Classes, interfaces, functions or package dependencies |
+| Runtime sequence / dynamic view | What happens, and in what order, for one scenario? | Requests, responses, events, timeouts, retries and state transitions |
+| Deployment / physical view | Where does software run, and which infrastructure relationships matter? | Nodes, processes, regions, zones, networks, replicas and routing |
+| Data model / ownership view | Which facts exist, who owns them, and how are they related? | Entities, keys, constraints, authoritative owners and derived copies |
+| Trust-boundary view | Where do identities, privileges or trust assumptions change? | Principals, security zones, authentication and authorization enforcement points |
+| Failure / recovery view | What fails together, and how is service restored? | Failure domains, redundancy, promotion, restore paths and degraded modes |
+
+The C4 model is one useful way to describe static software structure at different levels: system context, containers, components and code. In that model, a “container” means an application or data store, not necessarily an operating-system or Docker container. A deployment diagram is a separate view because the same logical structure can be deployed differently in development, staging, one region, or multiple regions.
+
+Do not force every diagram type into every design. Use the smallest set that answers the decision at hand. For most high-level discussions, context and container views establish scope and major responsibilities; sequence, deployment, data, or trust-boundary views are added when the decision depends on those details.
+
+### Example: do not mix logical structure with deployment topology
+
+A logical view might show Web application → Order service → Order database. It answers responsibility and communication questions. A deployment view may show three service replicas across two zones behind a load balancer, a database primary and standby, and a private subnet. It answers placement and failure-domain questions. Combining the two can be useful, but only if labels distinguish logical components from deployed instances.
+
+```mermaid
+flowchart TB
+  subgraph Logical["Logical structure"]
+    UI[Web application] --> API[Order service]
+    API --> DB[(Order database)]
+  end
+  subgraph Deployment["Deployment view: one possible production placement"]
+    LB[Load balancer] --> R1[Order replica A]
+    LB --> R2[Order replica B]
+    R1 --> P[(Database primary)]
+    R2 --> P
+    P -. replication .-> S[(Standby in another failure domain)]
+  end
+```
+
+This is an illustrative pair of views, not a claim that every order service should use this deployment. The logical relationship and physical topology must be validated independently: two replicas in the same failure domain do not protect against that domain's loss, and a standby does not guarantee safe failover without a tested promotion and fencing process.
+
+### Diagram quality checklist
+
+- State the question the diagram is intended to answer and its scope.
+- Name each element consistently across related diagrams.
+- Label important arrows with protocol, direction, data, or meaning where ambiguity matters.
+- Distinguish synchronous calls from asynchronous events.
+- Show trust boundaries and authoritative data ownership when they affect the decision.
+- Include error, timeout, retry, or recovery paths when they change correctness.
+- Mark assumptions and illustrative elements rather than implying they are deployed facts.
+- Keep the view at one useful level of abstraction; split it when readers cannot follow the relationships.
+- Update diagrams when the architecture changes; stale diagrams can be more harmful than missing diagrams.
+
+
 ## Further reading
 
+- [C4 model: diagrams](https://c4model.com/diagrams) and [introduction](https://c4model.com/introduction) — context, container, component, code, dynamic, and deployment views.
 - [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) — practitioner guidance for architecture quality.
 - [Microsoft Cloud Design Patterns](https://learn.microsoft.com/en-us/azure/architecture/patterns/) — patterns and their contexts.
 - [Martin Fowler on microservices](https://martinfowler.com/articles/microservices.html) — trade-offs and organizational implications.
