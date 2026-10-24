@@ -440,3 +440,16 @@ A focused consistency pass compared the main concepts that are taught in one cha
 The Chapter 09 hot-key gap found during the targeted review has been corrected with a dedicated section. The chapter's glossary and related concepts now align on LWW, PITR, QUIC, event-time watermarks, feature flags, idempotent receivers, database-per-service, and fencing tokens.
 
 **Limit:** this is a focused consistency pass over high-risk concept boundaries, not a proof that no contradiction or duplicate remains anywhere in all 20 chapters. The 21-family inventory stays Developing; no row is promoted to Deep.
+
+
+
+## CI validation path for blocked tooling — 2026-10-24
+
+To avoid leaving renderer/spec validation as a purely environmental blocker, a repository-native route has been added:
+
+- `.github/workflows/system-design-validation.yml` runs on textbook changes, pull requests and manual dispatch.
+- `system-design-mastery/scripts/validate_artifacts.py` extracts fenced Mermaid diagrams and the embedded OpenAPI 3.1 example. It fails if the expected 20 chapters, 29 Mermaid diagrams or one OpenAPI document are not found, and screens diagram declaration lines.
+- One CI job installs `openapi-spec-validator` and validates the extracted specification.
+- A separate CI job installs the official Mermaid CLI, renders each diagram to SVG, checks that all 29 outputs exist, and uploads the rendered files as an artifact.
+
+**Current status: configured, not yet proven passing.** The files were re-fetched after creation and the chapter-root path in the extraction script was corrected. A completed workflow result has not yet been retrieved; therefore neither real Mermaid rendering nor full OpenAPI validation is marked passed. Once the Actions run completes, inspect both job results and repair any failures before acceptance. If Mermaid CLI cannot install its browser/runtime on the hosted runner, use its documented container alternative or pin a compatible CLI/browser combination and rerun. If OpenAPI validation flags an issue, confirm against the versioned OpenAPI 3.1 specification and fix the actual contract rather than suppressing the error.
