@@ -410,3 +410,16 @@ A new check was run against all 20 current chapter pages, recognizing both backt
 - Whole-book contradictions, prerequisite flow and residual duplication: **still open beyond prior scoped checks**.
 
 The textbook is structurally clean and review-ready, but formal technical acceptance is not yet justified. Do not promote coverage rows to Deep or label the book fully validated until the remaining checks have evidence.
+
+
+
+## Reference-link availability pass — 2026-10-24
+
+The current reference catalog was re-fetched and all **74 unique destinations** in `references/README.md` were opened or attempted in the web retrieval environment. This included foundational distributed-systems papers; IETF RFCs; PostgreSQL and SQLite; versioned Kafka 4.3 and OpenAPI 3.1.0 documentation; Google SRE; AWS, Google Cloud and Azure architecture material; Docker and Kubernetes; OpenTelemetry; C4; WCAG 2.2; OAuth/OIDC; OWASP; CISA/NIST; SLSA v1.2; and SPDX. The two Chapter 09 references added during the current pass (AWS caching best practices and the OWASP Web Cache Security Cheat Sheet) were also opened successfully.
+
+Availability caveats:
+- The page reader could not fetch the DOI destinations for the FLP consensus paper and the LSM-tree paper directly. Search results independently confirm both DOI identifiers and the cited publications.
+- The generic CISA SBOM landing page returned HTTP 403 to the retrieval environment. The linked CISA 2026 SBOM bulletin resolves and describes the updated minimum elements.
+- Some sites redirect to canonical trailing-slash URLs or versioned pages; the redirects led to the intended sources.
+
+This is a **reference-catalog link-availability pass**, not a complete claim-by-claim source audit. It does not cover every chapter-only URL or verify every sentence against a source. Continue to keep source-to-claim alignment open until the remaining chapter-level review is complete.
