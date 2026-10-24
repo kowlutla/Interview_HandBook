@@ -90,7 +90,7 @@ The following sections are present and are the starting points for the deeper re
 | Security and privacy | Chapter 16: Threat modeling, Authorization models, Tenant isolation, OAuth 2.0 and OpenID Connect, 16.2 Threat modeling a system architecture, 16.3 API threat patterns, 16.4 tenant-scoped export threat model |
 | Observability and operations | Chapter 17: RED and USE, Percentiles and cardinality, SLO-driven alerting, 17.1A–17.1I, 17.2 Observability in practice, 17.3 worked SLO alert design |
 | Cloud and Kubernetes | Chapter 18: Containers and Kubernetes, 18.1A–18.1I, 18.2 Kubernetes architecture, 18.3 Service mesh, 18.4 IaC state and drift, 18.5 software supply-chain security |
-| Client-side and real-time architecture | Chapter 20: 20.1–20.13 | Rendering/delivery, state ownership, offline persistence, sync/conflicts, real-time transport, WebRTC, collaboration, micro-frontends, interactive sessions | Review source alignment, security boundaries, reconnect/replay behavior, and all operational failure modes |
+| Client-side and real-time architecture | Chapter 20: 20.1–20.13 — rendering/delivery, state ownership, offline persistence, synchronization/conflicts, real-time transport, WebRTC, collaboration, micro-frontends, interactive sessions, security and operations |
 | Patterns and anti-patterns | Chapter 19: Probabilistic data structures including Bloom-filter sizing, Distributed scheduling, Multi-tenancy, Multi-region consistency and routing, 19.2 Architecture pattern catalog, 19.3 worked multi-tenant fairness scenario, 19.4 pattern interactions |
 
 ## New additions in the current review pass
