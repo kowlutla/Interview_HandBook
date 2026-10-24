@@ -326,6 +326,53 @@ This is an illustrative pair of views, not a claim that every order service shou
 - Keep the view at one useful level of abstraction; split it when readers cannot follow the relationships.
 - Update diagrams when the architecture changes; stale diagrams can be more harmful than missing diagrams.
 
+## 1.16 Worked architecture evaluation: choose a boundary from evidence
+
+Consider an illustrative event-registration application used by one product team. It manages events, registrations, a limited number of seats, confirmation messages and an integration with an external payment provider. Assume moderate traffic, one main release cadence, and a hard invariant that accepted registrations must not exceed available seats. The numbers and constraints are deliberately illustrative; a real decision requires measured workload and business requirements.
+
+### Step 1: separate requirements from assumptions
+
+| Item | Type | Consequence for the design |
+|---|---|---|
+| Never confirm more registrations than available seats | Business invariant | Seat allocation needs an atomic authoritative decision; eventual reconciliation alone may be insufficient |
+| Payment provider can time out after processing a request | Dependency behavior to design for | Payment outcomes need idempotency and reconciliation; a timeout cannot be treated as proof of failure |
+| One team owns the application and releases together | Organizational constraint | Independent deployment may have limited immediate value |
+| Registration traffic may spike when popular events open | Workload assumption to validate | Capacity tests should model bursts and hot events, not just average daily traffic |
+| Confirmation messages can be delayed briefly | Candidate quality trade-off | Notifications can be asynchronous if the accepted-registration state remains correct |
+
+### Step 2: compare plausible structures
+
+| Candidate | Strengths for this context | Costs and risks |
+|---|---|---|
+| Single-process modular monolith with one authoritative database | Simple local transaction boundary for seat allocation; one deployment; clear modules can still enforce ownership | Whole application may scale as a unit; module boundaries need discipline |
+| Microservices for events, registration, payment coordination and notifications | Independent scaling/deployment and explicit service ownership can help when those needs are real | More network failure paths, distributed workflow states, cross-service observability and operational overhead; seat invariants need a clear owner |
+| Serverless functions and managed services | Can fit bursty workloads and reduce server management | Limits, cold starts, workflow state, local testing and service-specific quotas need evaluation; does not remove correctness or idempotency requirements |
+
+### Step 3: make a conditional decision
+
+Under the stated assumptions, start with a **modular monolith**: separate event, registration, payment-workflow and notification modules behind explicit interfaces, but keep seat allocation and registration persistence in one authoritative transaction boundary. Write a durable state transition and an outbox record together; publish confirmation work asynchronously. Use a stable payment idempotency key and a reconciliation path for uncertain provider outcomes.
+
+This is not a claim that modular monoliths are universally better. It is the simplest candidate that appears to satisfy the current invariants and team constraints without introducing distributed coordination prematurely.
+
+### Step 4: define evidence that would change the decision
+
+Revisit service extraction if evidence shows a capability needs an independent release cadence, a distinct security boundary, a substantially different scaling profile, or a separate team with clear ownership. Before extracting registration, prove how seat allocation remains atomic and how callers handle timeout, retry, duplicate commands and partial workflow completion. Before extracting notifications, verify the outbox/consumer path is replay-safe and can tolerate delay.
+
+### Architecture decision record, in miniature
+
+- **Decision:** begin with a modular monolith and explicit module/data ownership.
+- **Why:** one team and release cadence; a local transaction can protect the seat invariant; no measured need for independent deployment yet.
+- **Accepted costs:** application modules share deployment and some runtime resources.
+- **Validation:** burst/load test hot events; inject payment timeouts; test concurrent final-seat registrations; verify outbox replay and notification deduplication.
+- **Revisit triggers:** sustained independent scaling needs, team ownership changes, deployment bottlenecks, or measured failure-isolation requirements that justify a network boundary.
+
+### Self-check
+
+- [ ] Can each requirement be distinguished from an assumption?
+- [ ] Is the authoritative owner of the seat invariant explicit?
+- [ ] Does the proposed structure handle a payment timeout after the provider commits?
+- [ ] Are the benefits of a service boundary measurable rather than assumed?
+- [ ] Are the validation evidence and revisit triggers stated before the decision is treated as permanent?
 
 ## Further reading
 
