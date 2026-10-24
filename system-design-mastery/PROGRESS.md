@@ -70,6 +70,7 @@ Check items only when the work has actually been performed.
 - [ ] Validate Mermaid diagrams with a renderer; currently added diagrams have only been manually reviewed.
 - [x] Check all 19 chapter pages for balanced fenced code blocks and exact duplicate Markdown headings; none were found.
 - [x] Re-run structural and relative-link checks across all 19 chapter pages after the latest content edits; no broken relative file targets, unbalanced code fences, or duplicate headings were found.
+- [x] Recheck all 19 chapter pages and the textbook landing page after the latest worked labs; relative Markdown links resolve, fenced blocks are balanced, and no duplicate headings were found.
 - [x] Independently recalculate the chapter's traffic, bandwidth, storage, Little's Law and fan-out examples; results match within rounding.
 - [ ] Review assumptions, caveats and implementation-specific claims.
 - [ ] Audit for missing topics, duplication and out-of-scope content.
