@@ -42,7 +42,7 @@ STRIDE is one common threat-categorization aid: spoofing, tampering, repudiation
 
 ## 16.1B Identity lifecycle and credential validation
 
-Identity is more than a token. Consider enrollment, authentication, session refresh, privilege change, credential rotation, revocation, account recovery, and termination. A former employee or compromised service account must lose access through a defined revocation process.
+Identity and access management (IAM) governs human and workload identities, authenticators, entitlements, lifecycle, revocation and audit. Treat IAM and identity-provider services as dependencies with their own availability and recovery requirements. Identity is more than a token: consider enrollment, authentication, session refresh, privilege change, credential rotation, revocation, account recovery, and termination. A former employee or compromised service account must lose access through a defined revocation process.
 
 For a signed JWT, validation generally includes signature verification using a trusted key, allowed algorithm policy, issuer, audience, expiry and not-before times where present, intended token type, and required claims. Key discovery and rotation must be bounded and trusted. Do not accept an algorithm merely because the token header names it. A valid signature proves the token was signed by a trusted key; it does not prove the requested resource access is authorized.
 
