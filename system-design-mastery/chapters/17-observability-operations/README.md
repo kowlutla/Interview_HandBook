@@ -224,11 +224,6 @@ Keep metric dimensions bounded (for example, service, route template, region and
 - [ ] Recovery is confirmed using the user-facing SLI, not merely a green process or dependency health check.
 
 
-## Further reading
-- [OpenTelemetry documentation](https://opentelemetry.io/docs/).
-- Google [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
-
-
 ## Observability is a feedback loop
 
 ```mermaid
@@ -245,6 +240,11 @@ flowchart TD
 ```
 
 Metrics reveal patterns, logs add event context, and traces connect work across services. None is sufficient alone for every incident; correlation and low-cardinality labels matter.
+
+## Further reading
+- [OpenTelemetry documentation](https://opentelemetry.io/docs/).
+- Google [Site Reliability Engineering book](https://sre.google/sre-book/table-of-contents/).
+
 
 
 ---
