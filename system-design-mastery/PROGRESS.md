@@ -62,6 +62,7 @@ Check items only when the work has actually been performed.
 - [x] Add a worked Chapter 19 noisy-neighbor scenario covering tenant fairness, replica-multiplied limits, reserved capacity and failure-topology testing.
 - [x] Add a Chapter 16 tenant-scoped document-export threat model covering API, queue, worker, database, object-storage and operational trust boundaries.
 - [x] Add a Chapter 9 cross-tenant/cache-poisoning test matrix covering tenant and role variation, header/key poisoning, revocation, stale-fill races and cache failure.
+- [x] Add a Chapter 19 cross-pattern review of retry/hedge/breaker interactions, aggregate pool limits, cache/replica freshness, outbox/inbox, failover fencing and replay side effects.
 - [x] Add a Chapter 6 worked OpenAPI evolution example covering additive fields, breaking changes, contract tests and deprecation gates.
 - [x] Add a Chapter 13 worked concurrency-limit decision using illustrative throughput, p99 latency, error rate and queue-growth measurements.
 - [x] Add write-skew and inbox-pattern terms to the glossary.
