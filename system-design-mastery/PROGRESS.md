@@ -35,6 +35,7 @@ Check items only when the work has actually been performed.
 - [x] Remove duplicate entries from the research library and group newly added protocol/webhook/SBOM references with the existing source catalog.
 - [x] Add C4 model, WCAG 2.2 and provider sustainability references to support the latest chapter expansions.
 - [x] Add The Tail at Scale as a primary reference and update the OWASP API Security Top 10 link to its canonical current domain.
+- [x] Add NIST SSDF, SLSA provenance and SPDX specification references to support cloud software-supply-chain guidance; check that SP 800-218 v1.1 is labeled as a final publication while later revision status is checked separately.
 
 ## Textbook implementation
 - [x] Draft all 19 chapter files.
