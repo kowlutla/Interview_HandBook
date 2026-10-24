@@ -57,6 +57,7 @@ Check items only when the work has actually been performed.
 - [x] Add Mermaid diagrams where request flows, data paths, decision loops, or recovery sequences benefit from visualization.
 - [x] Create glossary.
 - [x] Create reference library.
+- [x] Perform a scoped manual review of Chapter 01's worked architecture decision and Chapter 02's quality-attribute scenarios/interactions; clarify provider-specific payment idempotency-key scope and retention, and record review limits in COVERAGE-AUDIT.md.
 - [ ] Review each module for accuracy, clarity, depth and prerequisite coverage.
 - [x] Expand chapters 1–5 with additional first-principles explanations, mechanisms, edge cases, failure modes, operational checklists, and worked reasoning where appropriate.
 - [x] Add a Chapter 5 protocol deep dive covering IPv6, DNSSEC versus encrypted DNS, TLS/mTLS, HTTP/2 versus HTTP/3, and DDoS/resource exhaustion, with relevant RFC references.
