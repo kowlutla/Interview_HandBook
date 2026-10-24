@@ -303,16 +303,16 @@ If a business requirement demands erasure or correction, determine whether the e
 
 ## 12.4 Worked failure timeline: a consumer crashes around a database commit
 
-Assume a consumer receives OrderPaid(order-481) and must update an order database. The broker offset and the database transaction are separate durable state unless the architecture explicitly coordinates them.
+Assume a consumer receives OrderPaid(order-481) at log offset 812 and must update an order database. The broker offset and the database transaction are separate durable state unless the architecture explicitly coordinates them. In Kafka, the committed consumer position is conventionally the **next offset to consume**; after successfully processing record 812, the stored position is typically 813. The timeline below uses “commit progress through offset 812” to avoid confusing the processed record's offset with the next position.
 
 ### Timeline A: database commit happens before offset commit
 
 | Time | Consumer / database | Broker |
 |---|---|---|
 | T1 | Reads event at offset 812 | Offset 812 is delivered |
-| T2 | Applies the order update and commits | Offset 812 remains uncommitted |
-| T3 | Process crashes before committing its offset | |
-| T4 | A replacement consumer resumes from the last committed offset | Delivers offset 812 again |
+| T2 | Applies the order update and commits | Progress through offset 812 remains uncommitted |
+| T3 | Process crashes before committing progress through offset 812 | |
+| T4 | A replacement consumer resumes from the last committed position | Delivers offset 812 again |
 | T5 | Handler runs again | Duplicate delivery is possible |
 
 Without protection, the business effect may be applied twice. A successful database commit does not atomically advance the broker offset.
@@ -322,9 +322,9 @@ Without protection, the business effect may be applied twice. A successful datab
 | Time | Consumer / database | Broker |
 |---|---|---|
 | T1 | Reads event at offset 812 | Offset 812 is delivered |
-| T2 | Commits offset 812 | Broker records progress |
+| T2 | Commits progress through offset 812 (typically stores next position 813) | Broker records progress |
 | T3 | Process crashes before the database effect commits | |
-| T4 | Replacement consumer resumes after offset 812 | Event may never be processed again |
+| T4 | Replacement consumer resumes from the committed position after offset 812 | Event may never be processed again |
 
 This ordering can lose the business effect. Moving the acknowledgement earlier trades duplicates for loss; it does not eliminate the atomicity gap.
 
