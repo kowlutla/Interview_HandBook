@@ -199,13 +199,6 @@ flowchart TD
 A real system often combines styles: for example, a layered modular monolith may publish events for integration, use a CDN and API gateway at the edge, and deploy selected workloads as functions. Explain the style at each boundary instead of assigning one fashionable label to the entire system.
 
 
-## Further reading
-- Microsoft Azure Architecture Center, [Architecture styles](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles) and [Microservices architecture style](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/microservices).
-- Fowler, [Microservices](https://martinfowler.com/articles/microservices.html).
-- Fowler, [Strangler Fig Application](https://martinfowler.com/bliki/StranglerFigApplication.html).
-- Microsoft [Cloud Design Patterns](https://learn.microsoft.com/en-us/azure/architecture/patterns/).
-
-
 ## Choosing and evolving a boundary
 
 ```mermaid
@@ -222,6 +215,13 @@ flowchart TD
 ```
 
 The purpose of a boundary is to make change and invariants manageable. Independent deployment is useful only when the operational cost and distributed coordination are justified.
+
+## Further reading
+- Microsoft Azure Architecture Center, [Architecture styles](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles) and [Microservices architecture style](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/microservices).
+- Fowler, [Microservices](https://martinfowler.com/articles/microservices.html).
+- Fowler, [Strangler Fig Application](https://martinfowler.com/bliki/StranglerFigApplication.html).
+- Microsoft [Cloud Design Patterns](https://learn.microsoft.com/en-us/azure/architecture/patterns/).
+
 
 
 ---
