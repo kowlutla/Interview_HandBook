@@ -78,6 +78,7 @@ Check items only when the work has actually been performed.
 - [x] Add explicit Chapter 16 injection guidance (parameterized queries, allow-listed identifiers, safe command execution, context-aware template/output handling) and a verification case; update the inventory map.
 - [x] Add the OWASP Injection Prevention and SQL Injection Prevention Cheat Sheets to the reference library and link them from Chapter 16.
 - [x] Spot-check OWASP injection-prevention URLs against the live Cheat Sheet pages; correct the SQL injection link to the verified HTML endpoint and make the SPDX reference version-neutral where the official index and spec redirect differ.
+- [x] Spot-check the current OWASP Webhook Security Cheat Sheet and Debezium stable Outbox Event Router pages; implementation-specific validation remains required.
 - [x] Inventory external URLs in all 19 chapter pages and the reference catalog; standardize the remaining Chapter 6 OWASP API Security link and replace the dated AWS Well-Architected curriculum link with the current framework entry point.
 - [x] Add an explicit idempotent-receiver pattern explanation in Chapter 19 and define it in the glossary to match the mandatory cross-cutting pattern inventory.
 - [x] Make powers-of-two binary capacity units explicit in Chapter 3 and map the concept to the capacity/performance inventory.
