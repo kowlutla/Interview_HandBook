@@ -245,6 +245,47 @@ During shutdown, stop admitting new work, signal cancellation, allow a bounded d
 - Can late results mutate state or publish events after cancellation?
 - Are cancellation, deadline expiry, cleanup failures and orphaned work observable?
 
+## 4.17 Worked cancellation scenario: fan-out under one deadline
+
+Assume a product-details endpoint has a 300 ms end-to-end deadline. It calls a required inventory service and a required pricing service in parallel, and an optional recommendations service. It also may enqueue a durable “email me when available” job when the user explicitly requests one.
+
+### Define child budgets and outcomes
+
+| Work | Required for response? | Cancellation/deadline policy |
+|---|---|---|
+| Inventory lookup | Yes | Propagate the remaining request deadline; cancel or stop waiting when the parent deadline expires |
+| Pricing lookup | Yes | Same shared deadline budget; do not give it a fresh 300 ms timeout after the request has already spent time elsewhere |
+| Recommendations | No | If the required response is ready or the deadline is near, cancel best-effort work and return a response without recommendations if the contract allows it |
+| Durable notification job | No; explicitly accepted work | Once durably accepted, it has its own lifecycle and cancellation/status contract; client disconnect does not silently erase accepted work |
+
+Parallel calls can reduce latency, but the deadline includes scheduling, queue wait, connection-pool acquisition, network time, service processing and response serialization. A child timeout is not automatically equal to the parent's full budget. Reserve time for combining results and writing the response.
+
+### Failure timeline
+
+1. The parent starts inventory, pricing and recommendations with bounded concurrency and propagated deadlines.
+2. Pricing returns successfully, but inventory is waiting for a saturated downstream connection pool.
+3. The parent deadline approaches. It stops waiting for optional recommendations and signals cancellation to child work that is no longer useful.
+4. If inventory has not completed, the endpoint returns the documented timeout/degraded result. The inventory service may still be executing if cancellation is not supported or has not yet been observed.
+5. The endpoint records cancellation requested, cancellation observed where measurable, and late child completion separately. It does not claim that a remote write was rolled back.
+6. If the user separately requested a durable notification and the API already confirmed that the job was accepted, that job continues under its own worker supervision and status model.
+
+### Correctness and resource safeguards
+
+- Use one end-to-end deadline and derive each child budget from the remaining time.
+- Bound fan-out and connection-pool waits; cancellation does not protect against a queue that is already unbounded.
+- Do not start retries when the remaining deadline is too short for a meaningful attempt.
+- Ensure late child completions cannot overwrite a response, publish an event or mutate state after the parent has abandoned them unless that behavior is explicitly part of a durable workflow.
+- For any side effect whose outcome may be unknown, use idempotency, a status lookup or reconciliation; cancellation is not proof of rollback.
+- During shutdown, stop new admission, signal cancellation, drain within a bounded period, and return durable unfinished work to its workflow/queue safely.
+
+### Test cases
+
+- [ ] Delay each child independently and verify the parent stays within its deadline policy.
+- [ ] Force optional recommendations to stall and confirm the required response can still complete.
+- [ ] Disconnect the client and observe whether child work stops or continues, according to the documented contract.
+- [ ] Simulate a late child completion and verify it cannot cause an unintended side effect.
+- [ ] Verify accepted durable jobs continue independently and expose a stable status.
+- [ ] Restart the service during shutdown and confirm queued/in-flight durable work is not silently lost.
 
 ## Further reading
 - [Linux man-pages: pthreads](https://man7.org/linux/man-pages/man7/pthreads.7.html).
