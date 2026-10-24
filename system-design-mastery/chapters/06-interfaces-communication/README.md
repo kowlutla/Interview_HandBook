@@ -352,16 +352,6 @@ Safer sequence:
 - [ ] Can old and new server/client versions coexist during rollout?
 - [ ] Is deprecation based on measured usage and a communicated support policy?
 
-## Further reading
-- OWASP, [Webhook Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Webhook_Security_Cheat_Sheet.html), covering signatures, replay protection, duplicate processing and SSRF risks.
-- AWS API Gateway, [HTTP API throttling](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-throttling.html) as an implementation-specific token-bucket example.
-- OWASP, [API Security Top 10](https://owasp.org/API-Security/editions/2023/en/0x00-header/) for common API threat categories.
-- IETF [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html).
-- [gRPC concepts](https://grpc.io/docs/what-is-grpc/core-concepts/).
-- [GraphQL specification](https://spec.graphql.org/).
-- OpenAPI Initiative, [current OpenAPI Specification](https://spec.openapis.org/oas/latest.html) and [OpenAPI 3.1.0 specification](https://spec.openapis.org/oas/v3.1.0.html), the version used in the worked example.
-
-
 ## Retry safely when the outcome is uncertain
 
 ```mermaid
@@ -380,6 +370,16 @@ sequenceDiagram
 ```
 
 The key must be scoped, retained for a defined period, and bound to a request fingerprint so a different command cannot accidentally reuse the same key. The state change and the deduplication record must share a reliable transactional boundary.
+
+## Further reading
+- OWASP, [Webhook Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Webhook_Security_Cheat_Sheet.html), covering signatures, replay protection, duplicate processing and SSRF risks.
+- AWS API Gateway, [HTTP API throttling](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-throttling.html) as an implementation-specific token-bucket example.
+- OWASP, [API Security Top 10](https://owasp.org/API-Security/editions/2023/en/0x00-header/) for common API threat categories.
+- IETF [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html).
+- [gRPC concepts](https://grpc.io/docs/what-is-grpc/core-concepts/).
+- [GraphQL specification](https://spec.graphql.org/).
+- OpenAPI Initiative, [current OpenAPI Specification](https://spec.openapis.org/oas/latest.html) and [OpenAPI 3.1.0 specification](https://spec.openapis.org/oas/v3.1.0.html), the version used in the worked example.
+
 
 
 ---
