@@ -116,6 +116,16 @@ An inbox stores processed message identifiers and the local effect in one transa
 
 
 
+## 12.1I Batch and stream processing compared
+
+**Batch processing** works on a bounded collection—such as a time partition, file set, or captured snapshot—and produces results after a job or stage completes. It suits periodic aggregates, historical backfills, reconciliation, and large transformations where minutes of latency may be acceptable. Its design concerns include input completeness, checkpoint/restart, bounded resource use, deterministic reruns, and idempotent or versioned output.
+
+**Stream processing** continuously consumes records and updates state as events arrive. It suits low-latency reactions, live aggregates, event-driven decisions and continuously maintained projections. It adds questions about event time versus processing time, out-of-order and late events, window finalization, state checkpointing, source-position coordination and recovery from replay.
+
+**Micro-batch** systems process small bounded groups on a recurring schedule, trading some latency for efficient batch execution. The labels do not determine delivery or correctness guarantees: a batch can partially publish output, and a streaming job can duplicate external effects after recovery unless its source offsets, operator state and sink commit are coordinated or the output is idempotent.
+
+A common hybrid is to stream provisional updates quickly and periodically reconcile or rebuild results from durable historical data. Define which result is authoritative, how late corrections are applied, how consumers observe freshness, and how batch output is reconciled with live writes. Choose based on freshness objective, event volume, late-data behavior, replay needs, cost and operational complexity—not because one model is universally more modern.
+
 ## 12.2 Message brokers and delivery semantics in depth
 
 A broker is not merely a network buffer. It defines persistence, routing, acknowledgement, redelivery, ordering scope, retention, consumer coordination, and operational recovery. When choosing a broker or log, ask what is persisted before acknowledgement, how ownership changes, what a consumer can replay, and which failures may duplicate or delay work.
