@@ -239,6 +239,60 @@ The hard part is not copying bytes; it is defining the source of truth while wri
 - Are backup, restore, monitoring and incident procedures shard-aware?
 - What evidence would justify adding another shard rather than optimizing the existing design?
 
+## 7.3 Worked concurrency lab: write skew and invariant protection
+
+Consider an on-call rota with two doctors, Alice and Ben. The invariant is: **at least one doctor must remain on call**. Both rows initially have on_call = true. Two requests arrive concurrently, one asking Alice to go off call and the other asking Ben to go off call.
+
+### The unsafe interleaving
+
+| Step | Transaction A | Transaction B |
+|---|---|---|
+| 1 | Reads count of on-call doctors = 2 | |
+| 2 | | Reads count of on-call doctors = 2 |
+| 3 | Decides Alice can go off call | |
+| 4 | | Decides Ben can go off call |
+| 5 | Updates Alice's row to false | |
+| 6 | | Updates Ben's row to false |
+| 7 | Commits | |
+| 8 | | Commits |
+
+Each transaction changed a different row. A row-level write conflict may therefore be absent even though the combined result violates the business invariant. This is **write skew**: local decisions based on overlapping reads create a global state that no valid serial execution would allow.
+
+### Why “use a transaction” is not enough
+
+A transaction groups operations atomically, but the guarantee depends on its isolation level and the database implementation. A stable snapshot is not automatically serializable. Likewise, checking the rule in application code and then updating a row is unsafe if concurrent requests can make the same decision.
+
+### Candidate protections and their trade-offs
+
+| Approach | How it protects the invariant | Trade-offs and caveats |
+|---|---|---|
+| Declarative constraint | Encodes the rule in a database constraint when the schema can express it | A simple row-level CHECK cannot generally enforce an aggregate condition across arbitrary rows; engine-specific features matter |
+| Shared coordination row | Every transition locks or atomically updates one shared row that represents rota state | Can serialize a hot invariant; every path must follow the same protocol |
+| Serializable transaction | The database rejects a set of concurrent commits that cannot be equivalent to a serial execution | Applications must retry the whole transaction from fresh state after serialization failure |
+| Data-model redesign | Represents assignments so the invariant can be enforced by a unique key or a single atomic transition | May change query shape and domain model; must still model time windows and valid transitions correctly |
+
+No option is universally best. Choose the least complex mechanism that enforces the actual invariant under the chosen database's documented semantics.
+
+### Retry correctly
+
+When a serialization failure or deadlock is explicitly identified as retryable:
+
+1. Roll back the failed transaction completely.
+2. Start a new transaction and re-read current state.
+3. Re-evaluate the business rule; do not reuse a stale decision.
+4. Apply bounded retries with jitter where appropriate.
+5. Return a clear conflict or temporary-failure response when the retry budget is exhausted.
+
+Do not blindly retry every database error. Constraint violations may represent a genuine business conflict, and an uncertain client outcome after commit requires idempotency or reconciliation rather than assuming rollback.
+
+### Test matrix
+
+- [ ] Start two concurrent requests that each try to remove one doctor from the rota.
+- [ ] Verify the invariant after both requests finish, including when one is retried.
+- [ ] Force a transaction abort and confirm the entire decision is recomputed from fresh state.
+- [ ] Test every write path, including administrative tools and background jobs.
+- [ ] Record serialization/deadlock retries, transaction duration, lock waits and invariant violations.
+- [ ] Repeat the test against the actual database engine and configured isolation level; do not infer behavior from the isolation-level name alone.
 
 ## Further reading
 - PostgreSQL [transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html), [indexes](https://www.postgresql.org/docs/current/indexes.html), [EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html), [point-in-time recovery](https://www.postgresql.org/docs/current/continuous-archiving.html).
