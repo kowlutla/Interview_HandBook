@@ -374,7 +374,7 @@ The key must be scoped, retained for a defined period, and bound to a request fi
 ## Further reading
 - OWASP, [Webhook Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Webhook_Security_Cheat_Sheet.html), covering signatures, replay protection, duplicate processing and SSRF risks.
 - AWS API Gateway, [HTTP API throttling](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-throttling.html) as an implementation-specific token-bucket example.
-- OWASP, [API Security Top 10](https://owasp.org/API-Security/editions/2023/en/0x00-header/) for common API threat categories.
+- OWASP, [API Security Top 10](https://api-security.owasp.org/editions/2023/en/0x00-header/) for common API threat categories.
 - IETF [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html).
 - [gRPC concepts](https://grpc.io/docs/what-is-grpc/core-concepts/).
 - [GraphQL specification](https://spec.graphql.org/).
