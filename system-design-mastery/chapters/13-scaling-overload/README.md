@@ -202,6 +202,40 @@ Adaptive limits do not replace timeouts, bounded queues, admission control or lo
 - Does adaptive concurrency have hard limits and stable feedback?
 - Has behavior been tested during both degradation and recovery?
 
+## 13.4 Worked concurrency-limit decision from measured results
+
+The following fictional measurements illustrate how to reason about a concurrency limit. They are not a recommended default. Assume a service is load-tested with the same representative request mix, dependency topology and hardware at each step.
+
+| Maximum in-flight requests | Completed throughput | p99 latency | Error rate | Queue behavior |
+|---:|---:|---:|---:|---|
+| 20 | 600 requests/s | 110 ms | 0.02% | Stable, little waiting |
+| 40 | 980 requests/s | 150 ms | 0.03% | Stable |
+| 60 | 1,120 requests/s | 290 ms | 0.10% | Queue begins to grow during bursts |
+| 80 | 1,150 requests/s | 800 ms | 1.8% | Queue age rises; retries increase |
+
+### Interpret the knee, not just peak throughput
+
+Raising the limit from 40 to 60 increases throughput by about 14%, but nearly doubles p99 latency and begins to create a queue. Raising it from 60 to 80 adds only about 3% throughput while p99 latency increases sharply and errors rise. The system is past the useful concurrency region: additional in-flight work mostly increases contention and queueing rather than useful completions.
+
+An initial policy could cap normal in-flight work below the observed knee (for example, begin validating a limit around 40–50), keep a hard upper bound, and reject or shed excess work before it becomes an unbounded queue. This is a candidate to test, not a final answer from one benchmark.
+
+### Validate the decision
+
+1. Repeat the measurement at different times and with realistic hot-key, cache-miss and expensive-operation distributions.
+2. Inspect the constrained dependency, connection-pool wait, CPU, lock wait, queue age and retry traffic to explain the observed knee.
+3. Test the proposed limit when one replica or dependency is degraded; the healthy-state limit may be unsafe during failure.
+4. Confirm that rejected work receives a clear retryable or non-retryable response and that clients do not immediately retry in a synchronized storm.
+5. Recheck after scaling the application: per-instance limits multiply across replicas and can overwhelm a shared database.
+6. If using adaptive concurrency, retain a hard ceiling/floor, smooth noisy feedback and test behavior during both slowdown and recovery.
+
+### Decision checklist
+
+- [ ] Choose the limit from useful throughput, tail latency, errors and queue stability together.
+- [ ] Identify the resource that becomes constrained as concurrency rises.
+- [ ] Count retry/hedge attempts as real work in the capacity model.
+- [ ] Set bounded queues and explicit overload behavior.
+- [ ] Recalculate aggregate concurrency across all replicas.
+- [ ] Re-test during dependency degradation and after deployment/configuration changes.
 
 ## Further reading
 - Google SRE [Handling Overload](https://sre.google/sre-book/handling-overload/).
