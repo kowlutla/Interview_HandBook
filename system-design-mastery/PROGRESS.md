@@ -238,3 +238,15 @@ The sprint improves confidence in repository structure but does not certify tech
 - [x] Added MDN's WebRTC protocol reference for ICE/STUN/TURN/SFU context.
 - [ ] Continue checking all Chapter 20 references and source-to-claim alignment; the opened subset is not an exhaustive external-link audit.
 - [ ] Validate Mermaid diagrams using a real renderer and run a full OpenAPI validator. Network/package retrieval is not available in the current execution environment; do not report these checks as passed.
+
+
+## Final structural and focused source pass — 2026-10-24
+
+- [x] Re-run the structural sweep across all 20 chapter pages after the Chapter 09 and Chapter 20 edits: all have balanced fences, no exact duplicate headings, a Further reading section, and the textbook navigation footer at the end.
+- [x] Re-inventory chapter Mermaid blocks after removing a second, redundant Cache-aside read-path diagram from Chapter 09. Current chapter-page inventory is 21 non-empty Mermaid blocks with recognized diagram declarations; actual rendering remains unverified.
+- [x] Remove the duplicate Chapter 09 cache-aside sequence diagram because the same read path is already explained and illustrated near the start of the chapter.
+- [x] Add explicit draft-status qualifiers for the W3C Service Workers and IndexedDB 3.0 references in Chapter 20 and add MDN's WebRTC protocol guide.
+- [x] Spot-check the current official MDN browser-storage and WebRTC protocol pages, Cloudflare's provider-specific TURN FAQ, and the W3C publication status pages. Results and limits are recorded in COVERAGE-AUDIT.md.
+- [ ] Complete the full repository-wide external-link audit and source-to-claim review. A subset of Chapter 20 links and several foundational standards have been opened; this is not exhaustive.
+- [ ] Run a Mermaid renderer and full OpenAPI 3.1 validator. Package retrieval failed in the current execution environment, so only static Mermaid checks and YAML parsing/targeted OpenAPI checks are confirmed.
+- [ ] Complete the independent 21-family coverage acceptance and cross-chapter consistency review. Do not label the textbook fully technically accepted until these checks are performed.
