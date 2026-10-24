@@ -373,3 +373,40 @@ A fresh pass fetched all 20 current chapter pages and counted Mermaid declaratio
 The row for coordination/distributed transactions previously referenced Chapter 11 section 11.2A, which is absent from the current chapter. The mapping now points only to the current sections 11.1A–11.1C, 11.5A–11.5I, and 11.6.
 
 The latest mapping check compared every numbered section endpoint cited in the 21-row mandatory inventory with the current chapter headings. All referenced endpoints exist after correcting the stale Chapter 11 section reference. A separate static pass checked the first non-comment line of all 29 Mermaid blocks: each declares a recognized flowchart or sequence diagram. Neither check proves content depth or actual Mermaid rendering.
+
+
+
+## Independent depth review and final structural recheck — 2026-10-24
+
+### Focused review and correction
+
+The current versions of all 20 chapter pages were re-fetched and checked against the curriculum map. A targeted mechanism-level read covered storage-model selection; cache correctness, security and invalidation; consistency and quorum assumptions; consensus, fencing, two-phase commit and sagas; messaging delivery, replay, schema evolution and event-time handling; OAuth/OIDC token roles, injection and tenant isolation; Kubernetes/cloud delivery; and offline synchronization, realtime transports and WebRTC.
+
+One substantive gap was found in Chapter 09: hot keys appeared in review checklists but did not have their own mechanism-level treatment. A new section now explains how to diagnose skew and choose safe mitigations, distinguishes hot reads from hot writes, and warns that key salting/partitioning is only safe when the invariant and aggregation model permit it. It also adds a targeted validation scenario that keeps total load fixed while making one key disproportionately hot. The chapter's further reading now includes the official AWS Caching Best Practices and OWASP Web Cache Security Cheat Sheet. These official pages were opened during this review.
+
+This correction is a concrete improvement, not evidence that every inventory row now qualifies as Deep. The mandatory inventory remains provisional until the full mechanism/example/selection/trade-off/failure-mode and source checks are completed row by row.
+
+### Fresh structural check
+
+A new check was run against all 20 current chapter pages, recognizing both backtick and tilde Markdown fence styles. Results:
+- All 20 chapter pages have balanced fenced blocks.
+- No exact duplicate Markdown headings were found.
+- Each chapter has a Further reading section.
+- Navigation footers are present at the end.
+- No instructional headings appear after Further reading.
+- The inventory contains 29 Mermaid blocks across the chapters. All 29 begin with recognized Mermaid diagram declarations after skipping blank/comment lines.
+
+**Limit:** this is static Markdown/diagram-declaration validation. No actual Mermaid renderer was available, so successful rendering and visual layout are unverified.
+
+### Acceptance status after this pass
+
+- Structural Markdown checks: **passed** for all 20 chapters.
+- Focused Chapter 09 hot-key depth gap: **corrected**.
+- Selected Chapter 09 source pages: **opened and checked**.
+- All 21 topic-family depth acceptance: **still open**; targeted inspection must not be presented as exhaustive independent acceptance.
+- Repository-wide external-link liveness and claim-to-source alignment: **still open**; selected official references are verified, not every link/claim.
+- Mermaid rendering: **still open**; the environment could not acquire the required renderer.
+- Full OpenAPI 3.1 validation: **still open**; prior YAML parse and targeted invariants passed, but no full validator/linter ran.
+- Whole-book contradictions, prerequisite flow and residual duplication: **still open beyond prior scoped checks**.
+
+The textbook is structurally clean and review-ready, but formal technical acceptance is not yet justified. Do not promote coverage rows to Deep or label the book fully validated until the remaining checks have evidence.
