@@ -47,6 +47,7 @@ Check items only when the work has actually been performed.
 - [x] Expand chapters 1–5 with additional first-principles explanations, mechanisms, edge cases, failure modes, operational checklists, and worked reasoning where appropriate.
 - [x] Add a Chapter 5 protocol deep dive covering IPv6, DNSSEC versus encrypted DNS, TLS/mTLS, HTTP/2 versus HTTP/3, and DDoS/resource exhaustion, with relevant RFC references.
 - [x] Add a Chapter 5 practical troubleshooting lab with phase-based symptoms, evidence and hypotheses, a disciplined investigation sequence, and a timeout-after-deployment worked example.
+- [x] Add a Chapter 17 worked request-based SLO alert example connecting good-event definitions, error-budget arithmetic, burn rate, alert response policy and validation.
 - [x] Add a worked Chapter 7 sharding/resharding example, Chapter 10 consistency timeline, and Chapter 14 SLO/error-budget calculation.
 - [x] Deepen Chapter 1 with architecture viewpoints and diagram selection; Chapter 2 with accessibility, usability, internationalization, operability, portability, cost and sustainability; Chapter 3 with load-test methodology; and Chapter 4 with cancellation and structured concurrency.
 - [x] Deepen Chapter 9 with cache-key security, cache poisoning, tenant isolation, stale-serving policies, permission revocation and deletion; deepen Chapter 12 with event sourcing/CQRS distinctions, projection rebuilds, schema compatibility and event-data privacy.
