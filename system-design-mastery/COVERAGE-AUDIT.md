@@ -490,3 +490,12 @@ The initial workflow run has now been inspected directly. Run [40103087271](http
 The workflow was updated at commit `4d868540e7913b027acd3f43c58304586d80cb61` to pass Puppeteer a no-sandbox configuration and to treat missing rendered files as an upload failure. Corrected run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824) was still in progress at the last inspection: the OpenAPI job had passed and the Mermaid job was installing Mermaid CLI. Mermaid rendering remains **pending**, not passed, until that run finishes and the logs/artifact establish that all 29 diagrams rendered.
 
 This does not change the overall acceptance decision: all 21 inventory families remain Developing/provisional, source-to-claim review remains incomplete, and whole-book technical acceptance is open.
+
+
+## Confirmed CI run — 2026-10-24
+
+Corrected workflow run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824) completed both jobs successfully:
+- The extracted embedded OpenAPI 3.1 document passed `openapi-spec-validator`.
+- The renderer processed all 29 Mermaid inputs; the job verified the count and uploaded [29 SVG files](https://github.com/kowlutla/System-Design/actions/runs/40104445824/artifacts/12563862191). The job log lists all rendering inputs and confirms artifact upload.
+
+This is verified automated rendering, not a manual visual inspection of diagram clarity/layout. It also does not complete the separate 21-family depth acceptance or the exhaustive claim-to-source/whole-book consistency audit. All inventory rows remain Developing/provisional.
