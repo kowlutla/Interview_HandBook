@@ -18,6 +18,7 @@ Check items only when the work has actually been performed.
 - [x] Roadmap and dependency sketch.
 - [x] Curriculum and coverage matrix.
 - [x] Create an explicit chapter-by-chapter coverage audit with Missing/Mentioned/Developing/Deep definitions, prioritized gaps, and a section-level map for the current expansion pass.
+- [x] Refresh the coverage audit's remaining risks after closing multiple content gaps; separate content work from still-open source, schema, OpenAPI, Mermaid and cross-chapter verification.
 - [x] Link the coverage audit from the textbook landing page.
 - [x] Editorial and verification standard.
 - [ ] Independent curriculum completeness and duplication review.
