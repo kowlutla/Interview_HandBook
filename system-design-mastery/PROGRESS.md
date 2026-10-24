@@ -312,3 +312,14 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [ ] Whole-book contradiction/prerequisite review remains open beyond the targeted consistency checks already recorded.
 
 **Acceptance state:** Structural checks are passing and the identified Chapter 09 hot-key gap is closed. The textbook remains review-ready, not formally technically accepted, until the remaining source, renderer, schema and full-depth checks are completed.
+
+
+
+## Reference-link availability pass — 2026-10-24
+
+- [x] Re-opened all **74 unique URL destinations** in the current reference catalog through the web retrieval environment, including RFC Editor standards, primary papers, versioned Kafka/OpenAPI/SLSA specifications, PostgreSQL documentation, cloud-provider architecture guidance, Kubernetes, OpenTelemetry, OWASP, WCAG and CISA/NIST materials.
+- [x] Reconfirmed the newly added Chapter 09 references: AWS Caching Best Practices and the OWASP Web Cache Security Cheat Sheet both resolve to the intended pages.
+- [x] Followed up on two DOI URLs that the page reader could not fetch directly: search results confirmed the cited FLP consensus paper DOI (10.1145/3149.214121) and the O'Neil et al. LSM-tree paper DOI (10.1007/s002360050048). These are reader limitations, not evidence of dead links.
+- [x] Confirmed the CISA 2026 SBOM bulletin URL resolves and describes the updated minimum-elements guidance. The generic CISA SBOM landing page returned HTTP 403 in the retrieval environment, so its availability cannot be confirmed by that direct fetch.
+- [ ] This pass covers the reference catalog and the two new Chapter 09 URLs, not every external URL repeated or added within all chapter pages. Chapter-specific link liveness and claim-to-source alignment remain open.
+- [ ] The link check establishes page availability and basic topical match for the sources inspected; it does not prove that every claim throughout the textbook is fully supported by its cited source.
