@@ -268,6 +268,54 @@ Repeat the test with the required failure scenario: one replica unavailable, a d
 - Is capacity re-tested with the required failure-domain loss?
 - Are the test environment, configuration, assumptions and results reproducible?
 
+## 3.18 Worked capacity test plan with explicit pass criteria
+
+This is an illustrative plan for a request/response API whose target peak offered load is 1,000 requests per second. Replace every number with a requirement derived from the actual product; these thresholds are examples, not general industry defaults.
+
+### Workload and acceptance contract
+
+| Dimension | Example test assumption or target | Why it is specified |
+|---|---|---|
+| Offered load | 1,000 requests/s sustained; a 2,000 requests/s spike for 5 minutes | Separates steady capacity from burst response |
+| Operation mix | 70% reads, 25% writes, 5% expensive searches | Prevents a read-only microbenchmark from standing in for production |
+| Data shape | Production-like row count, index size, payload distribution and hot-key skew | Exposes query-plan, cache and hotspot behavior |
+| Latency | p95 ≤ 200 ms and p99 ≤ 500 ms at the client boundary | Measures the user-visible tail, including queueing and network time |
+| Correctness/error rate | Eligible-request error rate < 0.1%; no invariant violations or duplicate business effects | Prevents throughput from masking incorrect behavior |
+| Queueing | Queue depth returns to its baseline after the spike; oldest-item age stays within the product's processing objective | Detects hidden overload and slow recovery |
+| Resource guardrails | No sustained growth in memory, connection wait, disk backlog or retry rate | Detects a system that passes briefly but cannot remain stable |
+
+### Execution sequence
+
+1. **Validate the test harness.** Confirm the generator can sustain the offered arrival rate, uses the intended open- or closed-loop model, and records scheduled, sent, admitted, completed, failed and timed-out requests. Check that generator CPU/network capacity is not limiting the result.
+2. **Warm-up and baseline.** Run a low load to validate data correctness, dashboards, tracing and the test path. Record cache state and background jobs rather than silently excluding them.
+3. **Ramp gradually.** Increase offered load in controlled steps (for example, 250, 500, 750, then 1,000 requests/s). Hold each step long enough to observe latency, saturation and queue trends.
+4. **Steady-state run.** Hold 1,000 requests/s for at least 30 minutes in this example. Pass only if latency and error criteria hold, correctness checks pass, and queues/resource usage are stable rather than trending upward.
+5. **Spike and recovery.** Increase to 2,000 requests/s for 5 minutes, then return to 1,000 requests/s. Measure rejection behavior, autoscaling delay, retry amplification and the time needed for queues and latency to recover.
+6. **Find the failure boundary safely.** If required, increase load beyond target in a controlled non-production environment until the first acceptance criterion fails. Record the bottleneck and degradation behavior; do not interpret the first failed threshold as an exact universal capacity number.
+7. **Failure-domain test.** Repeat the target load with the required failure condition, such as one application replica or one zone unavailable. Verify the surviving topology still meets the agreed service objective or follows an explicitly accepted degraded mode.
+8. **Soak and repeat.** Run long enough to expose delayed behavior such as memory growth, compaction debt, cache churn, token expiry, scheduled jobs and log growth. Repeat after material code, data, configuration or infrastructure changes.
+
+### Interpret results before changing the design
+
+- If p99 rises while CPU remains low, inspect queue wait, connection-pool acquisition, locks, downstream latency and generator behavior before adding CPU.
+- If throughput plateaus while queue depth grows, the offered rate exceeds sustainable completion capacity or a downstream bottleneck is limiting progress.
+- If normal-state targets pass but a zone-loss test fails, capacity must be evaluated against the failure topology—not only the healthy topology.
+- If the test passes only with warm caches or unrealistically uniform keys, the workload model is incomplete.
+- If retries rise during the spike, count retry traffic as additional offered work and verify that retries do not push the system further into overload.
+
+### Evidence to preserve
+
+Store the workload definition, generator configuration, test-data version, service/dependency versions, infrastructure shape, offered/admitted/completed rates, latency histograms, error classes, queue age, saturation metrics, correctness results and any deviations from the plan. A result that cannot be reproduced or tied to a configuration is weak evidence for a capacity decision.
+
+### Test-plan acceptance checklist
+
+- [ ] Every threshold is linked to a requirement or explicitly labeled exploratory.
+- [ ] The generator's arrival model and coordinated-omission behavior are understood.
+- [ ] The steady-state run is long enough to detect queue and resource trends.
+- [ ] Spike recovery and at least one required failure scenario are measured.
+- [ ] Correctness and side effects are checked alongside latency and throughput.
+- [ ] Results identify the first bottleneck and include configuration/data assumptions.
+- [ ] The test is repeatable and has a safe abort condition.
 
 ## Further reading
 - [Google SRE Book: Handling Overload](https://sre.google/sre-book/handling-overload/).
