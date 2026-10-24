@@ -6,7 +6,7 @@ A queue distributes work among consumers, often with one consumer in a group han
 Asynchrony reduces temporal coupling: producers need not wait for consumers to finish. It does not remove dependency; it changes when errors appear and how progress is observed.
 
 ## Kafka concepts
-Kafka organizes records into topics and partitions. Offsets identify positions within a partition; order is defined within a partition, not globally across all partitions. A consumer group distributes partitions among members, and reassignment can cause pauses or duplicate processing depending on offset and effect coordination. Replication protects partitions according to configured policies. Consumer lag is a gap in progress, but a lag count alone does not show age or business impact. See [Kafka design documentation](https://kafka.apache.org/documentation/#design).
+Kafka organizes records into topics and partitions. Offsets identify positions within a partition; order is defined within a partition, not globally across all partitions. A consumer group distributes partitions among members, and reassignment can cause pauses or duplicate processing depending on offset and effect coordination. Replication protects partitions according to configured policies. Consumer lag is a gap in progress, but a lag count alone does not show age or business impact. See the versioned [Kafka 4.3 design documentation](https://kafka.apache.org/43/design/design/) and its [message delivery semantics](https://kafka.apache.org/43/design/design/#message-delivery-semantics); check the documentation matching the deployed broker/client version.
 
 ## Delivery semantics
 - **At-most-once:** messages may be lost but are not redelivered under the stated semantics.
