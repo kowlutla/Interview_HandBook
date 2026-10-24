@@ -189,9 +189,67 @@ Connection pooling and keep-alive reduce setup cost but require lifecycle manage
 - Can telemetry identify the actual saturated resource?
 
 
+
+## 4.16 Cancellation, task lifetime and structured concurrency
+
+A request may stop being useful before its work completes. The client can disconnect, a deadline can expire, an upstream request can be cancelled, or a sibling task can fail. If the system does not propagate cancellation, expensive work can continue after the caller has abandoned it, consuming threads, connections, CPU and downstream quota.
+
+### Timeout is not the same as cancellation
+
+A timeout bounds how long a caller waits or how long a particular operation is allowed to run according to that API. It does not automatically stop work on another thread, cancel a database query, close a socket, or undo a committed side effect. Cancellation is a signal or operation requesting that work stop; whether it takes effect depends on the runtime and library.
+
+A safe cancellation design asks:
+- Is cancellation cooperative or immediate?
+- Which resources are released when cancellation is observed?
+- Can the operation already have committed a side effect?
+- Is cleanup bounded and reliable?
+- Does the caller know whether the result is cancelled, failed, or unknown?
+- Can a late completion still publish a message or mutate state?
+
+Cancellation must not be treated as transaction rollback. If a payment or database write may have committed before cancellation arrived, recovery needs idempotency, status lookup, transaction semantics or reconciliation.
+
+### Propagate deadlines and cancellation across dependencies
+
+When a request calls multiple dependencies, each child operation should have a budget bounded by the caller's remaining deadline. Giving every dependency the original full timeout can make the overall request exceed its intended deadline. Reserve time for response handling and cleanup, and avoid retrying when too little budget remains for a meaningful attempt.
+
+Cancellation should flow to work that exists only to serve the abandoned request. However, some work is intentionally durable and outlives the request—for example, a job accepted into a persistent queue. In that case, the API should acknowledge durable acceptance and give the job its own lifecycle, cancellation policy and status rather than pretending it is part of the synchronous request.
+
+### Structured concurrency and task ownership
+
+Structured concurrency is a design approach in which child tasks are scoped to a parent operation or lexical/task scope, with explicit rules for waiting, failure propagation and cancellation. It makes task lifetime easier to reason about than launching detached background tasks with no owner.
+
+The exact API and guarantees depend on the language/runtime. The general design goals are:
+- A parent operation knows which child tasks it started.
+- Child failure and cancellation have defined effects on siblings and the parent.
+- The parent does not report completion while required child work is silently still running.
+- Resources are released when the scope ends.
+- Truly background work is moved into an explicit durable workflow or supervised service.
+
+Parallel fan-out still needs a concurrency limit. Starting hundreds of child requests at once can overload a downstream service even if the parent waits for all results. Bound fan-out, share a deadline, and define whether one child failure fails the whole operation, produces a partial result, or triggers a fallback.
+
+### Supervision and detached background work
+
+Long-running workers need an owner responsible for restart policy, health, backoff, queue consumption, shutdown and observability. Restarting a crashed worker does not prove that an in-flight message was not processed before the crash; durable queues and idempotent handling are still necessary.
+
+During shutdown, stop admitting new work, signal cancellation, allow a bounded drain period, persist or return uncompleted durable work to its queue, and then terminate. Forced termination may interrupt cleanup, so correctness cannot depend only on graceful shutdown succeeding.
+
+### Cancellation review checklist
+
+- Does work stop when the caller no longer needs the result?
+- Are deadlines reduced as work crosses dependency boundaries?
+- Can a timed-out task continue consuming scarce resources?
+- Is cancellation distinct from rollback and from a definitive operation failure?
+- Are child tasks scoped, supervised or explicitly durable?
+- Is fan-out concurrency bounded?
+- What happens to queued and in-flight work during shutdown?
+- Can late results mutate state or publish events after cancellation?
+- Are cancellation, deadline expiry, cleanup failures and orphaned work observable?
+
+
 ## Further reading
 - [Linux man-pages: pthreads](https://man7.org/linux/man-pages/man7/pthreads.7.html).
 - [Java concurrency package documentation](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html).
+- [Java 21 Structured Concurrency API (preview)](https://docs.oracle.com/en/java/javase/21/docs/api/jdk.incubator.concurrent/jdk/incubator/concurrent/StructuredTaskScope.html) — an implementation-specific API example; preview status and API details vary by JDK version.
 
 
 ## A bounded worker-pool model
