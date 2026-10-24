@@ -332,3 +332,13 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Record the scoped findings and limitations in COVERAGE-AUDIT.md. Key terminology remains aligned across the inspected boundaries; this pass does not prove that no contradiction or duplication exists anywhere in the book.
 - [x] Update the Chapter 09 inventory row to include the newly added hot-key section and a skewed-load validation requirement.
 - [ ] Full chapter-by-chapter contradiction, prerequisite and residual-duplication review remains open; do not mark the 21-family inventory Deep on the basis of this focused pass.
+
+
+
+## CI validation route added — 2026-10-24
+
+- [x] Added `.github/workflows/system-design-validation.yml`, triggered by relevant pushes, pull requests and manual dispatch. It has separate jobs for OpenAPI validation and real Mermaid rendering.
+- [x] Added `system-design-mastery/scripts/validate_artifacts.py` to extract the embedded OpenAPI 3.1 YAML and all Mermaid blocks from the 20 chapter pages. It enforces the expected counts (one OpenAPI document and 29 Mermaid diagrams) before tool validation.
+- [x] Re-fetched both new files after commit and inspected their contents. The script's chapter-root path was corrected and re-fetched.
+- [ ] **Not yet verified:** no completed GitHub Actions run result has been retrieved in this pass. Do not treat the workflow definition as proof that rendering or OpenAPI validation passed. Check the Actions run after GitHub executes it; investigate and fix any install, browser, renderer, schema or script errors.
+- [ ] The validator checks the embedded OpenAPI example and Mermaid syntax/renderability, but does not replace full topic-depth or claim-to-source acceptance.
