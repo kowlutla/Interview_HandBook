@@ -185,6 +185,20 @@ A low-latency database volume may favor block storage with predictable IOPS and 
 
 The cheapest per-gigabyte option may not be cheapest overall. Include request charges, retrieval tiers, cross-zone/region transfer, replication, metadata operations, recovery speed and engineering effort. A restore path that takes several days can violate a recovery objective even when the storage is durable.
 
+### Comparative access-pattern example: one product, several workloads
+
+Suppose a commerce application must support transactional order updates, full-text product search, image delivery and historical sales analysis. These are different access patterns and do not necessarily belong in one storage engine. The table shows a possible division of responsibility, not a requirement to adopt every store.
+
+| Workload | Candidate storage/read model | Authority and consistency question | Main caveat |
+|---|---|---|---|
+| Create an order and enforce business constraints | Relational database with transactions and indexes | Which transaction commits the order and its invariants? | Cross-service side effects still need an explicit workflow/outbox protocol |
+| Search products by text, facets and relevance | Derived search index | How quickly does a committed product change become searchable, and how is the index rebuilt? | Search results may be stale; index availability does not make it the source of truth |
+| Store product images and downloadable assets | Object storage, optionally fronted by a CDN | Who may read/write each object, and how are versions, deletion and cache invalidation handled? | Object APIs do not automatically provide database transactions or arbitrary filesystem semantics |
+| Analyze months of sales by region/product/time | Columnar warehouse or lakehouse over governed data | What is the freshness and lineage of the analytical dataset? | Batch/stream ingestion, schema evolution and late corrections require governance |
+| Repeatedly read a hot product summary | Cache or materialized view | What staleness is acceptable, and how is invalidation/rebuild performed? | Cached values are derived copies; authorization and tenant scope must be reflected in keys/policies |
+
+Keep the authoritative write path small and explicit. Search indexes, analytical tables and caches should have a rebuild or reconciliation strategy. Add a separate store only when its access pattern, scale, latency, isolation or operational benefit justifies the extra consistency and recovery work. A single well-operated relational system may be the better choice when it already meets the requirements.
+
 ### Distributed storage review checklist
 
 - Does the application need block, file, or object semantics?
