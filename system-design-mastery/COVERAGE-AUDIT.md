@@ -56,7 +56,7 @@ This table mirrors the 21 topic-family rows in `CURRICULUM.md`. The status is de
 | Storage and search | Ch. 08: 8.1A–8.1I and 8.2–8.7 | Developing | Check B-tree/LSM, WAL/checkpoint, compaction/amplification and object/block/file distinctions; deepen any underdeveloped graph, wide-column, time-series, inverted-index or lakehouse comparisons. |
 | Caching and locality | Ch. 09: 9.1A–9.1H, 9.2, 9.3 (cache layers, invalidation, HTTP behavior, failure modes and tenant isolation); database buffer/page cache distinction added alongside application and edge caches | Developing | Verify HTTP directive and CDN-specific behavior; check eviction/admission, negative caching, hot-key handling, invalidation races, cache poisoning, tenant isolation and revocation/deletion propagation. |
 | Distributed systems | Ch. 10: 10.7–10.18 | Developing | Verify consistency definitions and CAP/PACELC wording against primary literature; test quorum assumptions, failure-detector limits, clock uncertainty, CRDT invariants and multi-region failover claims. |
-| Coordination and distributed transactions | Ch. 11: 11.1A–11.1C, 11.2A, 11.5A–11.5I, 11.6 | Developing | Verify Raft/Paxos and membership-change summaries against primary sources; make 2PC blocking/recovery assumptions, fencing enforcement and saga compensation boundaries explicit. |
+| Coordination and distributed transactions | Ch. 11: 11.1A–11.1C, 11.5A–11.5I, 11.6 | Developing | Verify Raft/Paxos and membership-change summaries against primary sources; make 2PC blocking/recovery assumptions, fencing enforcement and saga compensation boundaries explicit. |
 | Messaging and data movement | Ch. 12: 12.1–12.8 (messaging models, delivery semantics, partitions, retries, outbox/inbox, stream processing, schema evolution, CQRS/event sourcing and rebuilds) | Developing | Validate Kafka guarantees against the deployed-version docs; choose a concrete serialization/registry compatibility model for the schema matrix; verify replay, watermarks, retention and projection cutover assumptions. |
 | Scaling and traffic management | Ch. 13: 13.1A–13.1G, 13.2–13.4; Ch. 19: 19.3 | Developing | Recalculate examples and validate the concurrency-knee assumptions; review autoscaling feedback delay, aggregate per-replica limits, consistent hashing/skew, hedge amplification and overload priorities. |
 | Reliability and recovery | Ch. 14: 14.1A–14.1G, 14.2–14.4 | Developing | Recheck availability math and SLO/error-budget calculations; validate RTO/RPO definitions, backup/restore evidence, failback fencing, chaos-test safety and incident-response roles. |
@@ -298,7 +298,7 @@ This is a targeted source spot-check, not a complete Chapter 20 claim-by-claim r
 ## Final structural and focused source pass — 2026-10-24
 
 - **Chapter 09 duplication correction:** removed a second cache-aside sequence diagram that repeated the read path already illustrated near the chapter's opening. The chapter now has one cache-aside read-path diagram.
-- **Fresh structural check:** all 20 chapter pages still have balanced code fences, no exact duplicate Markdown headings, a Further reading section, and the navigation footer at the end. The chapter-page Mermaid inventory is now 21 blocks; static declaration checks pass, but rendering is not validated.
+- **Fresh structural check:** all 20 chapter pages still have balanced code fences, no exact duplicate Markdown headings, a Further reading section, and the navigation footer at the end. The current chapter-page Mermaid inventory is 29 blocks across the 20 chapters; static declaration checks pass, but rendering is not validated.
 - **Chapter 20 source qualification:** checked current MDN browser-storage and WebRTC protocol guidance, Cloudflare's provider-specific TURN FAQ, and W3C publication statuses. The chapter now identifies the Service Workers publication as an evolving Candidate Recommendation Draft and Indexed Database API 3.0 as a Working Draft, and includes the MDN WebRTC protocols guide. These are targeted checks, not exhaustive claim/source verification.
 
 The book-wide technical acceptance remains open: no Mermaid renderer or full OpenAPI validator was successfully run; external-link liveness and source-to-claim alignment are not exhaustive; and the 21 curriculum inventory families have not all received independent depth verification. Do not mark them Deep or claim the entire textbook technically certified until those checks are completed.
@@ -328,7 +328,7 @@ This establishes that these selected references resolve and that their document 
 
 ### Remaining acceptance blockers
 
-- Mermaid rendering of all 21 chapter diagrams is still unverified. No local Mermaid CLI/standalone parser is available, and external package retrieval fails due network/DNS restrictions.
+- Mermaid rendering of all 29 chapter-page diagrams is still unverified. No local Mermaid CLI/standalone parser is available, and external package retrieval fails due network/DNS restrictions.
 - Full OpenAPI 3.1 schema/spec validation is still unverified for the same package-access constraint.
 - The full source-to-claim audit, repository-wide external-link audit, independent review of all 21 mandatory topic families, and cross-chapter consistency pass remain incomplete. Do not promote provisional coverage statuses to Deep based on these targeted checks.
 
@@ -359,8 +359,15 @@ The latest verification re-opened the live curriculum, editorial standard, progr
 
 1. Read every mandatory inventory row against the actual chapter text and verify mechanism, example, selection criteria, trade-offs, failure modes and operational/design implications before changing provisional coverage statuses.
 2. Audit every external link for liveness/redirects and verify claim-to-source alignment, including the Chapter 20 links that received only targeted checks.
-3. Render all 21 Mermaid diagrams in a real renderer. This remains blocked in the current environment because no renderer is available and package retrieval fails under network/DNS restrictions.
+3. Render all 29 chapter-page Mermaid diagrams in a real renderer. This remains blocked in the current environment because no renderer is available and package retrieval fails under network/DNS restrictions.
 4. Run a full OpenAPI 3.1 validator/linter against the Chapter 06 example. Targeted YAML parsing and invariant checks are not equivalent; package retrieval is blocked in the current environment.
 5. Complete the cross-chapter review for terminology, contradictions, duplicate explanations, prerequisite gaps and numerical assumptions.
 
 **Status:** review-ready content draft; **formal technical acceptance remains open**. Do not mark the textbook fully validated until the blockers above have evidence of completion.
+
+
+## Inventory reconciliation — 2026-10-24
+
+A fresh pass fetched all 20 current chapter pages and counted Mermaid declarations directly in their Markdown. The current chapter-page total is **29 blocks**: 16 in Chapters 01–10 and 13 in Chapters 11–20. Earlier checkpoints in this file recorded 21 or 22 blocks; those are historical counts from earlier content states and are superseded by this inventory. Rendering remains unverified, so this is a count of declared blocks only, not a syntax or visual acceptance result.
+
+The row for coordination/distributed transactions previously referenced Chapter 11 section 11.2A, which is absent from the current chapter. The mapping now points only to the current sections 11.1A–11.1C, 11.5A–11.5I, and 11.6.
