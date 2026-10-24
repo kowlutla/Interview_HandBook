@@ -29,12 +29,12 @@ Do not infer “Deep” from a heading or keyword match. This is an initial audi
 | Distributed failure, consistency, clocks, CAP/PACELC | 10 | Developing | Section 10.18 now adds a write-timeout/read-replica timeline and explains why quorum arithmetic alone does not prove linearizability. Verify the consistency claims against primary literature and implementation contracts. |
 | Replication, consensus, leases, locks, fencing, transactions | 11 | Developing | Compare Raft/Paxos concepts, failover safety, 2PC/Saga and distributed lock limits with examples. |
 | Queues, pub/sub, logs, Kafka, CDC and stream processing | 12 — 12.1A–12.1H, 12.2, 12.3 event sourcing/CQRS/schema governance | Developing | Verify broker-specific delivery/transaction guarantees; add a worked projection rebuild/replay example and schema compatibility matrix for a chosen format. |
-| Scaling, hashing, partitioning, hotspots, overload | 13 | Developing | Add worked algorithms, failure-domain capacity, admission control, load shedding and autoscaling pitfalls. |
+| Scaling, hashing, partitioning, hotspots, overload | 13 — 13.1A–13.1G, 13.2, 13.3 hedged requests/adaptive concurrency | Developing | Verify hedging safety and load amplification; add a measured decision example and check adaptive-concurrency stability claims. |
 | Reliability, SLOs, redundancy, backup/restore, DR | 14 | Developing | Sections 14.2–14.3 now include availability composition, RTO/RPO, restore validation, and a worked request-based SLO/error-budget/burn-rate example. Continue checking measurement definitions and recovery assumptions. |
-| Security, identity, privacy, tenant isolation | 16 | Developing | Threat-model examples, authorization boundaries, secrets/key lifecycle, abuse controls and privacy lifecycle. |
+| Security, identity, privacy, tenant isolation | 16 — 16.1A–16.1J, 16.2, 16.3 API threat patterns | Developing | Validate controls against OWASP guidance and add a worked multi-tenant authorization threat model with explicit trust boundaries. |
 | Observability and production operations | 17 | Developing | Deepen alert design, cardinality, sampling, tracing limitations, burn-rate alerts and runbooks. |
 | Cloud, containers, Kubernetes, IaC and delivery | 18 | Developing | Sections 18.2–18.5 now deepen Kubernetes, service mesh, IaC state/drift, SBOM, provenance, signing and build/deployment trust. Still verify supply-chain guidance against primary standards and test examples. |
-| Cross-cutting patterns, cost, multi-tenancy and multi-region | 19 | Developing | Build a pattern catalog with context, forces, consequences, anti-patterns and interactions. |
+| Cross-cutting patterns, cost, multi-tenancy and multi-region | 19 — 19.1A–19.1F, 19.2 pattern catalog, Bloom-filter sizing example | Developing | Verify approximation assumptions, add a worked multi-tenant fairness scenario, and review pattern interactions across chapters. |
 
 
 ## Exact section map for the current expansion pass
@@ -55,15 +55,18 @@ The following sections are present and are the starting points for the deeper re
 | Distributed consistency | Chapter 10: Consistency models, CAP and PACELC, 10.7–10.18 including worked consistency timeline |
 | Replication and coordination | Chapter 11: Leader election, Leases and fencing tokens, Two-phase commit, Sagas and compensation, 11.5A–11.5G, 11.6 Consensus and transaction boundaries |
 | Messaging and stream processing | Chapter 12: Queue, pub-sub and event log, Delivery semantics, Outbox, inbox and CDC, 12.1A–12.1H, 12.2 Message brokers and delivery semantics, 12.3 Event sourcing/CQRS/schema governance |
-| Scaling and overload | Chapter 13: Load balancing and consistent hashing, Overload controls, 13.1A–13.1G, 13.2 Admission control, load shedding, and backpressure |
+| Scaling and overload | Chapter 13: Load balancing and consistent hashing, Overload controls, 13.1A–13.1G, 13.2 Admission control/load shedding/backpressure, 13.3 Hedged requests/adaptive concurrency |
 | Reliability and recovery | Chapter 14: SLI, SLO, SLA and error budget, Recovery objectives, Zones, regions and disaster recovery, 14.1A–14.1G, 14.2 Recovery engineering, 14.3 Worked SLO and error-budget example |
 | Architectural styles and evolution | Chapter 15: Monolith, modular monolith and microservices, Sidecars and service meshes, 15.1A–15.1H, 15.1I Architectural styles |
-| Security and privacy | Chapter 16: Threat modeling, Authorization models, Tenant isolation, OAuth 2.0 and OpenID Connect, 16.2 Threat modeling a system architecture |
+| Security and privacy | Chapter 16: Threat modeling, Authorization models, Tenant isolation, OAuth 2.0 and OpenID Connect, 16.2 Threat modeling a system architecture, 16.3 API threat patterns |
 | Observability and operations | Chapter 17: RED and USE, Percentiles and cardinality, SLO-driven alerting, 17.1A–17.1I, 17.2 Observability in practice |
 | Cloud and Kubernetes | Chapter 18: Containers and Kubernetes, 18.1A–18.1I, 18.2 Kubernetes architecture, 18.3 Service mesh, 18.4 IaC state and drift, 18.5 software supply-chain security |
-| Patterns and anti-patterns | Chapter 19: Probabilistic data structures, Distributed scheduling, Multi-tenancy, Multi-region consistency and routing, 19.2 Architecture pattern catalog |
+| Patterns and anti-patterns | Chapter 19: Probabilistic data structures including Bloom-filter sizing, Distributed scheduling, Multi-tenancy, Multi-region consistency and routing, 19.2 Architecture pattern catalog |
 
 ## New additions in the current review pass
+| Tail latency and duplicate work | Chapter 13, 13.3 | Explains hedged requests, cancellation, idempotency, shared bottlenecks and adaptive concurrency feedback | Validate against The Tail at Scale and verify workload-specific trade-offs |
+| API threat patterns | Chapter 16, 16.3 | Adds object/function/property-level authorization, sensitive business flows, resource abuse, SSRF, unsafe upstream APIs and API inventory | Build a threat model and verify controls against the OWASP API Security Top 10 |
+| Probabilistic structure sizing | Chapter 19, Bloom filter sizing subsection | Adds standard approximate false-positive and bit-budget formulas plus a million-item worked example | Independently recalculate formula and label assumptions clearly |
 | Cache security and data lifecycle | Chapter 09, 9.3 | Covers tenant-aware cache keys, cache poisoning/deception, stale-while-revalidate/stale-if-error, permission revocation, deletion and privacy propagation | Verify against HTTP caching semantics and add a concrete cross-tenant test matrix |
 | Event sourcing, CQRS and schema governance | Chapter 12, 12.3 | Distinguishes commands/events, event sourcing/notification, CQRS/read-model lag, projection rebuilds, schema compatibility and event-data privacy | Verify broker/registry-specific semantics and add a worked projection rebuild example |
 
