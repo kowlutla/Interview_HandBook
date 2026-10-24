@@ -22,7 +22,7 @@ Kafka organizes records into topics and partitions. Order is defined within a pa
 
 Choose the partition key around the entity whose events must remain ordered—for example, an order or account. A poor key can concentrate traffic on a small number of partitions. Adding partitions may also change key-to-partition mapping for some partitioning strategies, so consider how that affects ordering and stateful consumers.
 
-A consumer's committed offset records its progress through a partition. Be precise about what the offset represents: a record has an offset, while the committed consumer position typically points to the next record to read. Consumer restarts and group rebalances can cause records to be processed again if the external side effect and progress update are not coordinated.
+A consumer's committed offset records its progress through a partition. Be precise about what the offset represents: a record has an offset, while the committed consumer position typically points to the next record to read. For example, after processing record offset 812, a consumer commonly commits position 813 as the next offset to consume. Consumer restarts and group rebalances can cause records to be processed again if the external side effect and progress update are not coordinated.
 
 **Consumer lag** is the gap between the latest available data and a consumer's progress. Count alone is not enough: a thousand expensive events may take longer than a million tiny ones. Monitor lag age, arrival and processing rates, failures, batch size, and estimated drain time. If events arrive faster than the system can process them for a sustained period, the backlog will keep growing.
 
