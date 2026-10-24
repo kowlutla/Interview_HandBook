@@ -302,3 +302,32 @@ This is a targeted source spot-check, not a complete Chapter 20 claim-by-claim r
 - **Chapter 20 source qualification:** checked current MDN browser-storage and WebRTC protocol guidance, Cloudflare's provider-specific TURN FAQ, and W3C publication statuses. The chapter now identifies the Service Workers publication as an evolving Candidate Recommendation Draft and Indexed Database API 3.0 as a Working Draft, and includes the MDN WebRTC protocols guide. These are targeted checks, not exhaustive claim/source verification.
 
 The book-wide technical acceptance remains open: no Mermaid renderer or full OpenAPI validator was successfully run; external-link liveness and source-to-claim alignment are not exhaustive; and the 21 curriculum inventory families have not all received independent depth verification. Do not mark them Deep or claim the entire textbook technically certified until those checks are completed.
+
+
+## Additional validation pass — 2026-10-24
+
+### Chapter 06 OpenAPI example
+
+The embedded Orders API YAML was re-parsed with PyYAML and passed targeted structural invariants: OpenAPI version is 3.1.0; the paths map is non-empty; the templated `{orderId}` path has exactly one matching `in: path` parameter; that parameter is `required: true`; and the operation has an `operationId` and response definition. This does **not** establish full OpenAPI 3.1 compliance. The environment lacks `openapi-spec-validator`, and package-host DNS/network access is unavailable, so the full validator remains pending.
+
+### Primary-source availability and status spot-check
+
+The following reference pages were opened successfully through the web retrieval environment:
+- [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html)
+- [RFC 9293 — TCP](https://www.rfc-editor.org/rfc/rfc9293.html)
+- [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html)
+- [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html)
+- [OpenAPI Specification 3.1.0](https://spec.openapis.org/oas/v3.1.0.html)
+- [Google SRE Workbook — Example Error Budget Policy](https://sre.google/workbook/error-budget-policy/)
+- [WCAG 2.2](https://www.w3.org/TR/WCAG22/) — W3C Recommendation
+- [MDN — Storage quotas and eviction criteria](https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria)
+- [MDN — WebRTC protocols](https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Protocols)
+- [W3C — Indexed Database API 3.0](https://www.w3.org/TR/IndexedDB-3/) — Working Draft
+
+This establishes that these selected references resolve and that their document statuses were checked. It is not a repository-wide URL liveness audit and does not verify every technical claim against the nearest cited source.
+
+### Remaining acceptance blockers
+
+- Mermaid rendering of all 21 chapter diagrams is still unverified. No local Mermaid CLI/standalone parser is available, and external package retrieval fails due network/DNS restrictions.
+- Full OpenAPI 3.1 schema/spec validation is still unverified for the same package-access constraint.
+- The full source-to-claim audit, repository-wide external-link audit, independent review of all 21 mandatory topic families, and cross-chapter consistency pass remain incomplete. Do not promote provisional coverage statuses to Deep based on these targeted checks.
