@@ -38,11 +38,11 @@ Connect workload models to bottlenecks, queueing, overload, redundancy, recovery
 **Checkpoint:** Identify where a system saturates first, why tail latency can rise before average latency looks alarming, and how overload controls preserve critical work.
 
 ## Pass 6 — Compose and operate
-**Read:** Chapters 15–19.
+**Read:** Chapters 15–20.
 
-Study boundaries, evolution, security, observability, deployment, and advanced cross-cutting concerns as parts of one operating system—not isolated checklists.
+Study boundaries, evolution, security, observability, deployment, advanced cross-cutting concerns, and client-side/offline/real-time behavior as parts of one operating system—not isolated checklists.
 
-**Checkpoint:** Defend an architectural decision by stating its context, alternatives, assumptions, failure modes, operational cost, and migration path.
+**Checkpoint:** Defend an architectural decision by stating its context, alternatives, assumptions, failure modes, operational cost, and migration path. For a client-facing system, also explain which state is authoritative, how offline edits and reconnects are reconciled, and what delivery guarantees each real-time transport actually provides.
 
 ## Dependency sketch
 
