@@ -69,7 +69,7 @@ Check items only when the work has actually been performed.
 - [x] Perform a targeted source review of Chapter 20 browser-storage durability and WebRTC TURN/SFU encryption boundaries; record the official/provider references and remaining verification scope in COVERAGE-AUDIT.md.
 - [ ] Review Chapter 20's technical claims against primary/official sources; verify rendering/security details and all external references.
 - [x] Perform a targeted structural check of Chapter 20: balanced fences, no duplicate headings, Further reading order, two recognized Mermaid declarations, and valid textbook footer links.
-- [ ] Perform a current structural and relative-link check across all 28 Markdown files after adding Chapter 20.
+- [x] Perform a current structural and relative-link check across all 28 Markdown files after adding Chapter 20; all local relative targets resolve, fences are balanced, headings are unique, and no instructional headings follow Further reading.
 - [ ] Validate the two new Mermaid diagrams with a renderer; currently they have only been manually inspected.
 - [ ] Review each module for accuracy, clarity, depth and prerequisite coverage.
 - [x] Expand chapters 1–5 with additional first-principles explanations, mechanisms, edge cases, failure modes, operational checklists, and worked reasoning where appropriate.
@@ -156,10 +156,25 @@ The textbook now has 20 substantive chapter pages in chapter folders, supported 
 
 The original 19 chapters had a prior structural and relative-link check; Chapter 20 has since been added with two Mermaid diagrams and has not yet completed the current whole-tree structural/link pass. The textbook currently contains 28 Markdown files and 26 Mermaid blocks by inventory (24 in the original 19 chapters plus two in Chapter 20); the new diagrams have been manually inspected but not renderer-validated. Scoped technical reviews and corrections are recorded in COVERAGE-AUDIT.md, including payment idempotency-key retention boundaries and Kafka record-offset versus next-position terminology.
 
-Still open: independent curriculum/duplication review; claim-by-claim source verification; exhaustive external-link audit; verification of all 21 mandatory inventory rows; review of Chapter 20's client/offline/realtime claims; current structural and internal-link checks across all 28 Markdown files; Mermaid rendering; OpenAPI parser/linter validation; and cross-chapter consistency review. Do not mark the textbook complete or promote a row to Deep until the relevant acceptance criteria have actually passed.
+Still open: independent curriculum/duplication review; claim-by-claim source verification; exhaustive external-link audit; verification of all 21 mandatory inventory rows; review of Chapter 20's client/offline/realtime claims; Mermaid rendering; OpenAPI parser/linter validation; and cross-chapter consistency review. The current 28-file structural and relative-link pass has now completed successfully. Do not mark the textbook complete or promote a row to Deep until the relevant acceptance criteria have actually passed.
 
 Latest editorial correction and verification: a whole-book heading-order audit found supplemental worked diagrams/guidance placed after Further reading in multiple chapters. Those sections were moved into the instructional body before Further reading. A fresh check of all 19 chapter pages then confirmed balanced fenced blocks, no exact duplicate headings, no instructional headings after Further reading, and navigation footers at the end. Relative Markdown targets were also checked across all 27 Markdown files in the target tree; no missing local targets were found. This structural pass does not validate Mermaid rendering or prove technical claims; the full claim-by-claim and source-link audits remain open.
 
 
 ## Scope extension — 2026-10-24
 The independent curriculum review found that the 19-chapter draft did not meaningfully cover client-side rendering/delivery, offline-first persistence, synchronization and conflict resolution, persistent real-time transports, WebRTC, collaborative editing, or micro-frontends. Rather than mark those topics as covered by passing mentions in API/network chapters, a dedicated Chapter 20 was added and linked from the landing page, roadmap, curriculum, coverage audit and glossary. The mandatory inventory now contains 21 topic families (the original 20 plus client-side/real-time architecture). Chapter 20 is substantive but remains **Developing** until its sources, assumptions, examples and diagrams receive the same independent verification as the other chapters.
+
+
+## Human-readable consolidation pass — 2026-10-24
+
+The user emphasized that the textbook must read like a human-written, readable explanation. The editorial standard now explicitly requires natural transitions, clear motivation before jargon, connected prose, purposeful examples, selective use of bullets/tables, and removal of repeated explanations and mechanical checklists.
+
+- [x] Add explicit human-written readability criteria to EDITORIAL-STANDARD.md.
+- [x] Consolidate Chapter 05 (Networking): remove repeated introductory/deep-dive treatment and combine related protocol, edge, security, timeout and troubleshooting guidance into a coherent request-journey explanation. Word count reduced from approximately 6,133 to 2,423 while retaining the main networking fundamentals.
+- [x] Consolidate Chapter 12 (Messaging): merge repeated summaries and detailed sections into one learning path covering delivery semantics, partitions, retries, outbox/inbox, stream processing, schema evolution, CQRS/event sourcing, projection rebuilds, and privacy. Word count reduced from approximately 5,334 to 1,932.
+- [x] Recheck relative Markdown targets across all 28 Markdown files in system-design-mastery/ after these edits; no missing local targets found.
+- [x] Run static structure checks across all 28 Markdown files: balanced fenced blocks, no exact duplicate headings, and no instructional headings after Further reading.
+- [ ] Continue human-readability and duplication review for the remaining chapters, prioritizing chapters with overlapping sections or dense lists/tables.
+- [ ] Validate Mermaid diagrams with a renderer; static declaration and fence checks are not rendering validation.
+- [ ] Run an OpenAPI parser/linter on the Chapter 06 example.
+- [ ] Complete the claim-by-claim source and external-link audit.
