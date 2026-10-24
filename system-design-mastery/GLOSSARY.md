@@ -15,6 +15,7 @@
 - **Reverse proxy:** server-side proxy that receives requests on behalf of backend/origin services and forwards them.
 - **Service mesh:** infrastructure for service-to-service traffic policy, workload identity and telemetry, commonly implemented with proxies and a control plane.
 - **Write amplification:** physical storage writes relative to logical application writes; important for storage-engine capacity and latency.
+- **Write skew:** concurrent transactions read overlapping state and update different rows, jointly violating an invariant even though each local update succeeds.
 - **Availability:** proportion of time or requests meeting a defined success criterion.
 - **Bandwidth:** transfer rate; distinguish bit/s from byte/s.
 - **Bulkhead:** isolation limiting the impact one failure or workload can have on another.
@@ -27,6 +28,7 @@
 - **Durability:** acknowledged committed changes survive the failures covered by the system's contract.
 - **Eventual consistency:** if updates stop and communication/reconciliation continues under the model's assumptions, replicas eventually converge; interim reads are not fully specified by this phrase alone.
 - **Idempotency:** repeating an operation has the same intended effect within a defined scope and key lifetime.
+- **Inbox pattern:** a consumer records a stable message or operation identifier in the same transaction as its local business effect, so duplicate deliveries can be detected safely.
 - **Latency:** elapsed time between defined start and end events.
 - **Linearizability:** each operation appears to take effect atomically between invocation and response, respecting real-time order.
 - **Little's Law:** for a stable system, average work in the system L equals arrival rate λ times average time W: L = λW.
