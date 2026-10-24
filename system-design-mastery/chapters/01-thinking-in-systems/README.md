@@ -250,6 +250,8 @@ Do not delay every decision until all uncertainty disappears. Instead, identify 
 
 A component should group responsibilities that change together and keep unrelated change separate. **Cohesion** describes how strongly the responsibilities within a component belong together. **Coupling** describes how much one component depends on another's structure, timing, state or release process.
 
+**Separation of concerns** means keeping distinct responsibilities or reasons for change understandable and independently evolvable where useful. It does not mean every concern deserves a separate service: modules inside one process can provide strong separation without adding network, deployment and data-consistency costs.
+
 Coupling is not only a code-import relationship. Two services may be operationally coupled if they must deploy together, data-coupled if they share tables, temporal-coupled if every request requires both to be available, or semantically coupled if a field change silently changes another service's interpretation.
 
 A useful boundary gives one owner clear responsibility for an invariant and exposes a contract to others. If multiple components can independently change the same authoritative state, ownership is ambiguous. If a simple user action requires many synchronous calls, the decomposition may create a fragile critical path.
@@ -290,6 +292,8 @@ Choose the view based on the question:
 | Failure / recovery view | What fails together, and how is service restored? | Failure domains, redundancy, promotion, restore paths and degraded modes |
 
 The C4 model is one useful way to describe static software structure at different levels: system context, containers, components and code. In that model, a “container” means an application or data store, not necessarily an operating-system or Docker container. A deployment diagram is a separate view because the same logical structure can be deployed differently in development, staging, one region, or multiple regions.
+
+**Logical architecture** describes responsibilities, boundaries and relationships without committing to placement. **Physical architecture** (often represented by a deployment view) maps those logical components to processes, hosts or containers, network zones, regions, storage and replicas. One logical service may have many deployed instances, and one host may run several logical components. Keep the mapping explicit when reasoning about capacity, failure domains, identity and cost; the logical/physical distinction is about the question being answered, not a strict one-to-one mapping.
 
 Do not force every diagram type into every design. Use the smallest set that answers the decision at hand. For most high-level discussions, context and container views establish scope and major responsibilities; sequence, deployment, data, or trust-boundary views are added when the decision depends on those details.
 
