@@ -51,6 +51,7 @@ Check items only when the work has actually been performed.
 - [x] Add a Chapter 7 concurrent write-skew lab showing invariant violation and comparing database protection strategies.
 - [x] Add a Chapter 12 consumer-crash timeline comparing database/offset commit ordering and the limits of exactly-once guarantees.
 - [x] Add a Chapter 11 stale-lease failure timeline showing why fencing must be enforced atomically by the protected resource.
+- [x] Add a Chapter 14 recovery rehearsal with timed restore, RTO/RPO measurement, data-integrity validation, stale-writer fencing and backlog drain.
 - [x] Add a worked Chapter 7 sharding/resharding example, Chapter 10 consistency timeline, and Chapter 14 SLO/error-budget calculation.
 - [x] Deepen Chapter 1 with architecture viewpoints and diagram selection; Chapter 2 with accessibility, usability, internationalization, operability, portability, cost and sustainability; Chapter 3 with load-test methodology; and Chapter 4 with cancellation and structured concurrency.
 - [x] Deepen Chapter 9 with cache-key security, cache poisoning, tenant isolation, stale-serving policies, permission revocation and deletion; deepen Chapter 12 with event sourcing/CQRS distinctions, projection rebuilds, schema compatibility and event-data privacy.
