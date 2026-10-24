@@ -213,12 +213,6 @@ Keep the authoritative write path small and explicit. Search indexes, analytical
 - Have application assumptions been checked against the actual storage API contract?
 
 
-## Further reading
-- [PostgreSQL storage documentation](https://www.postgresql.org/docs/current/storage.html).
-- O'Neil et al., [The Log-Structured Merge-Tree](https://doi.org/10.1007/s002360050048).
-- [Amazon S3 user guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html) for product-specific semantics.
-
-
 ## Conceptual write paths: B-tree and LSM
 
 ```mermaid
@@ -236,6 +230,12 @@ flowchart TD
 ```
 
 This is a conceptual comparison, not a claim that all engines follow identical paths. Real products combine logs, caches, indexes and recovery mechanisms differently. Compare read, write and space amplification under your workload.
+
+## Further reading
+- [PostgreSQL storage documentation](https://www.postgresql.org/docs/current/storage.html).
+- O'Neil et al., [The Log-Structured Merge-Tree](https://doi.org/10.1007/s002360050048).
+- [Amazon S3 user guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html) for product-specific semantics.
+
 
 
 ---
