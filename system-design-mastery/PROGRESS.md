@@ -82,6 +82,7 @@ Check items only when the work has actually been performed.
 - [x] Extend the glossary with batch processing, micro-batch, stream processing, CI/CD, IAM and synthetic-check definitions introduced or deepened during the coverage pass.
 - [x] Make separation of concerns and logical-versus-physical architecture explicit in Chapter 1, including why logical components do not map one-to-one to deployed instances.
 - [x] Clarify the database-per-service pattern in Chapter 15, including that it means data ownership/isolation rather than necessarily one physical server per service, and add anti-corruption-layer selection trade-offs.
+- [x] Add glossary definitions for database-per-service and anti-corruption layer to align shared terminology with Chapter 15.
 - [x] Recheck Chapter 1 after the architecture-foundations clarification; code fences, heading uniqueness, Further reading order and navigation footer remain valid.
 - [x] Recheck Chapter 15 after the database-per-service and anti-corruption-layer additions; code fences, heading uniqueness, Further reading order and navigation footer remain valid.
 - [x] Add a Chapter 9 cross-tenant/cache-poisoning test matrix covering tenant and role variation, header/key poisoning, revocation, stale-fill races and cache failure.
