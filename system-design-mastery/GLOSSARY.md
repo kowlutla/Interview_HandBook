@@ -52,3 +52,17 @@
 - **Throughput:** amount of useful work completed per unit time.
 - **Utilization:** fraction of a resource's capacity that is busy; high utilization can sharply increase queueing delay.
 - **Vector clock:** logical-clock structure tracking causal relationships and helping identify concurrent events.
+
+- **Client-side prediction:** client-side simulation of a likely result before authoritative server confirmation, later reconciled with authoritative state.
+- **Conflict-free Replicated Data Type (CRDT):** a data type with defined merge/update properties that permit replicas to converge under stated assumptions; convergence alone does not preserve arbitrary business invariants.
+- **Hydration:** attaching client-side behavior to server-rendered HTML, requiring compatible initial state and rendering assumptions.
+- **Local-first/offline-first:** design approach that allows useful work against durable local state and later synchronizes it with shared authoritative state under an explicit conflict policy.
+- **Micro-frontend:** independently owned or delivered UI module integrated into a larger application, adding runtime, interface, security and performance concerns.
+- **Optimistic UI:** presenting a proposed state change before the authoritative service confirms it; pending, rejected and unknown outcomes still need explicit handling.
+- **Operational Transformation (OT):** method for transforming concurrent editing operations so they can be applied consistently under a defined collaboration protocol.
+- **Server-Sent Events (SSE):** HTTP-based one-way server-to-client event stream; durable replay requires an application-level cursor/history contract.
+- **SFU (Selective Forwarding Unit):** media server that forwards selected participant streams to others rather than mixing all media into one output.
+- **STUN:** protocol used by a peer to discover network address information for connectivity establishment; it does not guarantee a direct path will work.
+- **Tombstone:** retained deletion marker used to propagate a deletion to replicas and prevent stale copies from being silently resurrected.
+- **TURN:** relay protocol/service used when peers cannot establish a suitable direct network path; relaying adds bandwidth and operational cost.
+- **WebRTC:** browser/device APIs and protocols for real-time peer connections carrying media or data, commonly requiring signaling and sometimes STUN/TURN infrastructure.
