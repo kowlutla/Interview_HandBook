@@ -22,7 +22,7 @@ Check items only when the work has actually been performed.
 - [x] Link the coverage audit from the textbook landing page.
 - [x] Editorial and verification standard.
 - [ ] Independent curriculum completeness and duplication review.
-- [ ] Complete evidence-based mapping of every mandatory inventory row to exact chapter sections and verify each status.
+- [ ] Independently verify each mapped mandatory inventory row's coverage status and evidence; promote to Deep only after its acceptance criteria pass.
 - [x] Draft a row-by-row map for all 20 mandatory curriculum topic families to exact teaching sections, with provisional statuses and explicit verification gaps; independent status verification remains open.
 - [x] Add targeted curriculum-gap sections for service discovery/configuration (Chapter 15), OAuth/OIDC token roles (Chapter 16), RED/USE observability methods (Chapter 17), and cloud service models (Chapter 18).
 
