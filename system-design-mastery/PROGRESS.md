@@ -202,5 +202,5 @@ The user emphasized that the textbook must read like a human-written, readable e
 - [x] Chapters 08–11 and 13–18: consolidated repeated overview sections where later sections already teach the same mechanism in depth. Unique material was retained or folded into the detailed treatment, including the cache-benefit calculation, 2PC-versus-saga trade-offs, idempotency boundaries, and orchestration-versus-choreography choices.
 - [x] Chapter 20: reviewed the full chapter for flow and repetition. Its sections address distinct client/offline/synchronization/realtime domains, so no broad shortening was warranted.
 - [x] Rechecked the edited chapter pages (01, 03, 04, 06–11, 13–18) and Chapter 20 for balanced code fences, duplicate headings, instructional headings after Further reading, and navigation footer placement; all checks passed.
-- [ ] Run a fresh repository-wide relative-link check after these edits.
+- [x] Run a fresh repository-wide relative-link check after these edits across all 28 Markdown files; no missing local relative targets found.
 - [ ] Continue technical/source verification, Mermaid rendering and OpenAPI validation; readability completion does not imply technical certification.
