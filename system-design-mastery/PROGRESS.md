@@ -154,7 +154,7 @@ Check items only when the work has actually been performed.
 ## Current status
 The textbook now has 20 substantive chapter pages in chapter folders, supported by the landing page, roadmap, curriculum, coverage audit, editorial standard, glossary and research library. A curriculum gap scan identified that client-side rendering/delivery, offline-first persistence, synchronization/conflict resolution, realtime transports, WebRTC, collaborative editing, micro-frontends and interactive-session architecture were not taught in depth; Chapter 20 was added rather than treating scattered mentions as sufficient coverage. The mandatory inventory now contains 21 topic families and all statuses remain provisional until independent acceptance checks pass.
 
-The original 19 chapters had a prior structural and relative-link check; Chapter 20 has since been added with two Mermaid diagrams and has not yet completed the current whole-tree structural/link pass. The textbook currently contains 28 Markdown files and 26 Mermaid blocks by inventory (24 in the original 19 chapters plus two in Chapter 20); the new diagrams have been manually inspected but not renderer-validated. Scoped technical reviews and corrections are recorded in COVERAGE-AUDIT.md, including payment idempotency-key retention boundaries and Kafka record-offset versus next-position terminology.
+The textbook currently contains 28 Markdown files and 26 Mermaid blocks by inventory. A current static check across all 28 files found balanced fenced blocks, no exact duplicate headings, no instructional headings after Further reading, and no broken local relative Markdown targets. Mermaid rendering remains unverified. Scoped technical reviews and corrections are recorded in COVERAGE-AUDIT.md, including payment idempotency-key retention boundaries and Kafka record-offset versus next-position terminology. Chapters 02, 05 and 12 have begun a human-readable consolidation pass to remove repeated explanations while preserving important concepts.
 
 Still open: independent curriculum/duplication review; claim-by-claim source verification; exhaustive external-link audit; verification of all 21 mandatory inventory rows; review of Chapter 20's client/offline/realtime claims; Mermaid rendering; OpenAPI parser/linter validation; and cross-chapter consistency review. The current 28-file structural and relative-link pass has now completed successfully. Do not mark the textbook complete or promote a row to Deep until the relevant acceptance criteria have actually passed.
 
@@ -178,3 +178,10 @@ The user emphasized that the textbook must read like a human-written, readable e
 - [ ] Validate Mermaid diagrams with a renderer; static declaration and fence checks are not rendering validation.
 - [ ] Run an OpenAPI parser/linter on the Chapter 06 example.
 - [ ] Complete the claim-by-claim source and external-link audit.
+
+
+## Additional human-readable review — 2026-10-24
+
+- [x] Consolidate Chapter 02: remove repeated availability/reliability/durability/correctness definitions, repeated prioritization guidance, and a redundant review checklist. Retain the accessibility, operability, portability, cost, sustainability and quality-interaction content. Word count reduced from approximately 3,939 to 3,684.
+- [x] Refresh coverage-audit section references after consolidating Chapters 02, 05 and 12.
+- [ ] Continue the same review across remaining chapters; focus on overlapping explanations and checklist/table overload rather than reducing length arbitrarily.
