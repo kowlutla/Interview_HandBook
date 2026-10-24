@@ -326,7 +326,7 @@ The following reference pages were opened successfully through the web retrieval
 
 This establishes that these selected references resolve and that their document statuses were checked. It is not a repository-wide URL liveness audit and does not verify every technical claim against the nearest cited source.
 
-### Remaining acceptance blockers
+### Remaining acceptance blockers — reference and tooling pass
 
 - Mermaid rendering of all 29 chapter-page diagrams is still unverified. No local Mermaid CLI/standalone parser is available, and external package retrieval fails due network/DNS restrictions.
 - Full OpenAPI 3.1 schema/spec validation is still unverified for the same package-access constraint.
