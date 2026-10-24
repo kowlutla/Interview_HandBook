@@ -260,3 +260,12 @@ The sprint improves confidence in repository structure but does not certify tech
 - [ ] Full OpenAPI 3.1 validation remains pending: the local environment does not have openapi-spec-validator installed and cannot resolve external package hosts. Targeted checks are not equivalent to full specification validation.
 - [ ] Mermaid render validation remains pending: the local environment has no Mermaid CLI or standalone Mermaid parser; package retrieval is blocked by network/DNS restrictions. Static fence/declaration checks are not a substitute for rendering.
 - [ ] This reference spot-check does not validate every external URL in all chapters or prove every claim is supported by its cited source. Complete the remaining claim-by-claim and inventory acceptance review before declaring technical acceptance.
+
+
+## Curriculum-gap corrections — 2026-10-24
+
+- [x] Chapter 05: added an explicit OSI/TCP-IP layered mental model, including how to assign failures to the responsible layer without assuming a one-to-one mapping; expanded global traffic-management and session-affinity trade-offs.
+- [x] Chapter 18: added feature-flag rollout guidance covering separation of deploy from exposure, ownership/lifetime, safe defaults, testing both paths, authorization, and stale-flag removal.
+- [x] Glossary: added definitions for feature flags, last-write-wins (LWW), point-in-time recovery (PITR), QUIC and event-time watermarks after comparing glossary entries with the mandatory inventory.
+- [x] Rechecked changed files for balanced fenced blocks, Further reading placement where applicable, and navigation footer in the two edited chapters.
+- [ ] The corrections address explicit curriculum/glossary omissions found during the independent pass, but do not close the full 21-family depth review or technical acceptance.
