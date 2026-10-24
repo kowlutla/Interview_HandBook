@@ -62,7 +62,7 @@ This table mirrors the 20 topic-family rows in `CURRICULUM.md`. The status is de
 | Security and privacy | Ch. 16: 16.1A–16.1J, 16.2–16.4, including the API injection guidance in 16.3 | Developing | Verify threat/control mappings against primary security guidance; expand any missing implementation examples for IAM, key rotation, encryption at rest, injection, browser/session threats and data deletion. |
 | Observability and operations | Ch. 17: 17.1A–17.1I, 17.2–17.3 | Developing | Recheck SLI/error-budget arithmetic and alert windows; verify cardinality/sampling trade-offs, synthetic checks, incident command, deployment markers, ownership and postmortem guidance. |
 | Cloud and delivery | Ch. 18: 18.1A–18.1I, 18.2–18.5 | Developing | Verify cloud responsibility models and Kubernetes behavior against current official docs; validate CI/CD, progressive delivery, IaC state/drift, cost/quota and supply-chain standards claims. |
-| Cross-cutting patterns | Ch. 19: 19.1A–19.1F, 19.2–19.4; cross-links to Chapters 06, 09, 11–15 | Developing | Audit each pattern's intent, preconditions and failure modes; check cross-pattern combinations, scheduler correctness, claim-check/materialized-view behavior, multi-tenancy and cost/complexity reasoning. |
+| Cross-cutting patterns | Ch. 19: 19.1A–19.1F, 19.2 (including idempotent receiver), 19.3–19.4; cross-links to Chapters 06, 09, 11–15 | Developing | Audit each pattern's intent, preconditions and failure modes; check cross-pattern combinations, scheduler correctness, claim-check/materialized-view behavior, multi-tenancy and cost/complexity reasoning. |
 
 ## Exact section map for the current expansion pass
 
