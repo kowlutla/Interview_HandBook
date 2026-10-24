@@ -150,6 +150,12 @@ A sidecar runs alongside an application to provide a capability such as proxying
 
 Multiple workers compete to process items from a shared queue or subscription. This improves throughput when tasks are independent, but requires idempotency, visibility/lease expiry behavior, poison-message handling and a bounded retry policy. If task completion can outlive the lease, two workers may process the same task; fencing or idempotent effects may be needed.
 
+### Idempotent receiver
+
+An idempotent receiver can safely handle the same logical message or command more than once. Use a stable operation identifier, define its scope and retention period, and record deduplication state atomically with the local business effect where possible. A unique constraint or conditional state transition can prevent a repeated delivery from applying the effect twice.
+
+The identifier must represent the logical operation, not a transient delivery attempt. If the receiver commits its effect but crashes before acknowledging the message, the retry should return or reconstruct the original outcome rather than perform a second payment, increment or external side effect. If the effect occurs outside the receiver's transaction boundary, use an explicit coordination protocol or accept and reconcile the remaining uncertainty.
+
 ### Fan-out/fan-in
 
 A request fans out to parallel subrequests and combines results. Latency is often dominated by the slowest required branch, and each branch consumes concurrency and downstream capacity. Bound fan-out width, use a shared deadline, define partial-result behavior, and avoid retrying every branch indiscriminately. A request that fans out to 100 dependencies can amplify traffic dramatically even if the incoming request rate is modest.
