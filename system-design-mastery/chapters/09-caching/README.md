@@ -56,6 +56,22 @@ A stampede occurs when many requests miss the same key and independently load or
 
 A lock or single-flight mechanism must handle loader failure and lock expiry. Do not let all waiting requests hold unbounded memory or wait beyond their deadline. Negative caching must be invalidated when a new resource is created and should not turn authorization failures into shared cached results.
 
+## 9.1C.1 Hot keys need a separate plan
+
+A hot key is one item or partition receiving a disproportionate share of traffic. A cache can have a healthy overall hit ratio and still overload one shard, one origin record, or one network path. Treat hot-key pressure as a distribution problem, not merely a cache-capacity problem.
+
+Start by measuring traffic and latency per key or a privacy-safe key class; avoid exporting raw identifiers into high-cardinality metrics. Then choose a mitigation that preserves the data's correctness:
+
+- **Serve from a nearer cache:** a bounded process-local cache can absorb repeated reads, but its copies multiply and may have different freshness windows. State the maximum tolerated staleness and provide an invalidation or expiry strategy.
+- **Coalesce and precompute:** combine concurrent misses for the same key and refresh expensive values before demand peaks. Bound waiters and refresh concurrency so the mitigation cannot itself exhaust memory or workers.
+- **Replicate read-only results:** deliberately fan out copies of a popular, immutable or versioned value when the extra memory and invalidation cost is justified. This does not automatically solve a hot write path.
+- **Partition only when semantics allow it:** splitting a key across buckets helps when the underlying work can be partitioned and recombined. Randomly salting a key is unsafe for counters, inventory, uniqueness constraints, or other values that require one authoritative update order unless a correct aggregation or coordination protocol is added.
+- **Protect the source:** apply per-key or per-tenant concurrency limits, quotas and admission control. If a single key is still overloaded, reject or degrade work explicitly rather than allowing an unbounded queue to form.
+
+For a hot write key, identify the invariant first. Options may include serializing updates through one owner, using an atomic database primitive, aggregating independent increments, or changing the data model. Replicating a mutable value across caches is not a substitute for a write-consistency design.
+
+A useful test deliberately drives one key far above the average distribution while keeping total traffic constant. Observe per-shard load, queue depth, p99 latency, source pressure and correctness under concurrent updates; an average hit ratio will not reveal the hotspot.
+
 ## 9.1D Cache outage and origin protection
 
 A cache outage can convert a large hit workload into a sudden source-of-truth workload. The source should have a defined safe fallback: bounded bypass, degraded reads, admission control, or rejection. Blindly sending all requests to the database can turn a cache incident into a database outage.
