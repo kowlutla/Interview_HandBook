@@ -261,3 +261,8 @@ The first human-readable consolidation pass now covers all 20 chapters. Earlier 
 - **Static structure check:** the edited chapter pages (01, 03, 04, 06–11, 13–18) and reviewed Chapter 20 have balanced fenced blocks, no exact duplicate headings, no instructional headings after Further reading, and the expected navigation footer. A fresh relative-link pass across all 28 Markdown files completed after these edits; no missing local relative targets were found.
 
 **What this status means:** readability consolidation is complete for the first pass; the technical claim/source audit, external-link liveness, Mermaid rendering, OpenAPI validation and cross-chapter consistency review remain open. Do not promote coverage rows to Deep on the strength of editorial work alone.
+
+
+## Rapid verification sprint — 2026-10-24
+
+A fresh fetch and structural scan of the current default-branch versions of all 20 chapter pages found balanced fenced blocks, no exact duplicate Markdown headings, a Further reading section, and the expected navigation footer in every chapter. The scan counted 22 Mermaid declarations in chapter pages. These results support structural integrity only; they do not prove that Mermaid renders, that the OpenAPI example passes a parser, or that the technical claims and source links are fully verified. All 21 mandatory inventory rows therefore remain provisional, and no row is promoted to Deep on the basis of this scan.
