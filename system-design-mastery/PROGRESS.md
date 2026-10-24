@@ -342,3 +342,12 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Re-fetched both new files after commit and inspected their contents. The script's chapter-root path was corrected and re-fetched.
 - [ ] **Not yet verified:** no completed GitHub Actions run result has been retrieved in this pass. Do not treat the workflow definition as proof that rendering or OpenAPI validation passed. Check the Actions run after GitHub executes it; investigate and fix any install, browser, renderer, schema or script errors.
 - [ ] The validator checks the embedded OpenAPI example and Mermaid syntax/renderability, but does not replace full topic-depth or claim-to-source acceptance.
+
+
+## Additional depth corrections — storage and Kafka guarantees — 2026-10-24
+
+- [x] Chapter 08: added section 8.2A comparing wide-column, graph, time-series, inverted-index search, warehouse/lakehouse and relational choices by representative query shape, efficient access path, and failure/operational cost. Added a commerce example separating transactional authority from search, recommendation and analytics projections.
+- [x] Chapter 12: added section 12.3A distinguishing Kafka idempotent producer behavior and Kafka transactional records/offsets from arbitrary external side effects. It includes the database-commit/offset-commit crash window, `read_committed` visibility, and a checklist for bounding exactly-once claims. The linked Kafka 4.3 delivery and transaction design documentation was opened.
+- [x] Updated the coverage audit's storage and messaging rows to point to the new sections and to keep acceptance criteria explicit.
+- [ ] The changes are not yet full acceptance for either topic family. Review them against representative workloads and deployed product contracts; keep statuses Developing until independent review is complete.
+- [ ] The CI workflow is configured, but no completed GitHub Actions result has yet been verified in this session. Mermaid rendering and full OpenAPI 3.1 validation remain unconfirmed pending those results.
