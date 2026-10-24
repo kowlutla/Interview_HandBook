@@ -156,6 +156,8 @@ These checks validate specific claims or source destinations; they do not consti
 
 ## Editorial and consistency review findings
 
+A fresh relative-Markdown-link pass after the Chapter 05 reference cleanup and Chapter 12 projection-boundary clarification scanned all 27 Markdown files in the target tree (with fenced code removed before link extraction); every local target resolved. This still does not validate external URL liveness or Mermaid rendering.
+
 A duplicate-URL scan of the reference catalog found 73 URL occurrences and 73 unique URLs; no duplicate destinations were found. This is a local catalog hygiene check only—external URL liveness, redirects, and claim-to-source alignment remain part of the open source audit.
 
 A follow-up scan of the Further reading blocks in all 19 chapters found duplicate RFC links in Chapter 05; the duplicates were removed and RFC 9111 (HTTP Caching) was added explicitly. The same scan found no duplicate URLs in the other 18 chapter reference blocks. This checks duplication only, not whether every external URL is live or every citation supports its adjacent claim.
