@@ -78,15 +78,19 @@ The following sections are present and are the starting points for the deeper re
 | Load, stress, spike, soak and scalability testing | Chapter 03, 3.17 | Connects estimates to reproducible evidence and explains open-loop/closed-loop traffic and coordinated omission | Review benchmark method and ensure a future worked test plan is concrete |
 | Cancellation and structured task lifetime | Chapter 04, 4.16 | Distinguishes timeout from cancellation, rollback, and durable background work; covers deadline propagation and orphaned work | Verify runtime-specific examples and clearly label version-specific APIs |
 
-## High-priority missing/depth risks
+## High-priority remaining verification risks
 
-1. **Traffic-entry architecture:** load balancer, reverse proxy, API gateway, ingress, service mesh and CDN must be differentiated by responsibility and trust boundary.
-2. **Architecture styles:** explain how to choose styles based on state ownership, deployment independence, consistency, team ownership and operational cost—not by trend.
-3. **Data-model breadth:** explicitly compare relational, key-value, document, wide-column, graph, time-series, search, object, analytical and lake/warehouse choices.
-4. **Failure and overload:** connect queues, timeouts, retries, circuit breakers, bulkheads, load shedding and autoscaling into one causal model.
-5. **Security by design:** identity, authorization, tenant isolation, API abuse, secrets, network trust, data lifecycle and audit must appear throughout the system journey.
-6. **Cloud-native delivery:** connect containers, orchestration, service discovery, configuration, health probes, rollout strategy, capacity and rollback.
-7. **Worked examples:** each chapter should include at least one example that changes an assumption and shows how the design decision changes.
+The recent expansions address several previously identified content gaps. The remaining work is now primarily evidence-backed verification and ensuring that the examples' assumptions are explicit:
+
+1. **Claim-by-claim technical review:** check protocol, consistency, recovery, security and runtime claims against primary standards, papers or official documentation. Keep product-specific behavior clearly labeled.
+2. **Schema compatibility:** verify the Chapter 12 change matrix against one selected serialization format and schema registry; compatibility labels and behavior vary by tooling and format.
+3. **Executable document validation:** run the Chapter 6 OpenAPI excerpt through a real parser/linter and validate every Mermaid block with a renderer. These checks have not been performed yet.
+4. **Source-link audit:** validate every external reference, replace stale or redirected links where needed, and confirm the source supports the adjacent claim.
+5. **Cross-chapter consistency:** review shared terminology and guarantees for retries, idempotency, timeouts, consistency/isolation, event delivery, RTO/RPO, tenant scope and architecture views.
+6. **Worked-example evidence:** recalculate arithmetic and inspect reasoning; where an example uses illustrative performance numbers or thresholds, label them as examples and do not imply they are measured production results.
+7. **Mandatory inventory closure:** map every inventory row to exact sections and upgrade a status to Deep only after mechanisms, variants, selection criteria, failure modes, security/operations, examples and sources have actually been reviewed.
+
+Do not treat a section's presence as evidence that these checks are complete.
 
 ## Review rules
 
