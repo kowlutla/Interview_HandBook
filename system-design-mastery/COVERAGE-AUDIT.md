@@ -40,7 +40,7 @@ Do not infer “Deep” from a heading or keyword match. This is an initial audi
 
 ## Mandatory inventory: row-by-row provisional mapping
 
-This table mirrors the 20 topic-family rows in `CURRICULUM.md`. The status is deliberately provisional: exact section presence is mapped, but each row still needs independent depth and technical review before it can be called Deep.
+This table mirrors the 21 topic-family rows in `CURRICULUM.md`. The status is deliberately provisional: exact section presence is mapped, but each row still needs independent depth and technical review before it can be called Deep.
 
 | Inventory row | Exact teaching locations | Provisional status | What remains before acceptance |
 |---|---|---|---|
@@ -64,6 +64,7 @@ This table mirrors the 20 topic-family rows in `CURRICULUM.md`. The status is de
 | Observability and operations | Ch. 17: 17.1A–17.1J (including synthetic checks, deployment markers and incident command), 17.2–17.3 | Developing | Recheck SLI/error-budget arithmetic and alert windows; verify cardinality/sampling trade-offs, synthetic checks, incident command, deployment markers, ownership and postmortem guidance. |
 | Cloud and delivery | Ch. 18: Delivery strategies; 18.1A–18.1I, 18.2–18.5 | Developing | Verify cloud responsibility models and Kubernetes behavior against current official docs; validate CI/CD, progressive delivery, IaC state/drift, cost/quota and supply-chain standards claims. |
 | Cross-cutting patterns | Ch. 19: 19.1A–19.1F, 19.2 (including idempotent receiver), 19.3–19.4; cross-links to Chapters 06, 09, 11–15 | Developing | Audit each pattern's intent, preconditions and failure modes; check cross-pattern combinations, scheduler correctness, claim-check/materialized-view behavior, multi-tenancy and cost/complexity reasoning. |
+| Client-side and real-time architecture | Ch. 20: 20.1–20.13 | Developing | Verify rendering trade-offs, local durability and synchronization guarantees, conflict strategies, transport/replay boundaries, WebRTC topology/security, and client-side operational metrics against primary sources and realistic failure scenarios. |
 
 ## Exact section map for the current expansion pass
 
@@ -89,6 +90,7 @@ The following sections are present and are the starting points for the deeper re
 | Security and privacy | Chapter 16: Threat modeling, Authorization models, Tenant isolation, OAuth 2.0 and OpenID Connect, 16.2 Threat modeling a system architecture, 16.3 API threat patterns, 16.4 tenant-scoped export threat model |
 | Observability and operations | Chapter 17: RED and USE, Percentiles and cardinality, SLO-driven alerting, 17.1A–17.1I, 17.2 Observability in practice, 17.3 worked SLO alert design |
 | Cloud and Kubernetes | Chapter 18: Containers and Kubernetes, 18.1A–18.1I, 18.2 Kubernetes architecture, 18.3 Service mesh, 18.4 IaC state and drift, 18.5 software supply-chain security |
+| Client-side and real-time architecture | Chapter 20: 20.1–20.13 | Rendering/delivery, state ownership, offline persistence, sync/conflicts, real-time transport, WebRTC, collaboration, micro-frontends, interactive sessions | Review source alignment, security boundaries, reconnect/replay behavior, and all operational failure modes |
 | Patterns and anti-patterns | Chapter 19: Probabilistic data structures including Bloom-filter sizing, Distributed scheduling, Multi-tenancy, Multi-region consistency and routing, 19.2 Architecture pattern catalog, 19.3 worked multi-tenant fairness scenario, 19.4 pattern interactions |
 
 ## New additions in the current review pass
@@ -156,11 +158,6 @@ These checks validate specific claims or source destinations; they do not consti
 | Webhooks and outbox implementation references | Current [OWASP Webhook Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Webhook_Security_Cheat_Sheet.html) and [Debezium stable Outbox Event Router documentation](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html) | The current pages cover the expected source topics: signature/replay protection, SSRF and duplicate handling for webhooks, and CDC-based outbox publication. These sources support the textbook's architectural boundaries but do not establish that any particular deployment is secure without configuration-specific testing. |
 | Network protocol references | RFC Editor pages for HTTP semantics (9110), TCP (9293), QUIC (9000), HTTP/3 (9114), HTTP caching (9111), cache extensions (5861), TLS 1.3 (8446), IPv6 (8200), DNSSEC requirements (4033) | Targeted protocol-source spot checks were performed. This does not replace line-by-line claim/source alignment across all networking content. |
 
-## Mandatory inventory additions
-
-| Inventory row | Exact teaching locations | Provisional status | What remains before acceptance |
-|---|---|---|---|
-| Client-side and real-time architecture | Ch. 20: 20.1–20.13 | Developing | Verify rendering trade-offs, local durability and synchronization guarantees, conflict strategies, transport/replay boundaries, WebRTC topology/security, and client-side operational metrics against primary sources and realistic failure scenarios. |
 
 ## Editorial and consistency review findings
 
