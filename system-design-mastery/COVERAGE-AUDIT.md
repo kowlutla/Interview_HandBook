@@ -99,3 +99,7 @@ Do not treat a section's presence as evidence that these checks are complete.
 - For every major component, teach purpose, internal mechanism, variants, selection criteria, trade-offs, failure modes, security, observability, scaling, and interactions.
 - Add a diagram when it clarifies sequence, topology, state ownership, or failure behavior.
 - Do not mark the textbook complete until every mandatory inventory row has an evidence-backed coverage status and technical verification.
+
+## Editorial and consistency review findings
+
+A whole-book heading-order pass found supplemental worked diagrams/guidance positioned after the `Further reading` heading in multiple chapters. The affected sections have been moved before `Further reading` so the teaching flow, references, and navigation footer are consistently ordered. This is an editorial correction, not evidence that the underlying technical claims have been fully verified. The next verification pass must rerun duplicate-heading, fenced-block, relative-link, and post-reference-heading checks across all 19 chapters, then continue the claim-by-claim and mandatory-inventory audit.
