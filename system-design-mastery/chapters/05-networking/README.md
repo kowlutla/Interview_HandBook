@@ -4,6 +4,12 @@ A request rarely travels directly from a client to an application and back. It m
 
 The useful mental model is to follow the request end to end. Networking concepts become easier to understand when you connect them to practical questions: Why did a connection fail? Why is the service slow even though the application CPU is low? Why did changing DNS not move all traffic? Why can a request time out even when the operation succeeded?
 
+## A layered mental model: OSI and TCP/IP
+
+The OSI model separates networking into seven conceptual layers: physical, data link, network, transport, session, presentation and application. The practical TCP/IP model groups responsibilities differently, commonly described as link, internet, transport and application. These models are maps for reasoning, not a claim that every production component fits neatly into one layer.
+
+For architecture work, ask which layer owns the behavior. IP routing and subnets affect reachability; TCP or QUIC affect transport delivery and congestion; TLS protects the connection and authenticates identities; HTTP defines request semantics; proxies and gateways apply routing or policy; application code enforces business authorization and invariants. A symptom can cross layers, so use the models to organize evidence rather than guess a cause from the layer name alone.
+
 ## 5.1 Follow one request
 
 A simplified request path looks like this:
@@ -99,6 +105,10 @@ Layer 4 load balancing primarily uses transport-level information. Layer 7 load 
 Health checks are imperfect observations. A process can respond to a simple health endpoint while still being unable to serve real requests. Readiness should indicate whether an instance can accept traffic; liveness should be used carefully because aggressive restart loops can worsen overload. Draining matters during deployment so existing work has time to finish where the protocol and application allow it.
 
 A CDN's cache key must represent every request dimension that changes the response. If tenant identity, authorization, or a relevant query parameter is accidentally omitted, one user's content can be served to another. Cache freshness, stale serving, origin shielding, purge behavior, and origin failover should be chosen deliberately—not assumed from the word “CDN.”
+
+For traffic spanning regions, global traffic management may use DNS-based routing, anycast, provider routing services, or combinations of these. Health signals, routing policy, client/resolver caching and existing connections mean a traffic shift is not necessarily immediate. A regional failover plan must also account for warm capacity, data consistency, dependency availability and the risk of sending all traffic to a cold or under-sized destination.
+
+Session affinity (sticky routing) sends a client's requests to the same target when possible. It can simplify some in-memory session designs, but it may create uneven load and complicate failover; it does not guarantee that a session survives target loss. Prefer explicit shared or client-carried session state when appropriate, and use affinity only when its trade-offs are understood.
 
 ## 5.8 Firewalls, WAFs, and private connectivity
 
