@@ -3,6 +3,29 @@
 ## Why cache?
 A cache stores reusable data closer to the consumer or in a faster access layer. It can reduce latency, repeated database work and network transfer. Benefit depends on reuse: caching rarely requested data may add complexity without meaningful savings. A cache is usually not the source of truth; if treated as authoritative, durability and consistency need explicit design.
 
+## Quantifying cache benefit
+
+If 90% of 2,000 lookups per second hit the cache, about 200 lookups per second reach the source for that lookup class. If each miss triggers three database queries, that path still creates roughly 600 database queries per second. A hit ratio is therefore useful only when combined with the cost of a miss, request fan-out, and burst behavior; synchronized expiration can send many misses to the source at once.
+
+```mermaid
+sequenceDiagram
+  participant App
+  participant Cache
+  participant DB
+  App->>Cache: Get key
+  alt Hit
+    Cache-->>App: Value
+  else Miss
+    Cache-->>App: Miss
+    App->>DB: Read authoritative value
+    DB-->>App: Value and version
+    App->>Cache: Populate with bounded TTL
+    App-->>App: Return value
+  end
+```
+
+This is the basic read path. Concurrent misses, stale fills and invalidation races need the additional controls discussed below.
+
 ## 9.1A Cache correctness begins with a freshness contract
 
 A cache policy should state what freshness the consumer requires. Some data can be stale for minutes; other data, such as authorization decisions, account balances, or inventory reservations, may require stricter validation. A TTL of 30 seconds means an entry may be reused within a time policy; it does not mean it is guaranteed to be at most 30 seconds behind the source under every failure or clock condition.
