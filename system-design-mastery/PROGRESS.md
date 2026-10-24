@@ -269,3 +269,20 @@ The sprint improves confidence in repository structure but does not certify tech
 - [x] Glossary: added definitions for feature flags, last-write-wins (LWW), point-in-time recovery (PITR), QUIC and event-time watermarks after comparing glossary entries with the mandatory inventory.
 - [x] Rechecked changed files for balanced fenced blocks, Further reading placement where applicable, and navigation footer in the two edited chapters.
 - [ ] The corrections address explicit curriculum/glossary omissions found during the independent pass, but do not close the full 21-family depth review or technical acceptance.
+
+
+## Final verification checkpoint — 2026-10-24
+
+This checkpoint separates checks supported by evidence from validation that could not be completed in the current environment.
+
+- [x] Re-opened the live curriculum, coverage audit, progress tracker, editorial standard, and representative chapters for networking, distribution/consistency, replication/coordination, messaging/streams, scaling/overload, reliability/recovery, API design, and cloud delivery.
+- [x] Confirmed that recent targeted content fixes are present in the live repository: OSI/TCP-IP and global traffic/session-affinity guidance in Chapter 05; feature-flag rollout guidance in Chapter 18; and feature flags, LWW, PITR, QUIC, and event-time watermarks in the glossary.
+- [x] Confirmed that the coverage audit retains provisional statuses and explicitly documents outstanding acceptance work; no topic family was promoted to Deep without the required evidence.
+- [x] Confirmed earlier recorded structural checks, targeted arithmetic checks, and Chapter 06 OpenAPI YAML checks are scoped as targeted checks rather than full standards validation.
+- [ ] Full independent mechanism/example/trade-off/failure-mode review of all 21 curriculum families remains open.
+- [ ] Repository-wide external-link liveness and claim-to-source audit remains open.
+- [ ] Mermaid rendering remains unverified; package acquisition is blocked by the current environment's network/DNS restrictions. Static checks do not establish successful rendering.
+- [ ] Full OpenAPI 3.1 validator/linter run remains unverified; package acquisition is blocked by the current environment's network/DNS restrictions. Targeted YAML checks do not establish full conformance.
+- [ ] Final whole-book contradiction, duplication, terminology, and prerequisite review remains open.
+
+**Closure decision:** The content-build/readability pass is in a review-ready state, but formal technical acceptance is not complete. Keep this distinction visible; do not describe the textbook as fully validated until the remaining checks are performed in an environment with the required validators and the full coverage/source reviews are completed.
