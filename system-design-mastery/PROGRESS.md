@@ -441,3 +441,15 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Re-fetched all 20 current chapter pages from the default branch after the latest edits.
 - [x] Checked every chapter for balanced fenced-code markers, duplicate heading text, and the expected navigation footer. All 20 pages passed these specific structural checks.
 - [ ] This is not a Markdown renderer, link resolver, Mermaid renderer, or technical claim audit; those checks remain distinct. The prior green OpenAPI/Mermaid workflow predates the latest content commits, and a post-edit workflow run has not been verified.
+
+
+## Textbook v1 closure checkpoint — 2026-10-24
+
+- [x] Froze the current 20-chapter conceptual HLD textbook scope; no further broad expansion is planned for this phase.
+- [x] Recorded the closure decision and verification boundaries in COVERAGE-AUDIT.md.
+- [x] Confirmed the latest fetched versions of all 20 chapter pages passed the scoped structural checks (balanced fences, unique heading text, expected navigation footer).
+- [x] Preserved the verified historical CI evidence: run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824) passed OpenAPI validation and rendered 29 Mermaid diagrams.
+- [ ] **Post-edit CI is not verified.** The successful run predates the latest chapter edits; do not imply those changes were validated by that run.
+- [ ] Full 21-family source/depth acceptance and exhaustive link/claim audit are not complete. Inventory statuses remain Developing/provisional.
+
+**Stopping rule:** Treat the textbook content as v1-complete for learning use, with technical acceptance explicitly provisional. Reopen only for a concrete defect or missing prerequisite. Interview Q&A and end-to-end case studies remain separate future phases.
