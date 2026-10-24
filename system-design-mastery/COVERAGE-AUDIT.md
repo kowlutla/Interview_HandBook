@@ -281,3 +281,15 @@ The following scoped checks were completed during the rapid closeout pass; they 
 - **SLO evidence:** checked Google's [SRE Workbook error-budget policy](https://sre.google/workbook/error-budget-policy/) for the definition of error budget as 1 minus the SLO and the dependence of request budgets on the chosen SLI.
 
 **Still open:** no Mermaid renderer was obtained because the npx attempt timed out; no full OpenAPI linter was run. These checks are targeted, not a claim-by-claim source audit. All 21 curriculum inventory statuses remain provisional; the independent coverage, external-link, source alignment and cross-chapter consistency reviews are not complete.
+
+
+## Chapter 20 source spot-check — 2026-10-24
+
+A focused source spot-check was completed against the live official/vendor pages for browser storage, WebRTC protocol behavior, and the status of the cited W3C publications.
+
+- MDN's storage guidance confirms that browser-origin data is best-effort by default; eviction, quotas, and persistent-storage approval vary by browser. Chapter 20's warning not to treat browser storage as a guaranteed server-side durable record is appropriate.
+- MDN's WebRTC protocol guidance supports the chapter's distinction between ICE connectivity checks, STUN address discovery, and TURN relaying. Cloudflare's provider-specific TURN FAQ confirms that its TURN service relays WebRTC-encrypted packets and distinguishes TURN's point-to-point relay role from SFU media fan-out. The chapter correctly scopes the privacy claim to a TURN relay and separately warns that an SFU/MCU may access media unless a separate end-to-end media-encryption design prevents it.
+- The cited W3C [Service Workers publication](https://www.w3.org/TR/service-workers/) is currently an evolving Candidate Recommendation Draft, and [Indexed Database API 3.0](https://www.w3.org/TR/IndexedDB-3/) is a Working Draft. Chapter 20's Further reading section now explicitly identifies these statuses, so readers do not mistake them for finalized Recommendations.
+- MDN WebRTC protocol guidance has been added alongside the existing general WebRTC API reference.
+
+This is a targeted source spot-check, not a complete Chapter 20 claim-by-claim review. The chapter's full external-link audit and all other chapters' source verification remain open. Mermaid rendering and full OpenAPI validation also remain unverified.
