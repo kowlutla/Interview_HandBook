@@ -13,6 +13,8 @@ Microservices are not an automatic scalability strategy. If boundaries are unsta
 ## Data ownership and composition
 Private data stores support service ownership and reduce accidental cross-service writes, but complicate cross-domain queries. API composition or materialized read models can combine information at the cost of extra calls or eventual consistency. A shared database can be a pragmatic transition, but ungoverned cross-service schema access creates hidden coupling.
 
+The **database-per-service** pattern makes each service the authority for its own data and exposes other consumers through contracts, APIs or events rather than direct table access. It does not require one physical database server per service: a managed cluster can host multiple isolated schemas or databases, provided permissions and ownership boundaries are enforced. The trade-off is that cross-service joins, global uniqueness and multi-service transactions become harder; use API composition, materialized views, events or a workflow designed around local transactions instead of quietly restoring shared-table coupling.
+
 ## Orchestration and choreography
 Orchestration centralizes workflow progression in a coordinator. Choreography lets services react to events. Orchestration makes transitions visible but can create a complex coordinator; choreography avoids central control but can obscure end-to-end behavior. Both need timeouts, retries, duplicate handling, terminal states, compensation and observability.
 
@@ -37,6 +39,8 @@ Technical debt is the future cost created by constraints, shortcuts, unclear own
 A bounded context is a boundary within which a domain model and its language have a consistent meaning. The same word can represent different concepts in different contexts: a “customer” in billing may be the legal payer, while a “customer” in support may be the person contacting the help desk.
 
 A context map makes relationships explicit: which context owns a concept, which depends on another, where translation occurs, and where integration contracts are needed. A shared database schema or shared model library can accidentally force contexts to evolve together.
+
+An **anti-corruption layer** translates between an external or legacy model and the local domain model, keeping upstream naming, lifecycle and assumptions from leaking through the boundary. It is useful when integrating with a model the team does not control; it adds mapping code and another contract to maintain, so do not create one for a simple stable interface without a real semantic mismatch.
 
 Domain boundaries should be tested against real change and invariant patterns. A service boundary is not justified merely because a noun exists in the business domain; it should clarify ownership, change, or operational responsibility.
 
