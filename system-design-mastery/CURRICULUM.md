@@ -29,6 +29,7 @@ The existing repository was consulted only to understand the separation between 
 | 17 — Observability and operations | Logs/metrics/traces; structured logs/correlation IDs/context propagation; RED/USE; percentiles; monitoring/alerts; SLI/SLO/SLA/error budgets; capacity diagnosis; incident analysis; readiness and ownership | M02, M14–M16 | Connect technical signals to user impact; discuss cardinality and sampling |
 | 18 — Cloud and delivery | Cloud service models; compute/network/storage; regions/zones; ingress/LB/routing; containers/Docker; Kubernetes architecture, requests/limits/probes/autoscaling; managed vs self-hosted; IaC/config; CI/CD; rolling/blue-green/canary/flags/rollback; cost drivers | M04, M13–M17 | Relate deployment choices to failure domains, operability and cost |
 | 19 — Advanced synthesis | Queueing/tail latency; storage amplification; serialization/schema compatibility; distributed scheduling; noisy neighbors; multi-region consistency/global routing; cost-performance-reliability-complexity frontier; architecture migration/evolution | M03–M18 | Integrate concepts into coherent, assumption-aware architectural reasoning |
+| 20 — Client-side, offline-first and real-time systems | Rendering and delivery strategies; client/server state ownership; optimistic updates; local durability; offline queues; synchronization cursors; conflict resolution and tombstones; WebSockets/SSE/WebRTC; collaboration; micro-frontends; game-session authority; client security and telemetry | M02, M05–M06, M09–M14, M16–M18 | Explain client-visible guarantees, synchronization recovery, transport limits and the security/cost implications of persistent or offline clients |
 
 
 ## Mandatory topic inventory (coverage audit)
@@ -56,6 +57,7 @@ The table above defines the learning sequence. This inventory makes commonly mis
 | Security and privacy | Threat modeling; trust boundaries; authentication vs authorization; OAuth/OIDC/JWT; sessions/cookies; RBAC/ABAC; IAM/service identity/mTLS; secrets/key rotation; encryption in transit/at rest; least privilege/zero trust; WAF/API abuse; SSRF; injection; tenant isolation; audit; retention/deletion | 16 | 05, 06, 15, 18 |
 | Observability and operations | Logs/metrics/traces; context propagation; RED/USE; percentiles; cardinality/sampling; dashboards/alerts; SLI/SLO/error budget; health checks; runbooks; incident command; postmortems; capacity signals; deployment markers; synthetic checks | 17 | 02, 13, 14, 18 |
 | Cloud and delivery | IaaS/PaaS/SaaS/serverless; compute/network/storage; regions/zones; containers; Kubernetes control plane/nodes/scheduling/services/ingress/probes/requests/limits; autoscaling; IaC; config/secrets; CI/CD; rolling/blue-green/canary; feature flags; rollback; supply-chain security; cost governance | 18 | 04, 05, 14, 16, 17 |
+| Client-side and real-time architecture | CSR/SSR/SSG/hybrid rendering; hydration and edge caching; authoritative vs local vs replicated state; offline persistence and operation queues; synchronization checkpoints; optimistic concurrency; LWW/OT/CRDT trade-offs; tombstones and deletion; polling/long polling/SSE/WebSockets/WebRTC; signaling/STUN/TURN/SFU; reconnect/replay/backpressure; collaboration; micro-frontends; server-authoritative interactive sessions; local data security | 20 | 02, 05–06, 09–14, 16–18 |
 | Cross-cutting patterns | Retry, timeout, circuit breaker, bulkhead, throttling, cache-aside, CQRS, saga, outbox, strangler, anti-corruption layer, sidecar/ambassador, leader election, scheduler, competing consumers, fan-out/fan-in, idempotent receiver, claim check, materialized view, sharding, multi-tenancy | 19 | All |
 
 ### External reference basis
@@ -64,7 +66,7 @@ This curriculum was cross-checked against broad, vendor-neutral architecture gui
 
 ## Completion checks
 
-- [x] All 19 modules have substantive chapters, not placeholder summaries.
+- [x] All 20 modules have substantive chapters, not placeholder summaries.
 - [ ] Each module includes mechanism, examples, trade-offs and failure modes appropriate to its topic.
 - [ ] Technical claims have nearby citations to relevant primary sources where available.
 - [ ] Worked calculations include units, assumptions and sanity checks.
