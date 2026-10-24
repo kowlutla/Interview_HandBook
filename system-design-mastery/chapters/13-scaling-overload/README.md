@@ -161,9 +161,52 @@ A circuit breaker can temporarily stop calls to a dependency that is failing, bu
 - How does the system recover gradually after an overload event?
 
 
+
+## 13.3 Tail-latency techniques: hedged requests and adaptive concurrency
+
+Tail latency can be caused by a slow replica, queueing, garbage collection, noisy neighbors, network variation or an overloaded dependency. Replicating a request can reduce the chance that one slow attempt dominates the response, but it also creates additional work. These techniques should be used only after measuring the tail and understanding the failure mode.
+
+### Hedged requests
+
+A hedged request begins with one attempt to a suitable replica. If that attempt has not completed after a chosen delay, the client sends a duplicate to another eligible replica and uses the first acceptable result. It should cancel or suppress remaining attempts once a result is selected, where the client and server support cancellation.
+
+The delay is a trade-off. A threshold near a high latency percentile can limit how often a second attempt is launched, while an aggressive threshold reduces latency for more requests but increases duplicate load. The correct threshold depends on the measured latency distribution, replica correlation, request cost and available headroom.
+
+Hedging is safest for idempotent reads or operations with an explicit deduplication protocol. Do not hedge a non-idempotent write merely because it is slow: both attempts may commit. Even for reads, cancellation is not guaranteed to stop remote work already executing, so the losing attempt may continue consuming resources.
+
+Hedging can make a partial outage worse if slow replicas are already overloaded. Use it only with bounded concurrency, request budgets, replica diversity, cancellation, and monitoring of hedge rate and duplicate work. If all replicas share the same saturated database or network path, sending more requests to another replica may not improve latency.
+
+### Adaptive concurrency limits
+
+A fixed concurrency limit is simple but may be too high when a dependency slows and too low when capacity is available. Adaptive concurrency mechanisms estimate a safe level from signals such as latency, queueing, or observed throughput, then adjust the maximum number of in-flight requests. Algorithms differ and can oscillate if signals are noisy or feedback is delayed.
+
+A safe implementation needs:
+- A hard upper bound and a conservative startup value.
+- A signal that reflects the constrained dependency rather than unrelated latency.
+- Stabilization and gradual adjustment to avoid oscillation.
+- A fallback policy if telemetry is missing or misleading.
+- Separate budgets for materially different operation classes.
+- Tests during dependency slowdown, recovery and changing workload mix.
+
+Adaptive limits do not replace timeouts, bounded queues, admission control or load shedding. They are another feedback mechanism and can fail if the observed signal does not represent the true bottleneck.
+
+### Tail-latency review checklist
+
+- Is the tail caused by queueing, resource contention, network variance or a slow replica?
+- Are hedged operations safe to duplicate?
+- Does the hedge target a genuinely independent replica or the same shared bottleneck?
+- Is the hedge threshold based on measured distributions?
+- Can the losing attempt be cancelled, and what happens if it continues?
+- Is duplicate work counted in capacity and cost models?
+- Are hedge rate and extra downstream load bounded?
+- Does adaptive concurrency have hard limits and stable feedback?
+- Has behavior been tested during both degradation and recovery?
+
+
 ## Further reading
 - Google SRE [Handling Overload](https://sre.google/sre-book/handling-overload/).
 - Google SRE [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/).
+- Dean and Barroso, [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) — latency variability and hedged/tied requests.
 
 
 ## Overload control should happen before queues explode
