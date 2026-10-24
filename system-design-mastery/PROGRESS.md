@@ -154,7 +154,7 @@ Check items only when the work has actually been performed.
 ## Current status
 The textbook now has 20 substantive chapter pages in chapter folders, supported by the landing page, roadmap, curriculum, coverage audit, editorial standard, glossary and research library. A curriculum gap scan identified that client-side rendering/delivery, offline-first persistence, synchronization/conflict resolution, realtime transports, WebRTC, collaborative editing, micro-frontends and interactive-session architecture were not taught in depth; Chapter 20 was added rather than treating scattered mentions as sufficient coverage. The mandatory inventory now contains 21 topic families and all statuses remain provisional until independent acceptance checks pass.
 
-The textbook currently contains 28 Markdown files and 26 Mermaid blocks by inventory. A current static check across all 28 files found balanced fenced blocks, no exact duplicate headings, no instructional headings after Further reading, and no broken local relative Markdown targets. Mermaid rendering remains unverified. Scoped technical reviews and corrections are recorded in COVERAGE-AUDIT.md, including payment idempotency-key retention boundaries and Kafka record-offset versus next-position terminology. Chapters 02, 05 and 12 have begun a human-readable consolidation pass to remove repeated explanations while preserving important concepts.
+The textbook currently contains 28 Markdown files and 26 Mermaid blocks by inventory. A current static check across all 28 files found balanced fenced blocks, no exact duplicate headings, no instructional headings after Further reading, and no broken local relative Markdown targets. Mermaid rendering remains unverified. Scoped technical reviews and corrections are recorded in COVERAGE-AUDIT.md, including payment idempotency-key retention boundaries and Kafka record-offset versus next-position terminology. The human-readable consolidation pass now covers all 20 chapters. Chapters 02, 05, 12 and 19 received earlier focused edits; the latest pass reviewed Chapters 01, 03, 04, 06–11 and 13–18, and Chapter 20 was reviewed for flow and unnecessary repetition.
 
 Still open: independent curriculum/duplication review; claim-by-claim source verification; exhaustive external-link audit; verification of all 21 mandatory inventory rows; review of Chapter 20's client/offline/realtime claims; Mermaid rendering; OpenAPI parser/linter validation; and cross-chapter consistency review. The current 28-file structural and relative-link pass has now completed successfully. Do not mark the textbook complete or promote a row to Deep until the relevant acceptance criteria have actually passed.
 
@@ -174,7 +174,7 @@ The user emphasized that the textbook must read like a human-written, readable e
 - [x] Consolidate Chapter 12 (Messaging): merge repeated summaries and detailed sections into one learning path covering delivery semantics, partitions, retries, outbox/inbox, stream processing, schema evolution, CQRS/event sourcing, projection rebuilds, and privacy. Word count reduced from approximately 5,334 to 2,139 after retaining a compact schema-compatibility matrix and event-identity guidance.
 - [x] Recheck relative Markdown targets across all 28 Markdown files in system-design-mastery/ after these edits; no missing local targets found.
 - [x] Run static structure checks across all 28 Markdown files: balanced fenced blocks, no exact duplicate headings, and no instructional headings after Further reading.
-- [ ] Continue human-readability and duplication review for the remaining chapters, prioritizing chapters with overlapping sections or dense lists/tables.
+- [x] Complete the first human-readability and duplication pass across all 20 chapters, prioritizing repeated summaries, overlapping explanations and checklist/table overload without shortening merely to reduce word count.
 - [ ] Validate Mermaid diagrams with a renderer; static declaration and fence checks are not rendering validation.
 - [ ] Run an OpenAPI parser/linter on the Chapter 06 example.
 - [ ] Complete the claim-by-claim source and external-link audit.
@@ -184,9 +184,23 @@ The user emphasized that the textbook must read like a human-written, readable e
 
 - [x] Consolidate Chapter 02: remove repeated availability/reliability/durability/correctness definitions, repeated prioritization guidance, and a redundant review checklist. Retain the accessibility, operability, portability, cost, sustainability and quality-interaction content. Word count reduced from approximately 3,939 to 3,684.
 - [x] Refresh coverage-audit section references after consolidating Chapters 02, 05 and 12.
-- [ ] Continue the same review across remaining chapters; focus on overlapping explanations and checklist/table overload rather than reducing length arbitrarily.
+- [x] Complete the same review across the remaining chapters; focus on overlapping explanations and checklist/table overload rather than reducing length arbitrarily.
 
 - [x] Consolidate Chapter 19 (Advanced Cross-Cutting Reasoning): remove short summary sections that repeated the later worked explanations, preserve the queueing/tail-latency concept as a coherent section, and link back to the chapters that teach storage engines and messaging in depth. Word count reduced from approximately 3,890 to 3,499.
 
 - [x] Recheck relative links, fenced blocks and duplicate headings in the changed chapters (02, 05, 12, 19) and their progress/audit/editorial documents after the consolidation edits; no issues found.
 - [x] Open the canonical IETF RFC pages for TCP, TLS 1.3, HTTP semantics and HTTP/3, the versioned Kafka 4.3 design documentation, and the W3C WCAG 2.2 Recommendation; checked URLs resolve to the intended official sources. Claim-by-claim verification remains open.
+
+
+## Remaining-chapter readability pass — 2026-10-24
+
+- [x] Chapter 01: reduced repeated architecture-decision and decomposition explanations while retaining reversible/irreversible decision guidance and the distinct architecture-view and worked-evaluation sections.
+- [x] Chapter 03: made the latency-budget section focus on budget composition and linked queueing detail to the dedicated saturation/tail-latency section.
+- [x] Chapter 04: reduced repetition between the pool introduction, pool-sizing discussion and runtime-resource section.
+- [x] Chapter 06: removed the repeated idempotent-retry sequence diagram while retaining the contract, retry, idempotency and failure-path explanations.
+- [x] Chapter 07: replaced repeated introductory summaries with a short chapter orientation and removed duplicated isolation, query-plan, migration and checklist explanations; retained the overselling example, connection-pool admission-control guidance, sharding example and write-skew lab.
+- [x] Chapters 08–11 and 13–18: consolidated repeated overview sections where later sections already teach the same mechanism in depth. Unique material was retained or folded into the detailed treatment, including the cache-benefit calculation, 2PC-versus-saga trade-offs, idempotency boundaries, and orchestration-versus-choreography choices.
+- [x] Chapter 20: reviewed the full chapter for flow and repetition. Its sections address distinct client/offline/synchronization/realtime domains, so no broad shortening was warranted.
+- [x] Rechecked the edited chapter pages (01, 03, 04, 06–11, 13–18) and Chapter 20 for balanced code fences, duplicate headings, instructional headings after Further reading, and navigation footer placement; all checks passed.
+- [ ] Run a fresh repository-wide relative-link check after these edits.
+- [ ] Continue technical/source verification, Mermaid rendering and OpenAPI validation; readability completion does not imply technical certification.
