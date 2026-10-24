@@ -400,3 +400,11 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Inspected the Mermaid job log; it names all 29 rendering inputs and confirms that 29 files were uploaded. This confirms renderer execution, not a human visual inspection of every resulting diagram.
 - [ ] Full 21-family mechanism/example/trade-off/failure-mode and source acceptance remains open. No row is promoted to Deep.
 - [ ] Whole-book contradiction/prerequisite/duplication review and exhaustive chapter-local claim-to-source audit remain open. The textbook is not yet formally accepted solely because structural/render/schema validation passed.
+
+
+## Focused Kafka consumer correctness correction — 2026-10-24
+
+- [x] Added a new mechanism-focused section to Chapter 12 on consumer-group rebalances, offset correctness, lag versus drain time, ownership revocation, bounded shutdown, durable-effect/offset crash windows, and tests for reassignment and uncertain commit responses.
+- [x] Updated the mandatory messaging/data-movement audit row to reflect the new material and retain the explicit remaining verification work.
+- [ ] The messaging family remains Developing: this addition is not evidence that all Kafka version/configuration claims, schema-registry choices, replay semantics, or external side-effect boundaries have passed independent source review.
+- [ ] Continue the remaining 21-family depth/source review and whole-book consistency review; do not mark the textbook accepted on the strength of this focused correction.
