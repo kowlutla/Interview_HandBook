@@ -8,6 +8,8 @@ Use consistent units. One byte is 8 bits. Decimal storage units commonly use KB 
 
 A rate is quantity divided by time. Requests/s, MB/s, and events/s are not interchangeable; each event may have a different payload size and processing cost.
 
+Binary capacity units are powers of two: 1 KiB = 2^10 bytes, 1 MiB = 2^20 bytes, and 1 GiB = 2^30 bytes. This matters when sizing RAM, caches, and memory limits; a provider's advertised storage or network quantities may use decimal units instead. Keep the unit conversion visible rather than mixing GB with GiB or Mbit/s with MB/s.
+
 ## 3.2 Average traffic and peak traffic
 
 Suppose a service receives 30 million requests per day.
