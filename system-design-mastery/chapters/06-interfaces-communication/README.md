@@ -359,7 +359,7 @@ Safer sequence:
 - IETF [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html).
 - [gRPC concepts](https://grpc.io/docs/what-is-grpc/core-concepts/).
 - [GraphQL specification](https://spec.graphql.org/).
-- [OpenAPI specification](https://spec.openapis.org/oas/latest.html).
+- OpenAPI Initiative, [current OpenAPI Specification](https://spec.openapis.org/oas/latest.html) and [OpenAPI 3.1.0 specification](https://spec.openapis.org/oas/v3.1.0.html), the version used in the worked example.
 
 
 ## Retry safely when the outcome is uncertain
