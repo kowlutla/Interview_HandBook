@@ -12,10 +12,10 @@ Do not infer “Deep” from a heading or keyword match. This is an initial audi
 
 | Topic family | Primary chapter(s) | Initial status | Gap to close |
 |---|---|---|---|
-| Systems thinking, boundaries, architecture decisions | 01 | Developing | Add worked boundary/decomposition examples and architecture evaluation techniques; verify all key concepts. |
-| Requirements and quality attributes | 02 | Developing | Add concrete measurable scenarios, prioritization, and requirement-to-design examples. |
-| Workload estimation and capacity | 03 | Developing | Add worked end-to-end sizing examples, queueing intuition, uncertainty ranges, and validation. |
-| Execution, concurrency, runtime resources | 04 | Developing | Expand memory/GC, file descriptors, worker models, async/event loops, and resource isolation as needed. |
+| Systems thinking, boundaries, architecture decisions | 01 — 1.1–1.14, 1.15 Architecture views | Developing | Validate the new view taxonomy and diagram-selection guidance; add a worked architecture evaluation example and verify core claims. |
+| Requirements and quality attributes | 02 — 2.1–2.18, 2.19 accessibility/usability/internationalization, 2.20 operability/portability/cost/sustainability, 2.21 quality-attribute interactions | Developing | Validate examples against standards and make sure each quality attribute has measurable acceptance scenarios and explicit verification ownership. |
+| Workload estimation and capacity | 03 — 3.1–3.16, 3.17 load/stress/spike/soak/scalability tests | Developing | Verify coordinated-omission discussion and test methodology; add a reproducible worked test plan with assumptions and acceptance thresholds. |
+| Execution, concurrency, runtime resources | 04 — 4.1–4.15, 4.16 cancellation and structured task lifetime | Developing | Verify runtime-specific examples, add cancellation propagation scenarios, and ensure thread/task/pool limits are distinguished. |
 | Network fundamentals: IP, routing, TCP/UDP, DNS, TLS, HTTP | 05 — sections 5.1–5.18 | Developing | Sections 5.22 now add IPv6 coexistence, DNSSEC versus encrypted DNS, TLS/mTLS, HTTP/2 versus HTTP/3, and DDoS/resource-exhaustion distinctions. Still verify protocol details against the cited RFCs and add practical troubleshooting exercises. |
 | Load balancing, reverse proxies, ingress, global traffic management | 05 — 5.19; 13 — Load balancing and consistent hashing, 13.1B; 18 — Cloud primitives | Developing | Dedicated mechanism-level coverage: L4/L7, algorithms, health, draining, affinity, locality, TLS, failure modes, metrics. |
 | CDN, edge delivery, origin shielding and invalidation | 05 — 5.20; 09 — Local, distributed and CDN caches, 9.1F, 9.1G | Developing | Dedicated edge-cache behavior, cache-key correctness, stale content, purge, origin failover, security and cost. |
@@ -43,10 +43,10 @@ The following sections are present and are the starting points for the deeper re
 
 | Area | Exact chapter section(s) to review |
 |---|---|
-| Architecture reasoning | Chapter 01: 1.4, 1.6, 1.7, 1.9, 1.13, 1.14 |
-| Measurable quality attributes | Chapter 02: 2.5–2.12, 2.15–2.18 |
-| Workload and capacity | Chapter 03: 3.1–3.15, 3.16 Worked capacity example |
-| Runtime and resource limits | Chapter 04: 4.1–4.14, 4.15 Runtime resource limits |
+| Architecture reasoning | Chapter 01: 1.4, 1.6, 1.7, 1.9, 1.13, 1.14, 1.15 architecture views and diagram selection |
+| Measurable quality attributes | Chapter 02: 2.5–2.12, 2.15–2.21 including accessibility, usability, internationalization, operability, portability, cost, sustainability and attribute interactions |
+| Workload and capacity | Chapter 03: 3.1–3.15, 3.16 Worked capacity example, 3.17 Workload testing methodology |
+| Runtime and resource limits | Chapter 04: 4.1–4.14, 4.15 Runtime resource limits, 4.16 Cancellation and structured concurrency |
 | Networking and request path | Chapter 05: 5.1–5.18, 5.19 Load balancers, 5.20 CDNs, 5.21 Network boundaries, 5.22 Protocol details and operational edge cases |
 | API contracts and gateway | Chapter 06: 6.1–6.10H, 6.11 API gateways and API management, 6.12 Webhooks |
 | Relational data and transactions | Chapter 07: Isolation anomalies, Optimistic versus pessimistic concurrency, Query planning, Safe schema migration, Relational systems in practice, 7.2 Sharding and resharding |
@@ -62,6 +62,16 @@ The following sections are present and are the starting points for the deeper re
 | Observability and operations | Chapter 17: RED and USE, Percentiles and cardinality, SLO-driven alerting, 17.1A–17.1I, 17.2 Observability in practice |
 | Cloud and Kubernetes | Chapter 18: Containers and Kubernetes, 18.1A–18.1I, 18.2 Kubernetes architecture, 18.3 Service mesh, 18.4 IaC state and drift, 18.5 software supply-chain security |
 | Patterns and anti-patterns | Chapter 19: Probabilistic data structures, Distributed scheduling, Multi-tenancy, Multi-region consistency and routing, 19.2 Architecture pattern catalog |
+
+## New additions in the current review pass
+
+| Addition | Location | Why it matters | Remaining verification |
+|---|---|---|---|
+| Architecture viewpoints and diagram selection | Chapter 01, 1.15 | Separates context, logical structure, runtime behavior, deployment, data ownership and trust boundaries instead of relying on one overloaded diagram | Validate diagram terminology and review the logical-versus-deployment example |
+| Accessibility, usability and internationalization | Chapter 02, 2.19 | Makes critical user journeys, assistive technology, locale/time handling and accessible error behavior explicit quality attributes | Confirm conformance language against WCAG 2.2 and define project-specific targets |
+| Operability, portability, cost and sustainability | Chapter 02, 2.20–2.21 | Adds lifecycle qualities and explains interactions between performance, cost, retention, resilience and environmental impact | Provider guidance is illustrative; validate measurable targets and avoid implying a single universal sustainability metric |
+| Load, stress, spike, soak and scalability testing | Chapter 03, 3.17 | Connects estimates to reproducible evidence and explains open-loop/closed-loop traffic and coordinated omission | Review benchmark method and ensure a future worked test plan is concrete |
+| Cancellation and structured task lifetime | Chapter 04, 4.16 | Distinguishes timeout from cancellation, rollback, and durable background work; covers deadline propagation and orphaned work | Verify runtime-specific examples and clearly label version-specific APIs |
 
 ## High-priority missing/depth risks
 
