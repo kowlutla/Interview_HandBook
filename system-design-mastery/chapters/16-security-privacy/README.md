@@ -64,6 +64,18 @@ Data minimization reduces both breach impact and operational complexity. Avoid c
 
 Deletion workflows must account for replicas, caches, derived indexes, event logs, analytics, exports, backups, and legal retention exceptions. Where immediate physical deletion from immutable backups is not feasible, document the policy, access restrictions, expiry timeline, and restoration-time deletion replay.
 
+## 16.1G1 Authorization caching, revocation, and stale privilege
+
+Authorization decisions are often tempting to cache because policy evaluation or relationship lookup may be expensive. The cache is safe only when its key represents the full decision context and its staleness is acceptable for the operation. Depending on the policy model, relevant dimensions can include subject, action, resource, tenant, resource state, environment attributes, and a policy or relationship version. Omitting a dimension can turn a performance optimization into a cross-user or cross-tenant authorization bypass.
+
+A short TTL bounds some stale-decision windows but does not make them harmless. If an administrator removes access at time (t_0), a cached allow may remain usable until expiry unless revocation actively invalidates it or the protected operation checks a newer policy/version. Choose an explicit revocation contract: for example, bounded staleness for low-risk reads, synchronous policy checks for high-risk mutations, or versioned decisions invalidated through a reliable change stream. Document what happens when the policy service or invalidation channel is unavailable; fail-open behavior can preserve availability while violating the security invariant.
+
+Keep response caching separate from decision caching. A cache hit must not bypass the current request's authorization check. For shared HTTP/CDN caches, define cacheability per route and ensure every response-changing input is represented in the cache key or disallowed. Authenticated, personalized, tenant-specific, or sensitive responses should not be shared by default. HTTP `no-cache` means revalidation is required before reuse; it does not mean the response cannot be stored. `no-store` prohibits storage by compliant caches, but changing a directive does not purge objects already stored.
+
+**Example:** A user is removed from a project but a project-membership decision is cached for five minutes. If a high-risk export endpoint trusts that cached allow, revocation is delayed for up to five minutes unless invalidation/version checks intervene. Decide whether that delay is acceptable, enforce the policy at the export operation, and test the exact revocation path—including a lost invalidation event and a cache node that is temporarily partitioned.
+
+Test at least: role or membership removal, account disablement, tenant switch, policy-version change, invalidation loss/replay, cache outage, and requests through the actual CDN/proxy/application path. Record the expected maximum revocation delay and alert on violations. See OWASP's [Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) and [Web Cache Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Web_Cache_Security_Cheat_Sheet.html).
+
 ## 16.1H Security logging and incident readiness
 
 Security logs should record principal, action, target, outcome, timestamp, correlation context, and policy decision where appropriate, while excluding passwords, access tokens, cryptographic keys, and unnecessary sensitive payloads. Logs need integrity protection, access control, retention, and time synchronization appropriate to the investigation.
