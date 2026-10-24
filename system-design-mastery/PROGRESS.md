@@ -351,3 +351,12 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Updated the coverage audit's storage and messaging rows to point to the new sections and to keep acceptance criteria explicit.
 - [ ] The changes are not yet full acceptance for either topic family. Review them against representative workloads and deployed product contracts; keep statuses Developing until independent review is complete.
 - [ ] The CI workflow is configured, but no completed GitHub Actions result has yet been verified in this session. Mermaid rendering and full OpenAPI 3.1 validation remain unconfirmed pending those results.
+
+
+## All-chapter section map recheck — 2026-10-24
+
+- [x] Re-fetched the current heading structure for all 20 chapters and reviewed the teaching sequence/section coverage for Chapters 01–07 and 13–19, alongside the previously focused mechanism-level review of Chapters 08–12 and 16/18/20.
+- [x] Confirmed that the current chapters contain dedicated treatment for requirements and quality attributes, capacity testing, runtime/concurrency limits, networking layers, API semantics and gateways, relational isolation/sharding, scaling and overload, SLO/recovery rehearsal, architecture styles, IAM/threat modeling, metrics/cardinality/incident response, Kubernetes/IaC/supply chain, and cross-cutting fairness/pattern interactions.
+- [x] Added two substantive gaps found during deeper reading: Chapter 08 specialized storage selection (8.2A) and Chapter 12 Kafka exactly-once boundary (12.3A). Rechecked the three changed chapter pages (08, 09, 12): no duplicate headings or unclosed fences; each retains Further reading and the navigation footer.
+- [ ] This section-map pass is not an exhaustive sentence-by-sentence acceptance of all 21 families. The inventory remains Developing until examples, failure modes, source alignment and selection criteria have been independently confirmed for every row.
+- [ ] GitHub Actions validation workflow and extractor are committed. The available Actions tool only returned pull-request-filtered workflow runs and showed none for the workflow-creation commit; the actual run result for the latest push could not be inspected through the available interface. Do not claim the OpenAPI or Mermaid jobs passed until their run and logs are accessible.
