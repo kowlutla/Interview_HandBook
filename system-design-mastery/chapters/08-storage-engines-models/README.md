@@ -139,6 +139,24 @@ A search engine often indexes data from an authoritative database through change
 
 Search results may be stale because indexing and refresh are asynchronous. Define whether the user can tolerate eventual visibility, how updates/deletes propagate, and how a full rebuild is performed. The index should be reconstructible from authoritative data or durable change history where feasible. Search ranking, analyzers, tokenization, language support and filters are product semantics, not just storage implementation details.
 
+## 8.3A Search-index authorization, deletion, and rebuild safety
+
+A derived search index can be stale in two independent ways: the indexed document may lag behind the source record, and its access-control attributes may lag behind current policy. Treat index filters as a query optimization and defense-in-depth layer, not as the sole authority for high-risk access decisions. For sensitive results, re-check current authorization before returning protected fields or performing a follow-on action. If this is too expensive for every hit, explicitly define the tolerated revocation window and use a reliable invalidation/version strategy rather than assuming indexing is instantaneous.
+
+Apply tenant and visibility filters before pagination and ranking semantics are finalized where the search engine supports it. Filtering only after retrieving a page can produce short pages, incorrect totals, or ranking/pagination behavior that reveals the existence of inaccessible documents. Even when snippets are hidden, counts, facets, highlights, autocomplete, and error differences can disclose protected information. Test these auxiliary paths, not only the main result body.
+
+Deletion needs a durable propagation contract. A source deletion should create a durable delete/tombstone event or equivalent change record; retries must be idempotent, and out-of-order updates must not resurrect an older document after a newer deletion. Retention and compaction rules matter because tombstones can be removed only when the system can safely conclude that older versions will not reappear. If the source event history expires before a rebuild or consumer recovery completes, the system needs a snapshot/reconciliation strategy.
+
+A rebuild should be treated as a controlled data migration:
+1. Capture a source snapshot or consistent change-log position.
+2. Build a new index generation without exposing partially indexed data.
+3. Replay changes after the snapshot boundary with deduplication/version checks.
+4. Compare counts and representative query/authorization results.
+5. Switch readers atomically or through a controlled alias/routing change.
+6. Retain a rollback window and retire the old generation only after verification.
+
+The exact snapshot-plus-stream protocol depends on the database, CDC connector and search product; the design must state how it avoids gaps between snapshot and live changes. Verify deletion and authorization behavior after replay, restore, alias switch, and partial rebuild failure.
+
 ## 8.4 Row stores, columnar stores, lakehouses and warehouses
 
 Row-oriented storage places fields for a record together, often helping point lookups and transactional updates. Columnar formats group values by column, enabling compression and reading only selected columns during analytical scans. These are workload tendencies rather than strict boundaries; many systems support mixed execution or storage modes.
