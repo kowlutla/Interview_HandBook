@@ -237,12 +237,6 @@ An initial policy could cap normal in-flight work below the observed knee (for e
 - [ ] Recalculate aggregate concurrency across all replicas.
 - [ ] Re-test during dependency degradation and after deployment/configuration changes.
 
-## Further reading
-- Google SRE [Handling Overload](https://sre.google/sre-book/handling-overload/).
-- Google SRE [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/).
-- Dean and Barroso, [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) — latency variability and hedged/tied requests.
-
-
 ## Overload control should happen before queues explode
 
 ```mermaid
@@ -258,6 +252,12 @@ flowchart TD
 ```
 
 Adding instances can help only when the constrained resource scales with them. If a database, lock, hot key or downstream quota is the bottleneck, more application replicas can make the overload worse.
+
+## Further reading
+- Google SRE [Handling Overload](https://sre.google/sre-book/handling-overload/).
+- Google SRE [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/).
+- Dean and Barroso, [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) — latency variability and hedged/tied requests.
+
 
 
 ---
