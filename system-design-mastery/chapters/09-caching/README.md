@@ -174,6 +174,19 @@ A cache key must include every input that can change the response's meaning or t
 
 Do not blindly include a raw bearer token in a cache key: it can leak credentials into cache metadata, logs or metrics and creates poor reuse. Instead, design a safe authorization-aware caching policy. For sensitive or user-specific responses, private/no-store behavior or a cache partition keyed by a stable, non-secret identity/scope may be more appropriate. Authorization must still be enforced according to the application's contract; possession of a cache key is not authorization.
 
+### Worked example: tenant-safe cache keys and revocation
+
+Suppose `GET /tenants/{tenantId}/projects/{projectId}` returns a project representation with fields visible only to members. A key such as `project:{projectId}` is unsafe if the representation or authorization differs by tenant, membership, locale, or API version. One user's cached representation could be reused for another caller if the request path, cache key, and authorization policy do not agree.
+
+A safer design separates two questions:
+
+1. **Can this caller access this project now?** Resolve tenant scope from authenticated identity and enforce the current policy at the required consistency boundary. A client-supplied tenant ID is a selector, not proof of membership.
+2. **Which representation can be reused?** Either cache a policy-independent project payload and authorize before selecting protected fields, or include all representation-varying dimensions in a carefully defined key. If caching per-principal results, account for role/membership changes and avoid unbounded cardinality.
+
+For example, a representation key might include tenant, project, locale and representation version. That still does not prove access is currently allowed. If a user's membership is revoked after a cache entry is populated, the system needs an explicit policy: synchronously recheck authorization for protected reads, use a versioned decision with reliable invalidation, or document and enforce a bounded revocation window. A short TTL alone does not satisfy an immediate-revocation requirement.
+
+Test with two tenants that deliberately use the same project identifier, two users with different project roles, a locale/API-version change, a membership removal during a cache hit, and a lost invalidation event. Assert not only that response bodies are isolated, but also that status codes, result counts, pagination, ETags and cache-hit behavior do not reveal protected data. Include both direct-origin and CDN/proxy paths. Keep raw identity tokens and sensitive data out of cache keys and telemetry.
+
 ### Cache poisoning and untrusted input
 
 A cache-poisoning vulnerability occurs when an attacker can influence the response stored under a key that other users will later request. Risks include inconsistent interpretation of Host or forwarding headers, unkeyed request headers that affect origin output, unsafe URL normalization, and differences between the cache and origin's parsing rules.
