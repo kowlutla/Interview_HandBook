@@ -123,6 +123,7 @@ Check items only when the work has actually been performed.
 - [x] Re-run structural and relative-link checks across all 19 chapter pages after the latest content edits; no broken relative file targets, unbalanced code fences, or duplicate headings were found.
 - [x] Recheck all 19 chapter pages and the textbook landing page after the latest worked labs; relative Markdown links resolve, fenced blocks are balanced, and no duplicate headings were found.
 - [x] Independently recalculate the chapter's traffic, bandwidth, storage, Little's Law and fan-out examples; results match within rounding.
+- [x] Perform a scoped review of Chapters 9 and 16–18 covering cache isolation and revocation, asynchronous authorization, API threat boundaries, telemetry cardinality/context trust, and supply-chain artifact evidence. Record remaining implementation-specific verification in COVERAGE-AUDIT.md; full review remains open.
 - [ ] Review assumptions, caveats and implementation-specific claims.
 - [ ] Audit for missing topics, duplication and out-of-scope content.
 - [x] Verify final repository path boundary against the original textbook baseline; the checked comparison contains no paths outside system-design-mastery/.
