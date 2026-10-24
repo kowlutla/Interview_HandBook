@@ -112,6 +112,16 @@ Network security controls serve different purposes:
 
 These controls are complementary, not interchangeable. A WAF does not replace application authorization, and a private network does not make every workload trustworthy. Use the minimum required connectivity and verify the real path through routing, NAT, proxies, and policy enforcement.
 
+### A few protocol details that change design decisions
+
+IPv4 and IPv6 may coexist in the same deployment. A service that works over IPv4 is not necessarily configured correctly for IPv6: DNS records, firewall rules, listeners, routing, monitoring, and dependency access all need to match the intended address families. Test the actual client-to-service path rather than assuming dual-stack support from one successful request.
+
+DNS security mechanisms solve different problems. DNSSEC lets validating resolvers verify the authenticity and integrity of DNS data; it does not encrypt the lookup. DNS over HTTPS (DoH) and DNS over TLS (DoT) encrypt the client-to-resolver channel, but encryption alone does not prove that the returned DNS data is authentic. Choose based on the threat model and operational environment.
+
+Mutual TLS adds client-certificate authentication to TLS, but the application still needs authorization. Likewise, HTTP caching directives and CDN-specific controls must agree: a shared cache must not reuse personalized or tenant-specific responses across users, and a purge request is only useful if it reaches the relevant cache layers.
+
+Finally, denial-of-service protection is a capacity and trust-boundary problem as well as a filtering problem. Volumetric traffic can saturate links or upstream capacity before an application firewall sees the request. Lower-volume attacks can exhaust connection slots, TLS handshakes, request workers, queues, or expensive application operations. Use layered controls—upstream mitigation where needed, bounded connections and queues, rate limits, request-size and execution limits, and graceful overload behavior. No single WAF rule or autoscaling policy protects every layer.
+
 ## 5.9 Timeouts and connection lifecycles
 
 Different timeouts protect different stages: DNS lookup, TCP connection establishment, TLS handshake, connection-pool acquisition, request processing, downstream reads and writes, and idle connections. They should fit within an overall request deadline.
