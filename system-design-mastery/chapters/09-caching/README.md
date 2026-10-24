@@ -242,6 +242,8 @@ Record the cache key/policy decision, response status and cache status for each 
 ## Further reading
 - [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html).
 - [Redis eviction documentation](https://redis.io/docs/latest/develop/reference/eviction/).
+- [AWS Caching Best Practices](https://aws.amazon.com/caching/best-practices/) — cacheability, TTLs and thundering-herd considerations.
+- [OWASP Web Cache Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Web_Cache_Security_Cheat_Sheet.html) — shared-cache risks, key design and tenant isolation.
 
 
 
