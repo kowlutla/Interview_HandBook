@@ -519,3 +519,21 @@ Chapter 09 now includes a worked tenant-safe cache-key and authorization-revocat
 ## Repository-wide structure recheck — 2026-10-24
 
 All 20 current chapter pages were fetched again after the latest edits. Each page had balanced fenced-code markers, no duplicate heading text, and the expected navigation footer. This confirms those specific structural properties only; it does not replace Markdown rendering, link resolution, post-edit Mermaid/OpenAPI CI, or mechanism/source acceptance. The inventory statuses remain provisional.
+
+
+## Textbook v1 scope closure — 2026-10-24
+
+The current 20-chapter conceptual HLD textbook is **content-frozen for this phase**. Do not keep adding chapters or expanding examples in pursuit of an unbounded “perfect” standard. Interview Q&A and end-to-end design case studies are explicitly out of scope and belong in later phases.
+
+### Verified at closure
+- All 20 chapter pages were re-fetched from the default branch and passed the scoped structural checks: balanced fenced-code markers, no duplicate heading text, and the expected navigation footer.
+- Historical GitHub Actions run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824) passed the embedded OpenAPI 3.1 validation and rendered all 29 Mermaid diagrams to SVG. This run predates the latest content edits, so it is historical evidence rather than a post-edit full validation.
+- Recent focused corrections cover search-index authorization/deletion/rebuild, tenant-safe cache reuse and revocation, Kafka rebalance/offset correctness, authorization-cache revocation, Kubernetes rollback boundaries, and replay/live-stream handoff.
+
+### Explicit acceptance limits
+- The latest post-edit GitHub Actions result has not been verified in this pass.
+- The 21 mandatory topic families remain **Developing/provisional**; no claim is made that every family has passed full mechanism, trade-off, failure-mode and source review.
+- No exhaustive whole-book claim-to-source audit, complete link-resolution run, or manual visual review of all rendered diagrams is claimed.
+
+### Closure decision
+Treat this as **v1 content complete, technical acceptance provisional**. Keep the scope frozen. Reopen only for a concrete correctness defect, a broken navigation/validation issue, or a clearly missing prerequisite—not for general polishing. This records a bounded stopping point without misrepresenting unfinished verification as passed.
