@@ -379,3 +379,14 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Found and disambiguated a duplicate “Remaining acceptance blockers” heading in COVERAGE-AUDIT.md so Markdown section anchors are unique for that pair of sections.
 - [ ] Repository-wide structural validation after the latest edits has not been rerun as a single automated suite. The CI workflow remains the intended route, but its completed run cannot be inspected through the available Actions helper in this session.
 - [ ] Full acceptance remains open: no inventory family has been promoted to Deep; no claim-to-source audit or real Mermaid/OpenAPI validation is being represented as complete.
+
+
+## CI validation results and renderer fix — 2026-10-24
+
+- [x] Inspected GitHub Actions run [40103087271](https://github.com/kowlutla/System-Design/actions/runs/40103087271) from commit `f8e75f9e22a13dbcae5f60f69581ad76d81c7ccf`, including both jobs and the Mermaid job log.
+- [x] Confirmed the extractor ran successfully and extracted exactly 29 Mermaid blocks and one OpenAPI 3.1 document.
+- [x] Confirmed the `openapi-spec-validator` step completed successfully against the extracted OpenAPI document. This is a verified full validator run for that embedded specification, not a claim that every API design in the textbook has been audited.
+- [x] Diagnosed the Mermaid job failure from its logs: Mermaid CLI installed, but Chromium failed to launch with `No usable sandbox`; rendering stopped on the first diagram and produced no rendered artifact.
+- [x] Updated the workflow at commit `4d868540e7913b027acd3f43c58304586d80cb61` to pass Puppeteer a config enabling `--no-sandbox` and `--disable-setuid-sandbox`, and made the render artifact upload fail if no files are found.
+- [ ] Re-run of the corrected workflow is queued as run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824) at the time this entry was written; its outcome has not yet been inspected. Do not mark Mermaid rendering passed until all 29 SVGs are generated and the job completes successfully.
+- [ ] The full 21-family depth/source acceptance, whole-book contradiction review and all chapter-local source verification remain open; statuses must remain provisional.
