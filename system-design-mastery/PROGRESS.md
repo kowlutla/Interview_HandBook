@@ -323,3 +323,12 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Confirmed the CISA 2026 SBOM bulletin URL resolves and describes the updated minimum-elements guidance. The generic CISA SBOM landing page returned HTTP 403 in the retrieval environment, so its availability cannot be confirmed by that direct fetch.
 - [ ] This pass covers the reference catalog and the two new Chapter 09 URLs, not every external URL repeated or added within all chapter pages. Chapter-specific link liveness and claim-to-source alignment remain open.
 - [ ] The link check establishes page availability and basic topical match for the sources inspected; it does not prove that every claim throughout the textbook is fully supported by its cited source.
+
+
+
+## Cross-chapter consistency pass — 2026-10-24
+
+- [x] Compare high-risk concept boundaries across Chapters 03/13/19 (capacity, replica-multiplied limits and retry/hedge amplification); Chapters 07/10/11 (isolation, distributed consistency, consensus, 2PC/saga and fencing); Chapters 09/16/20 (cache authorization, revocation, deletion and offline tombstones); Chapters 06/12/19 (idempotency, outbox/inbox, duplicate publication, schema compatibility and replay); and Chapters 14/18 (recovery objectives, failover, stale writers and progressive delivery compatibility).
+- [x] Record the scoped findings and limitations in COVERAGE-AUDIT.md. Key terminology remains aligned across the inspected boundaries; this pass does not prove that no contradiction or duplication exists anywhere in the book.
+- [x] Update the Chapter 09 inventory row to include the newly added hot-key section and a skewed-load validation requirement.
+- [ ] Full chapter-by-chapter contradiction, prerequisite and residual-duplication review remains open; do not mark the 21-family inventory Deep on the basis of this focused pass.
