@@ -199,6 +199,46 @@ CQRS separates command and query models; event sourcing makes an event history a
 - Can a simpler design meet the requirement?
 - What is the migration and rollback path?
 
+## 19.3 Worked multi-tenant fairness scenario
+
+Assume a shared API serves three tenants. Tenant A runs a bursty batch integration, while tenants B and C serve interactive users. The service has four replicas and a shared database. A single global request-rate limit may let A consume most of the budget; a separate per-process limit may accidentally multiply the intended tenant allowance by the replica count.
+
+### Define what fairness means
+
+Fairness is not one universal metric. For this service, assume the policy is:
+
+- Preserve a minimum share of capacity for interactive tenants B and C during A's batch bursts.
+- Permit A to use spare capacity when it does not harm the interactive latency objective.
+- Bound total database concurrency across all four replicas.
+- Apply the same authorization and data-isolation rules regardless of which tenant receives capacity.
+
+### Why a per-instance rate limit can mislead
+
+If each of four replicas independently allows tenant A 100 requests/s, the effective allowance may approach 400 requests/s when traffic spreads across all replicas. Conversely, a single shared limit can be accurate but adds coordination latency and becomes another dependency. The implementation must state whether the limit is per process, per tenant globally, per route, or per resource cost.
+
+### A candidate policy
+
+1. **Bound the scarce resource first.** Set a total database concurrency ceiling based on tested database capacity, leaving room for administration and recovery operations.
+2. **Reserve critical capacity.** Use separate pools or weighted concurrency budgets so a burst from A cannot consume every slot needed by interactive work.
+3. **Add tenant-aware admission.** Enforce per-tenant sustained rates, burst allowances and in-flight limits. If limits are distributed, define how replicas coordinate and what temporary overrun is acceptable during a partition.
+4. **Use cost-aware limits where needed.** One expensive export may consume far more CPU, I/O or database time than one cached read; request count alone may not represent resource fairness.
+5. **Reject or defer predictably.** Return an explicit retryable response or queue batch work within a bounded durable backlog. Do not let clients retry immediately without jitter and a shared deadline.
+6. **Observe fairness and isolation separately.** Measure per-tenant admitted/rejected work, latency, resource consumption and queue age using bounded labels or controlled logs. Keep authorization tests separate from resource-fairness tests.
+
+### Validate the policy with a noisy-neighbor test
+
+Run a representative baseline with all three tenants, then raise A's offered load sharply while B and C continue their interactive workload. Verify that B and C remain within their agreed latency/error objectives, the database concurrency ceiling holds, A's excess work is rejected or delayed according to policy, and spare capacity can be used when available. Repeat with uneven traffic across replicas and during a replica loss to expose local-limit multiplication and failover effects.
+
+### Review checklist
+
+- [ ] Is fairness defined as request count, resource share, priority, reserved capacity or latency objective?
+- [ ] Do per-instance limits multiply with replica count, and is that acceptable?
+- [ ] Can one tenant exhaust shared database connections, queue slots, cache or worker pools?
+- [ ] Are batch and interactive work isolated or weighted appropriately?
+- [ ] Are quotas and overload responses safe during retries and partial coordination failure?
+- [ ] Are noisy-neighbor tests run both in healthy topology and after replica/zone loss?
+- [ ] Are per-tenant metrics useful without creating unbounded metric cardinality?
+- [ ] Are security isolation and resource fairness tested as separate properties?
 
 ## Further reading
 - O'Neil et al., [LSM-tree paper](https://doi.org/10.1007/s002360050048).
