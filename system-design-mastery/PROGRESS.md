@@ -418,3 +418,11 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [x] Updated COVERAGE-AUDIT.md with both focused changes while retaining Developing statuses.
 - [ ] Recheck changed chapters structurally and verify the latest CI result after these commits; the earlier green run predates these edits.
 - [ ] Continue full 21-family depth review, whole-book contradiction/prerequisite/duplication review, and claim-to-source verification. These focused additions do not constitute final acceptance.
+
+
+## Focused search-index safety correction — 2026-10-24
+
+- [x] Added Chapter 08 section 8.3A on stale authorization attributes, tenant filtering before pagination, side channels through facets/counts/highlights/autocomplete, durable deletion/tombstone ordering, and safe snapshot-plus-stream index rebuild/cutover.
+- [x] Updated COVERAGE-AUDIT.md to record the additional search-index depth while retaining Developing status.
+- [ ] Verify the snapshot/CDC handoff and deletion semantics against the actual database, connector, and search product selected for any concrete design; this chapter intentionally states the generic mechanism, not vendor guarantees.
+- [ ] Re-run the full repository validation workflow after the recent Chapter 08/16/18 edits; the last verified green run predates these commits and the current Actions helper does not expose push-triggered runs.
