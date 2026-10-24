@@ -96,6 +96,7 @@ Check items only when the work has actually been performed.
 - [x] Re-run chapter-level structural checks after the section-order correction: all 19 pages have balanced fenced blocks, no exact duplicate headings, no instructional headings after Further reading, and the navigation footer at the end.
 - [x] Revalidate relative Markdown targets across all 27 Markdown files in the textbook tree after section reordering; no missing local targets found.
 - [x] Recheck Chapters 12 and 16 after the versioned Kafka-link and injection-guidance edits; their fences, headings, Further reading order, and navigation footers remain structurally valid.
+- [x] Recheck Chapters 6, 16 and 19 after the final source-link and pattern edits; chapter fences, duplicate headings, Further reading order and navigation footers remain valid.
 - [x] Validate relative internal Markdown links in all created Markdown files against the expected file set; no broken internal targets found.
 - [x] Recheck all 27 Markdown paths in the target tree and the relative links in the landing page and all chapter pages.
 - [ ] Validate Mermaid diagrams with a renderer; currently added diagrams have only been manually reviewed.
