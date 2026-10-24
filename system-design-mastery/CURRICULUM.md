@@ -64,13 +64,13 @@ This curriculum was cross-checked against broad, vendor-neutral architecture gui
 
 ## Completion checks
 
-- [ ] All 19 modules have substantive chapters, not placeholder summaries.
+- [x] All 19 modules have substantive chapters, not placeholder summaries.
 - [ ] Each module includes mechanism, examples, trade-offs and failure modes appropriate to its topic.
 - [ ] Technical claims have nearby citations to relevant primary sources where available.
 - [ ] Worked calculations include units, assumptions and sanity checks.
 - [ ] Distributed-systems claims distinguish safety, liveness, timing assumptions and implementation behavior.
 - [ ] Diagrams are valid Mermaid and are explained in surrounding prose.
-- [ ] Internal links resolve.
+- [x] Internal links resolve.
 - [ ] Glossary terms match chapter usage.
-- [ ] No interview Q&A bank or complete end-to-end HLD case studies have been introduced.
+- [x] No interview Q&A bank or complete end-to-end HLD case studies have been introduced.
 - [ ] A final path audit confirms all changes are inside this directory.
