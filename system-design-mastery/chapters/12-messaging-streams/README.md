@@ -102,7 +102,18 @@ Batch processing handles a bounded collection of data, while stream processing h
 
 A schema registry can store message schemas and enforce configured compatibility rules, but it cannot guarantee that a consumer interprets the data correctly. Compatibility depends on the serialization format, reader/writer behavior, defaults, deployment order, and the registry policy.
 
-Additive optional fields are often easier to introduce than removing fields, changing types, or changing a field's meaning. Before a rollout, test old and new payloads against old and new consumers—including missing fields, unknown enum values, defaults, malformed records, and replay from retained history. Make sure active consumers can tolerate the next producer output before the producer starts emitting it.
+The common compatibility labels describe different promises. **Backward compatibility** generally means a newer reader can read older data; **forward compatibility** means an older reader can read data written by a newer version; **full compatibility** aims to support both directions. Some registries also offer **transitive** modes that compare a new schema with a broader history, not only the immediately previous version. Exact definitions depend on the registry and serialization format, so check the policy you actually configure.
+
+| Schema change | Typical risk | Safer approach |
+|---|---|---|
+| Add an optional field | Often low, but defaults and unknown-field handling matter | Make consumers tolerant before producers start sending it. |
+| Add a required field or remove a field | Older events or consumers may not satisfy the new contract | Use a transition period, defaults/backfill, or a versioned event. |
+| Change a field's type, units, or meaning | Data may fail to parse or be silently misinterpreted | Prefer a new field or event version and test the conversion explicitly. |
+| Add an enum value | Older consumers may reject a value they do not recognize | Make unknown values safe or coordinate the rollout. |
+
+An event should also carry a stable identity, event type, schema/version information, and the domain identifiers needed to process it safely. Include only metadata and payload fields consumers actually need; an event may be copied into many systems and retained for a long time.
+
+Before a rollout, test old and new payloads against old and new consumers—including missing fields, unknown enum values, defaults, malformed records, and replay from retained history. Make sure active consumers can tolerate the next producer output before the producer starts emitting it.
 
 Keep three related ideas distinct:
 
