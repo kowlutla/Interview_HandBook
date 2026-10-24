@@ -342,3 +342,25 @@ A focused comparison of curriculum requirements, Chapter 05/18 content, and glos
 - **Glossary:** added definitions for feature flags, LWW, PITR, QUIC and stream-processing watermarks.
 
 These are genuine coverage improvements. They are not enough to promote the associated inventory families to Deep: the full chapter-by-chapter mechanism/failure-mode review and standards/source verification still need completion.
+
+
+## Final acceptance checkpoint — 2026-10-24
+
+The latest verification re-opened the live curriculum, editorial standard, progress tracker and representative chapters across networking, distribution/consistency, coordination, messaging, scaling, reliability, API design and cloud delivery. Recent targeted fixes are present in the repository. The chapter content supports keeping the relevant topic families at **Developing** until the full acceptance criteria are independently checked; no status is upgraded on the basis of headings or keyword scans.
+
+### What is supported by checks so far
+
+- Twenty chapter pages and the supporting curriculum, roadmap, editorial standard, glossary, reference library, progress tracker and coverage audit are part of the textbook structure recorded in the progress tracker.
+- Prior structural checks recorded in the tracker include balanced fences, unique headings, Further reading placement, navigation footers and resolving relative links across the 28 Markdown files at that checkpoint.
+- Selected primary-source spot checks, targeted capacity/SLO/Bloom-filter arithmetic, and targeted Chapter 06 OpenAPI YAML invariants have been recorded. These are bounded checks, not a full source-to-claim audit or full standards validation.
+- The current spot review identified and fixed explicit networking, feature-flag and glossary omissions; the changes do not by themselves establish deep coverage across all 21 topic families.
+
+### Remaining acceptance blockers
+
+1. Read every mandatory inventory row against the actual chapter text and verify mechanism, example, selection criteria, trade-offs, failure modes and operational/design implications before changing provisional coverage statuses.
+2. Audit every external link for liveness/redirects and verify claim-to-source alignment, including the Chapter 20 links that received only targeted checks.
+3. Render all 21 Mermaid diagrams in a real renderer. This remains blocked in the current environment because no renderer is available and package retrieval fails under network/DNS restrictions.
+4. Run a full OpenAPI 3.1 validator/linter against the Chapter 06 example. Targeted YAML parsing and invariant checks are not equivalent; package retrieval is blocked in the current environment.
+5. Complete the cross-chapter review for terminology, contradictions, duplicate explanations, prerequisite gaps and numerical assumptions.
+
+**Status:** review-ready content draft; **formal technical acceptance remains open**. Do not mark the textbook fully validated until the blockers above have evidence of completion.
