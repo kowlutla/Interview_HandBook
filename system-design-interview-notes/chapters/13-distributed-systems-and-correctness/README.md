@@ -125,3 +125,20 @@ A saga is often more practical across independently owned services where long-ru
 - [Apache Kafka design documentation](https://kafka.apache.org/documentation/#design) — partitions, replication, delivery, and transactional processing; product guarantees are scoped to the documented boundary.
 - [AWS Builders' Library: Making retries safe with idempotent APIs](https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/) — practical treatment of ambiguous outcomes and idempotency.
 
+## 13.7 Consensus, clocks, and leases
+
+Consensus protocols help distributed nodes agree on an ordered log or a single value despite specified failures, under assumptions about the network and participating nodes. Consensus is not the same as “send a message to every replica,” and it does not remove the need to define membership, quorum, failure detection, and recovery behavior. Raft is a widely used example of a consensus algorithm for replicated logs.
+
+Physical clocks are imperfect: machines can drift, clocks can jump, and timestamps do not by themselves prove causal order. Use database versions, sequence numbers, log offsets, or logical clocks when the required ordering is about operations rather than wall-clock display time. Hybrid logical clocks combine physical-time information with logical ordering, but their guarantees still depend on the system's design.
+
+A **lease** grants authority for a bounded interval, often to a leader or lock holder. It is safe only when the protocol's timing assumptions and renewal behavior are respected. A paused process can resume after its lease has expired and mistakenly act as owner. A fencing token—a monotonically increasing epoch or generation checked by the protected resource—can reject writes from stale owners.
+
+Do not use a timestamp as a fencing token unless the system can guarantee the ordering property the resource needs. If two owners can produce writes, the protected resource must be able to distinguish a newer authority from an older one.
+
+### Q5. Why is a timeout-based failure detector not proof that a node has failed?
+
+A slow node and an unreachable node can look identical to the observer. The node may still be processing requests or may be isolated from only part of the cluster. Treat timeouts as suspicion, then use quorum/consensus and explicit ownership rules to decide whether an operation may safely proceed.
+
+### Q6. Why might a distributed lock need a fencing token?
+
+A lock can expire while its former holder is paused. If that process resumes, it may still attempt a write even though another process acquired the lock. The protected resource must reject stale generations; merely having a lock service issue a lease does not stop a stale process from sending commands.
