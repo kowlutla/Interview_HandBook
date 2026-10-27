@@ -319,7 +319,7 @@ Store the workload definition, generator configuration, test-data version, servi
 - [ ] Results identify the first bottleneck and include configuration/data assumptions.
 - [ ] The test is repeatable and has a safe abort condition.
 
-## DAU/MAU-to-traffic estimates: a worked example
+## DAU-to-traffic estimates: a worked example
 
 Daily and monthly active users describe audience size, not request rate by themselves. Convert them into traffic only after stating how often an active user performs the relevant action and how many backend requests each action causes. Use DAU for a daily workload estimate; MAU is useful for reach and growth context, but dividing MAU directly by seconds in a day does not produce a meaningful RPS estimate.
 
