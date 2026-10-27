@@ -504,3 +504,19 @@ Technical status remains provisional: these changes improve navigation and addre
 - Scanned chapter Markdown links for explicit local heading fragments; none were present, so the section-heading hierarchy changes did not break fragment links in the chapters. The repository validator continues to check local Markdown target paths.
 - Spot-checked Kafka delivery-semantics and HTTP caching explanations against official Kafka design documentation and IETF RFC 9111. The chapters correctly scope Kafka transactions to supported broker processing boundaries and distinguish no-cache revalidation from no-store storage prohibition.
 - The latest CI runs were queued at the time of this note. Do not treat prior successful runs as validation of later commits; the latest branch head must complete both jobs.
+
+
+## Final chapter audit continuation — 2026-10-28
+
+- [x] Reviewed Chapters 15–20 against the curriculum with targeted edits only where a material explanatory gap was found.
+- [x] Chapter 15 adds database-per-service ownership, saga/outbox boundaries, service-mesh trade-offs, and system-wide multi-tenant isolation.
+- [x] Chapter 16 clarifies that access tokens may be opaque or JWTs and that resource servers must follow the issuer's defined validation model.
+- [x] Chapter 17 reviewed for observability signals, RED/USE, SLO math, alerting, incident response and capacity diagnosis; no content edit was needed in this pass.
+- [x] Chapter 18 clarifies Kubernetes Secret base64 encoding versus encryption and adds protection, access and rotation considerations.
+- [x] Chapter 19 adds cross-cutting guidance on serialization/schema compatibility during mixed-version deployments and storage amplification/temporary capacity.
+- [x] Chapter 20 reviewed against the client/offline/realtime curriculum; no content edit was needed in this pass.
+- [x] A historical validation run was inspected after its failure: the extractor rejected 30 Mermaid diagrams because it hard-coded an expected count of 29. Removed the brittle exact-count guard; the validator now requires at least one diagram and extracts all found diagrams for the renderer.
+- [ ] Re-run validation against the latest branch head. The inspected failing run predates the latest edits; no passing post-edit run has been verified.
+- [ ] Mermaid rendering, full OpenAPI validation, exhaustive external-link liveness, claim-to-source verification, and full 21-family depth acceptance remain open. No inventory family is promoted to Deep.
+
+The chapter-level structural checks were targeted per changed chapter (headings, fenced Mermaid declarations and navigation links); they are not a substitute for the repository validation workflow or full semantic acceptance. The audit branch remains separate from `main`.
