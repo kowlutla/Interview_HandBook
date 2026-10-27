@@ -45,21 +45,21 @@ The case studies in `real-world-examples/` are canonical. Use this order: first 
 
 | Stage | Canonical case study | Concepts to practise | Follow-up variation |
 |---|---|---|---|
-| 1. Fundamentals | [URL shortener](../../real-world-examples/001.url-shortener.md) | API, key generation, cache, read/write ratio, redirect latency | Custom aliases and abuse prevention |
-| 2. Traffic protection | [Rate limiter](../../real-world-examples/003.rate-limiter.md) | Token bucket, distributed counters, strict vs approximate limits | Limiter dependency outage |
-| 3. Data distribution | [Key-value store](../../real-world-examples/005.key-value-store.md) | Partition keys, replication, quorum, rebalancing | Node failure during write |
-| 4. IDs and ordering | [Unique ID generator](../../real-world-examples/006.unique-id-generator.md) | Coordination, uniqueness scope, clock/worker risks | Clock rollback or worker ID collision |
-| 5. Async fan-out | [Notification system](../../real-world-examples/011.notification-system.md) | Queue, retries, DLQ, idempotency, provider limits | Provider outage and backlog |
-| 6. Social read scaling | [News feed](../../real-world-examples/009.news-feed-system.md) | Fan-out on write/read, cache, hot users, freshness | Celebrity with millions of followers |
-| 7. Real-time state | [Chat system](../../real-world-examples/010.chat-system.md) | Persistent connections, durable history, ordering, reconnect | Multi-device synchronization |
-| 8. Search | [Autocomplete](../../real-world-examples/025.typeahead-autocomplete.md) | Prefix index, cache, ranking, freshness | Popular-prefix hot key |
-| 9. File systems | [File sync and storage](../../real-world-examples/019.file-sync-and-storage.md) | Object storage, metadata, upload lifecycle, sync | Interrupted multipart upload |
-| 10. Business correctness | [Payment gateway](../../real-world-examples/029.payment-gateway.md) | Idempotency, ambiguous outcomes, ledger, reconciliation | Provider timeout after successful charge |
-| 11. Contention | [Flash sale / ticketing](../../real-world-examples/030.flash-sale-ticketing.md) | Inventory invariant, admission control, queues, hot partitions | Sudden 100x launch traffic |
-| 12. Analytics | [Metrics monitoring](../../real-world-examples/038.metrics-monitoring-alerting.md) | High-cardinality data, ingestion, retention, aggregation | Delayed consumer and storage pressure |
-| 13. Scheduling | [Distributed job scheduler](../../real-world-examples/041.distributed-job-scheduler.md) | Durable schedules, leases, retries, duplicate execution | Worker crash after side effect |
-| 14. Global systems | [Distributed cache](../../real-world-examples/039.distributed-cache.md) | Sharding, replication, hot keys, failure modes | Regional cache outage |
-| 15. Collaboration | [Collaborative document editor](../../real-world-examples/040.collaborative-doc-editor.md) | Real-time fan-out, concurrent edits, reconnect | Offline edits and conflict handling |
+| 1. Fundamentals | [URL shortener](../../../real-world-examples/001.url-shortener.md) | API, key generation, cache, read/write ratio, redirect latency | Custom aliases and abuse prevention |
+| 2. Traffic protection | [Rate limiter](../../../real-world-examples/003.rate-limiter.md) | Token bucket, distributed counters, strict vs approximate limits | Limiter dependency outage |
+| 3. Data distribution | [Key-value store](../../../real-world-examples/005.key-value-store.md) | Partition keys, replication, quorum, rebalancing | Node failure during write |
+| 4. IDs and ordering | [Unique ID generator](../../../real-world-examples/006.unique-id-generator.md) | Coordination, uniqueness scope, clock/worker risks | Clock rollback or worker ID collision |
+| 5. Async fan-out | [Notification system](../../../real-world-examples/011.notification-system.md) | Queue, retries, DLQ, idempotency, provider limits | Provider outage and backlog |
+| 6. Social read scaling | [News feed](../../../real-world-examples/009.news-feed-system.md) | Fan-out on write/read, cache, hot users, freshness | Celebrity with millions of followers |
+| 7. Real-time state | [Chat system](../../../real-world-examples/010.chat-system.md) | Persistent connections, durable history, ordering, reconnect | Multi-device synchronization |
+| 8. Search | [Autocomplete](../../../real-world-examples/025.typeahead-suggestion.md) | Prefix index, cache, ranking, freshness | Popular-prefix hot key |
+| 9. File systems | [File sync and storage](../../../real-world-examples/019.file-sync-and-storage.md) | Object storage, metadata, upload lifecycle, sync | Interrupted multipart upload |
+| 10. Business correctness | [Payment gateway](../../../real-world-examples/029.payment-gateway.md) | Idempotency, ambiguous outcomes, ledger, reconciliation | Provider timeout after successful charge |
+| 11. Contention | [Flash sale / ticketing](../../../real-world-examples/030.flash-sale-ticketing-system.md) | Inventory invariant, admission control, queues, hot partitions | Sudden 100x launch traffic |
+| 12. Analytics | [Metrics monitoring](../../../real-world-examples/038.metrics-monitoring-and-alerting-system.md) | High-cardinality data, ingestion, retention, aggregation | Delayed consumer and storage pressure |
+| 13. Scheduling | [Distributed job scheduler](../../../real-world-examples/041.distributed-job-scheduler.md) | Durable schedules, leases, retries, duplicate execution | Worker crash after side effect |
+| 14. Global systems | [Distributed cache](../../../real-world-examples/039.distributed-cache.md) | Sharding, replication, hot keys, failure modes | Regional cache outage |
+| 15. Collaboration | [Collaborative document editor](../../../real-world-examples/040.collaborative-doc-editor.md) | Real-time fan-out, concurrent edits, reconnect | Offline edits and conflict handling |
 
 **Repository link check note:** These paths are curated against the canonical case-study index; validate exact filenames against the current default branch before relying on the path list. The case studies remain separate; this guide does not duplicate their full designs.
 
