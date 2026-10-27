@@ -76,3 +76,39 @@ A partition receiving disproportionate traffic or work. It can saturate even whe
 - Asynchronous replication can lose unreplicated recent writes during failover.
 - A good shard key balances data and traffic while supporting important queries.
 - Cross-shard operations and rebalancing add complexity.
+
+## Replication and sharding in practice
+
+```mermaid
+flowchart LR
+    W[Write request] --> L[Leader]
+    L -->|replicate| R1[Replica A]
+    L -->|replicate| R2[Replica B]
+    L -->|acknowledgement policy| ACK[Client response]
+    Q[Read request] --> ROUTE{Freshness requirement?}
+    ROUTE -->|Must observe recent write| L
+    ROUTE -->|Stale read acceptable| R1
+```
+
+This diagram is intentionally simplified: the exact acknowledgement policy depends on the database. With asynchronous replication, a successful write can be acknowledged before a replica receives it. A failover can therefore expose stale data or lose recent acknowledged writes if the promoted replica is behind.
+
+Sharding splits ownership across partitions; replication copies data within or across those partitions. A useful shard key distributes load while supporting common queries. A monotonically increasing key can create a hot range, while a tenant key can overload one partition when a tenant dominates traffic. Rebalancing changes data placement and consumes network and disk capacity, so it must be planned as an operational event.
+
+## Scenario practice
+
+**Scenario:** Read traffic is high and the primary database is near its read limit, but writes are healthy. Should you shard immediately?
+
+**Reasoning:** First inspect query plans, indexes, caching opportunities, and whether stale reads are acceptable on read replicas. A read replica can help with read capacity but does not increase primary write throughput and can return stale data. Shard only when a single node remains a limiting factor or dataset placement requires it, because cross-shard queries and rebalancing add complexity.
+
+## Interview questions
+
+### Q1. What is the difference between replication and sharding?
+Replication keeps copies of the same data to improve redundancy, recovery, or read capacity. Sharding divides the dataset across nodes to distribute storage and workload. A system often combines them: each shard has replicas.
+
+### Q2. Does (R+W>N) automatically guarantee linearizability?
+No. It can ensure quorum intersection under the stated replica model, but linearizability depends on the full protocol, write ordering, version handling, concurrent updates, and failover rules.
+
+## Further reading
+
+- [Designing Data-Intensive Applications: replication and partitioning concepts](https://dataintensive.net/) — background reading; verify concrete guarantees against the chosen database's documentation.
+
