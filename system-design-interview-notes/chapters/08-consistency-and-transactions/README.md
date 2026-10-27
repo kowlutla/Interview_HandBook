@@ -53,28 +53,6 @@ A database transaction usually cannot atomically commit arbitrary operations acr
 
 Compensation is not necessarily a literal rollback. A sent email cannot be unsent, and a payment refund is a new business operation with its own failure modes. Sagas need durable state, retries, idempotent steps, timeout handling, and a path for manual recovery.
 
-## 8.7 Common interview questions
-
-### Is eventual consistency the same as weak durability?
-
-No. Consistency concerns which values reads can observe and how replicas converge. Durability concerns whether acknowledged changes survive failures. A system can have durable writes while reads temporarily observe stale replicas.
-
-### When should a system use stronger consistency?
-
-When incorrect or stale reads would violate important invariants—for example, account balances, unique reservations, or ownership changes. Some systems can use stronger guarantees only for critical operations and tolerate eventual consistency for feeds, analytics, or derived views.
-
-### What is write skew?
-
-Two concurrent transactions read a shared condition and update different rows, so each transaction's individual checks pass but their combined result violates a business invariant. Preventing it may require serializable isolation, explicit locking, constraints, or redesigning the invariant around a single atomic record, depending on the database.
-
-### How do you handle a conflict in optimistic locking?
-
-Detect that the expected version no longer matches. Then decide whether to retry from fresh state, merge changes, reject the operation, or ask the user to resolve it. Blindly retrying the same stale write can repeat the conflict indefinitely.
-
-### What is a saga?
-
-A saga is a distributed business workflow composed of local transactions with coordination and, when needed, compensating actions. It avoids pretending that independent services share one atomic transaction, but introduces eventual completion, durable orchestration, idempotency, and recovery requirements.
-
 ## Quick revision
 
 - Define the exact consistency guarantee needed.
@@ -106,21 +84,12 @@ sequenceDiagram
     API-->>U: Updated setting
 ```
 
-## Scenario practice
+## Scenario analysis
 
-**Scenario:** Two users attempt to reserve the last seat at the same time. A cache shows one seat available to both. How do you prevent overselling?
+**Case:** Two users attempt to reserve the last seat at the same time. A cache shows one seat available to both users. How do you prevent overselling?
 
 **Reasoning:** Do not use a cached count as the authority for reservation. Use a conditional transactional update, row lock, or unique reservation constraint so only one operation can claim the final seat. The cache can display an approximate count, but the write path must enforce the invariant and return a clear conflict for the losing request.
-
-## Interview questions
-
-### Q1. Is eventual consistency always acceptable for read-heavy systems?
-No. Read-heavy describes load, not correctness. Eventual consistency is acceptable only where temporary divergence does not violate user expectations or business invariants. Account balances, inventory reservations, and authorization changes may require stronger guarantees at the authoritative boundary.
-
-### Q2. When would you use optimistic versus pessimistic concurrency?
-Optimistic concurrency is useful when conflicts are rare: read a version and update only if it has not changed, retrying or reporting conflict otherwise. Pessimistic locking can fit high-contention critical sections but holds locks and can reduce throughput or create deadlocks. The decision depends on contention and the cost of retrying.
 
 ## Further reading
 
 - [PostgreSQL documentation: Transaction Isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — isolation behavior and anomalies.
-
