@@ -55,24 +55,6 @@ A timeout does not prove that the remote operation failed. The server may have c
 | Coarse-grained API | One operation can satisfy a use case efficiently | May return data the caller does not need |
 | Fine-grained API | Reusable operations and independent control matter | More round trips and orchestration |
 
-## 3.6 Common interview questions
-
-### When should you split a monolith into microservices?
-
-Split when there is a clear benefit such as independent ownership, release cadence, scaling, or fault isolation. First check whether modular boundaries inside a single deployment would solve the problem. Microservices are not automatically more scalable or reliable.
-
-### When should a request use a queue?
-
-Use a queue when the caller does not need the full work result immediately, when bursts should be buffered, or when producers and consumers need decoupling. Keep synchronous processing for operations where immediate confirmation is required and the work fits the latency budget.
-
-### Why are retries dangerous for state-changing APIs?
-
-A timeout can occur after the server has performed the operation. Retrying a non-idempotent request may create duplicate effects. Use an idempotency key or another deduplication mechanism, define its scope and retention, and handle retries that occur after the deduplication window.
-
-### What makes an API backward-compatible?
-
-Existing clients should continue to work under the new contract. Additive optional fields are often safer than removing or changing existing fields, but compatibility depends on client behavior, validation rules, and serialization. Changes should be evaluated against actual consumers and tested with contract checks where appropriate.
-
 ## Quick revision
 
 - Define ownership before splitting services.
@@ -82,22 +64,13 @@ Existing clients should continue to work under the new contract. Additive option
 - A timeout does not prove a write failed.
 - Make retries safe through idempotency or deduplication.
 
-## Scenario practice
+## Scenario analysis
 
-**Scenario:** A checkout API calls inventory, pricing, promotions, payment, and email services synchronously. Its p99 latency rises and one slow dependency causes broad failures. How would you reshape the flow?
+**Case:** A checkout API calls inventory, pricing, promotions, payment, and email services synchronously. Its p99 latency rises, and one slow dependency causes broad failures.
 
 **Reasoning:** Keep synchronous calls only where the user needs an immediate decision, bound each call by a propagated deadline, and isolate optional work. Email and other post-commit side effects are good asynchronous candidates. Use an explicit checkout state machine for long-running work; do not turn payment or inventory correctness into fire-and-forget tasks. Reduce unnecessary network hops before splitting more services.
-
-## Interview questions
-
-### Q1. When is a modular monolith better than microservices?
-When one team can own the domain and a shared deployment does not block independent scaling or release needs. A modular monolith keeps in-process calls and local transactions simpler. Extract a service when a clear boundary, ownership need, scaling profile, or isolation requirement justifies network and operational complexity.
-
-### Q2. When should an API operation be asynchronous?
-When the work may take longer than a request budget, can finish later, or benefits from durable buffering/replay. Return a durable operation or resource identifier and expose status. Do not acknowledge work as accepted until the system has safely recorded enough state to recover it.
 
 ## Further reading
 
 - [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110) — HTTP method and response semantics.
 - [Google API Design Guide](https://cloud.google.com/apis/design) — API resource and compatibility guidance.
-
