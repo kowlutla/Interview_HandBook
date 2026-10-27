@@ -112,6 +112,21 @@ A database connection pool bounds concurrent database work and reuses expensive 
 
 Set pool limits from database capacity, query cost, service concurrency and the total replica count. Observe acquisition wait separately from query execution latency. Use bounded acquisition timeouts and fail predictably rather than building an invisible unbounded queue in the application.
 
+## Partitioning, sharding, and replication are different dimensions
+
+These terms are related, but they solve different problems:
+
+- **Partitioning** divides a logical dataset into subsets according to a rule. Depending on the database and its terminology, partitions may be stored and managed inside one database cluster or distributed across nodes.
+- **Sharding** is horizontal partitioning in which different subsets of the data are assigned to different shards, commonly to distribute storage, write throughput, or operational load across nodes. A shard may itself contain multiple tables or indexes.
+- **Replication** keeps additional copies of data. Replicas can improve read capacity or availability and support recovery, but they do not by themselves divide ownership of the write workload.
+- **Vertical partitioning** separates columns or groups of attributes, often to isolate access patterns or large fields; it is different from horizontal partitioning, which separates rows.
+
+A database can use partitioning, sharding, and replication together. For example, tenant-keyed shards may each have a primary and one or more replicas, while each shard's largest table is partitioned by time. Do not count those as interchangeable scaling mechanisms: table partitions on one host may help pruning and maintenance without increasing the host's CPU or network capacity, while replicas may increase read capacity but leave a single-writer bottleneck unchanged.
+
+The partition key determines where rows live and therefore affects both performance and correctness. A good key distributes expected load, supports important queries, and keeps common transactions local where possible. A poor key creates **skew** (uneven data distribution), **hot partitions** (a small subset receives disproportionate traffic), or expensive cross-shard operations. Adding more shards does not fix a hot key if all requests for that key still land on the same shard.
+
+Before choosing a strategy, answer four questions: what unit is assigned to a partition, how placement is determined, how queries find all relevant partitions, and how data moves when capacity or key distribution changes. Then plan for rebalancing, uniqueness constraints, cross-partition transactions, index locality, and failure recovery—not just the initial routing function.
+
 ## 7.2 Sharding and resharding: a worked design example
 
 Sharding divides a dataset across multiple independently managed partitions. It can increase storage and write capacity, but adds routing, rebalancing, cross-shard query, transaction and operational complexity. Do not shard simply because the table is large; first establish which resource is constrained and whether indexing, query redesign, archiving, vertical capacity or read replicas can meet the requirement.
