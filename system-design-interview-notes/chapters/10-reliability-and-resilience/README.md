@@ -48,24 +48,6 @@ Identify the failure domains that matter and place replicas accordingly. More re
 
 Backups are useful only if they can be restored within the required objectives. Test restoration, failover, and failback; verify dependencies such as keys, configuration, credentials, and DNS. A backup that has never been restored is an assumption, not demonstrated recovery capability.
 
-## 10.7 Common interview questions
-
-### Why are retries sometimes harmful?
-
-They increase load and can duplicate side effects. When a dependency is overloaded, retries may make recovery harder. Use bounded attempts, backoff, jitter, idempotency, and a total deadline.
-
-### What is a circuit breaker?
-
-A mechanism that stops sending normal traffic to a dependency after a configured failure pattern, then tests whether it has recovered. It limits cascading failures but does not replace timeouts or fix the underlying cause.
-
-### What is the difference between RTO and RPO?
-
-RTO is the target time to restore service; RPO is the tolerated amount of data loss. They drive different decisions about failover automation, backups, replication, and recovery testing.
-
-### Does running multiple instances guarantee high availability?
-
-No. Instances may share a database, network, zone, credentials, or configuration that becomes a common failure point. Availability depends on the full request path and independent failure domains, not just replica count.
-
 ## Quick revision
 
 - Bound waits with timeouts and end-to-end deadlines.
@@ -90,19 +72,11 @@ A circuit breaker limits calls to a dependency that is failing; it does not repa
 
 Retries should be bounded by an end-to-end deadline and a retry budget. Exponential backoff with jitter spreads attempts over time. Avoid retrying non-idempotent operations unless the operation has a safe idempotency contract. Multiple layers retrying independently can multiply load dramatically.
 
-## Scenario practice
+## Scenario analysis
 
-**Scenario:** A downstream service slows down. Callers time out and retry, increasing load until healthy instances also fail. What changes would you make?
+**Case:** A downstream service slows down. Callers time out and retry, increasing load until otherwise healthy instances also fail.
 
 **Reasoning:** Propagate deadlines, cap concurrency, set one clear retry owner, use bounded exponential backoff with jitter, and apply circuit breaking or load shedding where appropriate. Separate optional work with bulkheads. Monitor saturation and retry volume; do not rely on autoscaling alone if the dependency is the bottleneck.
-
-## Interview questions
-
-### Q1. Why can retries reduce availability?
-Retries add work precisely when a dependency is struggling. They can exhaust threads, connections, and CPU, causing a cascading failure. Retry only likely transient failures, use backoff/jitter and budgets, and ensure the operation is safe to repeat.
-
-### Q2. What is the difference between high availability and disaster recovery?
-High availability reduces interruption from common failures, often within a region using multiple zones and automatic failover. Disaster recovery addresses larger outages and data recovery using backups, replication, and tested procedures, with explicit RTO/RPO targets. Multi-region deployment can support both but adds cost and consistency complexity.
 
 ## Further reading
 
@@ -136,14 +110,14 @@ A useful interview answer defines:
 
 A payment service has a warm standby region and asynchronous database replication. The primary region disappears immediately after acknowledging a payment write. Do not claim that promoting the standby guarantees the latest payment is present. First establish the actual replication position and promotion guarantees, prevent the old primary from accepting writes if it returns, and reconcile uncertain operations with the payment provider or ledger before retrying side effects. The RPO determines whether some acknowledged data loss is acceptable; for financial invariants, the system may need a stronger commit/replication design instead.
 
-### Q3. When would you choose multi-region deployment over multi-zone deployment?
+### Multi-region versus multi-zone deployment
 
 Multi-zone deployment protects against many single-zone failures within a region and is usually simpler and lower-latency for a regional service. Multi-region deployment is justified when the recovery objective includes a regional outage, when users need regional proximity, or when data-residency requirements demand it. It adds replication, routing, failover, and consistency complexity; it should follow explicit RTO/RPO requirements rather than being treated as a default upgrade.
 
-### Q4. Why do RTO and RPO need separate targets?
+### Separate RTO and RPO targets
 
 RTO limits how long recovery may take; RPO limits how much recent data may be lost. A system can recover quickly but lose more data than the business accepts, or preserve data while taking too long to restore service. These targets determine whether backups, warm standby, synchronous replication, or automated failover are appropriate, and they must be validated through recovery exercises.
 
-### Q5. Does active-active automatically improve availability?
+### Active-active availability limitations
 
 No. It can serve traffic during some regional failures, but shared identity, global dependencies, network partitions, or conflicting writes can still fail the system. Active-active is simplest for stateless or naturally partitioned workloads. For mutable business data, define conflict semantics and write authority before claiming independent regional availability.
