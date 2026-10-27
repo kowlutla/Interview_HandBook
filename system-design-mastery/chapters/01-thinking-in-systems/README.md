@@ -20,6 +20,26 @@ A component cannot be understood entirely in isolation if its behavior depends o
 
 An order service may validate an order, reserve inventory, charge a payment method, persist order state, and send a confirmation. Each operation can work correctly alone while the workflow still fails: inventory might be reserved but payment may time out; payment may succeed while the response is lost; a confirmation may be sent twice. System design reasons about the end-to-end outcome and the intermediate states—not only each API.
 
+### Systems thinking: feedback loops, delays, and emergent behavior
+
+A system's behavior is shaped not only by its components but also by the feedback between them. **Reinforcing feedback** amplifies a change; **balancing feedback** counteracts a deviation or moves the system toward a target. Neither is inherently good or bad: the effect depends on what is being amplified or controlled.
+
+Consider an overloaded API:
+
+```mermaid
+flowchart TD
+  A[Request load rises] --> B[Queueing and latency rise]
+  B --> C[Client timeouts increase]
+  C --> D[Retries increase offered load]
+  D --> A
+```
+
+This is a reinforcing loop: retries intended to improve an individual request's chance of success can increase total load and make the original overload worse. A design should therefore bound retries, use deadlines and backoff with jitter, and avoid retrying non-idempotent operations without a safe deduplication strategy.
+
+A balancing response might reject or shed low-priority work when saturation crosses a threshold, reducing the work accepted by the system. But feedback has a **delay**: autoscaling may react only after queues and latency have already grown, and aggressive scale-up/scale-down policies can oscillate. Thresholds, cooldowns, queue limits, and measurements should be chosen with these delays in mind.
+
+This is why local optimizations can produce harmful system-wide outcomes. A component that retries more aggressively may look more resilient in isolation while reducing the availability of the whole dependency chain. When evaluating a design, trace the effects of a change through dependent components and ask whether the resulting feedback stabilizes the system or amplifies the problem.
+
 ## 1.2 Architecture is a set of consequential decisions
 
 **Software architecture** describes the important structures and decisions that shape system behavior: component boundaries, responsibilities, communication paths, state ownership, deployment units, trust boundaries, failure domains, and rules that allow the system to evolve.
