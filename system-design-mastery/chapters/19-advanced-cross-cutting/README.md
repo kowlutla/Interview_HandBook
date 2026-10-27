@@ -4,13 +4,13 @@ This chapter connects design choices that are often learned separately but inter
 
 For the underlying mechanics of workload estimation, storage engines, schema evolution, and messaging, use [Chapter 03](../03-workload-capacity/README.md), [Chapter 08](../08-storage-engines-models/README.md), and [Chapter 12](../12-messaging-streams/README.md). This chapter builds on those explanations rather than repeating their introductions.
 
-## Queueing and tail behavior
+## 19.1 Queueing and tail behavior
 
 Little's Law relates the average work in a stable system to its arrival rate and average time in the system: `L = λW`. It helps estimate average concurrency, but it does not predict tail latency by itself. When utilization is high, arrivals are bursty, or service times vary widely, requests can spend much longer waiting than the average suggests.
 
 A queue can absorb a short burst, but it does not create processing capacity. If work arrives faster than it can be completed for a sustained period, the backlog grows until the system rejects work, runs out of resources, or violates its latency target. Use bounded queues, measure queue age as well as depth, and define what should be shed or delayed under overload. See [Workload Models and Capacity Reasoning](../03-workload-capacity/README.md) and [Scaling, Load Distribution, and Overload](../13-scaling-overload/README.md).
 
-## 19.1A Probabilistic structures: what the error means
+### 19.1A Probabilistic structures: what the error means
 
 A Bloom filter represents set membership compactly. Under its standard assumptions, a negative answer means the element is definitely absent from the represented set, while a positive answer means it may be present. False positives cause extra work; false negatives are not expected unless the filter is misused, corrupted, or updated under unsupported conditions.
 
@@ -45,7 +45,7 @@ This is a planning approximation, not a guarantee that a concrete implementation
 A standard Bloom filter does not support safe arbitrary deletion because clearing a bit may cause false negatives for another item that set the same bit. Counting Bloom filters or rebuilding are alternatives, each with additional memory or operational cost. Bloom filters should reduce expensive authoritative lookups, not replace the source of truth.
 
 
-## 19.1B Distributed scheduling and logical execution
+### 19.1B Distributed scheduling and logical execution
 
 Schedulers must define what happens when a job is delayed, missed, duplicated, retried, or running longer than its interval. A lease can coordinate ownership but does not alone prevent a stale worker from committing effects after lease expiry. Use idempotent effects, fencing/version checks, unique execution records, and explicit catch-up policy as appropriate.
 
@@ -56,7 +56,7 @@ Distinguish:
 
 A scheduler can guarantee a dispatch policy under its own assumptions, but exactly one business effect requires the effect boundary to participate in deduplication or idempotency.
 
-## 19.1C Multi-tenancy, fairness, and noisy neighbors
+### 19.1C Multi-tenancy, fairness, and noisy neighbors
 
 Tenant isolation is not just a security filter. Tenants compete for CPU, memory, threads, database connections, cache capacity, queue slots, storage I/O, and rate limits. A noisy tenant can degrade others without crossing a security boundary.
 
@@ -64,7 +64,7 @@ Fairness must be defined: equal request count, equal resource consumption, weigh
 
 Measure per-tenant demand using bounded labels or sampled logs rather than unbounded metrics that create cardinality explosions. Test both a single hot tenant and aggregate load from many tenants.
 
-## 19.1D Multi-region behavior: serving is not consistency
+### 19.1D Multi-region behavior: serving is not consistency
 
 Global routing directs clients to a region but does not decide which region owns a write or what a read must observe. A complete design states:
 - Data placement and authoritative ownership.
@@ -78,13 +78,13 @@ Global routing directs clients to a region but does not decide which region owns
 
 Active-active serving can still use a single writer for each key or partition. Multi-writer writes require a conflict model that preserves business invariants. Active-passive failover can lose recent acknowledged changes if replication is asynchronous and the acknowledgment contract permits it. These are protocol decisions, not consequences of the topology label.
 
-## 19.1E Cost and complexity as first-class design variables
+### 19.1E Cost and complexity as first-class design variables
 
 A useful cost model includes infrastructure, data transfer, storage and replication, managed-service operations, observability, backups, idle headroom, incident response, and engineering effort. Optimize for cost per successful useful operation rather than raw request count; rejected or incorrect requests are not useful throughput.
 
 Complexity creates indirect costs: more failure modes, more dashboards, more deployment coordination, more runbooks, and more expertise required during incidents. A managed service can reduce operational burden while increasing provider dependence. A custom service can improve control while creating an ongoing maintenance obligation.
 
-## 19.1F Architecture review through explicit evidence
+### 19.1F Architecture review through explicit evidence
 
 For every consequential decision, connect:
 - Requirement and business invariant.
