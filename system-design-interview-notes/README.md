@@ -40,6 +40,15 @@ Most topics use this structure, adapting it when a section would add no value:
 10. [Reliability and Resilience](chapters/10-reliability-and-resilience/README.md)
 11. [Security and Multi-Tenancy](chapters/11-security-and-multi-tenancy/README.md)
 12. [Observability and Design Trade-offs](chapters/12-observability-and-trade-offs/README.md)
+13. [Distributed Systems and Business Correctness](chapters/13-distributed-systems-and-correctness/README.md)
+14. [Networking, Request Routing, and Real-Time Systems](chapters/14-networking-and-real-time-systems/README.md)
+15. [Specialized Infrastructure: Search, Files, Analytics, and Coordination](chapters/15-specialized-infrastructure-and-search/README.md)
+16. [HLD Interview Method and Estimation Workshop](chapters/16-interview-method-and-estimation-workshop/README.md)
+17. [Senior Trade-offs and Case-Study Practice Path](chapters/17-senior-tradeoffs-and-case-study-path/README.md)
+
+## Case-study learning path
+
+Use the [curated case-study pathway in Chapter 17](chapters/17-senior-tradeoffs-and-case-study-path/README.md#173-curated-case-study-learning-path) alongside the canonical [45-case-study index](../real-world-examples/README.md). Attempt each design before reading the example; the notes teach the method while the examples remain the source for full walkthroughs.
 
 ## Supporting documents
 
@@ -53,4 +62,4 @@ This guide focuses on HLD fundamentals. Deep implementation tutorials, exhaustiv
 
 ## Status
 
-The initial twelve chapter drafts now exist. Focused technical and link reviews are still required before calling the guide complete. The existing `system-design-mastery/` folder is intentionally left unchanged.
+Seventeen chapters now form the learning path, including dedicated material on distributed correctness, networking and real-time flows, specialized infrastructure, interview execution, and senior trade-offs. Content expansion is not the same as complete verification: consult [PROGRESS.md](PROGRESS.md) for checks actually performed. The existing `system-design-mastery/`, `tutorials/`, and `real-world-examples/` content remains a separate resource.
