@@ -537,3 +537,23 @@ The current 20-chapter conceptual HLD textbook is **content-frozen for this phas
 
 ### Closure decision
 Treat this as **v1 content complete, technical acceptance provisional**. Keep the scope frozen. Reopen only for a concrete correctness defect, a broken navigation/validation issue, or a clearly missing prerequisite—not for general polishing. This records a bounded stopping point without misrepresenting unfinished verification as passed.
+
+## Finalization audit — 2026-10-28
+
+### Directory and canonical-file decision
+
+A fresh recursive Git tree inspection of the published repository head confirmed the textbook directory contains 28 Markdown files: the landing page, curriculum, roadmap, progress tracker, glossary, editorial standard, coverage audit, reference catalog, and exactly 20 chapter `README.md` pages. The only non-Markdown file in the directory is the existing artifact-validation script. No unexpected Markdown fragments, duplicate chapter pages, or additional planning files were present in the complete tree response.
+
+**Cleanup result: no files removed.** Each of the eight supporting Markdown files has a distinct role and is linked from the landing page or supports coverage/quality tracking. Removing any of them would reduce navigation or auditability rather than improve the structure. The separate `tutorials/` and `real-world-examples/` paths were not changed.
+
+### Acceptance remains evidence-based
+
+This tree audit establishes file organization only. It does not promote any curriculum family to Deep. The 20 chapters cover the required breadth, and prior focused corrections are recorded above, but the following are still open unless a later dated entry records actual evidence:
+
+- Independent mechanism-level acceptance of all 21 mandatory topic families, including examples, selection criteria, trade-offs and failure modes.
+- Exhaustive chapter-level claim-to-source alignment and external-link liveness, including Chapter 20-only references.
+- Full relative-link resolution after the latest edits.
+- Post-latest-edit CI execution for the embedded OpenAPI document and all Mermaid diagrams, plus human visual inspection of diagram readability.
+- Whole-book consistency and prerequisite review beyond the previously documented focused checks.
+
+Do not describe the textbook as fully technically validated until those checks pass. The content-frozen scope remains appropriate: fix concrete correctness, navigation or validation defects, but do not create more chapters or expand content merely to chase an unbounded completeness target.
