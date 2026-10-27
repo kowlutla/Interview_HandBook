@@ -453,3 +453,17 @@ This checkpoint separates checks supported by evidence from validation that coul
 - [ ] Full 21-family source/depth acceptance and exhaustive link/claim audit are not complete. Inventory statuses remain Developing/provisional.
 
 **Stopping rule:** Treat the textbook content as v1-complete for learning use, with technical acceptance explicitly provisional. Reopen only for a concrete defect or missing prerequisite. Interview Q&A and end-to-end case studies remain separate future phases.
+
+## Finalization audit — 2026-10-28
+
+A fresh recursive Git tree inspection was performed against the repository's published `main` head (commit `9d2a8dc3f7bf136a113a1517c24761fff8546f6c`). The tree response was complete (not truncated).
+
+- [x] Confirm the scope boundary: all changes for this work remain limited to `system-design-mastery/`; `tutorials/`, `real-world-examples/` and other root paths are outside the cleanup scope.
+- [x] Inventory all 52 entries under `system-design-mastery/`: 28 Markdown files (20 chapter `README.md` pages and eight intentional landing/planning/reference pages) plus the existing validation script.
+- [x] Review the complete Markdown path inventory for extra lesson fragments, duplicate chapter pages, empty-looking planning-file names, or misplaced Markdown files. No unexpected Markdown paths were found; **no Markdown deletion is justified** by the tree audit.
+- [x] Confirm that the chapter structure remains one canonical Markdown page per chapter and that the index lists Chapters 01–20.
+- [ ] Do not mark whole-book technical acceptance complete based on this structural inventory. The existing 21-family matrix remains Developing/provisional until every family passes its mechanism, example, selection, trade-off, failure-mode and source-alignment criteria.
+- [ ] Run post-edit validation after substantive chapter changes: the known successful Mermaid/OpenAPI workflow run predates later content edits and is historical evidence only.
+- [ ] Finish complete local-link resolution and claim-to-source review, including Chapter 20 and any chapter-only URLs. No exhaustive link-liveness or claim-by-claim source pass is claimed by this tree audit.
+
+**Decision:** the current file structure is already clean and appropriately consolidated. Preserve the eight support pages because they serve distinct navigation, learning-sequence, terminology, source, editorial, coverage, and status purposes. Do not delete files merely to reduce the count. The remaining work is verification and any concrete correctness corrections discovered by it—not further structural reorganization.
