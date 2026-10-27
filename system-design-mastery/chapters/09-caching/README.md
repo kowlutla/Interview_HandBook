@@ -42,9 +42,17 @@ Consider this race:
 3. The update invalidates the cache.
 4. Request A finishes late and populates version 10 after invalidation.
 
-The cache is now stale even though invalidation occurred. Possible defenses include version-aware writes, compare-and-set, ordered invalidation, short TTLs as a safety bound, or re-reading after a suspected race. The correct approach depends on the cache and source capabilities.
+The cache is now stale even though invalidation occurred. Possible defenses include version-aware writes, compare-and-set, ordered invalidation, or re-reading after a suspected race. A short TTL can limit how long an incorrectly repopulated value remains in the cache, but it does not guarantee a maximum age relative to the source update: the stale value's TTL may start after the update has already committed. Strict freshness requirements need a version/ordering protocol or an authoritative read. The correct approach depends on the cache and source capabilities.
 
-Event-driven invalidation introduces another delay and failure path: the source commits, but the invalidation event is delayed, duplicated, or lost. A durable event path and reconciliation process may be required when freshness matters.
+Event-driven invalidation introduces another delay and failure path: the source commits, but the invalidation event is delayed, duplicated, or lost. A durable event path and reconciliation process may be required when freshness matters. Consumers should tolerate duplicate events, detect gaps where possible, and apply versions monotonically so an older event cannot undo a newer cache state.
+
+### Cache-aside write ordering and read-after-write behavior
+
+Cache-aside is simple, but the order of a source write and cache invalidation matters. A common sequence is: commit the source-of-truth update, then invalidate the cache. Invalidating before the source commit can allow a concurrent reader to reload the old value and repopulate it. Even commit-then-invalidate has a window in which readers can see the old cached value, and an in-flight read can repopulate stale data after invalidation; use versioning or coordination when that window is not acceptable.
+
+For read-your-writes behavior, return the committed result to the writer and consider bypassing or version-checking the cache on subsequent reads. If reads go to a lagging replica, invalidating the cache and immediately reloading from that replica can still cache an older version. Use a primary/consistent read, a minimum-version token, or another source-specific mechanism when read-after-write consistency is required. Do not describe ordinary cache-aside as strongly consistent unless the complete write, invalidation, and read paths actually enforce that guarantee.
+
+Deletes need the same care. A delayed in-flight read can repopulate a deleted object; a versioned tombstone or generation check can prevent older values from being accepted. Ensure a recreated object cannot accidentally inherit stale negative-cache or old-generation entries.
 
 ### Stampede prevention and request coalescing
 
@@ -84,7 +92,7 @@ Protect the origin with concurrency limits, connection budgets, request coalesci
 
 Eviction decides which entries leave when capacity is exhausted; admission decides whether a new value should enter. LRU and LFU describe different replacement signals, but pure policies can be vulnerable to scans or changing popularity. Some systems use frequency estimates or admission filters to avoid polluting the cache with one-time reads.
 
-Cache sizing should account for metadata, object overhead, fragmentation, replication, and headroom. A high hit ratio is not automatically good if it hides expensive refreshes, stale results, or a small number of critical misses. Measure hit ratio alongside source load, miss latency, eviction rate, memory pressure, freshness violations, and tail latency.
+Cache sizing should account for metadata, object overhead, fragmentation, replication, and headroom. A high hit ratio is not automatically good if it hides expensive refreshes, stale results, or a small number of critical misses. Measure hit ratio alongside source load, miss latency, eviction rate, memory pressure, freshness violations, and tail latency. Segment these measurements by cache tier and important workload/data class; an aggregate metric can hide a failing tenant, hot key, or critical endpoint.
 
 ### Multi-level caches and invalidation topology
 
@@ -107,6 +115,7 @@ Consult [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html) for normative HT
 - Does the cache key include tenant and representation dimensions?
 - How are invalidation events delivered and repaired?
 - Can an old in-flight read repopulate stale data?
+- What read-after-write guarantee is required, and can a lagging replica refill the cache with an older version?
 - What happens during cache outage or cold start?
 - How are stampedes and hot keys controlled?
 - Are negative results safe to cache?
