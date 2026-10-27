@@ -74,7 +74,7 @@ A robust consumer makes repeated delivery safe. Common approaches include a stab
 
 Broker-level transactions can coordinate particular broker operations, such as consuming records and producing new records. They do not automatically include an external payment provider, email system, or arbitrary database transaction. Always name the boundary of an exactly-once claim.
 
-## 12.3A Kafka's exactly-once boundary
+### 12.3A Kafka's exactly-once boundary
 
 Kafka-specific delivery claims need to name both the producer/consumer settings and the boundary of the effect. Kafka provides an idempotent producer mode that uses producer identity and sequence information to suppress duplicate writes caused by producer retries within the protocol's supported scope. This does not mean an application can retry an entire business command indefinitely without creating a second logical event: the application still needs stable command/event identity and a policy for uncertain outcomes.
 
