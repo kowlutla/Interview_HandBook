@@ -111,3 +111,28 @@ When a single data node remains a real storage, throughput, or isolation bottlen
 ### Q3. What should a case-study answer include if time is limited?
 Prioritize requirements, a rough workload estimate, APIs/entities, architecture, one read and one write flow, the likely bottleneck, and one important failure/correctness path. Then state trade-offs and next steps. Do not spend the whole round drawing boxes or listing every possible component.
 
+## 17.5 Architecture evolution and migration safety
+
+A senior design should explain how the system can evolve without requiring a risky all-at-once rewrite. Prefer incremental changes with observable checkpoints and a rollback or recovery strategy.
+
+A common migration sequence is:
+1. **Establish the baseline:** record correctness checks, latency, throughput, error rate, cost, and operational failure modes.
+2. **Introduce the new path:** use a compatibility layer or an expand-and-contract schema change so old and new versions can coexist.
+3. **Backfill safely:** process existing data in bounded batches, throttle to protect production, and make the backfill restartable.
+4. **Compare results:** shadow reads or reconciliation can expose differences; shadow traffic must not repeat external side effects.
+5. **Shift traffic gradually:** use a canary or percentage rollout with explicit stop conditions.
+6. **Retire the old path:** remove it only after correctness, observability, rollback windows, and dependent consumers are verified.
+
+Dual writes are a common trap: writing to two independent stores does not make the writes atomic. If the process crashes between writes, the stores diverge. Prefer one authoritative write plus an outbox/CDC pipeline where suitable, or define a reconciliation protocol and be explicit about temporary inconsistency.
+
+### Scenario D: moving from one database to a sharded database
+
+Before sharding, confirm the actual bottleneck with query plans, index health, connection saturation, write contention, and storage limits. If the database is constrained by poor indexes or inefficient queries, sharding may multiply operational complexity without fixing the root cause. If partitioning is justified, choose the shard key from access patterns, define how cross-shard operations work, rehearse data movement, and make ownership transitions safe against concurrent writes.
+
+### Q4. When is a strangler migration safer than a rewrite?
+
+When the old system can continue serving some responsibilities while a new path is introduced incrementally. Route a narrow capability at a time, compare behavior, and retain a rollback option. It is not automatically easy: shared data ownership, duplicated business rules, and inconsistent old/new behavior must be controlled.
+
+### Q5. Why are shadow reads useful, and what must not be shadowed blindly?
+
+Shadow reads compare a candidate implementation with production behavior without making it authoritative. They can reveal query or semantic differences before traffic is switched. Shadowing must avoid leaking sensitive data and must not replay mutations, charge payments, send emails, or trigger other non-idempotent side effects.
