@@ -28,15 +28,13 @@ This is the basic read path. Concurrent misses, stale fills and invalidation rac
 
 ## 9.1 Cache correctness and mechanisms
 
-### 9.1 Cache correctness and mechanisms
-
-### 9.1A Cache correctness begins with a freshness contract
+### Cache correctness begins with a freshness contract
 
 A cache policy should state what freshness the consumer requires. Some data can be stale for minutes; other data, such as authorization decisions, account balances, or inventory reservations, may require stricter validation. A TTL of 30 seconds means an entry may be reused within a time policy; it does not mean it is guaranteed to be at most 30 seconds behind the source under every failure or clock condition.
 
 Define whether stale data is allowed during source outages, whether stale values can be served while revalidating, and whether cache bypass is safe. Cache keys must include all dimensions that affect the result, including tenant, locale, representation version, and authorization context where relevant. Omitting a dimension can leak data or return the wrong representation.
 
-### 9.1B Invalidation and stale-fill races
+### Invalidation and stale-fill races
 
 Consider this race:
 1. Request A reads version 10 from the source.
@@ -48,7 +46,7 @@ The cache is now stale even though invalidation occurred. Possible defenses incl
 
 Event-driven invalidation introduces another delay and failure path: the source commits, but the invalidation event is delayed, duplicated, or lost. A durable event path and reconciliation process may be required when freshness matters.
 
-### 9.1C Stampede prevention and request coalescing
+### Stampede prevention and request coalescing
 
 A stampede occurs when many requests miss the same key and independently load or compute the same value. Mitigations include:
 - **Single-flight/request coalescing:** one in-flight load serves multiple waiting callers.
@@ -60,7 +58,7 @@ A stampede occurs when many requests miss the same key and independently load or
 
 A lock or single-flight mechanism must handle loader failure and lock expiry. Do not let all waiting requests hold unbounded memory or wait beyond their deadline. Negative caching must be invalidated when a new resource is created and should not turn authorization failures into shared cached results.
 
-### 9.1C.1 Hot keys need a separate plan
+### Hot keys need a separate plan
 
 A hot key is one item or partition receiving a disproportionate share of traffic. A cache can have a healthy overall hit ratio and still overload one shard, one origin record, or one network path. Treat hot-key pressure as a distribution problem, not merely a cache-capacity problem.
 
@@ -76,25 +74,25 @@ For a hot write key, identify the invariant first. Options may include serializi
 
 A useful test deliberately drives one key far above the average distribution while keeping total traffic constant. Observe per-shard load, queue depth, p99 latency, source pressure and correctness under concurrent updates; an average hit ratio will not reveal the hotspot.
 
-### 9.1D Cache outage and origin protection
+### Cache outage and origin protection
 
 A cache outage can convert a large hit workload into a sudden source-of-truth workload. The source should have a defined safe fallback: bounded bypass, degraded reads, admission control, or rejection. Blindly sending all requests to the database can turn a cache incident into a database outage.
 
 Protect the origin with concurrency limits, connection budgets, request coalescing, rate limits, and gradual cache warm-up. During recovery, avoid loading the entire keyspace at once. A cache should not be treated as infinitely available or as free capacity.
 
-### 9.1E Eviction, admission, and workload pollution
+### Eviction, admission, and workload pollution
 
 Eviction decides which entries leave when capacity is exhausted; admission decides whether a new value should enter. LRU and LFU describe different replacement signals, but pure policies can be vulnerable to scans or changing popularity. Some systems use frequency estimates or admission filters to avoid polluting the cache with one-time reads.
 
 Cache sizing should account for metadata, object overhead, fragmentation, replication, and headroom. A high hit ratio is not automatically good if it hides expensive refreshes, stale results, or a small number of critical misses. Measure hit ratio alongside source load, miss latency, eviction rate, memory pressure, freshness violations, and tail latency.
 
-### 9.1F Multi-level caches and invalidation topology
+### Multi-level caches and invalidation topology
 
 A local cache in each process can provide very low latency but creates multiple independent copies. A distributed cache centralizes some state but adds a network hop and a shared failure domain. A CDN adds geographic locality but makes cache-key and invalidation semantics more complex.
 
 For every level, define who owns invalidation, how versions propagate, what happens when an invalidation message is missed, and whether lower levels can serve stale data. Cache coherence protocols can be expensive; many web systems instead accept bounded staleness and use TTLs plus explicit invalidation for critical updates.
 
-### 9.1G HTTP caching details
+### HTTP caching details
 
 HTTP caches consider method, status, freshness metadata, validators, and request/response directives. Cache-Control: no-store instructs caches not to store a response; no-cache generally means a stored response must be revalidated before reuse, not that it may never be stored. private restricts storage to private caches, while public can allow shared caching under applicable conditions.
 
@@ -102,7 +100,7 @@ Vary identifies request headers that affect the representation and therefore par
 
 Consult [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html) for normative HTTP caching behavior; do not infer security from a cache directive without reviewing the complete response and deployment.
 
-### 9.1H Cache design checklist
+### Cache design checklist
 
 - What is the source of truth?
 - What freshness and stale-serving contract is acceptable?
