@@ -10,7 +10,7 @@ Little's Law relates the average work in a stable system to its arrival rate and
 
 A queue can absorb a short burst, but it does not create processing capacity. If work arrives faster than it can be completed for a sustained period, the backlog grows until the system rejects work, runs out of resources, or violates its latency target. Use bounded queues, measure queue age as well as depth, and define what should be shed or delayed under overload. See [Workload Models and Capacity Reasoning](../03-workload-capacity/README.md) and [Scaling, Load Distribution, and Overload](../13-scaling-overload/README.md).
 
-### 19.1A Probabilistic structures: what the error means
+## 19.2 Probabilistic structures: what the error means
 
 A Bloom filter represents set membership compactly. Under its standard assumptions, a negative answer means the element is definitely absent from the represented set, while a positive answer means it may be present. False positives cause extra work; false negatives are not expected unless the filter is misused, corrupted, or updated under unsupported conditions.
 
@@ -45,7 +45,7 @@ This is a planning approximation, not a guarantee that a concrete implementation
 A standard Bloom filter does not support safe arbitrary deletion because clearing a bit may cause false negatives for another item that set the same bit. Counting Bloom filters or rebuilding are alternatives, each with additional memory or operational cost. Bloom filters should reduce expensive authoritative lookups, not replace the source of truth.
 
 
-### 19.1B Distributed scheduling and logical execution
+## 19.3 Distributed scheduling and logical execution
 
 Schedulers must define what happens when a job is delayed, missed, duplicated, retried, or running longer than its interval. A lease can coordinate ownership but does not alone prevent a stale worker from committing effects after lease expiry. Use idempotent effects, fencing/version checks, unique execution records, and explicit catch-up policy as appropriate.
 
@@ -56,7 +56,7 @@ Distinguish:
 
 A scheduler can guarantee a dispatch policy under its own assumptions, but exactly one business effect requires the effect boundary to participate in deduplication or idempotency.
 
-### 19.1C Multi-tenancy, fairness, and noisy neighbors
+## 19.4 Multi-tenancy, fairness, and noisy neighbors
 
 Tenant isolation is not just a security filter. Tenants compete for CPU, memory, threads, database connections, cache capacity, queue slots, storage I/O, and rate limits. A noisy tenant can degrade others without crossing a security boundary.
 
@@ -64,7 +64,7 @@ Fairness must be defined: equal request count, equal resource consumption, weigh
 
 Measure per-tenant demand using bounded labels or sampled logs rather than unbounded metrics that create cardinality explosions. Test both a single hot tenant and aggregate load from many tenants.
 
-### 19.1D Multi-region behavior: serving is not consistency
+## 19.5 Multi-region behavior: serving is not consistency
 
 Global routing directs clients to a region but does not decide which region owns a write or what a read must observe. A complete design states:
 - Data placement and authoritative ownership.
@@ -78,13 +78,13 @@ Global routing directs clients to a region but does not decide which region owns
 
 Active-active serving can still use a single writer for each key or partition. Multi-writer writes require a conflict model that preserves business invariants. Active-passive failover can lose recent acknowledged changes if replication is asynchronous and the acknowledgment contract permits it. These are protocol decisions, not consequences of the topology label.
 
-### 19.1E Cost and complexity as first-class design variables
+## 19.6 Cost and complexity as first-class design variables
 
 A useful cost model includes infrastructure, data transfer, storage and replication, managed-service operations, observability, backups, idle headroom, incident response, and engineering effort. Optimize for cost per successful useful operation rather than raw request count; rejected or incorrect requests are not useful throughput.
 
 Complexity creates indirect costs: more failure modes, more dashboards, more deployment coordination, more runbooks, and more expertise required during incidents. A managed service can reduce operational burden while increasing provider dependence. A custom service can improve control while creating an ongoing maintenance obligation.
 
-### 19.1F Architecture review through explicit evidence
+## 19.7 Architecture review through explicit evidence
 
 For every consequential decision, connect:
 - Requirement and business invariant.
@@ -99,7 +99,7 @@ Prefer a prototype or load/failure test when the decision depends on uncertain p
 
 
 
-## 19.2 Architecture pattern catalog: context and consequences
+## 19.8 Architecture pattern catalog: context and consequences
 
 A pattern is a reusable response to a recurring design problem. It is not a universally correct component. Before adopting a pattern, identify the force it addresses, the new failure modes it introduces, and the invariant it must preserve.
 
@@ -174,7 +174,7 @@ CQRS separates command and query models; event sourcing makes an event history a
 - Can a simpler design meet the requirement?
 - What is the migration and rollback path?
 
-## 19.3 Worked multi-tenant fairness scenario
+## 19.9 Worked multi-tenant fairness scenario
 
 Assume a shared API serves three tenants. Tenant A runs a bursty batch integration, while tenants B and C serve interactive users. The service has four replicas and a shared database. A single global request-rate limit may let A consume most of the budget; a separate per-process limit may accidentally multiply the intended tenant allowance by the replica count.
 
@@ -214,7 +214,7 @@ Run a representative baseline with all three tenants, then raise A's offered loa
 - [ ] Are noisy-neighbor tests run both in healthy topology and after replica/zone loss?
 - [ ] Are per-tenant metrics useful without creating unbounded metric cardinality?
 - [ ] Are security isolation and resource fairness tested as separate properties?
-## 19.4 Pattern interactions: combinations can amplify failure
+## 19.10 Pattern interactions: combinations can amplify failure
 
 Architecture patterns rarely operate alone. A retry policy changes the load seen by a circuit breaker; autoscaling changes the aggregate connection budget; caching changes freshness and authorization behavior; asynchronous replication changes disaster-recovery guarantees. Review the combined system rather than approving each pattern in isolation.
 
