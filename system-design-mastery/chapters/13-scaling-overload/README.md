@@ -7,6 +7,8 @@ Stateless application instances are easier to scale because any healthy instance
 
 ## 13.1 Scaling mechanisms and operating limits
 
+### 13.1 Scaling mechanisms and operating limits
+
 ### 13.1A Amdahl's law and the limits of parallelism
 
 If fraction p of a workload can be parallelized and fraction 1−p remains serial, an idealized speedup with N processors is:
