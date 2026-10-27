@@ -28,6 +28,21 @@ A consumer's committed offset records its progress through a partition. Be preci
 
 See the versioned [Kafka 4.3 design documentation](https://kafka.apache.org/43/design/design/) and [message delivery semantics](https://kafka.apache.org/43/design/design/#message-delivery-semantics) for Kafka-specific behavior; verify details against the broker and client versions actually deployed.
 
+### Producer acknowledgements, replication, and durability
+
+A successful producer send means only what the broker and producer configuration define. In Kafka, `acks=0` does not wait for a broker acknowledgement; `acks=1` waits for the leader to acknowledge the record; and `acks=all` waits for the current in-sync replica set to acknowledge it. For `acks=all`, `min.insync.replicas` can require a minimum number of in-sync replicas for the write to be accepted. If that minimum cannot be met, the write may fail rather than silently weakening the configured acknowledgement policy.
+
+These settings are not interchangeable with a blanket durability guarantee. The effective risk also depends on replication factor, in-sync replica health, leader-election policy, broker/storage behavior, producer retries and idempotence, and whether the application treats an ambiguous timeout as a possible successful append. Acknowledgement from the leader is not the same as every replica being current, and replication is not a backup against accidental deletion or application-level corruption.
+
+Idempotent producer support can suppress duplicate appends caused by supported producer retries, but it does not deduplicate two separately issued application commands that represent the same business operation. Use a stable operation/event identity when application retries must refer to the same logical action. Define how the producer recovers from a timeout where the append may have succeeded, and test broker failover while writes are in flight.
+
+### Dead-letter queues, ordering, and replay safety
+
+A dead-letter queue (DLQ) isolates records that cannot currently be processed, but moving a failed record aside can change observable ordering. If events for one aggregate must be applied in order, processing later events while an earlier event is quarantined may leave the aggregate in an invalid state. Decide whether to pause that partition/key, route later events to a holding area, or permit out-of-order progress under an explicit domain rule.
+
+A DLQ record should retain enough safe diagnostic context to investigate and replay it: original topic/queue, partition and offset or message ID, event type/schema version, failure category, attempt history, and relevant correlation identifiers. Avoid copying secrets or unnecessary personal data into the DLQ. Give the queue an owner, retention policy, alerting threshold and documented remediation process.
+
+Replay is a new execution attempt, not merely moving bytes back to the original queue. Confirm whether downstream effects already happened, preserve the original event identity when deduplicating the same logical event, and use a deliberate replay strategy that avoids overwhelming consumers or violating ordering. If a corrected event is a genuinely new business fact, assign a new identity and maintain a traceable relationship to the original. Test duplicate replay, partial prior success, poison records and per-key ordering.
 ### Consumer-group rebalances, lag and offset correctness
 
 A partitioned log assigns each partition to a consumer within a consumer group, so one partition is normally processed by only one active member of that group at a time. Membership changes, slow processing, session timeouts and deployments can trigger a rebalance. Rebalances are not merely a throughput event: they change which worker is allowed to advance progress for a partition and can expose duplicate work or stalled partitions if application processing is not designed for ownership changes.
@@ -74,7 +89,7 @@ A robust consumer makes repeated delivery safe. Common approaches include a stab
 
 Broker-level transactions can coordinate particular broker operations, such as consuming records and producing new records. They do not automatically include an external payment provider, email system, or arbitrary database transaction. Always name the boundary of an exactly-once claim.
 
-## 12.3A Kafka's exactly-once boundary
+### Kafka's exactly-once boundary
 
 Kafka-specific delivery claims need to name both the producer/consumer settings and the boundary of the effect. Kafka provides an idempotent producer mode that uses producer identity and sequence information to suppress duplicate writes caused by producer retries within the protocol's supported scope. This does not mean an application can retry an entire business command indefinitely without creating a second logical event: the application still needs stable command/event identity and a policy for uncertain outcomes.
 

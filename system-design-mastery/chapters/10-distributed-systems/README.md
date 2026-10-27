@@ -1,41 +1,59 @@
 # 10. Distribution, Failure, and Consistency
 
-## Distribution changes the failure model
+## 10.1 Distribution changes the failure model
 A remote call can be delayed, duplicated by retries, rejected, partially processed, or completed while its response is lost. A caller may not distinguish a slow process from a failed process. Failures are partial: one node can fail while others work, or a process can be alive but unable to reach its database. In asynchronous systems, delay alone cannot prove permanent failure.
 
 State the fault model: crash-stop processes, network loss/delay/partition, disk failure, correlated infrastructure failure, or Byzantine behavior. Most service designs assume non-Byzantine components but still need crash and communication failure handling.
 
-## 10.7 Failure models: crash, omission, partition, and Byzantine behavior
+## 10.2 Safety and liveness: what does “correct” mean?
+
+Distributed-system guarantees become clearer when separated into **safety** and **liveness**:
+
+- **Safety:** something bad never happens. Examples: two clients are never both granted the same unique seat; a stale leader never overwrites a newer owner's state; a committed transaction never disappears under the stated durability model.
+- **Liveness:** something good eventually happens. Examples: a valid request eventually completes; a queued job is eventually processed; a failed replica can eventually rejoin and catch up.
+
+Safety and liveness are different obligations. A system can preserve safety by refusing writes during a network partition, yet lose availability for those writes. A system can remain responsive by accepting conflicting writes on both sides of a partition, but then it cannot promise that every operation preserves a single globally linearizable history. A design must state which operations may wait, fail, or proceed under each failure condition.
+
+For example, suppose two regions can independently accept reservations for the last available seat. Both regions may respond quickly, satisfying a local notion of progress, while violating the global invariant. Preventing that violation requires an authority, coordination, preallocated capacity, or a business rule that makes concurrent allocation safe. Reconciliation after the fact cannot always restore an invariant whose violation has already caused an external side effect.
+
+When reviewing a guarantee, ask two questions separately:
+
+1. **Safety:** what must never happen, and which protocol or invariant enforcement prevents it even during retries, pauses, restarts, and partitions?
+2. **Liveness:** under which assumptions will the operation eventually complete, and what happens if those assumptions—such as quorum availability or dependency reachability—do not hold?
+
+Neither property should be asserted without its assumptions. “Eventually” requires conditions such as eventual network recovery, a functioning quorum, or a fair scheduler. “Never” depends on the modeled failures, durable state, and correctness of the enforcement mechanism. Tests can search for counterexamples, but passing tests alone do not prove a distributed protocol safe.
+
+## 10.3 Failure models: crash, omission, partition, and Byzantine behavior
 
 A distributed protocol should state which failures it tolerates. A **crash-stop** process halts and does not return. A **crash-recovery** process may restart with durable state. An **omission** failure drops a message or action. A **network partition** prevents some participants from communicating while other parts may continue. A **Byzantine** participant may send arbitrary or contradictory messages; most ordinary service architectures do not provide Byzantine fault tolerance and should not imply they do.
 
 The chosen model affects what guarantees are possible. A consensus protocol designed for crash failures does not automatically tolerate malicious nodes. Durable local state, message authentication, membership, quorum rules, and recovery behavior are part of the model.
 
-## 10.8 Failure detectors and suspicion
+## 10.4 Failure detectors and suspicion
 
 A timeout-based failure detector produces suspicion, not certainty. Short timeouts detect failures quickly but can falsely suspect slow or paused nodes; long timeouts reduce false suspicion but delay failover. Adaptive detectors can use observed latency, but still need safe protocol behavior when a suspicion is wrong.
 
 Heartbeats are useful signals but are not proof that the full request path is healthy. A process can send heartbeats while its database connection pool is exhausted. Separate process liveness, readiness to serve, and end-to-end synthetic checks according to the decision each signal drives.
 
-## 10.9 Happens-before and causal reasoning
+## 10.5 Happens-before and causal reasoning
 
 The happens-before relation captures causal order. It includes program order within one process and message send-before-receive relationships, then takes the transitive closure. If neither event happens before the other, they are concurrent in this model—even if their wall-clock timestamps differ.
 
 Lamport clocks preserve causal order but may order concurrent events arbitrarily. Vector clocks can represent more causal information but can grow with participants and are not a universal fit for large dynamic systems. Physical clocks with uncertainty bounds can support specialized ordering systems, but only when their synchronization assumptions and error bounds are part of the design.
 
-## 10.10 Consistency versus isolation
+## 10.6 Consistency versus isolation
 
 Consistency in distributed systems describes what values and operation order clients can observe across replicas. Database isolation describes how concurrent transactions interact relative to one another. The terms are related but not interchangeable.
 
 A linearizable key-value store can still be used incorrectly by an application that performs a read, makes a decision, and then issues an unrelated write without an atomic condition. Conversely, a transaction may have strong local isolation while reads from a lagging replica violate a client's read-your-writes expectation. State the operation boundary and invariant explicitly.
 
-## 10.11 Linearizability, sequential consistency, and serializability
+## 10.7 Linearizability, sequential consistency, and serializability
 
 Linearizability requires each operation to appear at one point between invocation and response, respecting real-time order. Sequential consistency requires a single total order consistent with each process's program order but need not respect real-time order between processes. Serializability requires a concurrent database transaction execution to be equivalent to some serial execution; it does not by itself require that serial order to respect real-time order.
 
 Strict serializability combines serializability with real-time order. These properties answer different questions: operation-level histories, process ordering, and transaction schedules. A system's guarantee must be named at the right level rather than summarized as strong.
 
-## 10.12 Read and session guarantees
+## 10.8 Read and session guarantees
 
 Applications may need narrower guarantees than global linearizability:
 - **Read-your-writes:** after a client successfully updates a value, its later reads see that update or a newer one.
@@ -45,25 +63,25 @@ Applications may need narrower guarantees than global linearizability:
 
 These guarantees can be implemented with session routing, version tokens, causal metadata, or waiting for replicas to catch up. They must specify scope and behavior when the necessary replica or metadata is unavailable.
 
-## 10.13 Quorums and their hidden assumptions
+## 10.9 Quorums and their hidden assumptions
 
 The familiar condition R + W > N gives read/write quorum intersection for a fixed set of N replicas under a simple counting model. It is not a complete consistency proof. The protocol also needs to determine which version is returned, how concurrent writes are ordered or merged, how replicas persist values, and how membership changes preserve safety.
 
 For example, a read quorum may intersect a write quorum at a replica that has not yet durably applied the newest version under the actual protocol. A stale leader may accept writes unless epochs and fencing prevent it. A configuration change can invalidate old quorum assumptions. Always reason from the full protocol and acknowledgment contract.
 
-## 10.14 CAP, PACELC, and per-operation policy
+## 10.10 CAP, PACELC, and per-operation policy
 
 During a partition, a service can reject or delay operations that require a single coherent history, or accept operations on separated sides and reconcile later. The latter behavior cannot guarantee linearizability for all those operations during the partition. In the formal CAP statement, availability means each request to a non-failing node receives a response; it does not guarantee that the response is fresh or useful for the business operation. Availability in the theorem is a formal response guarantee, not a promise of business usefulness.
 
 PACELC emphasizes the normal-operation trade-off between latency and consistency when no partition is occurring. Different endpoints may choose different policies: cached catalog reads can tolerate bounded staleness, while inventory reservation or financial transfers may require coordination. A product is not necessarily one uniform CAP category.
 
-## 10.15 Conflict resolution and CRDT limits
+## 10.11 Conflict resolution and CRDT limits
 
 Concurrent updates can be handled through serialization, application-specific conflict resolution, last-writer-wins, version metadata, or CRDTs. Each has a distinct contract. Last-writer-wins is deterministic only when its ordering and tie-breaking rules are defined; it may discard a legitimate domain update.
 
 CRDT convergence relies on the data type's algebra and delivery assumptions. Convergence does not guarantee that a business invariant holds at every point. If two regions independently allocate the last available seat, merging counters later cannot undo the oversell. The system must reserve capacity, coordinate the invariant, or define an acceptable conflict/compensation policy.
 
-## 10.16 Distributed design reasoning checklist
+## 10.12 Distributed design reasoning checklist
 
 - Which failure model is assumed?
 - What does the caller know after a timeout?
@@ -79,7 +97,7 @@ CRDT convergence relies on the data type's algebra and delivery assumptions. Con
 
 
 
-## 10.17 Multi-region systems: latency, consistency and failover
+## 10.13 Multi-region systems: latency, consistency and failover
 
 Multi-region architecture is not one design choice. A system may replicate data to another region for disaster recovery, serve read traffic from multiple regions, accept writes in one home region, or accept writes concurrently in several regions. Each model has different latency, conflict, failover and operational consequences.
 
@@ -122,7 +140,7 @@ Capacity must be planned for the surviving region to handle the required load. I
 
 
 
-## 10.18 Worked consistency timeline: write, timeout, and read
+## 10.14 Worked consistency timeline: write, timeout, and read
 
 Consider a client writing a new shipping address to a service that replicates data to another region. The client sends the write; the primary commits it; the response is lost; and the client times out. The client cannot infer whether the write committed from the timeout alone. Retrying with the same idempotency key can avoid creating a second logical operation, but the read behavior still depends on the system's consistency contract.
 

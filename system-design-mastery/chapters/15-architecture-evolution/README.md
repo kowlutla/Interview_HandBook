@@ -1,11 +1,11 @@
 # 15. Architectural Boundaries and Evolution
 
-## Boundaries around change and invariants
+## 15.1 Boundaries around change and invariants
 A module or service boundary should make responsibility, ownership and invariants clearer. Domain-driven design uses bounded contexts to identify where a model and its language are consistent. “Customer” can mean different things in identity, billing and support; forcing all domains to share one model may create coupling.
 
 Service boundaries should consider data ownership, transaction boundaries, team ownership, scaling profile, security, deployment cadence and failure containment. If two services constantly need synchronous round trips or distributed transactions to preserve one invariant, the boundary may be wrong or the workflow needs a different contract.
 
-## 15.1A Domain boundaries and bounded contexts
+### 15.1A Domain boundaries and bounded contexts
 
 A bounded context is a boundary within which a domain model and its language have a consistent meaning. The same word can represent different concepts in different contexts: a “customer” in billing may be the legal payer, while a “customer” in support may be the person contacting the help desk.
 
@@ -15,7 +15,7 @@ An **anti-corruption layer** translates between an external or legacy model and 
 
 Domain boundaries should be tested against real change and invariant patterns. A service boundary is not justified merely because a noun exists in the business domain; it should clarify ownership, change, or operational responsibility.
 
-## 15.1B Coupling dimensions
+### 15.1B Coupling dimensions
 
 Coupling is multidimensional:
 - **Code coupling:** direct dependency on classes, libraries, or internal implementation.
@@ -27,7 +27,7 @@ Coupling is multidimensional:
 
 A network boundary may reduce code and deployment coupling while increasing temporal and operational coupling. Asynchronous messaging can reduce temporal coupling but introduce schema, replay, ordering and eventual-consistency concerns. The goal is not to remove all coupling; it is to choose and manage the coupling that supports the system's goals.
 
-## 15.1C Modular monolith as an evolutionary strategy
+### 15.1C Modular monolith as an evolutionary strategy
 
 A modular monolith can enforce package/module boundaries, explicit interfaces, dependency direction and private data access while deploying as one unit. It retains in-process calls and often simpler transactions and local debugging.
 
@@ -41,7 +41,7 @@ Useful guardrails include:
 
 A modular monolith is not automatically well-modularized. It can still have a shared database with hidden coupling, cyclic dependencies and global mutable state. Architecture tests and code review can keep boundaries meaningful.
 
-## 15.1D Extracting a service safely
+### 15.1D Extracting a service safely
 
 Before extraction, identify the capability and its authoritative data. Then define an API or event contract, establish ownership, observe current usage, and plan migration and rollback.
 
@@ -56,19 +56,19 @@ A typical migration might:
 
 Dual writes are dangerous because one write can succeed while the other fails. If dual writes are unavoidable temporarily, track divergence, define repair, and make the migration window explicit. A strangler route is not sufficient without a data consistency strategy.
 
-## 15.1E Architecture Decision Records and reversibility
+### 15.1E Architecture Decision Records and reversibility
 
 An ADR records context, decision, alternatives, consequences, assumptions and revisit triggers. Decisions differ in reversibility. A library choice may be easy to change; a public API, data model, tenant boundary or globally distributed write protocol can be expensive to reverse after adoption.
 
 Prefer small experiments and reversible choices when uncertainty is high. Where an irreversible choice is necessary, invest more in evidence, failure analysis and review. Do not confuse “we can rewrite it later” with a real migration plan.
 
-## 15.1F Technical debt and evolutionary fitness
+### 15.1F Technical debt and evolutionary fitness
 
 Technical debt is a trade-off with future cost, not simply code that looks old. Track the debt's cause, impact, affected systems, risk, mitigation and trigger for repayment. Some debt is rational when a deadline or uncertainty makes a temporary solution valuable; unrecorded debt tends to become accidental architecture.
 
 Architecture fitness functions are repeatable checks that help preserve desired properties. Examples include tests that prevent dependency cycles, checks that forbid direct cross-module database access, latency budgets in performance tests, security policy checks, and restore drills. A fitness function should measure a meaningful property and avoid becoming a brittle proxy that teams optimize at the expense of the real goal.
 
-## 15.1G Control plane and data plane failure behavior
+### 15.1G Control plane and data plane failure behavior
 
 The data plane handles ordinary user traffic; the control plane configures or changes routing, scheduling, identity policy or other behavior. Ask what happens when the control plane is unavailable: do existing data-plane instances continue using last-known-good configuration, do certificates expire, can new workloads start, and can emergency changes be applied?
 
@@ -76,7 +76,7 @@ Keeping the data plane running during control-plane disruption improves resilien
 
 
 
-## 15.1H Service discovery and configuration are runtime dependencies
+### 15.1H Service discovery and configuration are runtime dependencies
 
 Service discovery answers how a caller finds a current instance or endpoint. Common approaches include DNS-based discovery, a platform-provided service name, a registry queried by clients, or a proxy/load balancer that performs discovery on behalf of callers. Each approach has different caching, health, propagation and failure semantics.
 
@@ -88,7 +88,7 @@ Do not treat configuration and secrets as interchangeable. Configuration may ide
 
 
 
-## 15.1I Architectural styles and when they fit
+### 15.1I Architectural styles and when they fit
 
 An architectural style organizes responsibilities, dependencies, communication and state ownership. A style is not a diagram to copy: the decision depends on invariants, change patterns, team structure, deployment requirements, workload shape and the operational capability available.
 
@@ -115,6 +115,32 @@ SOA groups capabilities behind service contracts and has historically included a
 Microservices can improve independent release, scaling and team autonomy when boundaries are stable. They also make network calls fallible, introduce contract evolution, distributed tracing, duplicated or replicated data, asynchronous consistency, deployment coordination, and higher operational cost. A service boundary is justified by an independent reason—such as ownership, scaling, security or change cadence—not merely because a noun exists in the domain.
 
 If two services frequently require synchronous round trips or distributed transactions to preserve one invariant, reconsider the boundary or explicitly model the workflow and its consistency contract.
+
+### Database-per-service and data ownership
+
+Database-per-service means each service owns its authoritative data and other services use its contract rather than directly reading or writing its tables. It does not require a separate database server for every service: separate schemas or logical databases can be a transitional deployment choice, provided ownership and access boundaries are enforced.
+
+The benefit is independent schema evolution and clearer responsibility. The cost is that cross-service queries, uniqueness constraints and multi-entity transactions can no longer rely on one local database transaction. Common responses include API composition, asynchronously maintained read models, or a workflow with explicit eventual-consistency and compensation semantics. Avoid creating a distributed join or synchronous fan-out for every screen without considering latency, partial failure and data freshness.
+
+If services share a physical database, document that as an operational compromise rather than claiming full isolation. Prevent direct cross-owner writes, define migration ownership, and plan how backups, restores, retention and tenant deletion cross service boundaries.
+
+### Sagas and transactional outbox as workflow building blocks
+
+A saga coordinates a business process across local transactions. Each step commits within its owning service; if a later step cannot complete, the workflow may run compensating actions. Compensation is a new business action, not a database rollback: a shipped item cannot be “unshipped,” and a refund may need its own accounting record. Define timeouts, retry limits, duplicate handling, terminal states, manual repair and reconciliation for steps whose outcome is uncertain.
+
+An orchestrated saga makes state transitions visible in a coordinator; a choreographed saga distributes them across event handlers. Either way, use stable workflow and command identifiers and make local effects idempotent. A transactional outbox records a domain change and its event in the same local transaction; a relay can publish duplicates, so consumers still need deduplication or idempotent effects. These patterns reduce dual-write risk but do not create a single atomic transaction across all services. See Chapter 11 for the detailed outbox/inbox and distributed-transaction mechanics.
+
+### Sidecars and service meshes
+
+A **sidecar** is a helper process or container deployed alongside an application instance to provide a capability such as proxying, telemetry or certificate handling. A **service mesh** commonly combines data-plane proxies with a control plane that distributes routing, identity and policy configuration. These mechanisms can standardize service-to-service encryption, identity, traffic policy and telemetry without embedding every feature in each application.
+
+They do not remove network failure or make retries automatically safe. Proxy retries can amplify load or repeat requests unless method semantics and idempotency are considered; timeouts and retry budgets must remain aligned with the end-to-end deadline. A mesh also adds resource overhead, configuration propagation and another operational dependency. Decide which features belong in application code, a shared library, a gateway or the mesh, and test behavior when the control plane is unavailable or policy is stale.
+
+### Multi-tenancy is an isolation and ownership decision
+
+A multi-tenant system must define which resources are shared and which boundaries isolate tenants: identity, data rows/schemas/databases, caches, queues, encryption keys, quotas, logs and administrative operations. Shared infrastructure can improve utilization and simplify operations, but increases the impact of authorization mistakes, noisy neighbors and tenant-specific data leaks. Dedicated resources can strengthen isolation but cost more and create more operational objects.
+
+Enforce tenant identity at trusted server-side boundaries; never rely on a client-supplied tenant identifier without authorization checks. Include tenant scope in data access and cache keys, apply per-tenant rate and resource limits, and ensure background jobs, exports, search indexes, analytics, backups and deletion workflows preserve the same boundary. Test cross-tenant access explicitly. Isolation is a system-wide invariant, not just a database-column convention.
 
 ### Event-driven architecture
 

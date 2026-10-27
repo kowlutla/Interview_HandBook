@@ -1,18 +1,18 @@
 # 11. Replication, Coordination, and Distributed Transactions
 
-## Leader election is not enough
+## 11.1 Leader election is not enough
 A leader coordinates writes or a replicated state machine. Election chooses a candidate, but the complete protocol must prevent stale leaders from committing conflicting state. A paused process may resume after its lease expired; believing it is leader does not make that belief valid.
 
 Consensus algorithms such as Raft and Paxos coordinate agreement despite specified failures. Guarantees depend on assumptions including non-Byzantine participants, durable state, quorum membership and correct implementation. Raft separates leader election, log replication and safety; it is not simply the node with the most votes. See [Raft resources](https://raft.github.io/).
 
 
-## 11.1A Replicated state machine model
+## 11.2 Replicated state machine model
 
 A common use of consensus is to replicate an ordered log of commands. If replicas apply the same deterministic commands in the same committed order from the same initial state, their state machines can converge to the same state. Consensus chooses which log entries are committed; application logic still must be deterministic and side effects must be handled carefully.
 
 A command may be appended to a leader's local log before it is committed. A client acknowledgment should reflect the protocol's commit rule, not merely local receipt. If a leader fails, a new leader must be elected according to rules that preserve committed entries. Acknowledging before the required replication point can lose data after failover.
 
-## 11.1B Raft at a conceptual level
+## 11.3 Raft at a conceptual level
 
 Raft divides the problem into leader election, log replication and safety:
 
@@ -26,7 +26,7 @@ Raft divides the problem into leader election, log replication and safety:
 
 A term acts as an epoch that helps distinguish stale leadership. Majority intersection is central to safety, but not the whole proof: voting restrictions, log freshness, commit rules and membership transitions are also necessary. The original Raft paper explains the complete algorithm and assumptions: [Ongaro and Ousterhout](https://web.stanford.edu/~ouster/cgi-bin/papers/raft-atc14.pdf).
 
-## 11.1C Paxos and consensus guarantees
+## 11.4 Paxos and consensus guarantees
 
 Paxos describes agreement through proposers, acceptors and learners, with phases that establish a proposal number and then attempt acceptance. Its safety depends on quorum intersection and rules requiring later proposers to preserve previously accepted values. Multi-Paxos amortizes leadership/phase work for a sequence of decisions.
 
@@ -47,7 +47,7 @@ flowchart TD
 
 Consensus algorithms differ in their exact rules, but the critical distinction is between receiving a command, replicating a log entry, committing it, applying it, and acknowledging the client. These are not interchangeable events.
 
-## 11.5A Consensus, replication, and transactions are different problems
+## 11.5 Consensus, replication, and transactions are different problems
 
 These concepts are related but should not be conflated:
 - **Replication** keeps copies of data or state on multiple nodes.
@@ -58,7 +58,7 @@ These concepts are related but should not be conflated:
 
 A replicated database may use consensus internally, but that does not mean a transaction spanning two independent databases is atomic. A saga can coordinate business steps without consensus over one global state. Select the mechanism based on the invariant that must be preserved.
 
-## 11.5B Quorums, terms, and epochs
+## 11.6 Quorums, terms, and epochs
 
 A quorum is a set of participants sufficient for a protocol decision. Majority quorums intersect in a fixed membership set, which helps prevent incompatible decisions from both being accepted. The protocol must also define what a vote means, which state is persisted before responding, how old terms are rejected, and how membership changes occur.
 
@@ -66,7 +66,7 @@ A **term** or **epoch** is a monotonically advancing generation used to distingu
 
 A lease based only on elapsed time has assumptions about clocks, pauses, and renewal. Fencing is stronger when the resource enforces it, because a stale process can resume after believing its lease is still valid.
 
-## 11.5C Failure recovery and durable protocol state
+## 11.7 Failure recovery and durable protocol state
 
 Consensus protocols rely on durable state such as terms, votes, and log entries. Restarting a node must not erase state whose persistence is required by the algorithm. Storage ordering and acknowledgement semantics are part of correctness, not merely performance tuning.
 
@@ -74,19 +74,19 @@ After restart, a node may need to recover its log, compare its state with peers,
 
 Operational procedures should never manually edit protocol metadata or independently promote a replica unless the system's documented recovery procedure explicitly supports it.
 
-## 11.5D Split brain, fencing, and failover
+## 11.8 Split brain, fencing, and failover
 
 Split brain means more than two processes both claiming to be leaders. The dangerous condition is that multiple authorities can accept incompatible writes to the same logical resource. A safe failover path must ensure that an old authority cannot continue committing after a new authority takes over.
 
 Useful safeguards include quorum-backed leadership, terms or epochs, storage-side fencing, single-writer routing, and explicit recovery of in-flight operations. DNS or load-balancer changes alone do not fence a stale writer; old connections and direct network paths may remain active.
 
-## 11.5E Two-phase commit details
+## 11.9 Two-phase commit details
 
 In a typical two-phase commit protocol, the coordinator asks each participant to prepare. A participant that votes yes promises it can later commit and durably records enough state to honor that promise. The coordinator durably records the final decision before informing participants. Participants may need to retain locks or prepared state while waiting for the decision.
 
 The difficult case is uncertainty: a prepared participant may not know whether the coordinator decided commit or abort. A timeout does not automatically make unilateral abort safe. Recovery depends on durable coordinator logs and a protocol for learning the decision. Two-phase commit can block under coordinator or network failures; it is not equivalent to a non-blocking saga.
 
-## 11.5F Saga design details
+## 11.10 Saga design details
 
 For every saga step, define:
 - The forward action and its durable state transition.
@@ -115,7 +115,14 @@ A saga is not equivalent to a global transaction: other requests may observe int
 
 At-least-once delivery can repeat a step. Store a message or operation identity with the business effect in the same transactional boundary, or use an equivalent durable protocol that closes the crash window. A broker's exactly-once feature applies only to its documented scope; it does not automatically make arbitrary database writes, emails, payments, or external API calls happen exactly once. Name the boundary and define reconciliation for uncertain outcomes.
 
-## 11.5G Distributed lock decision checklist
+### Transactional outbox and inbox
+
+A database update followed by a separate broker publish has a dual-write failure window: the database commit may succeed while publishing fails, or publishing may succeed before the process crashes and the database transaction rolls back. A transactional outbox closes the first atomicity gap by writing the business change and an event record in the same local database transaction. A relay publishes pending outbox records asynchronously; because a relay can crash after publishing but before marking a record sent, delivery is normally at least once and consumers must tolerate duplicates.
+
+An inbox or deduplication record lets a consumer recognize a repeated message. To prevent duplicate business effects, persist the message identity and apply the consumer's database mutation in the same transaction where possible. A unique constraint on the message ID can enforce deduplication under concurrency. If the effect is an external API call that cannot participate in that transaction, use the provider's idempotency mechanism when available and retain reconciliation for uncertain outcomes.
+
+Neither pattern makes the broker, database and arbitrary external side effects one global transaction. Define event identity, ordering requirements, retry and poison-message handling, outbox retention/cleanup, relay lag monitoring, and recovery after partial failure. The outbox guarantees that committed local state has a durable event to publish; it does not by itself guarantee immediate publication or exactly-once delivery.
+## 11.11 Distributed lock decision checklist
 
 Before introducing a distributed lock, ask:
 1. Is the lock protecting correctness or only avoiding duplicate effort?
@@ -128,11 +135,11 @@ Before introducing a distributed lock, ask:
 
 A lock adds a coordination dependency and can become a bottleneck. Prefer the simplest mechanism that preserves the invariant.
 
-## 11.5H Membership changes and quorum reasoning
+## 11.12 Membership changes and quorum reasoning
 
 A quorum intersection argument depends on the configured membership and protocol. Changing replica membership while writes are in flight can create configurations whose quorums do not intersect safely unless reconfiguration is part of the protocol. Do not treat “majority of current nodes” as a universal algorithm. Joint consensus or equivalent protocol rules are needed for safe transitions in systems that use them.
 
-## 11.5I Coordination review checklist
+## 11.13 Coordination review checklist
 
 - What exact state or decision must participants agree on?
 - What failures and timing assumptions does the protocol tolerate?
@@ -146,7 +153,7 @@ A quorum intersection argument depends on the configured membership and protocol
 - How is recovery tested under pauses, partitions, duplicate messages and restarts?
 
 
-## 11.6 Worked failure timeline: why a lease needs fencing
+## 11.14 Worked failure timeline: why a lease needs fencing
 
 Assume worker A acquires a lease to update a shared resource. A pauses for a long garbage-collection event or loses network connectivity. Its lease expires, worker B acquires a new lease, and then A resumes. A local belief that its lease is valid is not proof that it still owns the resource.
 

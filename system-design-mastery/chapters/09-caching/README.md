@@ -26,13 +26,15 @@ sequenceDiagram
 
 This is the basic read path. Concurrent misses, stale fills and invalidation races need the additional controls discussed below.
 
-## 9.1A Cache correctness begins with a freshness contract
+## 9.1 Cache correctness and mechanisms
+
+### Cache correctness begins with a freshness contract
 
 A cache policy should state what freshness the consumer requires. Some data can be stale for minutes; other data, such as authorization decisions, account balances, or inventory reservations, may require stricter validation. A TTL of 30 seconds means an entry may be reused within a time policy; it does not mean it is guaranteed to be at most 30 seconds behind the source under every failure or clock condition.
 
 Define whether stale data is allowed during source outages, whether stale values can be served while revalidating, and whether cache bypass is safe. Cache keys must include all dimensions that affect the result, including tenant, locale, representation version, and authorization context where relevant. Omitting a dimension can leak data or return the wrong representation.
 
-## 9.1B Invalidation and stale-fill races
+### Invalidation and stale-fill races
 
 Consider this race:
 1. Request A reads version 10 from the source.
@@ -40,11 +42,19 @@ Consider this race:
 3. The update invalidates the cache.
 4. Request A finishes late and populates version 10 after invalidation.
 
-The cache is now stale even though invalidation occurred. Possible defenses include version-aware writes, compare-and-set, ordered invalidation, short TTLs as a safety bound, or re-reading after a suspected race. The correct approach depends on the cache and source capabilities.
+The cache is now stale even though invalidation occurred. Possible defenses include version-aware writes, compare-and-set, ordered invalidation, or re-reading after a suspected race. A short TTL can limit how long an incorrectly repopulated value remains in the cache, but it does not guarantee a maximum age relative to the source update: the stale value's TTL may start after the update has already committed. Strict freshness requirements need a version/ordering protocol or an authoritative read. The correct approach depends on the cache and source capabilities.
 
-Event-driven invalidation introduces another delay and failure path: the source commits, but the invalidation event is delayed, duplicated, or lost. A durable event path and reconciliation process may be required when freshness matters.
+Event-driven invalidation introduces another delay and failure path: the source commits, but the invalidation event is delayed, duplicated, or lost. A durable event path and reconciliation process may be required when freshness matters. Consumers should tolerate duplicate events, detect gaps where possible, and apply versions monotonically so an older event cannot undo a newer cache state.
 
-## 9.1C Stampede prevention and request coalescing
+### Cache-aside write ordering and read-after-write behavior
+
+Cache-aside is simple, but the order of a source write and cache invalidation matters. A common sequence is: commit the source-of-truth update, then invalidate the cache. Invalidating before the source commit can allow a concurrent reader to reload the old value and repopulate it. Even commit-then-invalidate has a window in which readers can see the old cached value, and an in-flight read can repopulate stale data after invalidation; use versioning or coordination when that window is not acceptable.
+
+For read-your-writes behavior, return the committed result to the writer and consider bypassing or version-checking the cache on subsequent reads. If reads go to a lagging replica, invalidating the cache and immediately reloading from that replica can still cache an older version. Use a primary/consistent read, a minimum-version token, or another source-specific mechanism when read-after-write consistency is required. Do not describe ordinary cache-aside as strongly consistent unless the complete write, invalidation, and read paths actually enforce that guarantee.
+
+Deletes need the same care. A delayed in-flight read can repopulate a deleted object; a versioned tombstone or generation check can prevent older values from being accepted. Ensure a recreated object cannot accidentally inherit stale negative-cache or old-generation entries.
+
+### Stampede prevention and request coalescing
 
 A stampede occurs when many requests miss the same key and independently load or compute the same value. Mitigations include:
 - **Single-flight/request coalescing:** one in-flight load serves multiple waiting callers.
@@ -56,7 +66,7 @@ A stampede occurs when many requests miss the same key and independently load or
 
 A lock or single-flight mechanism must handle loader failure and lock expiry. Do not let all waiting requests hold unbounded memory or wait beyond their deadline. Negative caching must be invalidated when a new resource is created and should not turn authorization failures into shared cached results.
 
-## 9.1C.1 Hot keys need a separate plan
+### Hot keys need a separate plan
 
 A hot key is one item or partition receiving a disproportionate share of traffic. A cache can have a healthy overall hit ratio and still overload one shard, one origin record, or one network path. Treat hot-key pressure as a distribution problem, not merely a cache-capacity problem.
 
@@ -72,39 +82,53 @@ For a hot write key, identify the invariant first. Options may include serializi
 
 A useful test deliberately drives one key far above the average distribution while keeping total traffic constant. Observe per-shard load, queue depth, p99 latency, source pressure and correctness under concurrent updates; an average hit ratio will not reveal the hotspot.
 
-## 9.1D Cache outage and origin protection
+### Cache outage and origin protection
 
 A cache outage can convert a large hit workload into a sudden source-of-truth workload. The source should have a defined safe fallback: bounded bypass, degraded reads, admission control, or rejection. Blindly sending all requests to the database can turn a cache incident into a database outage.
 
 Protect the origin with concurrency limits, connection budgets, request coalescing, rate limits, and gradual cache warm-up. During recovery, avoid loading the entire keyspace at once. A cache should not be treated as infinitely available or as free capacity.
 
-## 9.1E Eviction, admission, and workload pollution
+### Eviction, admission, and workload pollution
 
 Eviction decides which entries leave when capacity is exhausted; admission decides whether a new value should enter. LRU and LFU describe different replacement signals, but pure policies can be vulnerable to scans or changing popularity. Some systems use frequency estimates or admission filters to avoid polluting the cache with one-time reads.
 
-Cache sizing should account for metadata, object overhead, fragmentation, replication, and headroom. A high hit ratio is not automatically good if it hides expensive refreshes, stale results, or a small number of critical misses. Measure hit ratio alongside source load, miss latency, eviction rate, memory pressure, freshness violations, and tail latency.
+Cache sizing should account for metadata, object overhead, fragmentation, replication, and headroom. A high hit ratio is not automatically good if it hides expensive refreshes, stale results, or a small number of critical misses. Measure hit ratio alongside source load, miss latency, eviction rate, memory pressure, freshness violations, and tail latency. Segment these measurements by cache tier and important workload/data class; an aggregate metric can hide a failing tenant, hot key, or critical endpoint.
 
-## 9.1F Multi-level caches and invalidation topology
+### Multi-level caches and invalidation topology
 
 A local cache in each process can provide very low latency but creates multiple independent copies. A distributed cache centralizes some state but adds a network hop and a shared failure domain. A CDN adds geographic locality but makes cache-key and invalidation semantics more complex.
 
 For every level, define who owns invalidation, how versions propagate, what happens when an invalidation message is missed, and whether lower levels can serve stale data. Cache coherence protocols can be expensive; many web systems instead accept bounded staleness and use TTLs plus explicit invalidation for critical updates.
 
-## 9.1G HTTP caching details
+### HTTP caching details
 
-HTTP caches consider method, status, freshness metadata, validators, and request/response directives. Cache-Control: no-store instructs caches not to store a response; no-cache generally means a stored response must be revalidated before reuse, not that it may never be stored. private restricts storage to private caches, while public can allow shared caching under applicable conditions.
+HTTP caches consider method, status, freshness metadata, validators, and request/response directives. Cache-Control: no-store instructs caches not to store a response; no-cache generally means a stored response must be revalidated before reuse, not that it may never be stored. private restricts storage to private caches, while public can allow shared caching under applicable conditions. Requests carrying an `Authorization` header have additional shared-cache restrictions: RFC 9111 generally requires an explicit response directive such as `public`, `s-maxage`, or `must-revalidate` before a shared cache may store the response. Do not treat a CDN override or a cache hit as a substitute for current authorization.
 
 Vary identifies request headers that affect the representation and therefore participate in the cache key. Incorrect use can fragment cache efficiency or, more seriously, serve the wrong representation. Authenticated responses need deliberate shared-cache policy. ETags and Last-Modified validators can support conditional revalidation without retransmitting unchanged bodies.
 
 Consult [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html) for normative HTTP caching behavior; do not infer security from a cache directive without reviewing the complete response and deployment.
 
-## 9.1H Cache design checklist
+### CDN and edge-cache behavior
+
+A CDN is a shared cache distributed across points of presence (PoPs). It can serve cacheable responses near users and reduce origin traffic, but the effective behavior depends on both HTTP semantics and provider configuration. Some deployments add an origin shield or regional cache between edge PoPs and the origin; this can reduce duplicate origin fetches but adds another cache layer whose freshness and failure behavior must be understood.
+
+For each cacheable route, document:
+- **Cache key:** which host, normalized path, query parameters, headers, cookies, and content-encoding dimensions participate. Ignore a dimension only when it cannot change the response; inconsistent normalization between edge and origin can create cache poisoning or representation leaks.
+- **TTL precedence:** how origin `Cache-Control`, shared-cache directives such as `s-maxage`, CDN minimum/default/maximum TTLs, and explicit edge rules interact. A provider override can change origin intent, so review the deployed rule rather than assuming the response header alone determines behavior.
+- **Personalization and authorization:** whether the response is public and representation-independent. Do not shared-cache user-specific or authorization-dependent content unless the key, policy and authorization checks make reuse safe.
+- **Invalidation:** whether purge targets one URL, a set of URLs, a surrogate key/tag, or a whole zone; whether the purge is synchronous or eventually propagated; and what happens when purge delivery fails. Provider APIs and propagation guarantees differ, so verify them against the chosen CDN's documentation.
+- **Failure and revalidation:** how the edge behaves on origin timeout, stale content, validator responses, shield failure and cold start. Stale serving is a policy decision, not automatically safe for every response.
+
+Example: a public product description may be cached at the edge for a bounded period and purged by a product tag after an update. A cart, account page or membership-dependent project response should not share that policy merely because it uses the same CDN. Test the deployed configuration with different query strings, locales, authorization states, purge failures and a stale origin response; inspect cache-status headers without treating them as proof of authorization.
+
+### Cache design checklist
 
 - What is the source of truth?
 - What freshness and stale-serving contract is acceptable?
 - Does the cache key include tenant and representation dimensions?
 - How are invalidation events delivered and repaired?
 - Can an old in-flight read repopulate stale data?
+- What read-after-write guarantee is required, and can a lagging replica refill the cache with an older version?
 - What happens during cache outage or cold start?
 - How are stampedes and hot keys controlled?
 - Are negative results safe to cache?
@@ -113,7 +137,7 @@ Consult [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html) for normative HT
 
 
 
-## 9.2 Cache patterns and failure modes in practice
+## 9.2 Cache access patterns and failure modes
 
 ### Read-through, write-through, write-behind and write-around
 
@@ -125,45 +149,13 @@ Consult [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html) for normative HT
 
 The correct pattern depends on whether the cache is disposable derived state or part of the acknowledged write path. Never assume a cache is durable because it replicates memory; define persistence and recovery guarantees explicitly.
 
-### Cache stampede, penetration and avalanche
+### Cache penetration and avalanche
 
-A **stampede** occurs when many callers load the same expired key simultaneously. Request coalescing, TTL jitter, refresh-ahead, bounded concurrency and stale-while-revalidate can help.
+**Cache penetration** occurs when repeated requests target keys that do not exist or bypass the cache, causing repeated origin work. Validate inputs, apply rate limits, and consider short-lived negative caching for confirmed absence. Negative entries must be invalidated when a resource is created; do not cache authorization failures as globally reusable absence.
 
-**Cache penetration** occurs when repeated requests target keys that do not exist or bypass the cache; negative caching, input validation and rate limits can reduce repeated origin work. Negative entries need short, appropriate lifetimes and must not cache authorization failures as globally reusable absence.
+A **cache avalanche** is a burst of misses caused by many entries expiring together or a cache restart. TTL jitter, gradual warm-up, admission controls, and origin protection reduce the risk. During a cache outage or cold start, use bounded fallback and concurrency limits rather than sending every request directly to the source.
 
-A **cache avalanche** is a burst of misses caused by many entries expiring together or a cache restart. TTL jitter, gradual warm-up, admission controls and origin protection reduce the risk. A cache outage can itself create a massive miss event, so the source must have a defined fallback rather than accepting unbounded traffic.
-
-### Cache invalidation is a consistency protocol
-
-When the source changes, the cache can be updated synchronously, invalidated by an event, or allowed to expire. Synchronous updates may add latency and partial-failure cases; event-driven invalidation introduces delivery delay, duplication and loss; TTL bounds some stale windows but may not satisfy strict correctness.
-
-An out-of-order event can invalidate or overwrite a newer value. Version-aware cache writes can reject older versions if the source provides comparable versions. For important data, define the maximum stale interval, event repair/reconciliation strategy, and behavior when freshness cannot be proven.
-
-### Cache correctness example: price and permissions
-
-A product description may tolerate a few seconds of staleness. A price used to display an estimate may tolerate bounded staleness if checkout revalidates it. A permission revocation often requires much faster enforcement because a stale allow decision can disclose data. These are different freshness contracts and should not share a cache policy just because they return JSON.
-
-Cache keys must include every dimension that changes the representation: tenant, locale, authorization scope, currency, feature version or request header as appropriate. Avoid caching a sensitive response under a key that omits the identity or authorization context. Cache invalidation must include CDN, local process, distributed cache and derived read-model layers where applicable.
-
-### Cache hit ratio is not the goal
-
-A high hit ratio can coexist with poor user latency if misses are extremely slow, hot keys are overloaded, or stale values cause repeated revalidation. Track hit/miss rate, miss latency, origin QPS, eviction, memory pressure, stampede suppression, refresh failures, stale-serving rate, and data-freshness violations. Measure latency at the user-visible boundary.
-
-### Cache review checklist
-
-- Is this cache disposable derived data or part of the durability path?
-- Which freshness contract applies to this data class?
-- What are the read/write patterns and invalidation path?
-- Can old in-flight reads repopulate stale values?
-- What happens when a key is absent or many keys expire together?
-- Are keys partitioned by tenant, authorization, locale and representation?
-- What happens to origin load during cache failure or cold start?
-- Does a high hit ratio hide tail latency or stale results?
-- Can deletion and revocation propagate to all cache layers?
-- Is there a repair path when invalidation messages are lost?
-
-
-
+For same-key concurrent misses, use request coalescing and the other stampede controls described in Section 9.1.
 ## 9.3 Cache security, tenant isolation and freshness strategies
 
 Caching changes where data is served from and which checks run on each request. A cache hit can bypass database work, but it must not bypass authorization, tenant isolation, privacy policy, or correctness checks that are required for the response. Cache correctness is therefore both a performance concern and a security boundary.
@@ -205,7 +197,7 @@ A related cache-deception problem occurs when an attacker tricks a cache into st
 
 A TTL defines when an entry becomes stale according to a particular cache's clock and policy; it does not guarantee immediate invalidation at the source. Freshness windows should be derived from the business meaning of the data. A product description may tolerate minutes of staleness; an authorization decision or account balance may require stronger controls or no shared caching.
 
-**Stale-while-revalidate** allows a cache to serve a stale response while refreshing it asynchronously for a bounded interval. This can reduce latency and origin load during refresh, but users may temporarily see old content. **Stale-if-error** can allow stale content to be served during an origin failure under a defined policy. Neither is universally safe: a stale public article differs from a revoked credential, current inventory count or permission check.
+**Stale-while-revalidate** allows a cache to serve a stale response while refreshing it asynchronously for a bounded interval. This can reduce latency and origin load during refresh, but users may temporarily see old content. **Stale-if-error** can allow stale content to be served during an origin failure under a defined policy. These are HTTP cache-control extensions described in [RFC 5861](https://www.rfc-editor.org/rfc/rfc5861.html), an Informational RFC rather than an Internet Standards Track specification; support and behavior should be verified for the cache implementation in use. Neither is universally safe: a stale public article differs from a revoked credential, current inventory count or permission check.
 
 Document:
 - Maximum permitted staleness by data class.
@@ -253,7 +245,8 @@ Record the cache key/policy decision, response status and cache status for each 
 
 
 ## Further reading
-- [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html).
+- [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html) — HTTP cache storage, reuse, freshness, validation and shared-cache rules.
+- [RFC 5861 — HTTP Cache-Control Extensions for Stale Content](https://www.rfc-editor.org/rfc/rfc5861.html) — `stale-while-revalidate` and `stale-if-error` (Informational RFC).
 - [Redis eviction documentation](https://redis.io/docs/latest/develop/reference/eviction/).
 - [AWS Caching Best Practices](https://aws.amazon.com/caching/best-practices/) — cacheability, TTLs and thundering-herd considerations.
 - [OWASP Web Cache Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Web_Cache_Security_Cheat_Sheet.html) — shared-cache risks, key design and tenant isolation.

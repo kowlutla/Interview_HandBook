@@ -1,9 +1,9 @@
 # 16. Security, Identity, and Privacy
 
-## Security is an architectural property
+## 16.1 Security is an architectural property
 Security controls should follow assets, actors, threats and trust boundaries. A threat model asks what must be protected, who might attack it, what capabilities they have, and what mitigations reduce likelihood or impact. It should be revisited as data flows, integrations and deployment topology change.
 
-## 16.1A Threat modeling as a repeatable design activity
+### 16.1A Threat modeling as a repeatable design activity
 
 Threat modeling is most useful before a design is fixed and whenever a major trust boundary or data flow changes. A practical workflow is:
 1. Identify assets, sensitive operations, actors, and data classifications.
@@ -15,7 +15,7 @@ Threat modeling is most useful before a design is fixed and whenever a major tru
 
 STRIDE is one common threat-categorization aid: spoofing, tampering, repudiation, information disclosure, denial of service, and elevation of privilege. It is a prompt list, not a guarantee that every threat has been found. Abuse cases and business-specific threats are also important.
 
-## 16.1B Identity lifecycle and credential validation
+### 16.1B Identity lifecycle and credential validation
 
 Identity and access management (IAM) governs human and workload identities, authenticators, entitlements, lifecycle, revocation and audit. Treat IAM and identity-provider services as dependencies with their own availability and recovery requirements. Identity is more than a token: consider enrollment, authentication, session refresh, privilege change, credential rotation, revocation, account recovery, and termination. A former employee or compromised service account must lose access through a defined revocation process.
 
@@ -23,19 +23,19 @@ For a signed JWT, validation generally includes signature verification using a t
 
 Access tokens should have appropriate audience and lifetime. Refresh tokens need stronger protection and rotation/reuse handling according to the identity system. Never place secrets or sensitive personal data in a token merely because it is signed; signed claims are often readable by token holders.
 
-## 16.1C Sessions, cookies, and browser threats
+### 16.1C Sessions, cookies, and browser threats
 
 Browser session design must consider theft, fixation, cross-site request forgery (CSRF), cross-site scripting (XSS), and logout/revocation. Secure cookie attributes such as HttpOnly, Secure, and an appropriate SameSite policy reduce specific risks but do not replace output encoding, CSRF controls where needed, or server-side authorization.
 
 A bearer token is usable by whoever possesses it. Keep it out of URLs, logs, analytics, crash reports, and browser storage choices that expose it to scripts where possible. The right design depends on application architecture and threat model; there is no single cookie or token storage strategy that is safe for every application.
 
-## 16.1D Authorization models and object-level checks
+### 16.1D Authorization models and object-level checks
 
 RBAC is useful when permissions map naturally to organizational roles. ABAC can express decisions based on subject, resource, action, and environmental attributes. ReBAC models authorization through relationships such as owner, member, manager, or collaborator. Systems may combine these models.
 
 The common failure is checking only whether a user has a broad role, without checking whether that user may access this specific object in this tenant or state. Enforce object-level authorization on every relevant operation, including list, search, export, background job, administrative API, and direct object-storage access. Deny by default and test negative cases explicitly.
 
-## 16.1E Secrets, keys, and cryptographic boundaries
+### 16.1E Secrets, keys, and cryptographic boundaries
 
 A secret manager reduces hard-coded secret exposure but does not eliminate access-control risk. Define which workload identity may retrieve each secret, how rotation propagates, how old and new credentials overlap, and how emergency revocation works.
 
@@ -43,7 +43,7 @@ Encryption at rest depends on key custody, permissions, backups, and rotation. E
 
 TLS certificate renewal, trust-root changes, signing-key rotation, and database credential rotation are production workflows. Test them before expiry rather than treating them as one-time configuration.
 
-## 16.1F Tenant isolation across layers
+### 16.1F Tenant isolation across layers
 
 Tenant isolation is an end-to-end invariant. A tenant boundary must be enforced consistently in:
 - API authorization and service-to-service calls.
@@ -56,7 +56,7 @@ Tenant isolation is an end-to-end invariant. A tenant boundary must be enforced 
 
 A tenant identifier supplied by a client is input, not proof of membership. Derive the authorized tenant scope from authenticated identity and policy, then apply it consistently. Test cross-tenant reads and writes using adversarial identifiers and alternate access paths.
 
-## 16.1G Privacy lifecycle and data minimization
+### 16.1G Privacy lifecycle and data minimization
 
 Privacy engineering starts with purpose and data inventory. For each field, document why it is collected, who can access it, where it is copied, how long it is retained, and how deletion or correction propagates.
 
@@ -64,7 +64,7 @@ Data minimization reduces both breach impact and operational complexity. Avoid c
 
 Deletion workflows must account for replicas, caches, derived indexes, event logs, analytics, exports, backups, and legal retention exceptions. Where immediate physical deletion from immutable backups is not feasible, document the policy, access restrictions, expiry timeline, and restoration-time deletion replay.
 
-## 16.1G1 Authorization caching, revocation, and stale privilege
+### 16.1H Authorization caching, revocation, and stale privilege
 
 Authorization decisions are often tempting to cache because policy evaluation or relationship lookup may be expensive. The cache is safe only when its key represents the full decision context and its staleness is acceptable for the operation. Depending on the policy model, relevant dimensions can include subject, action, resource, tenant, resource state, environment attributes, and a policy or relationship version. Omitting a dimension can turn a performance optimization into a cross-user or cross-tenant authorization bypass.
 
@@ -76,13 +76,13 @@ Keep response caching separate from decision caching. A cache hit must not bypas
 
 Test at least: role or membership removal, account disablement, tenant switch, policy-version change, invalidation loss/replay, cache outage, and requests through the actual CDN/proxy/application path. Record the expected maximum revocation delay and alert on violations. See OWASP's [Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) and [Web Cache Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Web_Cache_Security_Cheat_Sheet.html).
 
-## 16.1H Security logging and incident readiness
+### 16.1I Security logging and incident readiness
 
 Security logs should record principal, action, target, outcome, timestamp, correlation context, and policy decision where appropriate, while excluding passwords, access tokens, cryptographic keys, and unnecessary sensitive payloads. Logs need integrity protection, access control, retention, and time synchronization appropriate to the investigation.
 
 Design for credential compromise: revoke or rotate credentials, contain affected workloads, identify actions performed, preserve evidence, and restore trusted configuration. Detection without a practiced response path is incomplete protection.
 
-## 16.1I Security design review checklist
+### 16.1J Security design review checklist
 
 - What are the assets and trust boundaries?
 - Who authenticates each caller, and how are credentials revoked?
@@ -97,7 +97,7 @@ Design for credential compromise: revoke or rotate credentials, contain affected
 
 
 
-## 16.1J OAuth 2.0, OpenID Connect, and token roles in practice
+### 16.1K OAuth 2.0, OpenID Connect, and token roles in practice
 
 OAuth 2.0 is an authorization framework for delegated access. OpenID Connect (OIDC) adds an authentication layer with an ID token and standardized identity claims. JWT is a token representation that may be used for different purposes; a JWT is not automatically an OAuth access token or an OIDC ID token.
 
@@ -107,6 +107,8 @@ Keep the token roles separate:
 - **Refresh token:** used with the authorization server to obtain new tokens; protect it as a high-value credential and follow rotation/reuse detection rules supported by the provider.
 
 For browser-based and native public clients, Authorization Code with PKCE is the common modern pattern; the client must validate state and, in OIDC, nonce as appropriate to the flow. Client Credentials is for a confidential client acting as itself, not a substitute for end-user authentication. Avoid legacy flows unless a documented constraint requires them.
+
+An access token is not necessarily a JWT. It may be an opaque value whose meaning is resolved by the authorization server or an introspection endpoint. The resource server must follow the issuer's documented token profile: validate a signed token locally when that is the defined model, or use the defined introspection/validation mechanism for opaque tokens. Do not decode a token and treat its contents as trusted without verifying it, and do not assume that every token can be validated with a JWT library alone.
 
 Scopes are not a complete authorization decision. The resource server may still need object-level, tenant-level and relationship checks. Token validation also needs key rotation, trusted issuer metadata, algorithm allow-lists, clock-skew policy, and failure behavior when keys cannot be refreshed. Do not log raw tokens.
 

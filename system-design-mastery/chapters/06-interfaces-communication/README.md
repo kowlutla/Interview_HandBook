@@ -85,7 +85,7 @@ A method being idempotent does not mean every implementation is free from side e
 
 Use HTTP status codes consistently. Distinguish malformed input, unauthenticated requests, forbidden operations, missing resources, conflicts, failed preconditions, rate limiting, and server errors. Do not expose internal stack traces or secrets in error bodies. Error responses should be stable enough for clients to react without parsing human-readable text.
 
-## 6.10A Conditional requests and optimistic concurrency
+### 6.10A Conditional requests and optimistic concurrency
 
 HTTP conditional requests can prevent stale overwrites. An entity tag (ETag) can identify a representation version. A client may send an If-Match condition with the version it previously read; the server applies the update only if the current version matches, otherwise it returns a precondition failure.
 
@@ -93,7 +93,7 @@ This is an API-level form of optimistic concurrency control. The check and mutat
 
 Conditional GET requests using If-None-Match can avoid transferring an unchanged representation. Validators must represent the intended resource version and authorization scope; they are not authorization credentials.
 
-## 6.10B Pagination contracts and stable traversal
+### 6.10B Pagination contracts and stable traversal
 
 Offset pagination often uses LIMIT and OFFSET. Large offsets can require the engine to scan and discard many rows. Concurrent inserts or deletes can shift page boundaries, causing duplicates or omissions across requests.
 
@@ -101,7 +101,7 @@ Keyset pagination uses a stable sort key and a cursor representing the last obse
 
 Cursor pagination improves traversal under many workloads but does not automatically provide a consistent snapshot. If the product requires a snapshot across pages, the API needs a snapshot/version strategy or a documented weaker contract.
 
-## 6.10C API evolution and compatibility matrix
+### 6.10C API evolution and compatibility matrix
 
 Compatibility is directional:
 - A new consumer reading old producer data may fail if it assumes newly added fields always exist.
@@ -111,31 +111,31 @@ Compatibility is directional:
 
 Prefer additive changes with safe defaults, preserve existing meanings, and deploy tolerant readers before producers emit new forms. For event streams, consider retained historical messages as well as current traffic. For public APIs, document deprecation policy and use telemetry to determine whether old versions are still used.
 
-## 6.10D API security and resource governance
+### 6.10D API security and resource governance
 
 Authentication answers who is calling; authorization answers what the caller may do. Enforce object-level authorization for every resource identifier, not just at a list endpoint or UI. Validate input structure and semantics, constrain payload sizes and query complexity, and avoid reflecting untrusted content into logs or responses.
 
 Rate limits should be designed around identity and cost. A request count alone may not protect a GraphQL query that expands into hundreds of database operations. Use query depth/complexity limits, pagination caps, concurrency bounds, and per-tenant budgets where needed. Return a documented throttling response and, where appropriate, a retry hint without promising that every client should retry immediately.
 
-## 6.10E Choosing RPC, REST, GraphQL, and asynchronous commands
+### 6.10E Choosing RPC, REST, GraphQL, and asynchronous commands
 
 REST is often useful for durable resource-oriented contracts and broad client interoperability. RPC is useful for explicit operation contracts and typed internal communication. GraphQL can reduce over-fetching across related data but makes query-cost enforcement, caching, and field-level authorization more involved. Messaging is useful when completion can be delayed and producer availability should not be coupled to consumer availability.
 
 A common hybrid is an HTTP command endpoint that returns an operation identifier and an accepted status, with a status resource or event stream for completion. The contract must distinguish accepted for processing from completed successfully, define duplicate submissions, and explain how callers discover terminal failures.
 
-## 6.10F WebSockets, SSE, and reconnect correctness
+### 6.10F WebSockets, SSE, and reconnect correctness
 
 Long-lived connections introduce lifecycle concerns beyond message format. Clients disconnect, proxies time out idle connections, servers restart, and networks change. Define heartbeat behavior, reconnect backoff, authentication renewal, per-connection resource limits, and what happens to messages produced while a client is offline.
 
 Server-Sent Events can use event IDs and reconnection semantics, but the server needs a retention/replay strategy if clients must catch up. WebSockets provide bidirectional frames but do not automatically supply durable delivery, ordering across reconnects, or backpressure. If missing a message is unacceptable, pair the connection with a durable cursor or message history.
 
-## 6.10G End-to-end deadline budgeting
+### 6.10G End-to-end deadline budgeting
 
 A request deadline should cover queue wait, connection acquisition, processing, downstream calls, serialization, and response transit. If an upstream caller has 800 ms remaining, a downstream call cannot safely be given a fresh 800 ms budget after 500 ms has already elapsed.
 
 Propagate a deadline or remaining budget, reserve time for cleanup and response generation, and avoid retries that cannot finish before the deadline. Client cancellation may not cancel remote work already running, so servers should stop unnecessary work where cancellation is supported and preserve correctness if cancellation arrives after commit.
 
-## 6.10H Communication contract review checklist
+### 6.10H Communication contract review checklist
 
 - Is the response acceptance, completion, or a durable operation result?
 - Which methods and operations are safe or idempotent?
@@ -147,6 +147,15 @@ Propagate a deadline or remaining budget, reserve time for cleanup and response 
 - Are payload, query, concurrency, and tenant costs bounded?
 - Can streaming clients reconnect and recover missed events?
 - Are deadlines and retry budgets propagated end to end?
+
+
+### 6.10I Service discovery, circuit breakers, and bulkheads
+
+Service discovery lets a caller address a logical service name rather than hard-code a changing instance address. Discovery may be server-side (for example, a load balancer resolves or selects instances) or client-side (the caller queries a registry and selects an endpoint). DNS-based discovery is simple and widely supported; registry-based discovery can expose richer health and metadata, but introduces freshness and availability questions. Cached records can outlive an instance, so clients still need bounded connection and request timeouts, retry-safe behavior, and handling for stale endpoints. Readiness should mean an instance can accept the relevant traffic; graceful draining helps avoid routing new work to an instance that is shutting down. Discovery identifies a destination, not whether the caller is authorized to use it.
+
+A **circuit breaker** temporarily stops calls to a dependency that is repeatedly failing or timing out. A common state model is closed (calls flow and failures are measured), open (calls fail fast or use a defined fallback), and half-open (a limited number of probes test recovery). It limits wasted work and can prevent a failing dependency from consuming the caller's entire latency budget; it does not fix the dependency or replace timeouts. Tune thresholds and recovery probes to the workload, and do not treat every business error as evidence of dependency failure. A fallback is appropriate only when its stale or reduced result is acceptable for that operation.
+
+A **bulkhead** isolates resource pools or concurrency budgets so a slow dependency or noisy tenant cannot exhaust all request-handling capacity. Separate bounded pools, semaphores, per-route concurrency limits, and bounded queues are common implementations. Isolation improves fault containment but reserves capacity and can lower utilization if limits are poorly chosen. Monitor pool saturation, queue wait, rejected work, breaker transitions, timeout rates, and downstream latency. Coordinate these controls with retries: retries should be bounded, consume the same end-to-end deadline, and not repeatedly call a dependency while its breaker is open.
 
 
 
@@ -336,7 +345,7 @@ Safer sequence:
 
 ### Contract testing and rollout gates
 
-- The embedded OpenAPI 3.1 example in this chapter has passed `openapi-spec-validator` in CI run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824). Keep the specification under version control and rerun the validator after each contract change; generated-client compatibility and consumer/provider contract tests are separate checks.
+- The embedded OpenAPI 3.1 example passed `openapi-spec-validator` in historical CI run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824). The repository's GitHub Actions workflow has since been removed, so rerun the validator manually or through a separately configured check after contract changes. Schema validation does not replace generated-client compatibility or consumer/provider contract tests.
 - Compare proposed schemas against the supported compatibility policy; static schema checks cannot prove all runtime behavior.
 - Run provider tests for required fields, status codes, error bodies, pagination, authentication and documented side effects.
 - Run consumer contract tests for clients that depend on the response shape and semantics.

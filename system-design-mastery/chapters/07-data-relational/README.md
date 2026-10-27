@@ -5,19 +5,32 @@ A relational database is more than a place to store rows: its schema, constraint
 The sections below develop the main decisions in depth: modeling and constraints, concurrency and isolation, query plans, maintenance, replicas, migrations and sharding. The worked examples return to the same principle: correctness must hold under concurrent requests and operational change, not only in a single successful request.
 
 
-## 7.1A Functional dependencies and normalization reasoning
+## 7.1 Relational fundamentals
+
+### Functional dependencies and normalization reasoning
 
 A functional dependency X → Y means that, within the modeled relation, the value of X determines the value of Y. If employee_id determines employee_name, storing employee_name repeatedly on every assignment row may create update anomalies when the name changes. Normalization decomposes relations to reduce such anomalies while preserving the intended information and dependencies.
 
 Normalization is not an instruction to split every attribute into its own table. The model should represent domain facts and enforce meaningful constraints. Denormalization can be appropriate when it is deliberate, measured, and paired with a source of truth plus a strategy to update, invalidate, or reconcile copies.
 
-## 7.1B Constraints are concurrency controls for invariants
+### Constraints are concurrency controls for invariants
 
 Application validation alone is insufficient when multiple instances or alternate write paths can race. Suppose two requests both check that a username is unused and then insert it. Without a unique constraint, both may pass the check. The database constraint serializes the invariant at the authoritative boundary.
 
 Use primary keys, unique constraints, foreign keys, check constraints, and not-null constraints to express invariants where supported. Understand the engine's exact semantics: nullable unique columns, deferred constraints, collation, and partial indexes can affect behavior. A constraint failure is an expected concurrency outcome to handle, not necessarily an infrastructure failure.
 
-## 7.1C Isolation anomalies and practical consequences
+### ACID: what a transaction guarantees
+
+ACID summarizes four transaction properties, but the database engine and configuration determine their exact boundaries:
+
+- **Atomicity:** the transaction's changes commit as a unit or are rolled back as a unit. This does not automatically include side effects in an external service or message broker.
+- **Consistency:** a committed transaction preserves the database's declared constraints and application invariants that the transaction protocol actually enforces. ACID does not make an incorrect business rule correct.
+- **Isolation:** concurrent transactions are constrained according to the configured isolation semantics. Weaker levels may permit anomalies; stronger levels can add contention or aborts.
+- **Durability:** after a successful commit, changes survive the failures covered by the database's durability configuration. Acknowledgement policy, replication mode, storage guarantees and recovery configuration affect what failures are covered.
+
+A local database transaction cannot by itself make a database update and a remote HTTP call atomic. For cross-system workflows, use an explicit design such as a transactional outbox, idempotent consumer, or saga, and document the failure and reconciliation behavior.
+
+### Isolation anomalies and practical consequences
 
 - **Dirty read:** a transaction reads data another transaction has not committed.
 - **Non-repeatable read:** the same row read twice changes because another transaction committed an update.
@@ -29,7 +42,7 @@ Isolation-level names do not map identically to every database implementation. M
 
 Choose isolation based on invariants, not a generic preference for highest or lowest. If an invariant spans multiple rows, determine whether a constraint, explicit locking, serializable transaction, or redesigned data model is needed.
 
-## 7.1D Optimistic versus pessimistic concurrency
+### Optimistic versus pessimistic concurrency
 
 Pessimistic locking acquires locks before modifying contested state. It can prevent conflicting work but causes waits, deadlocks, and reduced concurrency. Optimistic concurrency reads a version and writes only if the version is unchanged; conflicts are detected and must be retried or surfaced.
 
@@ -37,13 +50,13 @@ A version update can be expressed conceptually as: update the row where id equal
 
 Retries should repeat the business decision from fresh state, not blindly repeat the same stale values. Some operations cannot be safely auto-retried because a conflict requires user or domain resolution.
 
-## 7.1E Transactions, locks, and deadlocks
+### Transactions, locks, and deadlocks
 
 A transaction should be as short as practical and should avoid network calls while holding database locks. Long transactions retain locks or old MVCC versions, consume connections, increase contention, and can delay vacuum or cleanup in some engines.
 
 A deadlock occurs when transactions form a wait cycle. Databases commonly detect a cycle and abort one participant. Applications need a bounded retry policy for recognized transient deadlock/serialization errors, with jitter where appropriate and an idempotent transaction boundary. Consistent lock ordering can reduce deadlock risk but does not eliminate all causes.
 
-## 7.1F Query planning, selectivity, and composite indexes
+### Query planning, selectivity, and composite indexes
 
 The optimizer estimates row counts and operator costs using statistics, then selects a plan. If data distribution is skewed or statistics are stale, estimated cardinalities can differ from reality and lead to poor join order, scans, or memory use.
 
@@ -51,37 +64,51 @@ A composite index can support queries that constrain a leading prefix and then o
 
 Use execution-plan tooling to compare estimated and actual rows, scan types, join algorithms, sort operations, and buffer/disk behavior. Do not assume an index is always faster: low-selectivity predicates or small tables may be cheaper to scan.
 
-## 7.1G Joins, pagination, and N+1 queries
+### Index structures and their trade-offs
+
+A **B-tree** is the general-purpose default in many relational engines. It supports equality and range predicates and can often provide ordered results. A **hash index** is primarily suited to equality lookup and does not provide range ordering; availability, durability and supported operations vary by engine. Some engines also provide specialized structures—for example, PostgreSQL offers GIN for values such as arrays or full-text search, GiST for extensible operator classes and spatial-style queries, and BRIN for large tables whose values correlate with physical row order.
+
+Choose an index from actual predicates, ordering, selectivity and engine support, then verify the plan. Every index consumes storage and adds work to inserts, updates and deletes; a wide composite index can also increase cache pressure. Index-only access depends on the engine and visibility/storage details, so the presence of all requested columns in an index does not guarantee that no table access will occur. Avoid creating indexes solely because a column appears in a WHERE clause—measure the workload and write cost.
+
+### Joins, pagination, and N+1 queries
 
 Joins express relationships in the query engine, but join cost depends on cardinality, indexes, join algorithm, memory, and data distribution. A nested-loop join may be excellent for a small outer input with indexed lookups and disastrous for a large one. Hash and merge joins have their own memory, sorting, and ordering trade-offs.
 
 An N+1 query pattern performs one query for a parent list and then one additional query per parent. ORM convenience can hide this behavior. Batching, joins, prefetching, or purpose-built read models can reduce round trips, but fetching everything in one huge join may multiply rows and memory use. Measure actual query count, payload, and execution plan.
 
-## 7.1H MVCC, vacuum, and storage maintenance
+### MVCC, vacuum, and storage maintenance
 
 Multi-version concurrency control (MVCC) lets transactions observe versions according to an isolation snapshot rather than requiring every reader to block every writer. Updates and deletes may leave old versions that cannot be reclaimed while active transactions still need them. Long-running transactions can therefore increase storage and maintenance pressure.
 
 The details differ by engine. PostgreSQL uses vacuum-related maintenance to reclaim or reuse space and maintain visibility information; other engines have different cleanup and compaction mechanisms. Operational health includes transaction age, dead tuples or equivalent version backlog, index bloat, checkpoint behavior, replication lag, and maintenance workload.
 
-## 7.1I Read replicas, lag, and read-your-writes
+### Read replicas, lag, and read-your-writes
 
 A replica may lag behind the primary because replication is asynchronous, apply is delayed, or the replica is under load. Routing a user immediately to a lagging replica after a successful write can violate read-your-writes expectations.
 
 Possible strategies include primary reads for a session, waiting until a replica reaches a required log position/version, sticky routing, or returning a version token that the read path can honor. Each has latency and availability costs. Read from a replica is a routing choice, not a consistency guarantee.
 
-## 7.1J Shard keys and distributed relational design
+### Shard keys and distributed relational design
 
 A shard key determines routing and often defines the unit of local transactions and queries. A good key supports dominant access patterns, distributes both data and work, and avoids hotspots. High cardinality alone is insufficient: a tenant key may have many possible values but one large tenant can dominate traffic.
 
 Cross-shard joins, uniqueness constraints, transactions, and rebalancing are harder because no single local index or transaction necessarily covers all participants. Application-level uniqueness may need a routing strategy or coordination service. Choose the shard key with data volume, request distribution, tenant isolation, and migration path in mind.
 
-## 7.1K Safe schema migration and backfill
+### Safe schema migration and backfill
 
 A rolling deployment means old and new application versions may access the database simultaneously. Use an expand-and-contract sequence: add compatible schema, deploy code that can handle old and new forms, backfill in bounded batches, verify, switch behavior, then remove obsolete structures only after old versions and consumers are gone.
 
 Backfills need throttling, progress checkpoints, idempotency, retry behavior, observability, and a pause/rollback plan. Large unbounded updates can cause lock contention, replication lag, transaction-log growth, or I/O saturation. A migration is a production workload and should be capacity-planned accordingly.
 
-## 7.1L Relational data review checklist
+### Backup, point-in-time recovery, and retention
+
+Replication is not a backup: an accidental delete, corrupt write or compromised credential may be replicated to every copy. A recovery plan should specify backup scope, retention, encryption and access control, plus the recovery point objective (how much recent data may be lost) and recovery time objective (how long restoration may take). Point-in-time recovery typically requires a usable base backup plus a continuous chain of transaction logs or equivalent recovery records; exact prerequisites depend on the engine.
+
+Test restores into an isolated environment and verify application-level consistency, permissions, schema compatibility and measured recovery time. A backup job reporting success is not proof that the data can be restored. For sharded systems, coordinate or explicitly reconcile restore points across shards when cross-shard invariants matter.
+
+Retention and deletion are also data-model and operational requirements. Define which records expire, whether legal holds or audit requirements apply, and how deletion propagates to replicas, caches, search indexes, exports and backups. Backup retention can mean deleted data remains recoverable until those backups expire; document that behavior instead of promising immediate erasure if the system cannot guarantee it.
+
+### Relational data review checklist
 
 - What are the domain invariants and which constraints enforce them?
 - What isolation anomalies could violate those invariants?
@@ -96,7 +123,7 @@ Backfills need throttling, progress checkpoints, idempotency, retry behavior, ob
 
 
 
-## Relational systems in practice: invariants, query paths, and migrations
+## 7.2 Relational systems in practice: invariants, query paths, and migrations
 
 ### Worked invariant: preventing overselling
 
@@ -112,7 +139,22 @@ A database connection pool bounds concurrent database work and reuses expensive 
 
 Set pool limits from database capacity, query cost, service concurrency and the total replica count. Observe acquisition wait separately from query execution latency. Use bounded acquisition timeouts and fail predictably rather than building an invisible unbounded queue in the application.
 
-## 7.2 Sharding and resharding: a worked design example
+## 7.3 Partitioning, sharding, and replication are different dimensions
+
+These terms are related, but they solve different problems:
+
+- **Partitioning** divides a logical dataset into subsets according to a rule. Depending on the database and its terminology, partitions may be stored and managed inside one database cluster or distributed across nodes.
+- **Sharding** is horizontal partitioning in which different subsets of the data are assigned to different shards, commonly to distribute storage, write throughput, or operational load across nodes. A shard may itself contain multiple tables or indexes.
+- **Replication** keeps additional copies of data. Replicas can improve read capacity or availability and support recovery, but they do not by themselves divide ownership of the write workload.
+- **Vertical partitioning** separates columns or groups of attributes, often to isolate access patterns or large fields; it is different from horizontal partitioning, which separates rows.
+
+A database can use partitioning, sharding, and replication together. For example, tenant-keyed shards may each have a primary and one or more replicas, while each shard's largest table is partitioned by time. Do not count those as interchangeable scaling mechanisms: table partitions on one host may help pruning and maintenance without increasing the host's CPU or network capacity, while replicas may increase read capacity but leave a single-writer bottleneck unchanged.
+
+The partition key determines where rows live and therefore affects both performance and correctness. A good key distributes expected load, supports important queries, and keeps common transactions local where possible. A poor key creates **skew** (uneven data distribution), **hot partitions** (a small subset receives disproportionate traffic), or expensive cross-shard operations. Adding more shards does not fix a hot key if all requests for that key still land on the same shard.
+
+Before choosing a strategy, answer four questions: what unit is assigned to a partition, how placement is determined, how queries find all relevant partitions, and how data moves when capacity or key distribution changes. Then plan for rebalancing, uniqueness constraints, cross-partition transactions, index locality, and failure recovery—not just the initial routing function.
+
+## 7.4 Sharding and resharding: a worked design example
 
 Sharding divides a dataset across multiple independently managed partitions. It can increase storage and write capacity, but adds routing, rebalancing, cross-shard query, transaction and operational complexity. Do not shard simply because the table is large; first establish which resource is constrained and whether indexing, query redesign, archiving, vertical capacity or read replicas can meet the requirement.
 
@@ -170,7 +212,7 @@ The hard part is not copying bytes; it is defining the source of truth while wri
 - Are backup, restore, monitoring and incident procedures shard-aware?
 - What evidence would justify adding another shard rather than optimizing the existing design?
 
-## 7.3 Worked concurrency lab: write skew and invariant protection
+## 7.5 Worked concurrency lab: write skew and invariant protection
 
 Consider an on-call rota with two doctors, Alice and Ben. The invariant is: **at least one doctor must remain on call**. Both rows initially have on_call = true. Two requests arrive concurrently, one asking Alice to go off call and the other asking Ben to go off call.
 
@@ -225,7 +267,7 @@ Do not blindly retry every database error. Constraint violations may represent a
 - [ ] Record serialization/deadlock retries, transaction duration, lock waits and invariant violations.
 - [ ] Repeat the test against the actual database engine and configured isolation level; do not infer behavior from the isolation-level name alone.
 
-## How a relational query travels
+## 7.6 How a relational query travels
 
 ```mermaid
 flowchart LR

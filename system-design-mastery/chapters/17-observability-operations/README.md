@@ -1,19 +1,19 @@
 # 17. Observability and Operating Production Systems
 
-## Signals and their roles
+## 17.1 Signals and their roles
 - **Logs** record discrete events with context.
 - **Metrics** aggregate numeric measurements over time.
 - **Traces** connect spans across a request or workflow.
 
 Structured logs make fields queryable. Correlation and trace IDs help connect events, but IDs should not contain secrets or unbounded user data. Context propagation must cross asynchronous boundaries and be handled safely at trust boundaries.
 
-## 17.1A Instrumentation boundaries and context propagation
+### 17.1A Instrumentation boundaries and context propagation
 
 Observability data should preserve enough context to connect an external request to its internal work without turning identifiers into high-cardinality metric labels. A trace context can flow through HTTP headers, message metadata, and asynchronous task boundaries. At trust boundaries, validate or replace untrusted context rather than blindly accepting arbitrary baggage.
 
 A trace ID correlates work; it is not an authentication credential. Do not use trace context to make authorization decisions. Background jobs and message consumers should link their processing to the originating operation where appropriate, while also representing long delays and retries accurately.
 
-## 17.1B Metrics: counters, gauges, histograms, and cardinality
+### 17.1B Metrics: counters, gauges, histograms, and cardinality
 
 - **Counter:** monotonically increasing event total, such as requests or failures.
 - **Gauge:** current value that can rise or fall, such as queue depth or active connections.
@@ -24,19 +24,19 @@ Use counters for rates after calculating deltas over time; do not interpret a pr
 
 Cardinality multiplies across labels. A metric with labels for tenant, user, URL, and request ID can create an unbounded series count. Keep labels bounded and use logs or traces for high-cardinality details with access and privacy controls.
 
-## 17.1C Histograms, percentiles, and tail interpretation
+### 17.1C Histograms, percentiles, and tail interpretation
 
 Percentiles depend on sample size, aggregation, time window, and bucket resolution. A p99 over ten requests is a weak indicator of rare tail behavior. Aggregating per-instance quantiles by arithmetic mean does not produce the fleet quantile. Use histograms or a suitable mergeable distribution.
 
 Latency should be measured at meaningful boundaries: client-visible end-to-end duration, service handler duration, queue wait, connection acquisition, and dependency duration answer different questions. Instrument retries separately so a successful final response does not conceal repeated failed attempts or excessive work.
 
-## 17.1D Logs and traces are evidence with limitations
+### 17.1D Logs and traces are evidence with limitations
 
 Structured logs should include stable event names and useful fields such as operation, result, dependency, duration, and correlation identifiers. Avoid logging secrets, full tokens, and unnecessary personal data. Sampling, buffering, and dropped telemetry mean absence of a log line is not proof that an event did not occur.
 
 A trace shows spans and causal relationships as instrumented, but instrumentation gaps, sampling, asynchronous work, and clock differences can complicate interpretation. A long span may include waiting rather than CPU execution. Correlate traces with resource metrics and application-level state transitions.
 
-## 17.1E SLOs, alerting, and burn rate
+### 17.1E SLOs, alerting, and burn rate
 
 An SLI needs an explicit good-event definition and eligible-event denominator. An SLO needs a target and window. Alerting should focus on user impact or rapid loss of error budget rather than every threshold crossing.
 
@@ -44,13 +44,13 @@ A burn rate compares the observed error rate with the allowed error rate implied
 
 A dashboard is not an alerting strategy. Each page should have an owner, an actionable next step, and enough context to assess impact. Alerts without a response path create noise rather than reliability.
 
-## 17.1F Capacity and saturation observability
+### 17.1F Capacity and saturation observability
 
 Monitor the constrained resource, not only CPU. Useful signals include queue depth and age, worker utilization, thread-pool rejection, connection acquisition latency, database lock waits, cache miss load, consumer lag, disk latency, network retransmissions, and rate-limit rejection.
 
 A growing queue can indicate the system is accepting more work than it can complete. Queue depth alone is insufficient if arrival rate is low; queue age and drain rate provide context. A system may have low CPU while waiting on exhausted connections or a slow dependency.
 
-## 17.1G Incident diagnosis and runbooks
+### 17.1G Incident diagnosis and runbooks
 
 For a significant or multi-team incident, establish explicit incident command rather than letting every responder coordinate informally. The incident commander tracks priorities and decisions; an operations lead coordinates technical mitigation; a communications lead keeps stakeholders informed; and a scribe records the timeline and decisions. One person may hold multiple roles for a small incident, but ownership and handoffs should remain clear. Separate coordination from hands-on debugging so the team retains a shared view of impact, risks and next actions.
 
@@ -66,7 +66,7 @@ A practical incident sequence is:
 
 Runbooks should state symptoms, safe checks, mitigation steps, expected signals, abort conditions, escalation paths, and verification criteria. Avoid blindly restarting components when doing so may destroy evidence, worsen a thundering herd, or interrupt recovery.
 
-## 17.1H Operational readiness checklist
+### 17.1H Operational readiness checklist
 
 - Service owner and escalation path are known.
 - SLIs/SLOs and error-budget policy are defined.
@@ -81,7 +81,7 @@ Runbooks should state symptoms, safe checks, mitigation steps, expected signals,
 
 
 
-## 17.1I RED and USE methods: choose signals by component
+### 17.1I RED and USE methods: choose signals by component
 
 The **RED method** is useful for request-driven services:
 - **Rate:** requests or operations per unit time.
@@ -99,7 +99,7 @@ Avoid dashboards that show only averages. Pair rates with p95/p99 duration, queu
 
 
 
-## 17.1J Synthetic checks, deployment markers and external perspective
+### 17.1J Synthetic checks, deployment markers and external perspective
 
 Metrics from inside a service can miss failures that occur before instrumentation starts or between the service and its users. **Synthetic checks** execute a small, controlled user journey from a known vantage point—for example, resolving the public hostname, establishing TLS, authenticating with a dedicated test identity, and reading a non-destructive health resource. Use synthetic checks to test the actual public path, but keep them bounded, isolated from real customer data, and safe to repeat.
 

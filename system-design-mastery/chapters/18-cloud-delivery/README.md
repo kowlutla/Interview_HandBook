@@ -1,23 +1,23 @@
 # 18. Cloud Infrastructure and Delivery
 
-## Cloud primitives
+## 18.1 Cloud primitives
 Cloud service models are commonly described as IaaS, PaaS and SaaS, but provider boundaries vary. Architecturally, systems still need compute, network, identity, storage, observability and recovery. Managed services transfer some operational responsibilities to a provider; they do not remove the need to understand quotas, failure behavior, backups, regional dependencies or cost.
 
 Regions and availability zones represent infrastructure failure domains, but their exact independence and connectivity are provider-specific. Deploying across zones helps only if traffic routing, state replication, capacity and failover behavior are designed accordingly.
 
-## 18.1A Cloud responsibility boundaries
+### 18.1A Cloud responsibility boundaries
 
 Cloud service models distribute operational responsibility differently, but responsibility is never simply “the provider handles everything.” Clarify who patches the guest OS or runtime, configures identity, rotates secrets, protects data, defines network rules, tests restore, monitors quotas, and responds to incidents.
 
 Managed databases may handle software patching and replication orchestration while leaving schema design, query performance, access policy, backup configuration, restore testing, and application-level correctness to the customer. Review the provider's shared-responsibility model and the exact service contract.
 
-## 18.1B Region, zone, and dependency topology
+### 18.1B Region, zone, and dependency topology
 
 A region is a geographic deployment area; zones are intended to provide some isolation within a region, but their exact architecture and failure independence are provider-specific. Multi-zone deployment helps only if the application, data layer, routing, capacity, identity, and operational procedures also tolerate a zone loss.
 
 Map dependencies by failure domain: compute, storage, control plane, DNS, identity, network, secrets, observability, and external SaaS providers. Two replicas may share one hidden dependency, such as a global identity service or one deployment pipeline. Redundancy should be evaluated against the actual outage being mitigated.
 
-## 18.1C Kubernetes controllers, probes, and resource behavior
+### 18.1C Kubernetes controllers, probes, and resource behavior
 
 Kubernetes controllers reconcile observed state toward desired state. Reconciliation is asynchronous: creating a Deployment does not mean all Pods are scheduled, started, ready, or able to serve production traffic.
 
@@ -31,19 +31,19 @@ A readiness check should reflect whether the instance can safely serve its role,
 
 CPU limits can cause throttling; memory-limit breaches may result in termination. Pod disruption budgets, topology spread, graceful termination, startup time, and capacity during node drain all affect availability. Kubernetes rescheduling is not instantaneous failover and does not replace application-level retries, idempotency, or state recovery.
 
-## 18.1D Containers, images, and supply chain
+### 18.1D Containers, images, and supply chain
 
 Containers share the host kernel in common implementations, so isolation depends on kernel features, runtime configuration, privileges, and host security. Use minimal trusted base images, pin and scan dependencies, avoid unnecessary capabilities, run as non-root where feasible, and keep secrets out of image layers.
 
 An image digest identifies artifact content more reliably than a mutable tag. A secure delivery pipeline should protect source control, build credentials, artifact registry, signing keys, deployment identity, and provenance. Build reproducibility and artifact signing can help establish what was deployed, but they do not prove the application logic is free of vulnerabilities.
 
-## 18.1E Infrastructure as code and state safety
+### 18.1E Infrastructure as code and state safety
 
 Infrastructure as code makes changes reviewable and repeatable, but state files can contain sensitive data and represent ownership of real resources. Protect state access, locking, backups, and recovery. Review plans for destructive replacement, dependency ordering, drift, and unintended exposure before applying changes.
 
 Separate reusable modules from environment-specific configuration without hiding important security or networking decisions. Use least-privilege identities for plan/apply workflows, protect production approvals, and test rollback or forward-fix procedures. A successful infrastructure deployment does not imply the application is healthy.
 
-## 18.1F Progressive delivery and data compatibility
+### 18.1F Progressive delivery and data compatibility
 
 Rolling, canary, and blue-green deployments each require old and new versions to coexist or a controlled switch between them. Database schema and event changes must remain compatible across this overlap.
 
@@ -61,13 +61,13 @@ A Kubernetes Deployment rollback is narrower than an application rollback: it re
 
 Feature flags can separate code deployment from feature exposure and allow a controlled rollout or rapid disablement. They also create a configuration and testing dimension: define an owner, intended lifetime, default/failure behavior, targeting rules, audit trail and removal date. A flag is not a substitute for backward-compatible data changes or safe authorization. Test both enabled and disabled paths, prevent client-controlled flags from granting privileges, and remove stale flags so temporary rollout logic does not become permanent complexity.
 
-## 18.1G Cost, quotas, and cloud failure modes
+### 18.1G Cost, quotas, and cloud failure modes
 
 Cloud cost includes idle reservations, cross-zone and cross-region transfer, managed requests, logs and traces, backup retention, replication, egress, support, and engineering operations. A chatty architecture may have modest compute use but high network or managed-service request charges.
 
 Quotas are capacity constraints and can cause partial outages when traffic grows or failover concentrates work. Understand per-region, per-account, per-service, and burst quotas. Design graceful behavior for quota exhaustion and request increases before a planned scale event. Autoscaling cannot exceed quotas or provision instantly during a sudden burst.
 
-## 18.1H Cloud delivery checklist
+### 18.1H Cloud delivery checklist
 
 - Failure domains and hidden shared dependencies are mapped.
 - IAM and deployment identities use least privilege.
@@ -82,7 +82,7 @@ Quotas are capacity constraints and can cause partial outages when traffic grows
 
 
 
-## 18.1I Cloud service models and placement trade-offs
+### 18.1I Cloud service models and placement trade-offs
 
 Cloud service models describe which layers the provider operates, but exact responsibility depends on the product:
 - **Infrastructure as a Service (IaaS):** the customer commonly manages guest operating systems, runtime, application and much of the network/security configuration, while the provider manages physical infrastructure and virtualization.
@@ -134,6 +134,8 @@ Pod disruption budgets can limit some voluntary disruptions but do not guarantee
 ### Configuration, secrets and delivery safety
 
 ConfigMaps and Secrets have different sensitivity expectations, but neither removes the need for access control and safe handling. Avoid putting secrets in images, logs or source control. Rotation must account for application reload behavior, connection reuse and overlap between old and new credentials.
+
+Kubernetes Secret values are base64-encoded in the API representation; base64 is not encryption. Protect access with least-privilege RBAC, configure encryption at rest for the cluster's backing store where supported, restrict who can create Pods that mount or expose secrets, and avoid printing secret values through environment dumps, debug endpoints or logs. Consider an external secret manager when it improves lifecycle and audit controls, but verify how credentials are fetched, cached, rotated and revoked at runtime. A secret reference or successful mount does not by itself guarantee that the application has reloaded the rotated value.
 
 Progressive delivery can use rolling updates, blue/green environments, or canary traffic. A safe rollback requires more than reverting an image: database changes, messages already emitted, external side effects and configuration may not be reversible. Prefer expand-and-contract schema changes and explicit rollback/forward-fix plans.
 
