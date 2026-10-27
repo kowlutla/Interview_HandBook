@@ -492,7 +492,7 @@ Structural corrections committed on this branch:
 - Chapter 07 now has sequential top-level sections 7.1–7.6; its relational fundamentals are nested under 7.1.
 - Chapter 10 now has sequential top-level sections 10.1–10.14.
 - Chapter 11 now has sequential top-level sections 11.1–11.14.
-- Lettered subsections in Chapters 08, 09, 13, 14, 15, 16, 17 and 18 are nested beneath explicit parent sections.
+- Lettered subsections in Chapters 08, 09, 13, 14, 15, 16, 17, 18 and 19 are nested beneath explicit parent sections.
 - The Chapter 16 authorization-cache subsection now uses 16.1H instead of the out-of-sequence 16.1G1 label.
 
 Technical status remains provisional: these changes improve navigation and address targeted fundamentals, but do not substitute for a complete claim-by-claim source audit and end-to-end semantic review of every chapter. Latest branch CI must be checked after these commits before final review readiness is claimed.
