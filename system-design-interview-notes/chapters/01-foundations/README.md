@@ -124,9 +124,9 @@ The example shows the method: requirements first, then the simplest architecture
 - [Google SRE Book: Embracing Risk](https://sre.google/sre-book/embracing-risk/)
 - [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html)
 
-## Interview workflow
+## Applying the workflow under a time budget
 
-Use this as a starting allocation for a 45-minute round, adjusting to the interviewer and problem:
+Use this as a starting allocation for a 45-minute design discussion, adjusting to the problem's complexity:
 
 ```mermaid
 flowchart TD
@@ -138,7 +138,7 @@ flowchart TD
     F --> G[42–45 min: trade-offs and summary]
 ```
 
-The important behavior is not the exact minute boundary. Keep the interviewer aligned, state assumptions, and spend the most time on the parts that change the design.
+The important behavior is not the exact minute boundary. Keep the reasoning clear, state assumptions, and spend the most time on the parts that change the design.
 
 ## Scenario analysis
 
