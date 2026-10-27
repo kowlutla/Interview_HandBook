@@ -21,7 +21,7 @@ The target is a compact set of connected notes, not a fixed chapter count. Merge
 | 13 | [Distributed Systems and Business Correctness](chapters/13-distributed-systems-and-correctness/README.md) | Reason about partial failure, CAP, quorums, delivery semantics, consensus, clocks, fencing, and business invariants. |
 | 14 | [Networking, Request Routing, and Real-Time Systems](chapters/14-networking-and-real-time-systems/README.md) | Trace requests through DNS, edge, proxies, application dependencies, and real-time transports. |
 | 15 | [Specialized Infrastructure](chapters/15-specialized-infrastructure-and-search/README.md) | Choose search, object storage, analytics, probabilistic structures, schedulers, CDC, and storage engines when justified. |
-| 16 | [Design Workflow and Estimation Workshop](chapters/16-interview-method-and-estimation-workshop/README.md) | Run a timed interview, estimate workload with units, and diagnose bottlenecks using observable signals. |
+| 16 | [Design Workflow and Estimation Workshop](chapters/16-interview-method-and-estimation-workshop/README.md) | Apply a structured design workflow, estimate workload with units, and diagnose bottlenecks using observable signals. |
 | 17 | [Senior Design Trade-offs and Case-Study Reference](chapters/17-senior-tradeoffs-and-case-study-path/README.md) | Defend conditional design choices, plan safe migrations, and practise canonical end-to-end problems. |
 
 ## Scope rules
