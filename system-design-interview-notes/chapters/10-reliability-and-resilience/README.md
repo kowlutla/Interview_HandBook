@@ -99,7 +99,7 @@ For each critical data set, state whether replication is synchronous or asynchro
 
 Failover must also prevent **split brain**: the old primary may still be alive but isolated. Use a clear authority/lease/epoch mechanism or provider-supported failover protocol so a stale region cannot continue making authoritative writes. DNS or load-balancer routing alone does not establish database ownership.
 
-A useful interview answer defines:
+A sound multi-region design defines:
 - RTO and RPO separately for each important workflow.
 - Which region is authoritative for each write and how ownership changes.
 - How secrets, keys, configuration, queues, identity, and third-party dependencies recover.
