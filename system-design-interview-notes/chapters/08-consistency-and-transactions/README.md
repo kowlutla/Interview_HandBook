@@ -86,7 +86,7 @@ sequenceDiagram
 
 ## Scenario analysis
 
-**Case:** Two users attempt to reserve the last seat at the same time. A cache shows one seat available to both users. How do you prevent overselling?
+**Case:** Two users attempt to reserve the last seat at the same time. A cache shows one seat available to both users, so the write path must enforce an atomic inventory invariant.
 
 **Reasoning:** Do not use a cached count as the authority for reservation. Use a conditional transactional update, row lock, or unique reservation constraint so only one operation can claim the final seat. The cache can display an approximate count, but the write path must enforce the invariant and return a clear conflict for the losing request.
 
