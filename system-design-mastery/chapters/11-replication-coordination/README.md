@@ -80,13 +80,13 @@ Split brain means more than two processes both claiming to be leaders. The dange
 
 Useful safeguards include quorum-backed leadership, terms or epochs, storage-side fencing, single-writer routing, and explicit recovery of in-flight operations. DNS or load-balancer changes alone do not fence a stale writer; old connections and direct network paths may remain active.
 
-## 11.5E Two-phase commit details
+## 11.9 Two-phase commit details
 
 In a typical two-phase commit protocol, the coordinator asks each participant to prepare. A participant that votes yes promises it can later commit and durably records enough state to honor that promise. The coordinator durably records the final decision before informing participants. Participants may need to retain locks or prepared state while waiting for the decision.
 
 The difficult case is uncertainty: a prepared participant may not know whether the coordinator decided commit or abort. A timeout does not automatically make unilateral abort safe. Recovery depends on durable coordinator logs and a protocol for learning the decision. Two-phase commit can block under coordinator or network failures; it is not equivalent to a non-blocking saga.
 
-## 11.5F Saga design details
+## 11.10 Saga design details
 
 For every saga step, define:
 - The forward action and its durable state transition.
