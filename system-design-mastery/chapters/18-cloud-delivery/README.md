@@ -135,6 +135,8 @@ Pod disruption budgets can limit some voluntary disruptions but do not guarantee
 
 ConfigMaps and Secrets have different sensitivity expectations, but neither removes the need for access control and safe handling. Avoid putting secrets in images, logs or source control. Rotation must account for application reload behavior, connection reuse and overlap between old and new credentials.
 
+Kubernetes Secret values are base64-encoded in the API representation; base64 is not encryption. Protect access with least-privilege RBAC, configure encryption at rest for the cluster's backing store where supported, restrict who can create Pods that mount or expose secrets, and avoid printing secret values through environment dumps, debug endpoints or logs. Consider an external secret manager when it improves lifecycle and audit controls, but verify how credentials are fetched, cached, rotated and revoked at runtime. A secret reference or successful mount does not by itself guarantee that the application has reloaded the rotated value.
+
 Progressive delivery can use rolling updates, blue/green environments, or canary traffic. A safe rollback requires more than reverting an image: database changes, messages already emitted, external side effects and configuration may not be reversible. Prefer expand-and-contract schema changes and explicit rollback/forward-fix plans.
 
 ### Kubernetes review checklist
