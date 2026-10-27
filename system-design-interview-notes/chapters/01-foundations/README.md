@@ -145,3 +145,38 @@ It is structured and collaborative. The candidate clarifies scope, makes assumpt
 
 - [Google SRE Book: Embracing Risk](https://sre.google/sre-book/embracing-risk/)
 - [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html)
+
+## Interview workflow
+
+Use this as a starting allocation for a 45-minute round, adjusting to the interviewer and problem:
+
+```mermaid
+flowchart TD
+    A[0–5 min: clarify scope and invariants] --> B[5–10 min: quality attributes and workload]
+    B --> C[10–15 min: APIs, entities, ownership]
+    C --> D[15–25 min: architecture and read/write flows]
+    D --> E[25–35 min: bottlenecks and scaling]
+    E --> F[35–42 min: failure, security, observability]
+    F --> G[42–45 min: trade-offs and summary]
+```
+
+The important behavior is not the exact minute boundary. Keep the interviewer aligned, state assumptions, and spend the most time on the parts that change the design.
+
+## Scenario practice
+
+**Scenario:** An interviewer asks you to design a photo-sharing service and immediately asks whether you would use Kafka, Redis, and microservices. What should you do first?
+
+**Reasoning:** Resist choosing technologies before defining user actions, traffic shape, privacy, upload size, feed freshness, and durability expectations. Sketch the smallest architecture that supports the agreed scope. Add a queue for a specific asynchronous need, a cache for a measured read path, and service boundaries only when ownership or independent scaling justifies them.
+
+## Interview questions
+
+### Q1. What makes a system design answer senior-level?
+It connects requirements to mechanisms and explains trade-offs, failure behavior, and operational evidence. Naming technologies is not enough; show why the component is needed and what guarantee it provides.
+
+### Q2. What do you do when requirements change?
+Restate the new constraint, identify which assumptions it invalidates, and update the smallest part of the design that no longer fits. Explain any new cost or guarantee that follows.
+
+## Further reading
+
+- [Google SRE Book: Service Level Objectives](https://sre.google/sre-book/service-level-objectives/) — connecting product expectations to measurable objectives.
+
