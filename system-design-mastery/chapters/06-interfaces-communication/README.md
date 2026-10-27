@@ -345,7 +345,7 @@ Safer sequence:
 
 ### Contract testing and rollout gates
 
-- The embedded OpenAPI 3.1 example in this chapter has passed `openapi-spec-validator` in CI run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824). Keep the specification under version control and rerun the validator after each contract change; generated-client compatibility and consumer/provider contract tests are separate checks.
+- The embedded OpenAPI 3.1 example passed `openapi-spec-validator` in historical CI run [40104445824](https://github.com/kowlutla/System-Design/actions/runs/40104445824). The repository's GitHub Actions workflow has since been removed, so rerun the validator manually or through a separately configured check after contract changes. Schema validation does not replace generated-client compatibility or consumer/provider contract tests.
 - Compare proposed schemas against the supported compatibility policy; static schema checks cannot prove all runtime behavior.
 - Run provider tests for required fields, status codes, error bodies, pagination, authentication and documented side effects.
 - Run consumer contract tests for clients that depend on the response shape and semantics.
