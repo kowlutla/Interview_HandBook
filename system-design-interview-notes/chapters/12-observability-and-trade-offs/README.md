@@ -68,3 +68,39 @@ It expresses how much unreliability is acceptable under an SLO. Teams can use it
 - Define user-centered SLIs and realistic SLOs.
 - Compare designs using requirements, benefits, costs, failure modes, and assumptions.
 - State what evidence would cause you to revisit an architectural choice.
+
+## Trace a slow request and connect SLOs to operations
+
+```mermaid
+flowchart LR
+    C[Client] --> G[Gateway span]
+    G --> A[Application span]
+    A --> K[Cache span]
+    A --> D[Database span]
+    A -. async publish .-> Q[Broker span]
+    Q -. consumer trace .-> W[Worker span]
+```
+
+Trace context should connect related spans across service boundaries where propagation is supported. Async work may continue after the initiating request ends, so link the consumer trace to the originating operation using correlation/event identifiers rather than pretending it is synchronous latency.
+
+An SLI is a measurement of user-relevant behavior, such as the fraction of valid requests completed successfully within a latency threshold. An SLO is the target for that SLI over a window. An SLA is an external commitment that may include consequences for missing the target. If an SLO permits 99.9% success over a 30-day window, the error budget is the remaining 0.1% of eligible events—not a general license to ignore incidents.
+
+## Scenario practice
+
+**Scenario:** Average latency remains 100 ms, but users report intermittent slowness and p99 rises from 300 ms to 2 seconds. What do you investigate?
+
+**Reasoning:** Segment latency by route, dependency, region, tenant, and request size. Inspect traces for slow spans, plus pool waits, queueing, retries, cache misses, and saturation. The average hides the tail. Use high-cardinality identifiers in logs/traces when appropriate, not as unrestricted metric labels.
+
+## Interview questions
+
+### Q1. What should you alert on?
+Alert on symptoms tied to user impact or an imminent SLO breach, such as elevated error rates, latency, and sustained saturation. Diagnostic metrics such as cache hit ratio or thread counts help explain the cause but may not need a page in isolation.
+
+### Q2. What is the difference between an SLI, SLO, and SLA?
+An SLI measures behavior; an SLO is an internal target for that measurement; an SLA is an agreement with users/customers and may define consequences. Keep the metric's population, time window, and success criteria explicit.
+
+## Further reading
+
+- [Google SRE Book: Monitoring Distributed Systems](https://sre.google/sre-book/monitoring-distributed-systems/)
+- [Google SRE Book: Service Level Objectives](https://sre.google/sre-book/service-level-objectives/)
+
