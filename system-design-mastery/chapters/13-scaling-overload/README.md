@@ -7,9 +7,7 @@ Stateless application instances are easier to scale because any healthy instance
 
 ## 13.1 Scaling mechanisms and operating limits
 
-### 13.1 Scaling mechanisms and operating limits
-
-### 13.1A Amdahl's law and the limits of parallelism
+### Amdahl's law and the limits of parallelism
 
 If fraction p of a workload can be parallelized and fraction 1−p remains serial, an idealized speedup with N processors is:
 
@@ -19,7 +17,7 @@ If 90% of a task is parallelizable and 10% is serial, infinite parallelism canno
 
 This explains why adding application replicas may not help when every request serializes on one database row, global lock, coordinator, or downstream API quota. Identify the serial or shared bottleneck before scaling out.
 
-### 13.1B Load balancing, health, and locality
+### Load balancing, health, and locality
 
 A load balancer chooses among candidate destinations using a policy such as round-robin, least connections, weighted routing, consistent hashing, or locality-aware selection. Each policy optimizes a different proxy for load. Least connections may be misleading when requests have very different costs; round-robin can distribute request counts evenly while CPU work is highly uneven.
 
@@ -27,13 +25,13 @@ Health checks have detection delay and can flap. A shallow process check may pas
 
 Locality-aware routing can reduce network latency and transfer costs but risks overloading a nearby zone while other capacity sits idle. Cross-zone failover should be included in capacity calculations, not treated as an unlimited escape path.
 
-### 13.1C Consistent hashing and virtual nodes
+### Consistent hashing and virtual nodes
 
 Consistent hashing maps keys and node identities into a circular or ordered hash space. A key is assigned according to a rule such as the next node clockwise. Adding or removing a node ideally remaps only a fraction of keys rather than reshuffling all keys.
 
 Virtual nodes give each physical node multiple positions in the hash space, improving distribution when node capacities differ. They do not solve workload skew: a single very popular key can still overload its owner. Rebalancing may require data transfer, cache warm-up, state migration and careful handling of requests during ownership changes.
 
-### 13.1D Rate limiting algorithms
+### Rate limiting algorithms
 
 Common algorithms have different burst behavior:
 - **Fixed window:** counts requests in fixed time buckets; traffic near a boundary can effectively double the allowed rate over a short interval.
@@ -44,7 +42,7 @@ Common algorithms have different burst behavior:
 
 A limit must define its key (user, tenant, API key, IP, resource), scope (instance or global), window, burst capacity, and rejection behavior. Per-instance limits multiply with instance count unless coordinated. A global distributed limiter adds coordination latency and can itself become a dependency.
 
-### 13.1E Retry storms and cascading failure
+### Retry storms and cascading failure
 
 A slow dependency causes timeouts; clients retry; retries increase load; increased load makes the dependency slower; more requests time out. This positive feedback loop can cascade across services.
 
@@ -60,7 +58,7 @@ Controls include:
 
 A circuit breaker does not fix a dependency or guarantee correctness. It is a local policy that can stop repeatedly spending resources on a failing path; half-open probes, reset behavior and fallback semantics must be designed.
 
-### 13.1F Autoscaling signal design
+### Autoscaling signal design
 
 CPU may be a poor autoscaling signal for a service waiting on database connections. Queue depth may be more useful for background workers, while request concurrency or latency may be useful for an API. Metrics should be causally related to the constrained resource and not so noisy that scaling oscillates.
 
@@ -68,7 +66,7 @@ Scaling delay includes metric collection, decision intervals, provisioning, imag
 
 A useful autoscaling design includes minimum and maximum bounds, cooldown or stabilization behavior, scale-in safety, dependency capacity, and a fallback when the platform cannot provision new instances.
 
-### 13.1G Capacity and overload review
+### Capacity and overload review
 
 Test at normal load, expected peak, burst, overload, dependency slowdown, instance loss, and recovery. Record throughput, p50/p95/p99 latency, errors, queue wait, backlog age, CPU, memory, network, connection waits and downstream saturation. A test that measures only successful requests can hide requests rejected or timed out during the run.
 
@@ -210,7 +208,7 @@ An initial policy could cap normal in-flight work below the observed knee (for e
 - [ ] Recalculate aggregate concurrency across all replicas.
 - [ ] Re-test during dependency degradation and after deployment/configuration changes.
 
-## Overload control should happen before queues explode
+## 13.5 Overload control should happen before queues explode
 
 ```mermaid
 flowchart TD
