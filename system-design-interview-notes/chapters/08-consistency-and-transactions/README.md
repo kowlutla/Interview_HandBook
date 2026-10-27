@@ -82,3 +82,45 @@ A saga is a distributed business workflow composed of local transactions with co
 - ACID depends on transaction scope, constraints, and isolation semantics.
 - Concurrency control prevents lost updates and invariant violations.
 - Sagas coordinate distributed workflows but are not equivalent to a global rollback.
+
+## Consistency is a user-visible contract
+
+A read-your-writes requirement is narrower than global linearizability. For example, after updating a profile, the same user's next read may need to show that update even if other users can temporarily observe older data. Possible mechanisms include routing that session to the leader, using a version token, or coordinating cache invalidation. Choose the least expensive mechanism that satisfies the actual contract.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API
+    participant P as Primary
+    participant R as Read replica
+    U->>API: Update setting
+    API->>P: Commit version 42
+    P-->>API: Commit acknowledged
+    API-->>U: Success
+    U->>API: Read setting
+    API->>R: Read request
+    R-->>API: Version 41 (lagging)
+    Note over API: Route to primary or wait for version 42
+    API->>P: Read at least version 42
+    P-->>API: Version 42
+    API-->>U: Updated setting
+```
+
+## Scenario practice
+
+**Scenario:** Two users attempt to reserve the last seat at the same time. A cache shows one seat available to both. How do you prevent overselling?
+
+**Reasoning:** Do not use a cached count as the authority for reservation. Use a conditional transactional update, row lock, or unique reservation constraint so only one operation can claim the final seat. The cache can display an approximate count, but the write path must enforce the invariant and return a clear conflict for the losing request.
+
+## Interview questions
+
+### Q1. Is eventual consistency always acceptable for read-heavy systems?
+No. Read-heavy describes load, not correctness. Eventual consistency is acceptable only where temporary divergence does not violate user expectations or business invariants. Account balances, inventory reservations, and authorization changes may require stronger guarantees at the authoritative boundary.
+
+### Q2. When would you use optimistic versus pessimistic concurrency?
+Optimistic concurrency is useful when conflicts are rare: read a version and update only if it has not changed, retrying or reporting conflict otherwise. Pessimistic locking can fit high-contention critical sections but holds locks and can reduce throughput or create deadlocks. The decision depends on contention and the cost of retrying.
+
+## Further reading
+
+- [PostgreSQL documentation: Transaction Isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — isolation behavior and anomalies.
+
