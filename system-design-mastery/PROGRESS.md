@@ -467,3 +467,10 @@ A fresh recursive Git tree inspection was performed against the repository's pub
 - [ ] Finish complete local-link resolution and claim-to-source review, including Chapter 20 and any chapter-only URLs. No exhaustive link-liveness or claim-by-claim source pass is claimed by this tree audit.
 
 **Decision:** the current file structure is already clean and appropriately consolidated. Preserve the eight support pages because they serve distinct navigation, learning-sequence, terminology, source, editorial, coverage, and status purposes. Do not delete files merely to reduce the count. The remaining work is verification and any concrete correctness corrections discovered by it—not further structural reorganization.
+
+## Targeted capacity-estimation correction — 2026-10-28
+
+A targeted read of Chapter 03 found that capacity estimation covered average/peak rates, storage, bandwidth and cache sizing, but did not explicitly connect DAU to backend request volume. Added a worked section that converts DAU × actions/user/day × requests/action into daily requests, active-period average RPS, assumed peak RPS, read/write rates, response bandwidth and retained raw storage. The example states its assumptions and distinguishes estimates from measured capacity. Arithmetic was checked: 60 million requests/day over 10 hours is about 1,667 RPS; a 3× peak is about 5,000 RPS; 12 KiB × 5,000 is about 59 MiB/s; and one million 2 KiB records/day is about 2 GiB/day before overhead.
+
+- [x] Add explicit DAU-to-RPS, fan-out, read/write split, bandwidth and retention calculations to Chapter 03.
+- [ ] Run the post-edit artifact validation workflow and check relative links after all changes.
