@@ -10,7 +10,8 @@ A software engineer preparing for HLD/System Design interviews who needs to unde
 - Prefer a short explanation plus a concrete example over a long list of facts.
 - Explain **why** a design choice works, not only what it is called.
 - Keep paragraphs focused; use tables to compare real alternatives, not to fragment prose.
-- Use diagrams sparingly and make arrows, actors, and data flow unambiguous.
+- Use diagrams where they explain a decision, request/data flow, state transition, or failure path; make arrows, actors, and data flow unambiguous.
+- Use Mermaid with concise labels. Read the prose and diagram together to check that the ordering and guarantees agree.
 - Include enough detail to understand mechanisms and trade-offs; avoid academic digressions and implementation trivia unless they change a design decision.
 - Distinguish universal principles from technology-specific behavior.
 - State assumptions in calculations and examples.
@@ -55,4 +56,5 @@ Answers should:
 - [ ] Important failure modes are included.
 - [ ] Interview answers are understandable without reading another long section.
 - [ ] No substantial duplication with other chapters.
-- [ ] Links and diagrams are valid.
+- [ ] Relative Markdown links resolve against the current repository tree.
+- [ ] Mermaid syntax is rendered and visually inspected when a renderer is available; manual inspection must not be reported as rendered validation.
