@@ -64,20 +64,9 @@ sequenceDiagram
     Note over B,DB: On reconnect, fetch messages after last durable cursor
 ```
 
-## 14.5 Networking questions
+## Scenario analysis
 
-### Q1. Why can adding application instances fail to improve latency?
-The bottleneck may be the database pool, a shared lock, a remote dependency, network bandwidth, or queueing at the load balancer. Measure the full request path and saturation signals before scaling a layer.
-
-### Q2. When would you choose SSE over WebSockets?
-Choose SSE when updates are primarily server-to-client and ordinary HTTP reconnection fits. Choose WebSockets when low-latency bidirectional communication is a real requirement. Do not choose persistent sockets just because the product has a live-looking UI.
-
-### Q3. What does a load balancer health check prove?
-Only that a particular check passed at that moment. A shallow process check may miss a saturated dependency; a deep check may mark every instance unhealthy during a shared dependency outage. Use checks that support safe routing, and distinguish liveness from readiness.
-
-## Scenario practice
-
-**Scenario:** A live chat service restarts and thousands of clients reconnect at once. How do you reduce the impact and avoid message loss?
+**Case:** A live chat service restarts and thousands of clients reconnect at once, creating a reconnect storm and risking delivery gaps.
 
 **Reasoning:** Apply exponential backoff with jitter, limit connection admission, and scale gateways based on connection count and message rate. Persist messages independently of sockets, publish through a durable stream when required, and resume from a durable cursor. Track reconnect rate, active connections, delivery lag, and per-tenant fan-out.
 
@@ -95,4 +84,3 @@ Only that a particular check passed at that moment. A shallow process check may 
 - [RFC 9000: QUIC Transport Protocol](https://www.rfc-editor.org/rfc/rfc9000) — transport behavior underlying HTTP/3.
 - [RFC 6455: The WebSocket Protocol](https://www.rfc-editor.org/rfc/rfc6455) — WebSocket framing and handshake.
 - [MDN: Server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) — browser-facing SSE behavior.
-
