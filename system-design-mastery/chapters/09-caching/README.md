@@ -28,6 +28,8 @@ This is the basic read path. Concurrent misses, stale fills and invalidation rac
 
 ## 9.1 Cache correctness and mechanisms
 
+### 9.1 Cache correctness and mechanisms
+
 ### 9.1A Cache correctness begins with a freshness contract
 
 A cache policy should state what freshness the consumer requires. Some data can be stale for minutes; other data, such as authorization decisions, account balances, or inventory reservations, may require stricter validation. A TTL of 30 seconds means an entry may be reused within a time policy; it does not mean it is guaranteed to be at most 30 seconds behind the source under every failure or clock condition.
