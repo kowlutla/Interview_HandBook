@@ -109,3 +109,33 @@ High availability reduces interruption from common failures, often within a regi
 - [Google SRE Book: Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) — overload, retries, and dependency protection.
 - [AWS Well-Architected Reliability Pillar](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html) — practical failure and recovery review guidance.
 
+## 10.8 Multi-region deployment and failover
+
+A multi-region design starts with a recovery objective and a data-ownership model—not with a decision to deploy every service everywhere.
+
+| Pattern | Strength | Main cost or risk |
+|---|---|---|
+| Backup and restore | Lowest steady-state complexity and cost | Recovery can be slow; restore procedures must be tested |
+| Pilot light | Critical data and minimal core services are ready | Capacity and dependencies still need scaling or activation |
+| Warm standby | A smaller secondary environment can take traffic relatively quickly | Ongoing cost and replication lag |
+| Active-passive | One region owns writes; another can take over | Failover coordination and fencing are essential |
+| Active-active | Regions serve traffic concurrently | Conflict resolution, global routing, and business invariants become harder |
+
+For each critical data set, state whether replication is synchronous or asynchronous, what acknowledged writes survive a regional loss, and who is allowed to accept writes after failover. Asynchronous replication can lose recent acknowledged writes if the primary region is lost before they replicate. Synchronous cross-region replication can increase write latency and may reduce write availability during a network partition.
+
+Failover must also prevent **split brain**: the old primary may still be alive but isolated. Use a clear authority/lease/epoch mechanism or provider-supported failover protocol so a stale region cannot continue making authoritative writes. DNS or load-balancer routing alone does not establish database ownership.
+
+A useful interview answer defines:
+- RTO and RPO separately for each important workflow.
+- Which region is authoritative for each write and how ownership changes.
+- How secrets, keys, configuration, queues, identity, and third-party dependencies recover.
+- How clients handle retries and ambiguous in-flight requests during failover.
+- How failback, reconciliation, and restore testing work.
+
+### Scenario: the primary region is unavailable
+
+A payment service has a warm standby region and asynchronous database replication. The primary region disappears immediately after acknowledging a payment write. Do not claim that promoting the standby guarantees the latest payment is present. First establish the actual replication position and promotion guarantees, prevent the old primary from accepting writes if it returns, and reconcile uncertain operations with the payment provider or ledger before retrying side effects. The RPO determines whether some acknowledged data loss is acceptable; for financial invariants, the system may need a stronger commit/replication design instead.
+
+### Q5. Does active-active automatically improve availability?
+
+No. It can serve traffic during some regional failures, but shared identity, global dependencies, network partitions, or conflicting writes can still fail the system. Active-active is simplest for stateless or naturally partitioned workloads. For mutable business data, define conflict semantics and write authority before claiming independent regional availability.
