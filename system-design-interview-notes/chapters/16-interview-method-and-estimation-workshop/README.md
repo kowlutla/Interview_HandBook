@@ -1,10 +1,10 @@
-# 16. HLD Interview Method and Estimation Workshop
+# 16. HLD Design Workflow and Estimation Workshop
 
-A strong interview is a sequence of explicit decisions, not a race to draw boxes. Keep the interviewer aligned by stating assumptions, connecting components to requirements, and explaining what changes when a constraint changes.
+A strong design process is a sequence of explicit decisions, not a race to draw boxes. Make the reasoning clear by stating assumptions, connecting components to requirements, and explaining what changes when a constraint changes.
 
 ## 16.1 A practical 45-minute workflow
 
-Treat this as a guide; follow the interviewer's pacing and spend more time where the problem demands it.
+Use this workflow flexibly, spending more time on the parts that materially affect the design.
 
 ```mermaid
 flowchart TD
@@ -103,7 +103,7 @@ flowchart TD
 - [ ] State scope and assumptions.
 - [ ] Separate functional requirements from quality attributes.
 - [ ] Identify invariants and unacceptable outcomes.
-- [ ] Ask only clarifying questions that can change the design.
+- [ ] Clarify only requirements that can change the design.
 
 **Middle**
 - [ ] Estimate the workload that affects architecture.
@@ -118,17 +118,6 @@ flowchart TD
 - [ ] Mention security, observability, and operational signals.
 - [ ] Name the next scaling step and the evidence that would trigger it.
 
-## Interview questions
-
-### Q1. What do you do if the interviewer changes the requirement halfway through?
-Restate the new requirement and identify which earlier assumptions it invalidates. Preserve the parts of the design that still fit, then adjust the smallest set of components or guarantees. For example, requiring read-your-writes may change read routing or session consistency without requiring a complete redesign.
-
-### Q2. How do you avoid overengineering?
-Start with requirements and workload, then add components only to solve identified constraints. State what the simpler design cannot handle and the measurable signal that would justify evolution. A modular monolith with a relational database may be more defensible than premature microservices and sharding.
-
-### Q3. What makes an estimate useful if it is imprecise?
-It narrows the order of magnitude and exposes the assumptions that drive the architecture. Correct units and a transparent range are more valuable than an unsupported exact server count.
-
 ## Quick revision
 
 Clarify → quantify → define ownership → draw → walk flows → find bottlenecks → handle failures → explain trade-offs. State assumptions aloud. A queue buffers bursts, a replica copies data, a shard distributes ownership, and a cache stores a copy—none is a universal scaling fix.
@@ -137,4 +126,3 @@ Clarify → quantify → define ownership → draw → walk flows → find bottl
 
 - [Google SRE Book: Service Level Objectives](https://sre.google/sre-book/service-level-objectives/) — connecting user expectations to measurable reliability targets.
 - [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) — a provider's architecture review framework; use it as guidance, not as a universal prescription.
-
