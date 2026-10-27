@@ -116,6 +116,32 @@ Microservices can improve independent release, scaling and team autonomy when bo
 
 If two services frequently require synchronous round trips or distributed transactions to preserve one invariant, reconsider the boundary or explicitly model the workflow and its consistency contract.
 
+### Database-per-service and data ownership
+
+Database-per-service means each service owns its authoritative data and other services use its contract rather than directly reading or writing its tables. It does not require a separate database server for every service: separate schemas or logical databases can be a transitional deployment choice, provided ownership and access boundaries are enforced.
+
+The benefit is independent schema evolution and clearer responsibility. The cost is that cross-service queries, uniqueness constraints and multi-entity transactions can no longer rely on one local database transaction. Common responses include API composition, asynchronously maintained read models, or a workflow with explicit eventual-consistency and compensation semantics. Avoid creating a distributed join or synchronous fan-out for every screen without considering latency, partial failure and data freshness.
+
+If services share a physical database, document that as an operational compromise rather than claiming full isolation. Prevent direct cross-owner writes, define migration ownership, and plan how backups, restores, retention and tenant deletion cross service boundaries.
+
+### Sagas and transactional outbox as workflow building blocks
+
+A saga coordinates a business process across local transactions. Each step commits within its owning service; if a later step cannot complete, the workflow may run compensating actions. Compensation is a new business action, not a database rollback: a shipped item cannot be “unshipped,” and a refund may need its own accounting record. Define timeouts, retry limits, duplicate handling, terminal states, manual repair and reconciliation for steps whose outcome is uncertain.
+
+An orchestrated saga makes state transitions visible in a coordinator; a choreographed saga distributes them across event handlers. Either way, use stable workflow and command identifiers and make local effects idempotent. A transactional outbox records a domain change and its event in the same local transaction; a relay can publish duplicates, so consumers still need deduplication or idempotent effects. These patterns reduce dual-write risk but do not create a single atomic transaction across all services. See Chapter 11 for the detailed outbox/inbox and distributed-transaction mechanics.
+
+### Sidecars and service meshes
+
+A **sidecar** is a helper process or container deployed alongside an application instance to provide a capability such as proxying, telemetry or certificate handling. A **service mesh** commonly combines data-plane proxies with a control plane that distributes routing, identity and policy configuration. These mechanisms can standardize service-to-service encryption, identity, traffic policy and telemetry without embedding every feature in each application.
+
+They do not remove network failure or make retries automatically safe. Proxy retries can amplify load or repeat requests unless method semantics and idempotency are considered; timeouts and retry budgets must remain aligned with the end-to-end deadline. A mesh also adds resource overhead, configuration propagation and another operational dependency. Decide which features belong in application code, a shared library, a gateway or the mesh, and test behavior when the control plane is unavailable or policy is stale.
+
+### Multi-tenancy is an isolation and ownership decision
+
+A multi-tenant system must define which resources are shared and which boundaries isolate tenants: identity, data rows/schemas/databases, caches, queues, encryption keys, quotas, logs and administrative operations. Shared infrastructure can improve utilization and simplify operations, but increases the impact of authorization mistakes, noisy neighbors and tenant-specific data leaks. Dedicated resources can strengthen isolation but cost more and create more operational objects.
+
+Enforce tenant identity at trusted server-side boundaries; never rely on a client-supplied tenant identifier without authorization checks. Include tenant scope in data access and cache keys, apply per-tenant rate and resource limits, and ensure background jobs, exports, search indexes, analytics, backups and deletion workflows preserve the same boundary. Test cross-tenant access explicitly. Isolation is a system-wide invariant, not just a database-column convention.
+
 ### Event-driven architecture
 
 Event-driven systems communicate using events, commonly through a broker or durable log. Producers and consumers can evolve and progress independently, and one event may support multiple consumers. The cost is that effects become asynchronous: delivery can be delayed or duplicated, ordering has a scope, replay may re-trigger side effects, and failures need dead-letter or repair paths.
