@@ -82,7 +82,7 @@ The following sections are present and are the starting points for the deeper re
 | Storage families and engines | Chapter 08: B-trees and LSM trees, 8.1A–8.1I, 8.2–8.6 data-system families/search/analytics/indexes, 8.7 Distributed file systems and object/block/file interfaces plus comparative access-pattern example |
 | Cache behavior | Chapter 09: Common patterns, TTL and invalidation, Failure modes, 9.1A–9.1H, 9.2 Cache patterns and failure modes, 9.3 Cache security/tenant isolation/freshness |
 | Distributed consistency | Chapter 10: Consistency models, CAP and PACELC, 10.3–10.14 including worked consistency timeline |
-| Replication and coordination | Chapter 11: Leader election, Leases and fencing tokens, Two-phase commit, Sagas and compensation, 11.5A–11.5I, 11.6 Worked stale-lease/fencing timeline |
+| Replication and coordination | Chapter 11: Leader election, Leases and fencing tokens, Two-phase commit, Sagas and compensation, 11.5–11.13, 11.14 Worked stale-lease/fencing timeline |
 | Messaging and stream processing | Chapter 12: sections 12.1–12.8, covering messaging models, partitioning, delivery/idempotency, retries/backpressure, outbox/inbox/CDC, stream processing, schema evolution, event sourcing/CQRS, projection rebuilds and privacy |
 | Scaling and overload | Chapter 13: Load balancing and consistent hashing, Overload controls, 13.1A–13.1G, 13.2 Admission control/load shedding/backpressure, 13.3 Hedged requests/adaptive concurrency, 13.4 worked concurrency-limit decision |
 | Reliability and recovery | Chapter 14: SLI, SLO, SLA and error budget, Recovery objectives, Zones, regions and disaster recovery, 14.1A–14.1G, 14.2 Recovery engineering, 14.3 worked SLO/error-budget example, 14.4 recovery rehearsal |
