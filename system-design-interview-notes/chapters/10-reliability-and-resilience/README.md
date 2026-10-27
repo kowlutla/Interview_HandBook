@@ -136,6 +136,14 @@ A useful interview answer defines:
 
 A payment service has a warm standby region and asynchronous database replication. The primary region disappears immediately after acknowledging a payment write. Do not claim that promoting the standby guarantees the latest payment is present. First establish the actual replication position and promotion guarantees, prevent the old primary from accepting writes if it returns, and reconcile uncertain operations with the payment provider or ledger before retrying side effects. The RPO determines whether some acknowledged data loss is acceptable; for financial invariants, the system may need a stronger commit/replication design instead.
 
+### Q3. When would you choose multi-region deployment over multi-zone deployment?
+
+Multi-zone deployment protects against many single-zone failures within a region and is usually simpler and lower-latency for a regional service. Multi-region deployment is justified when the recovery objective includes a regional outage, when users need regional proximity, or when data-residency requirements demand it. It adds replication, routing, failover, and consistency complexity; it should follow explicit RTO/RPO requirements rather than being treated as a default upgrade.
+
+### Q4. Why do RTO and RPO need separate targets?
+
+RTO limits how long recovery may take; RPO limits how much recent data may be lost. A system can recover quickly but lose more data than the business accepts, or preserve data while taking too long to restore service. These targets determine whether backups, warm standby, synchronous replication, or automated failover are appropriate, and they must be validated through recovery exercises.
+
 ### Q5. Does active-active automatically improve availability?
 
 No. It can serve traffic during some regional failures, but shared identity, global dependencies, network partitions, or conflicting writes can still fail the system. Active-active is simplest for stateless or naturally partitioned workloads. For mutable business data, define conflict semantics and write authority before claiming independent regional availability.
