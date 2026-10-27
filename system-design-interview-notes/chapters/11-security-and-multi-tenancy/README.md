@@ -65,3 +65,45 @@ Start with assets, threats, trust boundaries, and required controls. Use standar
 - Tenant isolation must cover all data paths, not only primary database queries.
 - Use least privilege, secret management, encryption, and privacy-aware logging.
 - Apply quotas and rate limits to protect shared resources.
+
+## Authentication and tenant isolation flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant IdP as Identity provider
+    participant G as API gateway
+    participant S as Service
+    participant DB as Tenant data store
+    C->>IdP: Authenticate
+    IdP-->>C: Access token
+    C->>G: Request + token
+    G->>G: Validate token and coarse policy
+    G->>S: Forward verified identity context
+    S->>S: Authorize action on resource and tenant
+    S->>DB: Query scoped by authorized tenant
+    DB-->>S: Tenant-scoped result
+    S-->>C: Response
+```
+
+A valid token establishes an identity and claims; it does not grant blanket access to every object. The service must authorize the requested action against the target resource and tenant. Tenant scoping should be enforced in data access paths and tested against cross-tenant identifier substitution. Gateway checks are useful, but they do not replace domain-level authorization.
+
+## Scenario practice
+
+**Scenario:** A multi-tenant SaaS application stores every tenant's records in shared tables. A new endpoint accepts a tenant identifier query parameter. What could go wrong?
+
+**Reasoning:** A caller may substitute another tenant's ID unless the server derives or validates tenant access from trusted identity and authorization policy. Apply tenant predicates consistently, enforce access in service/data layers, and test cross-tenant access. Add per-tenant quotas and resource isolation where noisy-neighbor risk warrants it. Shared tables reduce cost but increase the importance of consistent logical isolation.
+
+## Interview questions
+
+### Q1. Is authentication at the API gateway sufficient?
+No. The gateway can validate tokens and enforce coarse policies, but each service must trust only verified identity context and authorize the action on the specific resource. Internal calls also need an explicit service identity and trust model.
+
+### Q2. How do you choose a multi-tenant isolation model?
+Shared tables are cost-efficient but require strong logical controls; separate schemas provide more separation with more operational overhead; separate databases or accounts can offer stronger isolation for regulated or high-risk tenants at higher cost. Decide from threat model, compliance, noisy-neighbor risk, and operational capability.
+
+## Further reading
+
+- [OAuth 2.0 Security Best Current Practice (RFC 9700)](https://www.rfc-editor.org/rfc/rfc9700)
+- [OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0.html)
+
