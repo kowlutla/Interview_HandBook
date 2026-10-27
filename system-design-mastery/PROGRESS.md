@@ -536,3 +536,19 @@ A focused acceptance pass was completed for `chapters/01-thinking-in-systems/REA
 - [x] Added inline source links beside the retry-amplification, microservice trade-off, ADR, and C4 claims. Clarified the transactional-outbox prerequisite and linked to Chapter 12.
 
 **Validation boundary:** the audit branch has no active textbook-validation workflow, and a Mermaid renderer could not be obtained in the current environment. Therefore this entry records manual Mermaid syntax review, not automated SVG rendering or a post-edit CI pass. No Chapter 1 content correction remains identified by this focused pass; this is not a claim that the entire 20-chapter textbook or all 21 curriculum families have passed acceptance.
+
+
+## Chapter 09 focused technical acceptance — 2026-10-28
+
+A focused acceptance pass was completed for `chapters/09-caching/README.md` on the audit branch. The chapter was re-fetched after the source clarification and reviewed across cache correctness, cache patterns, CDN/HTTP behavior, tenant isolation, security, deletion/revocation, and failure testing.
+
+- [x] Rechecked the worked hit-ratio calculation: 90% of 2,000 lookups/s gives 200 cache misses/s; three source queries per miss gives approximately 600 source queries/s. The arithmetic is correct under the stated assumptions.
+- [x] Reviewed stale-fill races, commit-then-invalidate windows, lagging-replica refill, version/tombstone handling, stampede protection, hot-key mitigation, cache outage/origin protection, eviction/admission, multi-level invalidation, cache-aside/read-through/write-through/write-behind/write-around, cache penetration/avalanche, tenant isolation, revocation, cache poisoning/deception and CDN key/TTL/purge policy. No material correctness defect was identified.
+- [x] Rechecked HTTP directive claims against RFC 9111: `no-store`, `no-cache`, `private`, `public`, `Vary`, validators, and shared-cache restrictions for `Authorization` requests are described with appropriate qualifications.
+- [x] Added a direct source for `stale-while-revalidate` and `stale-if-error`: RFC 5861. The chapter now correctly identifies it as an Informational RFC, not an Internet Standards Track specification, and advises checking implementation support.
+- [x] Opened all five unique external references in Further reading (RFC 9111, RFC 5861, Redis eviction docs, AWS Caching Best Practices, and OWASP Web Cache Security). The pages returned content; no dead reference was identified.
+- [x] Verified the three relative navigation footer targets against repository files.
+- [x] Rechecked Markdown structure: 259 lines, 27 headings, no duplicate heading text, no unclosed fenced block, and all three numbered sections (9.1–9.3) present.
+- [x] Manually reviewed the one Mermaid sequence diagram's declaration, participants, hit/miss alternatives, message arrows and closure. No syntax defect was identified by manual review.
+
+**Validation boundary:** automated Mermaid rendering and post-edit CI were not run; no passing workflow run is claimed. This is a focused Chapter 09 content/source/structure acceptance, not acceptance of all 20 chapters or all 21 curriculum families.
