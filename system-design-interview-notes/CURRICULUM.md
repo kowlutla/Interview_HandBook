@@ -21,8 +21,8 @@ The target is a compact set of connected notes, not a fixed chapter count. Merge
 | 13 | [Distributed Systems and Business Correctness](chapters/13-distributed-systems-and-correctness/README.md) | Reason about partial failure, CAP, quorums, delivery semantics, consensus, clocks, fencing, and business invariants. |
 | 14 | [Networking, Request Routing, and Real-Time Systems](chapters/14-networking-and-real-time-systems/README.md) | Trace requests through DNS, edge, proxies, application dependencies, and real-time transports. |
 | 15 | [Specialized Infrastructure](chapters/15-specialized-infrastructure-and-search/README.md) | Choose search, object storage, analytics, probabilistic structures, schedulers, CDC, and storage engines when justified. |
-| 16 | [Interview Method and Estimation Workshop](chapters/16-interview-method-and-estimation-workshop/README.md) | Run a timed interview, estimate workload with units, and diagnose bottlenecks using observable signals. |
-| 17 | [Senior Trade-offs and Case-Study Practice](chapters/17-senior-tradeoffs-and-case-study-path/README.md) | Defend conditional design choices, plan safe migrations, and practise canonical end-to-end problems. |
+| 16 | [Design Workflow and Estimation Workshop](chapters/16-interview-method-and-estimation-workshop/README.md) | Run a timed interview, estimate workload with units, and diagnose bottlenecks using observable signals. |
+| 17 | [Senior Design Trade-offs and Case-Study Reference](chapters/17-senior-tradeoffs-and-case-study-path/README.md) | Defend conditional design choices, plan safe migrations, and practise canonical end-to-end problems. |
 
 ## Scope rules
 
@@ -30,9 +30,8 @@ The target is a compact set of connected notes, not a fixed chapter count. Merge
 - Keep foundational ideas in the core notes. Put specialized details in short callouts or a future advanced supplement.
 - Do not duplicate a full explanation across chapters; link back to the original explanation and focus on the new relationship.
 - Add diagrams only when they clarify flow, ownership, or failure behavior.
-- Include interview questions with explanatory answers, but avoid turning every chapter into an enormous question bank.
 - Full end-to-end designs remain in [`../real-world-examples/README.md`](../real-world-examples/README.md); Chapter 17 provides a curated practice order without duplicating them.
-- Networking, specialized infrastructure, real-time communication, and interview execution are covered in dedicated chapters 14–16; related tutorials remain deeper references.
+- Networking, specialized infrastructure, real-time communication, design workflow, and estimation are covered in dedicated chapters 14–16; related tutorials remain deeper references.
 
 ## Completion criteria
 
@@ -40,5 +39,4 @@ A chapter is ready when:
 - Its core concepts are accurate and explained in plain language.
 - The reader can identify when to use the technique and its major trade-offs.
 - Important failure modes are covered without drowning the reader in rare edge cases.
-- Interview questions have direct, technically sound answers.
 - Examples, diagrams, and internal links add value and work correctly.
