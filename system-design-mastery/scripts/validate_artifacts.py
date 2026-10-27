@@ -3,6 +3,7 @@
 import re
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 MASTERY = Path(__file__).resolve().parents[1]
 CHAPTERS = MASTERY / "chapters"
@@ -53,6 +54,31 @@ for file in files:
             target = OUT / "openapi" / f"{slug}-{openapi_count:02d}.yaml"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text, encoding="utf-8")
+
+# Resolve local Markdown links as part of the same artifact check. This is a
+# path-existence check only; it does not validate external URL liveness or anchors.
+repo_root = MASTERY.parent
+markdown_link_re = re.compile(r"!??\[[^\]]*\]\(([^)]+)\)")
+for markdown_file in sorted(MASTERY.rglob("*.md")):
+    source = markdown_file.read_text(encoding="utf-8")
+    for match in markdown_link_re.finditer(source):
+        destination = match.group(1).strip()
+        if destination.startswith("<") and ">" in destination:
+            destination = destination[1:destination.index(">")]
+        else:
+            destination = destination.split()[0] if destination else ""
+        parsed = urlsplit(destination)
+        if not destination or parsed.scheme or parsed.netloc or not parsed.path:
+            continue
+        local_target = (markdown_file.parent / unquote(parsed.path)).resolve()
+        try:
+            local_target.relative_to(repo_root.resolve())
+        except ValueError:
+            errors.append(f"{markdown_file}: link escapes repository root: {destination!r}")
+            continue
+        if not local_target.exists():
+            line = source.count("\n", 0, match.start()) + 1
+            errors.append(f"{markdown_file}:{line}: broken local Markdown link {destination!r}")
 
 if errors:
     print("\n".join(errors), file=sys.stderr)
