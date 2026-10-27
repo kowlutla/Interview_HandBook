@@ -20,6 +20,8 @@ These are broad families; verify the selected product's actual behavior.
 
 ## 8.1 Storage-engine fundamentals
 
+### 8.1 Storage-engine fundamentals
+
 ### 8.1A Storage-model selection starts with access patterns
 
 Describe operations before choosing a database family:
