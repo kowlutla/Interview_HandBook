@@ -2,7 +2,7 @@
 
 ## The target reader
 
-A software engineer preparing for HLD/System Design interviews who needs to understand the reasoning behind architectural choices and revise efficiently.
+A software engineer learning HLD/System Design who needs clear conceptual explanations and efficient revision notes.
 
 ## Required writing style
 
@@ -26,18 +26,17 @@ Use only sections that genuinely help for the topic:
 4. **When should you use it?**
 5. **Trade-offs and failure modes**
 6. **Example**
-7. **Interview questions and answers**
-8. **Quick revision**
+7. **Quick revision**
 
 Do not force all sections onto small concepts. Do not repeat the definition under multiple headings.
 
-## Interview answer quality
+## Explanatory quality
 
-Answers should:
-- Start with the direct answer.
-- Explain the mechanism or reasoning.
+Explanations should:
+- State the concept and the problem it solves.
+- Explain the mechanism or reasoning in plain language.
 - Mention the most relevant trade-off or limitation.
-- Add an example when it makes the answer clearer.
+- Add an example when it makes the idea clearer.
 - Avoid unsupported absolutes such as “always,” “never,” or “guarantees” unless technically justified.
 
 ## Length discipline
@@ -54,7 +53,7 @@ Answers should:
 - [ ] The mechanism is explained accurately.
 - [ ] Selection guidance and trade-offs are concrete.
 - [ ] Important failure modes are included.
-- [ ] Interview answers are understandable without reading another long section.
+- [ ] Explanations are self-contained and understandable without reading another long section.
 - [ ] No substantial duplication with other chapters.
 - [ ] Relative Markdown links resolve against the current repository tree.
 - [ ] Mermaid syntax is rendered and visually inspected when a renderer is available; manual inspection must not be reported as rendered validation.
