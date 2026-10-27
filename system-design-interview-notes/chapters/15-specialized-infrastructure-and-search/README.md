@@ -75,3 +75,10 @@ No. A negative can safely skip a lookup under the filter's correctness assumptio
 - Separate OLTP and OLAP when their workloads interfere.
 - Bloom filters trade memory for probabilistic pre-checks.
 - Add specialized infrastructure only when a clear workload justifies its operational cost.
+
+## Further reading
+
+- [Amazon S3 presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html) — provider-specific bearer-capability behavior and expiry.
+- [Apache Kafka documentation](https://kafka.apache.org/documentation/) — event-log, consumer, and delivery semantics.
+- [Apache Spark Structured Streaming guide](https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html) — stateful streaming, event time, and processing model.
+
