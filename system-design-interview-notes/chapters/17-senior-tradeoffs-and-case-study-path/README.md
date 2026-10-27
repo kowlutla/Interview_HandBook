@@ -1,10 +1,10 @@
-# 17. Senior Trade-offs and Case-Study Practice Path
+# 17. Senior Design Trade-offs and Case-Study Reference
 
 Senior-level answers are conditional. Explain what changes the decision, not just which option is “better.” The right choice follows from workload, correctness, team ownership, operational capacity, and cost.
 
 ## 17.1 Decision guide
 
-| Decision | Prefer A when… | Prefer B when… | Key question |
+| Decision | Prefer A when… | Prefer B when… | Decision to validate |
 |---|---|---|---|
 | SQL vs NoSQL | Relationships, constraints, joins, and transactions dominate | A specific access pattern needs a different distribution or data model | Which invariants and queries must be enforced? |
 | Modular monolith vs microservices | Team and domain are small enough for one deployment boundary | Independent ownership, scaling, or isolation has clear value | Can the team operate the network and deployment complexity? |
@@ -25,7 +25,7 @@ Senior-level answers are conditional. Explain what changes the decision, not jus
 | Simplicity vs extensibility | Requirements are stable and delivery speed matters | Likely change points justify abstraction | What concrete change would this abstraction enable? |
 | Performance vs cost | Latency/throughput is a binding requirement | Lower demand or looser SLO permits cheaper capacity | What is the cost per successful operation? |
 
-## 17.2 Explain the trade-off in interview language
+## 17.2 Communicate trade-offs clearly
 
 A good answer follows this shape:
 
@@ -100,17 +100,6 @@ flowchart TD
     G --> D
 ```
 
-## Interview questions
-
-### Q1. How do you explain a trade-off without sounding indecisive?
-Make a recommendation under explicit assumptions, explain the mechanism and its cost, then state which changed requirement would reverse the decision. Conditional reasoning is a strength: it shows that architecture follows constraints rather than personal preference.
-
-### Q2. When should you introduce sharding?
-When a single data node remains a real storage, throughput, or isolation bottleneck after query/index optimization and appropriate vertical scaling. Before sharding, define the partition key, query patterns, cross-shard operations, rebalancing plan, and failure model. Sharding early adds operational complexity without guaranteed benefit.
-
-### Q3. What should a case-study answer include if time is limited?
-Prioritize requirements, a rough workload estimate, APIs/entities, architecture, one read and one write flow, the likely bottleneck, and one important failure/correctness path. Then state trade-offs and next steps. Do not spend the whole round drawing boxes or listing every possible component.
-
 ## 17.5 Architecture evolution and migration safety
 
 A senior design should explain how the system can evolve without requiring a risky all-at-once rewrite. Prefer incremental changes with observable checkpoints and a rollback or recovery strategy.
@@ -129,10 +118,10 @@ Dual writes are a common trap: writing to two independent stores does not make t
 
 Before sharding, confirm the actual bottleneck with query plans, index health, connection saturation, write contention, and storage limits. If the database is constrained by poor indexes or inefficient queries, sharding may multiply operational complexity without fixing the root cause. If partitioning is justified, choose the shard key from access patterns, define how cross-shard operations work, rehearse data movement, and make ownership transitions safe against concurrent writes.
 
-### Q4. When is a strangler migration safer than a rewrite?
+### Strangler migration
 
 When the old system can continue serving some responsibilities while a new path is introduced incrementally. Route a narrow capability at a time, compare behavior, and retain a rollback option. It is not automatically easy: shared data ownership, duplicated business rules, and inconsistent old/new behavior must be controlled.
 
-### Q5. Why are shadow reads useful, and what must not be shadowed blindly?
+### Safe use of shadow reads
 
 Shadow reads compare a candidate implementation with production behavior without making it authoritative. They can reveal query or semantic differences before traffic is switched. Shadowing must avoid leaking sensitive data and must not replay mutations, charge payments, send emails, or trigger other non-idempotent side effects.
