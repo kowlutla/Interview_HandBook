@@ -82,3 +82,9 @@ No. A negative can safely skip a lookup under the filter's correctness assumptio
 - [Apache Kafka documentation](https://kafka.apache.org/documentation/) — event-log, consumer, and delivery semantics.
 - [Apache Spark Structured Streaming guide](https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html) — stateful streaming, event time, and processing model.
 
+## Scenario practice
+
+**Scenario:** Product managers want to add a search cluster, event stream, cache, and analytics warehouse to a small application before launch. Which components would you keep?
+
+**Reasoning:** Start from user-visible requirements and query patterns. A relational database may be enough for transactional CRUD and modest filtering. Add a search index when full-text relevance or query latency justifies its derived-data lifecycle; add a stream when durable fan-out/replay or decoupled processing is needed; add a warehouse when analytical scans materially interfere with OLTP. For each component, name the owner of authoritative data, the freshness contract, and the failure behavior. Avoid introducing infrastructure without a workload that needs it.
+
