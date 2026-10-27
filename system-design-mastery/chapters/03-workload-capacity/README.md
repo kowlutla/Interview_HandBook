@@ -319,6 +319,34 @@ Store the workload definition, generator configuration, test-data version, servi
 - [ ] Results identify the first bottleneck and include configuration/data assumptions.
 - [ ] The test is repeatable and has a safe abort condition.
 
+## DAU/MAU-to-traffic estimates: a worked example
+
+Daily and monthly active users describe audience size, not request rate by themselves. Convert them into traffic only after stating how often an active user performs the relevant action and how many backend requests each action causes. Use DAU for a daily workload estimate; MAU is useful for reach and growth context, but dividing MAU directly by seconds in a day does not produce a meaningful RPS estimate.
+
+Assume, for illustration:
+
+- 2,000,000 DAU.
+- Each active user performs 20 relevant actions per day.
+- Each action causes an average of 1.5 backend requests after accounting for fan-out.
+- The daily workload is spread over 10 hours of concentrated activity, and the observed/assumed peak is 3 times that active-period average.
+- The request mix is 80% reads and 20% writes.
+
+Calculate the order of magnitude explicitly:
+
+| Quantity | Calculation | Estimate |
+|---|---|---:|
+| Backend requests/day | 2,000,000 users × 20 actions/user/day × 1.5 requests/action | 60,000,000 |
+| Active-period average | 60,000,000 ÷ (10 × 3,600 seconds) | ~1,667 RPS |
+| Illustrative peak | 1,667 × 3 | ~5,000 RPS |
+| Peak reads | 5,000 × 0.80 | ~4,000 RPS |
+| Peak writes | 5,000 × 0.20 | ~1,000 RPS |
+
+These are planning estimates, not capacity guarantees. Real traffic may be burstier, actions may trigger different fan-out, and scheduled jobs or retries may add load. Validate the assumptions with production telemetry and load tests; use endpoint-specific costs rather than treating every request as equally expensive.
+
+The same method applies to bandwidth and storage, but use the relevant payload and retention assumptions. If the average response is 12 KiB, 5,000 responses/s would imply roughly 60,000 KiB/s (about 59 MiB/s) of response payload before protocol overhead and compression; do not confuse bits/s with bytes/s. If the system stores 1,000,000 new records/day at 2 KiB each, raw primary data grows by about 2 GiB/day using binary units, before indexes, replicas, metadata, compaction overhead and backups. Retention policy then determines the retained raw-data baseline; for 90 days, that is about 180 GiB before those additional costs.
+
+For every estimate, record the time window, request/action assumptions, fan-out, read/write mix, payload size, retention, replication/index overhead, peak factor and uncertainty range. Change one assumption at a time to see which ones dominate the result.
+
 ## A repeatable capacity-estimation path
 
 ```mermaid
