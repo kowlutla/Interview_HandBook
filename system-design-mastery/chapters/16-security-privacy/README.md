@@ -1,6 +1,6 @@
 # 16. Security, Identity, and Privacy
 
-## Security is an architectural property
+## 16.1 Security is an architectural property
 Security controls should follow assets, actors, threats and trust boundaries. A threat model asks what must be protected, who might attack it, what capabilities they have, and what mitigations reduce likelihood or impact. It should be revisited as data flows, integrations and deployment topology change.
 
 ## 16.1A Threat modeling as a repeatable design activity
