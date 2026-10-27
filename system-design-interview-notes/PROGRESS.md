@@ -14,6 +14,7 @@ The interview notes are the primary learn-and-revise path. The tutorials remain 
 - [x] Chapters 1–12 strengthened with scenario practice, interview Q&A, diagrams where useful, and targeted authoritative references.
 - [x] README and curriculum navigation updated for 17 chapters.
 - [x] Case-study pathways linked to canonical examples rather than copied.
+- [x] Added focused coverage for consistent hashing/rebalancing, multi-region failover, consensus/clocks/fencing, B-tree versus LSM trade-offs, CDC projections, and safe architecture migration.
 
 ## Verification status — do not infer completion from chapter existence
 
@@ -21,7 +22,7 @@ The interview notes are the primary learn-and-revise path. The tutorials remain 
 - [ ] Review the new addenda against neighboring chapter material to remove any duplication and align all terminology.
 - [ ] Independent technical review of all 17 chapters and all claims.
 - [x] All 15 case-study destination paths in Chapter 17 fetched successfully from the current repository.
-- [ ] All relative Markdown links checked mechanically.
+- [x] Relative Markdown links in all 21 Markdown files under `system-design-interview-notes/` checked mechanically against the current repository tree; 56 local links resolved and no missing targets were found. (This is not a whole-repository link audit.)
 - [ ] All Mermaid blocks rendered with a Mermaid renderer.
 - [x] Markdown code-fence counts checked for balance across the 17 chapter pages (this does not validate Mermaid syntax or rendering).
 - [ ] Numerical examples independently rechecked across every chapter.
@@ -31,9 +32,9 @@ The interview notes are the primary learn-and-revise path. The tutorials remain 
 ## Known review findings and limitations
 
 - The expanded chapters now include scenarios and interview Q&A across the core topics, plus additional request, replication, cache, outbox, resilience, security, observability, and interview-method diagrams. Mermaid syntax has not yet been rendered by a dedicated Mermaid renderer; a balanced Markdown code-fence check is not a rendering test.
-- The 15 curated case-study links in Chapter 17 were checked by fetching each exact destination. The wider set of relative links across all existing chapters has not yet been mechanically checked.
+- The 15 curated case-study links in Chapter 17 were checked by fetching each exact destination. Relative Markdown links in the entire `system-design-interview-notes/` subtree were also checked against the repository tree: 56 local links resolved with no missing targets. The rest of the repository has not yet had a full mechanical link audit.
 - The existing 12 chapters have now received targeted addenda and the new chapters have been expanded. A full line-by-line technical correction pass across all 17 chapters is still not claimed here.
-- No claim is made that the full 23-module inventory has passed acceptance. This tracker should only be updated after each outstanding check is actually performed.
+- Coverage has been strengthened in several high-value gaps, but no claim is made that the full 23-module inventory has passed acceptance. The whole-repository link audit, Mermaid rendering, and full technical review remain outstanding. This tracker should only be updated after each outstanding check is actually performed.
 
 ## Quality rules
 
