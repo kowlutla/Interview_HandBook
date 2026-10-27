@@ -43,24 +43,6 @@ When comparing designs, state:
 
 For example, a read replica may improve read capacity but introduce lag. If a use case requires read-your-writes, route those reads appropriately or choose a stronger mechanism. The right answer depends on the user-visible guarantee, not on a generic preference for replicas.
 
-## 12.5 Common interview questions
-
-### What is the difference between logs, metrics, and traces?
-
-Logs capture individual events, metrics show aggregated behavior over time, and traces show how a request flows through components. They complement one another: metrics often detect an issue, traces locate a slow or failing dependency, and logs provide event details.
-
-### Why monitor tail latency?
-
-An average can look healthy while a meaningful fraction of users experience very slow requests. Tail percentiles help expose queueing, uneven load, garbage collection, or slow dependencies. They should be interpreted with traffic volume and the SLO.
-
-### How do you choose between two architectures?
-
-Compare each against the stated requirements and assumptions. Explain the important gains, costs, failure modes, and operational burden. A good decision includes a reason to revisit it, such as traffic growth, stricter consistency needs, or measured saturation.
-
-### What is an error budget used for?
-
-It expresses how much unreliability is acceptable under an SLO. Teams can use it to balance feature delivery and reliability work, investigate repeated incidents, and decide when risky changes should slow down. It is meaningful only if the SLI reflects real user outcomes.
-
 ## Quick revision
 
 - Logs explain events; metrics reveal trends; traces connect request paths.
@@ -85,22 +67,13 @@ Trace context should connect related spans across service boundaries where propa
 
 An SLI is a measurement of user-relevant behavior, such as the fraction of valid requests completed successfully within a latency threshold. An SLO is the target for that SLI over a window. An SLA is an external commitment that may include consequences for missing the target. If an SLO permits 99.9% success over a 30-day window, the error budget is the remaining 0.1% of eligible events—not a general license to ignore incidents.
 
-## Scenario practice
+## Scenario analysis
 
-**Scenario:** Average latency remains 100 ms, but users report intermittent slowness and p99 rises from 300 ms to 2 seconds. What do you investigate?
+**Case:** Average latency remains 100 ms, but users report intermittent slowness and p99 latency rises from 300 ms to 2 seconds.
 
 **Reasoning:** Segment latency by route, dependency, region, tenant, and request size. Inspect traces for slow spans, plus pool waits, queueing, retries, cache misses, and saturation. The average hides the tail. Use high-cardinality identifiers in logs/traces when appropriate, not as unrestricted metric labels.
-
-## Interview questions
-
-### Q1. What should you alert on?
-Alert on symptoms tied to user impact or an imminent SLO breach, such as elevated error rates, latency, and sustained saturation. Diagnostic metrics such as cache hit ratio or thread counts help explain the cause but may not need a page in isolation.
-
-### Q2. What is the difference between an SLI, SLO, and SLA?
-An SLI measures behavior; an SLO is an internal target for that measurement; an SLA is an agreement with users/customers and may define consequences. Keep the metric's population, time window, and success criteria explicit.
 
 ## Further reading
 
 - [Google SRE Book: Monitoring Distributed Systems](https://sre.google/sre-book/monitoring-distributed-systems/)
 - [Google SRE Book: Service Level Objectives](https://sre.google/sre-book/service-level-objectives/)
-
