@@ -5,6 +5,8 @@ A relational database is more than a place to store rows: its schema, constraint
 The sections below develop the main decisions in depth: modeling and constraints, concurrency and isolation, query plans, maintenance, replicas, migrations and sharding. The worked examples return to the same principle: correctness must hold under concurrent requests and operational change, not only in a single successful request.
 
 
+## 7.1 Relational fundamentals
+
 ### Functional dependencies and normalization reasoning
 
 A functional dependency X → Y means that, within the modeled relation, the value of X determines the value of Y. If employee_id determines employee_name, storing employee_name repeatedly on every assignment row may create update anomalies when the name changes. Normalization decomposes relations to reduce such anomalies while preserving the intended information and dependencies.
