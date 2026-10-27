@@ -29,7 +29,7 @@ Locality-aware routing can reduce network latency and transfer costs but risks o
 
 Consistent hashing maps keys and node identities into a circular or ordered hash space. A key is assigned according to a rule such as the next node clockwise. Adding or removing a node ideally remaps only a fraction of keys rather than reshuffling all keys.
 
-Virtual nodes give each physical node multiple positions in the hash space, improving distribution when node capacities differ. They do not solve workload skew: a single very popular key can still overload its owner. Rebalancing may require data transfer, cache warm-up, state migration and careful handling of requests during ownership changes.
+Virtual nodes give each physical node multiple positions in the hash space, reducing placement imbalance when nodes have similar capacities. To account for heterogeneous capacity, assign proportionally more virtual nodes or weight to larger nodes; simply giving every node the same number of virtual nodes does not do that. Virtual nodes do not solve workload skew: a single very popular key can still overload its owner. Rebalancing may require data transfer, cache warm-up, state migration and careful handling of requests during ownership changes.
 
 ### Rate limiting algorithms
 
