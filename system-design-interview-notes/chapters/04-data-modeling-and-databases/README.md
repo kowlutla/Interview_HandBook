@@ -93,3 +93,45 @@ Independent ownership can reduce coupling, but separate databases increase opera
 - Indexes trade faster reads for storage and write overhead.
 - Use cursor pagination when deep offsets or concurrent changes matter.
 - Cross-service transactions require explicit workflow and consistency design.
+
+## Decision flow: choose storage from the workload
+
+```mermaid
+flowchart TD
+    A[Start with access patterns and invariants] --> B{Need relational constraints or multi-row transactions?}
+    B -->|Yes| SQL[Relational database]
+    B -->|No| C{Known key-based access at high scale?}
+    C -->|Yes| KV[Key-value or wide-column store]
+    C -->|No| D{Flexible aggregate-shaped documents?}
+    D -->|Yes| DOC[Document database]
+    D -->|No| E{Full-text relevance or graph traversal?}
+    E -->|Search| SEARCH[Search index]
+    E -->|Graph| GRAPH[Graph database]
+    E -->|Neither| REVIEW[Revisit query and operational requirements]
+    SQL --> REVIEW
+    KV --> REVIEW
+    DOC --> REVIEW
+    SEARCH --> REVIEW
+    GRAPH --> REVIEW
+```
+
+This is a shortlist, not an automatic selector. Operational maturity, query needs, consistency, migration cost, retention, and data ownership can outweigh a database category's theoretical fit. Search indexes and analytical stores are commonly derived from an authoritative source rather than used to enforce transactional invariants.
+
+## Scenario practice
+
+**Scenario:** A team proposes a document database because its product schema changes frequently, but core operations require unique usernames, account balances, and atomic updates across related records. What do you evaluate?
+
+**Reasoning:** Separate flexible attributes from hard invariants. A relational store may still support evolving schemas while providing unique constraints and transactions. Choose based on actual queries and transaction boundaries, not the frequency of adding optional fields. If multiple stores are introduced, document which one owns each fact and how derived copies are refreshed.
+
+## Interview questions
+
+### Q1. What should drive database selection?
+Access patterns, data relationships, transaction invariants, consistency/freshness, scale, retention, and operational constraints. Start with the simplest database that meets those requirements and prove the need before introducing polyglot persistence.
+
+### Q2. Why not use a search engine as the primary database?
+Search engines optimize indexing and retrieval and may update asynchronously. They generally are not the right authority for multi-record business invariants. Keep authoritative writes in a store that can enforce the required correctness, then update search as a derived view.
+
+## Further reading
+
+- [PostgreSQL documentation: Indexes](https://www.postgresql.org/docs/current/indexes.html) — index choices and query implications.
+
