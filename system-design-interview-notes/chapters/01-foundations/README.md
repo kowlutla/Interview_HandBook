@@ -1,6 +1,6 @@
 # 1. System Design Foundations
 
-System design is the process of turning requirements and constraints into a system architecture. In an interview, the goal is not to draw the most complicated diagram; it is to show that you can identify the real problem, choose reasonable components, and explain the trade-offs.
+System design is the process of turning requirements and constraints into a system architecture. In a design discussion, the goal is not to draw the most complicated diagram; it is to show that you can identify the real problem, choose reasonable components, and explain the trade-offs.
 
 ## 1.1 Start with the requirements
 
@@ -33,15 +33,15 @@ Do not treat every quality attribute as equally important. Ask which are critica
 
 ## 1.2 Clarify scope and assumptions
 
-Interviews are time-limited. Ask targeted questions that change the design, then state reasonable assumptions for details that do not.
+Design discussions are time-limited. Identify the requirements that change the design, then state reasonable assumptions for details that do not.
 
-Useful questions include:
-- Who are the users, and what are the main use cases?
-- What is the approximate read/write ratio?
-- What scale should the design support?
-- Is data loss acceptable? Is stale data acceptable?
-- Is global access required, or is one region enough?
-- Are there privacy, retention, or compliance constraints?
+Clarify the inputs that can materially change the architecture:
+- User groups and primary use cases.
+- Approximate read/write ratio and traffic shape.
+- Expected data and request scale.
+- Tolerance for data loss and stale reads.
+- Geographic reach and regional availability needs.
+- Privacy, retention, and compliance constraints.
 
 Avoid spending too much time asking questions whose answers would not affect the architecture.
 
@@ -72,7 +72,7 @@ Then add a component only when it solves an identified problem:
 
 This is a starting point, not a universal architecture. The correct design depends on requirements and bottlenecks.
 
-## 1.5 A repeatable interview workflow
+## 1.5 A repeatable design workflow
 
 1. **Clarify requirements** — functional and non-functional.
 2. **Estimate scale** — users, requests per second, storage, and bandwidth.
@@ -110,28 +110,6 @@ Suppose users can upload a file and share it through a link.
 
 The example shows the method: requirements first, then the simplest architecture that satisfies them, then targeted improvements.
 
-## 1.7 Common interview questions
-
-### What is the difference between functional and non-functional requirements?
-
-Functional requirements describe system behavior and features. Non-functional requirements describe qualities or constraints such as latency, availability, durability, security, and scale. Both shape the architecture: a feature tells you what must happen, while its quality requirements constrain how it should happen.
-
-### Why should we clarify requirements before designing?
-
-Different interpretations can lead to very different architectures. For example, a link that must be instantly revocable has different caching and authorization implications from a link that may remain valid for several minutes after revocation. Clarifying requirements avoids optimizing for the wrong problem.
-
-### Should we always design for millions of users?
-
-No. Design for the expected scale and credible growth, while keeping reasonable paths to evolve. Premature distribution increases operational complexity, failure modes, and cost. A simple architecture can be the right choice when it meets the requirements.
-
-### How do you choose between two architectures?
-
-Compare them against the requirements: latency, throughput, consistency, availability, durability, security, cost, and operational complexity. State the assumptions, explain the main trade-off, and identify what new evidence would make you change the decision.
-
-### What does a good system design interview answer look like?
-
-It is structured and collaborative. The candidate clarifies scope, makes assumptions explicit, estimates scale, draws a coherent design, explains critical data flows, identifies bottlenecks and failures, and justifies trade-offs. A sophisticated diagram without this reasoning is not enough.
-
 ## Quick revision
 
 - Requirements before technologies.
@@ -162,21 +140,12 @@ flowchart TD
 
 The important behavior is not the exact minute boundary. Keep the interviewer aligned, state assumptions, and spend the most time on the parts that change the design.
 
-## Scenario practice
+## Scenario analysis
 
-**Scenario:** An interviewer asks you to design a photo-sharing service and immediately asks whether you would use Kafka, Redis, and microservices. What should you do first?
+**Case:** A photo-sharing-service design begins with proposed technologies—Kafka, Redis, and microservices—before the requirements have been defined.
 
 **Reasoning:** Resist choosing technologies before defining user actions, traffic shape, privacy, upload size, feed freshness, and durability expectations. Sketch the smallest architecture that supports the agreed scope. Add a queue for a specific asynchronous need, a cache for a measured read path, and service boundaries only when ownership or independent scaling justifies them.
-
-## Interview questions
-
-### Q1. What makes a system design answer senior-level?
-It connects requirements to mechanisms and explains trade-offs, failure behavior, and operational evidence. Naming technologies is not enough; show why the component is needed and what guarantee it provides.
-
-### Q2. What do you do when requirements change?
-Restate the new constraint, identify which assumptions it invalidates, and update the smallest part of the design that no longer fits. Explain any new cost or guarantee that follows.
 
 ## Further reading
 
 - [Google SRE Book: Service Level Objectives](https://sre.google/sre-book/service-level-objectives/) — connecting product expectations to measurable objectives.
-
