@@ -482,3 +482,17 @@ A targeted read of Chapter 03 found that capacity estimation covered average/pea
 - Chapter 10 now explicitly separates **safety** from **liveness**, explains the trade-off under partitions, and includes an inventory-allocation example to connect formal properties to a business invariant.
 - Chapter 07 now distinguishes **partitioning**, **sharding**, **replication**, and **vertical partitioning**, including their different scaling effects, key-selection risks, skew/hot partitions, and resharding concerns.
 - These edits address conceptual gaps identified in the first pass; they do not constitute a completed line-by-line technical and source audit of every chapter. Overall acceptance remains provisional until the full review and validation rerun are complete. The reopened PR now contains these edits; CI must validate the updated head before structural acceptance is recorded.
+
+
+## Parallel chapter review and structural correction — 2026-10-28
+
+A parallel inventory pass covered all 20 chapter files and all eight supporting Markdown files. It checked heading maps, placeholder markers, Mermaid counts, source-link inventories, and likely over-absolute claims, then followed up with focused reads of capacity estimation, concurrency/cancellation, relational modeling, storage engines, caching, distributed consistency, replication/transactions, Kafka semantics, security, observability and client real-time behavior.
+
+Structural corrections committed on this branch:
+- Chapter 07 now has sequential top-level sections 7.1–7.6; its relational fundamentals are nested under 7.1.
+- Chapter 10 now has sequential top-level sections 10.1–10.14.
+- Chapter 11 now has sequential top-level sections 11.1–11.14.
+- Lettered subsections in Chapters 08, 09, 13, 14, 15, 16, 17 and 18 are nested beneath explicit parent sections.
+- The Chapter 16 authorization-cache subsection now uses 16.1H instead of the out-of-sequence 16.1G1 label.
+
+Technical status remains provisional: these changes improve navigation and address targeted fundamentals, but do not substitute for a complete claim-by-claim source audit and end-to-end semantic review of every chapter. Latest branch CI must be checked after these commits before final review readiness is claimed.
