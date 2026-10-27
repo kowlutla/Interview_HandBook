@@ -40,24 +40,6 @@ Rate limits and quotas can protect against accidental or malicious resource exha
 
 For high-impact operations, consider stronger authorization, audit logs, idempotency, and explicit confirmation where appropriate. Security logging should be useful without collecting secrets or excessive sensitive data.
 
-## 11.5 Common interview questions
-
-### What is the difference between authentication and authorization?
-
-Authentication establishes identity; authorization checks whether that identity may perform an action on a resource. Authorization must be enforced for each protected operation, even after a successful login.
-
-### How do you prevent cross-tenant data leaks?
-
-Make tenant identity part of the authorization and data-access model. Enforce scoping on reads, writes, background jobs, caches, and exports; use database constraints or isolation where available; and test attempts to access another tenant's identifiers. Hiding a tenant ID in the UI is not security.
-
-### Should every service trust the API gateway?
-
-No. Trust should be explicit and limited. Services may validate tokens or accept authenticated identity from a protected internal path, but they need controls against direct access, spoofed headers, and misconfigured network boundaries.
-
-### How do you design for security without overcomplicating the system?
-
-Start with assets, threats, trust boundaries, and required controls. Use standard, well-maintained authentication and encryption mechanisms, least privilege, centralized secret management, and auditable authorization. Add specialized controls when the threat model or compliance needs justify them.
-
 ## Quick revision
 
 - Authentication answers who; authorization answers what they may do.
@@ -88,22 +70,13 @@ sequenceDiagram
 
 A valid token establishes an identity and claims; it does not grant blanket access to every object. The service must authorize the requested action against the target resource and tenant. Tenant scoping should be enforced in data access paths and tested against cross-tenant identifier substitution. Gateway checks are useful, but they do not replace domain-level authorization.
 
-## Scenario practice
+## Scenario analysis
 
-**Scenario:** A multi-tenant SaaS application stores every tenant's records in shared tables. A new endpoint accepts a tenant identifier query parameter. What could go wrong?
+**Case:** A multi-tenant SaaS application stores tenants in shared tables, and a new endpoint trusts a tenant identifier supplied as a query parameter.
 
 **Reasoning:** A caller may substitute another tenant's ID unless the server derives or validates tenant access from trusted identity and authorization policy. Apply tenant predicates consistently, enforce access in service/data layers, and test cross-tenant access. Add per-tenant quotas and resource isolation where noisy-neighbor risk warrants it. Shared tables reduce cost but increase the importance of consistent logical isolation.
-
-## Interview questions
-
-### Q1. Is authentication at the API gateway sufficient?
-No. The gateway can validate tokens and enforce coarse policies, but each service must trust only verified identity context and authorize the action on the specific resource. Internal calls also need an explicit service identity and trust model.
-
-### Q2. How do you choose a multi-tenant isolation model?
-Shared tables are cost-efficient but require strong logical controls; separate schemas provide more separation with more operational overhead; separate databases or accounts can offer stronger isolation for regulated or high-risk tenants at higher cost. Decide from threat model, compliance, noisy-neighbor risk, and operational capability.
 
 ## Further reading
 
 - [OAuth 2.0 Security Best Current Practice (RFC 9700)](https://www.rfc-editor.org/rfc/rfc9700)
 - [OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0.html)
-
