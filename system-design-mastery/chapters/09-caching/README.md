@@ -102,7 +102,7 @@ For every level, define who owns invalidation, how versions propagate, what happ
 
 ### HTTP caching details
 
-HTTP caches consider method, status, freshness metadata, validators, and request/response directives. Cache-Control: no-store instructs caches not to store a response; no-cache generally means a stored response must be revalidated before reuse, not that it may never be stored. private restricts storage to private caches, while public can allow shared caching under applicable conditions.
+HTTP caches consider method, status, freshness metadata, validators, and request/response directives. Cache-Control: no-store instructs caches not to store a response; no-cache generally means a stored response must be revalidated before reuse, not that it may never be stored. private restricts storage to private caches, while public can allow shared caching under applicable conditions. Requests carrying an `Authorization` header have additional shared-cache restrictions: RFC 9111 generally requires an explicit response directive such as `public`, `s-maxage`, or `must-revalidate` before a shared cache may store the response. Do not treat a CDN override or a cache hit as a substitute for current authorization.
 
 Vary identifies request headers that affect the representation and therefore participate in the cache key. Incorrect use can fragment cache efficiency or, more seriously, serve the wrong representation. Authenticated responses need deliberate shared-cache policy. ETags and Last-Modified validators can support conditional revalidation without retransmitting unchanged bodies.
 
