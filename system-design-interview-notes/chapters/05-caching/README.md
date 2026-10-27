@@ -88,3 +88,46 @@ It depends on the database's capacity and the importance of the request. Blindly
 - TTL alone does not guarantee consistency.
 - Plan for stampedes, hot keys, eviction, and cache outages.
 - Protect the backing store during misses and cache recovery.
+
+## Cache-aside request and invalidation flows
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as Application
+    participant K as Cache
+    participant D as Database
+    C->>A: Read key
+    A->>K: GET key
+    alt Cache hit
+        K-->>A: Value
+    else Cache miss
+        K-->>A: Miss
+        A->>D: Read authoritative value
+        D-->>A: Value
+        A->>K: SET value with TTL
+    end
+    A-->>C: Response
+    Note over A,D: On write, commit DB first, then invalidate/update cache
+```
+
+Invalidation after a database commit still has race conditions: a concurrent reader can load an old database value and repopulate the cache after invalidation. Depending on correctness needs, use versioned values, write-through coordination, short TTLs, or a design that prevents stale repopulation. No single invalidation pattern fits every workload.
+
+## Scenario practice
+
+**Scenario:** A popular product key expires, and thousands of requests simultaneously miss the cache. The database becomes overloaded.
+
+**Reasoning:** Use request coalescing/single-flight so one request loads the value while peers wait briefly, add TTL jitter, and consider controlled warming for known hot keys. Bound waits and concurrency; stale-while-revalidate is acceptable only if the product tolerates stale values. If the cache is unavailable, protect the database rather than letting every request fall through without limits.
+
+## Interview questions
+
+### Q1. Is a cache the source of truth?
+Usually not. It is a derived copy that may be evicted, stale, or unavailable. The authoritative store owns business correctness unless the architecture explicitly uses a durable cache as a data system with documented guarantees.
+
+### Q2. What is a cache stampede and how do you mitigate it?
+Many callers simultaneously reload the same missing/expired key. Coalesce concurrent loads, add expiry jitter, warm predictable hot keys, and cap fallback concurrency. Choose stale serving only when correctness permits it.
+
+## Further reading
+
+- [Redis documentation](https://redis.io/docs/latest/) — data structures, expiration, eviction, and deployment behavior.
+
