@@ -149,6 +149,15 @@ Propagate a deadline or remaining budget, reserve time for cleanup and response 
 - Are deadlines and retry budgets propagated end to end?
 
 
+### 6.10I Service discovery, circuit breakers, and bulkheads
+
+Service discovery lets a caller address a logical service name rather than hard-code a changing instance address. Discovery may be server-side (for example, a load balancer resolves or selects instances) or client-side (the caller queries a registry and selects an endpoint). DNS-based discovery is simple and widely supported; registry-based discovery can expose richer health and metadata, but introduces freshness and availability questions. Cached records can outlive an instance, so clients still need bounded connection and request timeouts, retry-safe behavior, and handling for stale endpoints. Readiness should mean an instance can accept the relevant traffic; graceful draining helps avoid routing new work to an instance that is shutting down. Discovery identifies a destination, not whether the caller is authorized to use it.
+
+A **circuit breaker** temporarily stops calls to a dependency that is repeatedly failing or timing out. A common state model is closed (calls flow and failures are measured), open (calls fail fast or use a defined fallback), and half-open (a limited number of probes test recovery). It limits wasted work and can prevent a failing dependency from consuming the caller's entire latency budget; it does not fix the dependency or replace timeouts. Tune thresholds and recovery probes to the workload, and do not treat every business error as evidence of dependency failure. A fallback is appropriate only when its stale or reduced result is acceptable for that operation.
+
+A **bulkhead** isolates resource pools or concurrency budgets so a slow dependency or noisy tenant cannot exhaust all request-handling capacity. Separate bounded pools, semaphores, per-route concurrency limits, and bounded queues are common implementations. Isolation improves fault containment but reserves capacity and can lower utilization if limits are poorly chosen. Monitor pool saturation, queue wait, rejected work, breaker transitions, timeout rates, and downstream latency. Coordinate these controls with retries: retries should be bounded, consume the same end-to-end deadline, and not repeatedly call a dependency while its breaker is open.
+
+
 
 ## 6.11 API gateways and API management
 
