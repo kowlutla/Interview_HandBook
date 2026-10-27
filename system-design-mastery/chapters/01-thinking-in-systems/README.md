@@ -94,6 +94,8 @@ A reliable reasoning sequence is:
 
 Choosing a database, broker, cloud, or microservice boundary before clarifying access patterns and correctness needs reverses this order. Technology can make some choices easier, but it cannot rescue a misunderstood requirement.
 
+The requirements and constraints that most strongly shape the structure are called **architecture drivers**. They commonly include a small set of critical user capabilities, measurable quality goals (such as a p99 latency target or recovery objective), hard constraints (such as data residency), workload characteristics, and organizational or operational realities. Not every requirement is an architecture driver: the useful test is whether changing it could materially change the boundaries, data model, deployment, or failure strategy. Make the important drivers explicit so candidate designs can be evaluated against the same criteria.
+
 ### Separate facts, assumptions, and decisions
 
 These categories should not be mixed:
