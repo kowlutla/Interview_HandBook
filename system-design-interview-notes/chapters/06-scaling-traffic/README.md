@@ -54,24 +54,6 @@ When incoming work exceeds safe capacity, accepting everything can make the whol
 
 Define overload behavior explicitly: return a clear retryable error, degrade nonessential features, or prioritize critical requests. Avoid retry storms by using backoff and retry budgets.
 
-## 6.6 Common interview questions
-
-### When would you scale vertically versus horizontally?
-
-Vertical scaling is often simpler and can be enough for a modest workload. Horizontal scaling is useful when demand exceeds a single instance, availability requires redundancy, or independent capacity is needed. The decision depends on limits, state management, cost, and operational complexity.
-
-### Why make services stateless?
-
-Stateless instances can be replaced and scaled more easily because any healthy instance can handle a request. Durable state should generally live in an appropriate data store. Some local state can still be useful for performance, but correctness must not depend on an instance-specific copy unless routing and recovery explicitly support it.
-
-### Why can autoscaling fail to solve overload?
-
-Scaling may react too slowly, the bottleneck may be elsewhere, or a dependency may have a fixed limit. Adding application instances can even increase pressure on a saturated database. Combine scaling with capacity planning, backpressure, limits, and end-to-end observability.
-
-### What is the difference between backpressure and load shedding?
-
-Backpressure tries to regulate work entering a constrained component. Load shedding deliberately rejects work that cannot be safely served. Both protect the system, but they act differently and may be used together.
-
 ## Quick revision
 
 - Find the bottleneck before adding capacity.
@@ -96,21 +78,12 @@ flowchart LR
 
 Adding application instances increases concurrency against shared dependencies. If database CPU, connections, locks, or I/O are already saturated, more instances can increase contention rather than throughput. Scale the limiting resource or reduce its work first.
 
-## Scenario practice
+## Scenario analysis
 
-**Scenario:** Doubling the application fleet doubles database connections and increases p99 latency. What would you inspect?
+**Case:** Doubling the application fleet doubles database connections and increases p99 latency.
 
 **Reasoning:** Check connection-pool sizes across all instances, query latency, lock waits, database CPU/I/O, and connection queueing. Bound the total pool budget against database capacity, optimize expensive queries, and use caching or read replicas only when the access pattern fits. Autoscaling should consider downstream saturation rather than CPU alone.
-
-## Interview questions
-
-### Q1. Why doesn't horizontal scaling always increase throughput?
-A shared dependency or serialized operation can remain the bottleneck. Extra instances may increase contention, connections, and retries. Measure the whole request path and scale or redesign the constrained layer.
-
-### Q2. What makes an application stateless?
-Any healthy instance can handle a request without depending on local session state from a previous request. Persist durable state externally or use signed client tokens where appropriate; still protect shared stores from becoming bottlenecks.
 
 ## Further reading
 
 - [Google SRE Book: Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) — overload and dependency protection.
-
