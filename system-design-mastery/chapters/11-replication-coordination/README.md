@@ -115,7 +115,7 @@ A saga is not equivalent to a global transaction: other requests may observe int
 
 At-least-once delivery can repeat a step. Store a message or operation identity with the business effect in the same transactional boundary, or use an equivalent durable protocol that closes the crash window. A broker's exactly-once feature applies only to its documented scope; it does not automatically make arbitrary database writes, emails, payments, or external API calls happen exactly once. Name the boundary and define reconciliation for uncertain outcomes.
 
-## 11.5G Distributed lock decision checklist
+## 11.11 Distributed lock decision checklist
 
 Before introducing a distributed lock, ask:
 1. Is the lock protecting correctness or only avoiding duplicate effort?
@@ -128,11 +128,11 @@ Before introducing a distributed lock, ask:
 
 A lock adds a coordination dependency and can become a bottleneck. Prefer the simplest mechanism that preserves the invariant.
 
-## 11.5H Membership changes and quorum reasoning
+## 11.12 Membership changes and quorum reasoning
 
 A quorum intersection argument depends on the configured membership and protocol. Changing replica membership while writes are in flight can create configurations whose quorums do not intersect safely unless reconfiguration is part of the protocol. Do not treat “majority of current nodes” as a universal algorithm. Joint consensus or equivalent protocol rules are needed for safe transitions in systems that use them.
 
-## 11.5I Coordination review checklist
+## 11.13 Coordination review checklist
 
 - What exact state or decision must participants agree on?
 - What failures and timing assumptions does the protocol tolerate?
@@ -146,7 +146,7 @@ A quorum intersection argument depends on the configured membership and protocol
 - How is recovery tested under pauses, partitions, duplicate messages and restarts?
 
 
-## 11.6 Worked failure timeline: why a lease needs fencing
+## 11.14 Worked failure timeline: why a lease needs fencing
 
 Assume worker A acquires a lease to update a shared resource. A pauses for a long garbage-collection event or loses network connectivity. Its lease expires, worker B acquires a new lease, and then A resumes. A local belief that its lease is valid is not proof that it still owns the resource.
 
