@@ -19,6 +19,17 @@ Application validation alone is insufficient when multiple instances or alternat
 
 Use primary keys, unique constraints, foreign keys, check constraints, and not-null constraints to express invariants where supported. Understand the engine's exact semantics: nullable unique columns, deferred constraints, collation, and partial indexes can affect behavior. A constraint failure is an expected concurrency outcome to handle, not necessarily an infrastructure failure.
 
+### ACID: what a transaction guarantees
+
+ACID summarizes four transaction properties, but the database engine and configuration determine their exact boundaries:
+
+- **Atomicity:** the transaction's changes commit as a unit or are rolled back as a unit. This does not automatically include side effects in an external service or message broker.
+- **Consistency:** a committed transaction preserves the database's declared constraints and application invariants that the transaction protocol actually enforces. ACID does not make an incorrect business rule correct.
+- **Isolation:** concurrent transactions are constrained according to the configured isolation semantics. Weaker levels may permit anomalies; stronger levels can add contention or aborts.
+- **Durability:** after a successful commit, changes survive the failures covered by the database's durability configuration. Acknowledgement policy, replication mode, storage guarantees and recovery configuration affect what failures are covered.
+
+A local database transaction cannot by itself make a database update and a remote HTTP call atomic. For cross-system workflows, use an explicit design such as a transactional outbox, idempotent consumer, or saga, and document the failure and reconciliation behavior.
+
 ### Isolation anomalies and practical consequences
 
 - **Dirty read:** a transaction reads data another transaction has not committed.
@@ -53,6 +64,12 @@ A composite index can support queries that constrain a leading prefix and then o
 
 Use execution-plan tooling to compare estimated and actual rows, scan types, join algorithms, sort operations, and buffer/disk behavior. Do not assume an index is always faster: low-selectivity predicates or small tables may be cheaper to scan.
 
+### Index structures and their trade-offs
+
+A **B-tree** is the general-purpose default in many relational engines. It supports equality and range predicates and can often provide ordered results. A **hash index** is primarily suited to equality lookup and does not provide range ordering; availability, durability and supported operations vary by engine. Some engines also provide specialized structures—for example, PostgreSQL offers GIN for values such as arrays or full-text search, GiST for extensible operator classes and spatial-style queries, and BRIN for large tables whose values correlate with physical row order.
+
+Choose an index from actual predicates, ordering, selectivity and engine support, then verify the plan. Every index consumes storage and adds work to inserts, updates and deletes; a wide composite index can also increase cache pressure. Index-only access depends on the engine and visibility/storage details, so the presence of all requested columns in an index does not guarantee that no table access will occur. Avoid creating indexes solely because a column appears in a WHERE clause—measure the workload and write cost.
+
 ### Joins, pagination, and N+1 queries
 
 Joins express relationships in the query engine, but join cost depends on cardinality, indexes, join algorithm, memory, and data distribution. A nested-loop join may be excellent for a small outer input with indexed lookups and disastrous for a large one. Hash and merge joins have their own memory, sorting, and ordering trade-offs.
@@ -82,6 +99,14 @@ Cross-shard joins, uniqueness constraints, transactions, and rebalancing are har
 A rolling deployment means old and new application versions may access the database simultaneously. Use an expand-and-contract sequence: add compatible schema, deploy code that can handle old and new forms, backfill in bounded batches, verify, switch behavior, then remove obsolete structures only after old versions and consumers are gone.
 
 Backfills need throttling, progress checkpoints, idempotency, retry behavior, observability, and a pause/rollback plan. Large unbounded updates can cause lock contention, replication lag, transaction-log growth, or I/O saturation. A migration is a production workload and should be capacity-planned accordingly.
+
+### Backup, point-in-time recovery, and retention
+
+Replication is not a backup: an accidental delete, corrupt write or compromised credential may be replicated to every copy. A recovery plan should specify backup scope, retention, encryption and access control, plus the recovery point objective (how much recent data may be lost) and recovery time objective (how long restoration may take). Point-in-time recovery typically requires a usable base backup plus a continuous chain of transaction logs or equivalent recovery records; exact prerequisites depend on the engine.
+
+Test restores into an isolated environment and verify application-level consistency, permissions, schema compatibility and measured recovery time. A backup job reporting success is not proof that the data can be restored. For sharded systems, coordinate or explicitly reconcile restore points across shards when cross-shard invariants matter.
+
+Retention and deletion are also data-model and operational requirements. Define which records expire, whether legal holds or audit requirements apply, and how deletion propagates to replicas, caches, search indexes, exports and backups. Backup retention can mean deleted data remains recoverable until those backups expire; document that behavior instead of promising immediate erasure if the system cannot guarantee it.
 
 ### Relational data review checklist
 
