@@ -118,3 +118,10 @@ A saga is often more practical across independently owned services where long-ru
 - Replication is not partitioning; quorum math alone does not prove linearizability.
 - Sagas need durable state, idempotent steps, compensations, and reconciliation.
 - Preserve hard invariants in the authoritative transactional boundary.
+
+## Further reading
+
+- [Gilbert and Lynch: Brewer's conjecture and the feasibility of consistent, available, partition-tolerant web services](https://users.ece.cmu.edu/~adrian/731-sp04/readings/GL-cap.pdf) — original CAP result and assumptions.
+- [Apache Kafka design documentation](https://kafka.apache.org/documentation/#design) — partitions, replication, delivery, and transactional processing; product guarantees are scoped to the documented boundary.
+- [AWS Builders' Library: Making retries safe with idempotent APIs](https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/) — practical treatment of ambiguous outcomes and idempotency.
+
