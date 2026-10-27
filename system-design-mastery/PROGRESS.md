@@ -496,3 +496,11 @@ Structural corrections committed on this branch:
 - The Chapter 16 authorization-cache subsection now uses 16.1H instead of the out-of-sequence 16.1G1 label.
 
 Technical status remains provisional: these changes improve navigation and address targeted fundamentals, but do not substitute for a complete claim-by-claim source audit and end-to-end semantic review of every chapter. Latest branch CI must be checked after these commits before final review readiness is claimed.
+
+
+## Cross-chapter consistency checks — 2026-10-28
+
+- Scanned the 20 chapter files in parallel for placeholder markers and exact repeated substantive paragraphs; no placeholder markers or long verbatim paragraph duplicates were found in the chapter scan.
+- Scanned chapter Markdown links for explicit local heading fragments; none were present, so the section-heading hierarchy changes did not break fragment links in the chapters. The repository validator continues to check local Markdown target paths.
+- Spot-checked Kafka delivery-semantics and HTTP caching explanations against official Kafka design documentation and IETF RFC 9111. The chapters correctly scope Kafka transactions to supported broker processing boundaries and distinguish no-cache revalidation from no-store storage prohibition.
+- The latest CI runs were queued at the time of this note. Do not treat prior successful runs as validation of later commits; the latest branch head must complete both jobs.
