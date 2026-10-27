@@ -5,6 +5,24 @@ A remote call can be delayed, duplicated by retries, rejected, partially process
 
 State the fault model: crash-stop processes, network loss/delay/partition, disk failure, correlated infrastructure failure, or Byzantine behavior. Most service designs assume non-Byzantine components but still need crash and communication failure handling.
 
+## Safety and liveness: what does “correct” mean?
+
+Distributed-system guarantees become clearer when separated into **safety** and **liveness**:
+
+- **Safety:** something bad never happens. Examples: two clients are never both granted the same unique seat; a stale leader never overwrites a newer owner's state; a committed transaction never disappears under the stated durability model.
+- **Liveness:** something good eventually happens. Examples: a valid request eventually completes; a queued job is eventually processed; a failed replica can eventually rejoin and catch up.
+
+Safety and liveness are different obligations. A system can preserve safety by refusing writes during a network partition, yet lose availability for those writes. A system can remain responsive by accepting conflicting writes on both sides of a partition, but then it cannot promise that every operation preserves a single globally linearizable history. A design must state which operations may wait, fail, or proceed under each failure condition.
+
+For example, suppose two regions can independently accept reservations for the last available seat. Both regions may respond quickly, satisfying a local notion of progress, while violating the global invariant. Preventing that violation requires an authority, coordination, preallocated capacity, or a business rule that makes concurrent allocation safe. Reconciliation after the fact cannot always restore an invariant whose violation has already caused an external side effect.
+
+When reviewing a guarantee, ask two questions separately:
+
+1. **Safety:** what must never happen, and which protocol or invariant enforcement prevents it even during retries, pauses, restarts, and partitions?
+2. **Liveness:** under which assumptions will the operation eventually complete, and what happens if those assumptions—such as quorum availability or dependency reachability—do not hold?
+
+Neither property should be asserted without its assumptions. “Eventually” requires conditions such as eventual network recovery, a functioning quorum, or a fair scheduler. “Never” depends on the modeled failures, durable state, and correctness of the enforcement mechanism. Tests can search for counterexamples, but passing tests alone do not prove a distributed protocol safe.
+
 ## 10.7 Failure models: crash, omission, partition, and Byzantine behavior
 
 A distributed protocol should state which failures it tolerates. A **crash-stop** process halts and does not return. A **crash-recovery** process may restart with durable state. An **omission** failure drops a message or action. A **network partition** prevents some participants from communicating while other parts may continue. A **Byzantine** participant may send arbitrary or contradictory messages; most ordinary service architectures do not provide Byzantine fault tolerance and should not imply they do.
