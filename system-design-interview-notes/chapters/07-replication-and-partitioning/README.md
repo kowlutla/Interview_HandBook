@@ -112,3 +112,25 @@ No. It can ensure quorum intersection under the stated replica model, but linear
 
 - [Designing Data-Intensive Applications: replication and partitioning concepts](https://dataintensive.net/) — background reading; verify concrete guarantees against the chosen database's documentation.
 
+## 7.6 Consistent hashing and controlled rebalancing
+
+A shard key decides which partition owns a record. A good key distributes load and storage while keeping common queries targeted. A key such as `tenantId` can work well when tenants are similarly sized, but one very large tenant can create a hot partition. A monotonically increasing timestamp can concentrate new writes on the newest range.
+
+**Consistent hashing** maps keys and nodes onto a logical hash ring so adding or removing a node typically remaps only a portion of keys, rather than almost every key as with a simple `hash(key) % nodeCount`. Virtual nodes can improve balance when physical nodes differ in capacity. Consistent hashing does not automatically solve skew: a very hot key still maps to one owner unless the data model or routing strategy handles it.
+
+A safe rebalancing plan should account for:
+1. Copying existing data while normal reads and writes continue.
+2. Tracking changes made during the copy, using a log, change stream, or dual-write protocol with explicit reconciliation.
+3. Switching ownership/routing only after the target is sufficiently caught up.
+4. Preventing old and new owners from accepting conflicting writes; epochs or fencing tokens can reject stale owners.
+5. Monitoring replication lag, error rates, hot keys, and rollback conditions.
+
+Do not describe shard movement as a single atomic copy. It is a migration protocol with a period of overlapping state, and its correctness depends on how writes are ordered and ownership is changed.
+
+### Q3. Why is consistent hashing useful, and what does it not solve?
+
+It limits how many keys need reassignment when the node set changes, which can reduce data movement during scaling. It does not guarantee perfectly even traffic, remove hot keys, or make migration safe by itself. Virtual nodes improve distribution, while hot-key handling and a correct ownership-switch protocol address different problems.
+
+### Q4. How would you choose a shard key?
+
+Start with dominant queries, tenant boundaries, data growth, and write distribution. Prefer keys that route common requests to one shard and distribute workload reasonably evenly. Check for high-volume tenants, time-correlated keys, and queries that would require expensive fan-out. Revisit the key only with a migration plan, because changing it can require substantial data movement.
