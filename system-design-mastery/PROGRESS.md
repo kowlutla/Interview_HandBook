@@ -520,3 +520,19 @@ Technical status remains provisional: these changes improve navigation and addre
 - [ ] Mermaid rendering, full OpenAPI validation, exhaustive external-link liveness, claim-to-source verification, and full 21-family depth acceptance remain open. No inventory family is promoted to Deep.
 
 The chapter-level structural checks were targeted per changed chapter (headings, fenced Mermaid declarations and navigation links); they are not a substitute for the repository validation workflow or full semantic acceptance. The audit branch remains separate from `main`.
+
+
+## Chapter 01 focused technical acceptance — 2026-10-28
+
+A focused acceptance pass was completed for `chapters/01-thinking-in-systems/README.md` on the audit branch. The chapter was re-fetched after edits and reviewed section by section, including the worked architecture decision and its assumptions.
+
+- [x] Reviewed all 16 numbered sections for technical correctness, terminology, scope, prerequisites, readability and unnecessary repetition; no material correctness defect was found.
+- [x] Cross-checked the systems-feedback/retry-amplification explanation against Google's SRE guidance on cascading failures; the microservice/modular-monolith trade-off against Martin Fowler's published discussion; the C4 diagram taxonomy against the official C4 guide; and the ADR description against Microsoft's Well-Architected ADR guidance.
+- [x] Opened every external URL in the chapter's further-reading list and newly added inline references. The pages returned content; Google's architecture-framework URL redirects to the current Google Cloud documentation host. No dead link was identified in this check.
+- [x] Verified the four existing relative navigation links and the new Chapter 12 cross-link by checking their repository targets.
+- [x] Rechecked the Chapter 1 Mermaid blocks: five diagrams, recognized flowchart declarations, closed code fences, and manually reviewed node/edge/subgraph syntax. No syntax defect was identified by this manual review.
+- [x] Rechecked Markdown structure: 392 lines, 32 headings, no duplicate heading text, no unclosed code fence, and all 16 numbered sections present.
+- [x] Rechecked the worked registration scenario: seat-capacity invariant is owned by an authoritative transaction boundary; payment timeout is treated as an uncertain outcome; provider idempotency-key scope/retention is explicitly implementation-specific; outbox publication and notification replay are not presented as globally exactly-once.
+- [x] Added inline source links beside the retry-amplification, microservice trade-off, ADR, and C4 claims. Clarified the transactional-outbox prerequisite and linked to Chapter 12.
+
+**Validation boundary:** the audit branch has no active textbook-validation workflow, and a Mermaid renderer could not be obtained in the current environment. Therefore this entry records manual Mermaid syntax review, not automated SVG rendering or a post-edit CI pass. No Chapter 1 content correction remains identified by this focused pass; this is not a claim that the entire 20-chapter textbook or all 21 curriculum families have passed acceptance.
