@@ -74,3 +74,38 @@ No. Instances may share a database, network, zone, credentials, or configuration
 - Define degraded behavior for overload and dependency failures.
 - Design redundancy across relevant failure domains.
 - Set RTO/RPO and test actual restoration.
+
+## Circuit breaker and controlled retries
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: Failure threshold reached
+    Open --> HalfOpen: Reset interval elapsed
+    HalfOpen --> Closed: Probe succeeds
+    HalfOpen --> Open: Probe fails
+```
+
+A circuit breaker limits calls to a dependency that is failing; it does not repair the dependency. Its thresholds, open interval, and half-open probes should match the call volume and failure mode. A shared dependency outage can make every caller's breaker open at once, so recovery traffic still needs limits.
+
+Retries should be bounded by an end-to-end deadline and a retry budget. Exponential backoff with jitter spreads attempts over time. Avoid retrying non-idempotent operations unless the operation has a safe idempotency contract. Multiple layers retrying independently can multiply load dramatically.
+
+## Scenario practice
+
+**Scenario:** A downstream service slows down. Callers time out and retry, increasing load until healthy instances also fail. What changes would you make?
+
+**Reasoning:** Propagate deadlines, cap concurrency, set one clear retry owner, use bounded exponential backoff with jitter, and apply circuit breaking or load shedding where appropriate. Separate optional work with bulkheads. Monitor saturation and retry volume; do not rely on autoscaling alone if the dependency is the bottleneck.
+
+## Interview questions
+
+### Q1. Why can retries reduce availability?
+Retries add work precisely when a dependency is struggling. They can exhaust threads, connections, and CPU, causing a cascading failure. Retry only likely transient failures, use backoff/jitter and budgets, and ensure the operation is safe to repeat.
+
+### Q2. What is the difference between high availability and disaster recovery?
+High availability reduces interruption from common failures, often within a region using multiple zones and automatic failover. Disaster recovery addresses larger outages and data recovery using backups, replication, and tested procedures, with explicit RTO/RPO targets. Multi-region deployment can support both but adds cost and consistency complexity.
+
+## Further reading
+
+- [Google SRE Book: Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) — overload, retries, and dependency protection.
+- [AWS Well-Architected Reliability Pillar](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html) — practical failure and recovery review guidance.
+
