@@ -63,24 +63,6 @@ A cache outage can become a database outage if the architecture assumes every re
 - **Distributed cache:** Shared across instances, but adds a network hop and its own operational dependency.
 - **Database buffer/cache:** Often built into the database; do not confuse it with an application-level cache.
 
-## 5.7 Common interview questions
-
-### When should you introduce caching?
-
-When measurements or workload estimates show that repeated reads, latency, or backing-store load are a problem and the data can tolerate the chosen freshness policy. Caching adds complexity, so first identify the bottleneck and the acceptable staleness.
-
-### How do you invalidate cached data?
-
-Choose based on freshness needs. TTL is simple but permits stale reads until expiry. Explicit invalidation can be fresher but may race or fail. Versioned keys and event-driven invalidation can help in particular designs. Explain what happens if an invalidation event is lost.
-
-### What is a cache stampede, and how do you prevent it?
-
-It occurs when many requests simultaneously miss an entry and all query the backing store. Coalesce concurrent loads for the same key, stagger expiry, refresh before expiry, or serve a bounded stale value where acceptable.
-
-### Should the database be queried when the cache is unavailable?
-
-It depends on the database's capacity and the importance of the request. Blindly bypassing the cache can overwhelm the database. A design may use concurrency limits, rate limiting, graceful degradation, or fail-fast behavior to protect the system.
-
 ## Quick revision
 
 - Caching improves performance at the cost of freshness and complexity.
@@ -113,21 +95,12 @@ sequenceDiagram
 
 Invalidation after a database commit still has race conditions: a concurrent reader can load an old database value and repopulate the cache after invalidation. Depending on correctness needs, use versioned values, write-through coordination, short TTLs, or a design that prevents stale repopulation. No single invalidation pattern fits every workload.
 
-## Scenario practice
+## Scenario analysis
 
-**Scenario:** A popular product key expires, and thousands of requests simultaneously miss the cache. The database becomes overloaded.
+**Case:** A popular product key expires, thousands of requests miss the cache at once, and the database becomes overloaded.
 
 **Reasoning:** Use request coalescing/single-flight so one request loads the value while peers wait briefly, add TTL jitter, and consider controlled warming for known hot keys. Bound waits and concurrency; stale-while-revalidate is acceptable only if the product tolerates stale values. If the cache is unavailable, protect the database rather than letting every request fall through without limits.
-
-## Interview questions
-
-### Q1. Is a cache the source of truth?
-Usually not. It is a derived copy that may be evicted, stale, or unavailable. The authoritative store owns business correctness unless the architecture explicitly uses a durable cache as a data system with documented guarantees.
-
-### Q2. What is a cache stampede and how do you mitigate it?
-Many callers simultaneously reload the same missing/expired key. Coalesce concurrent loads, add expiry jitter, warm predictable hot keys, and cap fallback concurrency. Choose stale serving only when correctness permits it.
 
 ## Further reading
 
 - [Redis documentation](https://redis.io/docs/latest/) — data structures, expiration, eviction, and deployment behavior.
-
