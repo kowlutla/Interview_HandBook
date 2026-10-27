@@ -80,7 +80,7 @@ A failover mechanism is only one part of recovery. A complete recovery path must
 
 ### Availability math and dependency composition
 
-For a serial request path in which every dependency must succeed, end-to-end availability is approximately the product of dependency availabilities when failures are independent. If three required dependencies each have availability 99.9%, the rough combined availability is (0.999^3 approx 99.70\%). Real failures are often correlated, so this calculation is a useful first approximation, not a guarantee.
+For a serial request path in which every dependency must succeed, end-to-end availability is approximately the product of dependency availabilities when failures are independent. If three required dependencies each have availability 99.9%, the rough combined availability is \(0.999^3 \approx 99.70\%\). Real failures are often correlated, so this calculation is a useful first approximation, not a guarantee.
 
 Redundancy helps only if it reduces the relevant failure probability. Two replicas in one zone may share power, networking, credentials, a control plane or a bad rollout. A redundant application with one database remains dependent on that database unless the data layer has its own recovery strategy.
 
