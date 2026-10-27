@@ -53,6 +53,16 @@ TCP's ordered delivery also creates head-of-line blocking. If a segment is lost,
 
 UDP sends datagrams without TCP's built-in reliability or ordering. Applications using UDP must decide what reliability, congestion control, and security behavior they need. QUIC, used by HTTP/3, runs over UDP and provides transport features including independently progressing streams. This avoids the specific cross-stream ordering dependency caused by TCP loss, but it does not eliminate congestion, packet loss, or shared connection-capacity limits.
 
+### Connection setup, round trips, and packet loss
+
+A new TCP connection normally starts with a three-way handshake (SYN, SYN-ACK, ACK). For HTTPS over TCP, TLS negotiation then establishes cryptographic keys and authenticates the server before protected application data can be exchanged. The added latency depends on the protocol version, session resumption, and deployment; a reused connection can avoid repeating these setup steps. QUIC combines transport establishment with the TLS 1.3 handshake and can reduce setup round trips. TLS 1.3 early data (0-RTT), when supported, has replay considerations, so it must not be treated as safe for arbitrary non-idempotent operations.
+
+This matters especially for short requests: on a high-round-trip-time path, connection setup can cost more than the application work itself. Measure DNS, connection establishment, TLS, pool wait, server processing, and response transfer separately. Connection reuse and pooling can reduce repeated setup cost, but must still have bounded capacity, appropriate idle lifetimes, and stale-connection handling.
+
+Bandwidth and latency are different constraints. For a bulk transfer, the bandwidth-delay product (BDP) estimates how much data can be in flight to fill a path: `BDP = bandwidth × round-trip time`. Use consistent units (for example, bytes/second × seconds = bytes). A high-bandwidth path can still deliver small request/response exchanges slowly when RTT is high, while packet loss and congestion control can reduce achievable throughput. Avoid assuming that adding bandwidth alone will fix latency-sensitive RPCs.
+
+Packet loss can trigger retransmission and increase latency; repeated loss can reduce throughput as congestion control reacts. A **network partition** is a period when components cannot communicate over the network even though one or both may still be running. It can be asymmetric or intermittent, and a TCP connection may not fail immediately when a path becomes unusable. Application deadlines, connection health checks, and carefully configured keep-alives help bound detection time, but no timeout proves that a remote operation did not execute. Treat the result of a timed-out write as potentially unknown and use idempotency or reconciliation where necessary.
+
 Two different controls are worth separating:
 
 - **Flow control** protects a receiver from being overwhelmed by a sender.
