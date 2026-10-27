@@ -88,3 +88,22 @@ No. A negative can safely skip a lookup under the filter's correctness assumptio
 
 **Reasoning:** Start from user-visible requirements and query patterns. A relational database may be enough for transactional CRUD and modest filtering. Add a search index when full-text relevance or query latency justifies its derived-data lifecycle; add a stream when durable fan-out/replay or decoupled processing is needed; add a warehouse when analytical scans materially interfere with OLTP. For each component, name the owner of authoritative data, the freshness contract, and the failure behavior. Avoid introducing infrastructure without a workload that needs it.
 
+## 15.7 B-tree and LSM-tree storage trade-offs
+
+Storage-engine choice is about the workload and implementation, not a universal ranking.
+
+- **B-tree-family indexes** keep keys in an ordered structure and support efficient point lookups and range scans. They are common in relational databases. Updates may cause page writes and page splits, and secondary indexes add write and storage cost.
+- **Log-structured merge (LSM) trees** typically buffer writes in memory and flush sorted runs to disk, then compact those runs in the background. They can provide high write throughput, but compaction consumes I/O and space, and read amplification may require checking multiple structures unless filters and indexes narrow the search.
+- **Write amplification** is the amount of physical data written relative to the logical data changed. **Read amplification** is the extra work needed to serve a read. **Space amplification** is the additional storage consumed by indexes, obsolete versions, or compaction overlap.
+
+A write-heavy workload with sequential ingestion may favor an LSM-oriented engine, while a workload requiring efficient ordered access and predictable range queries may favor a B-tree-oriented design. Real systems include caching, compression, compaction policies, concurrency control, and other details, so benchmark representative operations before choosing.
+
+### Q4. Why can a write-optimized database have slower reads under some workloads?
+
+An LSM-based engine may need to consult multiple sorted runs and merge results; compaction and tombstones can add work. Bloom filters and indexes reduce unnecessary reads, while compaction policy trades background I/O and space for read efficiency. Measure the actual workload rather than assuming the storage-engine family determines performance by itself.
+
+## 15.8 Change data capture and derived projections
+
+Change data capture (CDC) publishes committed database changes to downstream consumers. It can maintain search indexes, analytics projections, or caches without putting every downstream update in the synchronous request path. A log-based CDC pipeline still introduces lag, schema compatibility concerns, duplicate/replayed events, and ordering constraints.
+
+Treat the projection as rebuildable derived state where possible. Include a stable event identity or source position, make consumers idempotent, define how schema changes are rolled out, and monitor the age of the latest processed change. A successful database commit does not mean every projection has already caught up.
