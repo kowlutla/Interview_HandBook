@@ -18,6 +18,11 @@ The target is a compact set of connected notes, not a fixed chapter count. Merge
 | 10 | [Reliability and Resilience](chapters/10-reliability-and-resilience/README.md) | Design timeouts, retries, backoff, circuit breakers, rate limits, and graceful degradation. |
 | 11 | [Security and Multi-Tenancy](chapters/11-security-and-multi-tenancy/README.md) | Cover authentication, authorization, isolation, secrets, and abuse controls at architecture level. |
 | 12 | [Observability and Design Trade-offs](chapters/12-observability-and-trade-offs/README.md) | Use logs, metrics, traces, SLIs/SLOs, and a repeatable method to compare designs. |
+| 13 | [Distributed Systems and Business Correctness](chapters/13-distributed-systems-and-correctness/README.md) | Reason about partial failure, CAP, quorums, delivery semantics, idempotency, sagas, and business invariants. |
+| 14 | [Networking, Request Routing, and Real-Time Systems](chapters/14-networking-and-real-time-systems/README.md) | Trace requests through DNS, edge, proxies, application dependencies, and real-time transports. |
+| 15 | [Specialized Infrastructure](chapters/15-specialized-infrastructure-and-search/README.md) | Choose search, object storage, analytics, probabilistic structures, schedulers, and rate limiters when justified. |
+| 16 | [Interview Method and Estimation Workshop](chapters/16-interview-method-and-estimation-workshop/README.md) | Run a timed interview, estimate workload with units, and diagnose bottlenecks using observable signals. |
+| 17 | [Senior Trade-offs and Case-Study Practice](chapters/17-senior-tradeoffs-and-case-study-path/README.md) | Defend conditional design choices and practise a curated sequence of canonical end-to-end problems. |
 
 ## Scope rules
 
@@ -26,7 +31,8 @@ The target is a compact set of connected notes, not a fixed chapter count. Merge
 - Do not duplicate a full explanation across chapters; link back to the original explanation and focus on the new relationship.
 - Add diagrams only when they clarify flow, ownership, or failure behavior.
 - Include interview questions with explanatory answers, but avoid turning every chapter into an enormous question bank.
-- End-to-end case studies (for example, URL shortener, chat, feed, or ride-hailing) are a separate future phase.
+- Full end-to-end designs remain in [`../real-world-examples/README.md`](../real-world-examples/README.md); Chapter 17 provides a curated practice order without duplicating them.
+- Networking, specialized infrastructure, real-time communication, and interview execution are covered in dedicated chapters 14–16; related tutorials remain deeper references.
 
 ## Completion criteria
 
