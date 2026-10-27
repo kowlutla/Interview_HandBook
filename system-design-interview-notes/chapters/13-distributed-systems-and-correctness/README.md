@@ -1,6 +1,6 @@
 # 13. Distributed Systems and Business Correctness
 
-Distributed systems make independent components coordinate over networks that can delay, duplicate, reorder, or lose messages. The central interview skill is to state the guarantee required, then explain which mechanism provides it—and where that guarantee ends.
+Distributed systems make independent components coordinate over networks that can delay, duplicate, reorder, or lose messages. The central design skill is to state the guarantee required, then explain which mechanism provides it—and where that guarantee ends.
 
 ## 13.1 Partial failure: timeout is not proof of failure
 
@@ -90,23 +90,9 @@ flowchart TD
 
 Use explicit states such as PENDING, CONFIRMED, FAILED, and COMPENSATING. Make transitions conditional, persist workflow progress, retry transient failures, and reconcile stuck/ambiguous operations. For an inventory invariant, a conditional update such as “decrement only where available_quantity >= requested_quantity” or a unique reservation record is more important than adding a queue.
 
-## Interview questions
+## Scenario analysis
 
-### Q1. A payment API times out. Why shouldn't the client simply retry with a new request?
-The original request may have succeeded and only the response was lost. A new request can charge the customer twice. Retry using the same idempotency key, persist the operation result, and query/reconcile with the payment provider when the outcome remains ambiguous.
-
-### Q2. Does a quorum guarantee strong consistency?
-No. Quorum intersection can help ensure reads and writes overlap, but strong guarantees also depend on the replication protocol, version ordering, concurrent-write resolution, and failover behavior. State the exact database guarantee rather than inferring it from (R+W>N).
-
-### Q3. How do you prevent a consumer from applying the same event twice?
-Assume redelivery can happen. Give each event a stable ID and atomically record its processing/deduplication state with the business mutation. Acknowledge only after commit. If the effect is external, propagate an idempotency key or build a reconciliation path.
-
-### Q4. When is a saga preferable to two-phase commit?
-A saga is often more practical across independently owned services where long-running work and eventual completion are acceptable. It requires explicit compensation and intermediate states, and compensation can fail. Two-phase commit offers a different atomicity model but couples participants to a coordinator/protocol and can block or reduce availability during failures.
-
-## Scenario practice
-
-**Scenario:** The order service commits an order and publishes an event separately. Occasionally the order exists but downstream inventory never receives the event. Design the fix.
+**Case:** The order service commits an order and publishes an event separately. Occasionally, the order exists but downstream inventory never receives the event.
 
 **Reasoning:** The database commit and broker publish are two independent writes; either can succeed alone. Write the order and an outbox row in one local transaction. A publisher retries unsent rows, marks delivery progress safely, and accepts duplicate publication. Consumers deduplicate by event ID and apply their business update transactionally. Monitor outbox age and consumer lag, and add a reconciliation job for stuck records.
 
@@ -135,10 +121,10 @@ A **lease** grants authority for a bounded interval, often to a leader or lock h
 
 Do not use a timestamp as a fencing token unless the system can guarantee the ordering property the resource needs. If two owners can produce writes, the protected resource must be able to distinguish a newer authority from an older one.
 
-### Q5. Why is a timeout-based failure detector not proof that a node has failed?
+### Timeout-based failure detection
 
 A slow node and an unreachable node can look identical to the observer. The node may still be processing requests or may be isolated from only part of the cluster. Treat timeouts as suspicion, then use quorum/consensus and explicit ownership rules to decide whether an operation may safely proceed.
 
-### Q6. Why might a distributed lock need a fencing token?
+### Fencing tokens for distributed locks
 
 A lock can expire while its former holder is paused. If that process resumes, it may still attempt a write even though another process acquired the lock. The protected resource must reject stale generations; merely having a lock service issue a lease does not stop a stale process from sending commands.
