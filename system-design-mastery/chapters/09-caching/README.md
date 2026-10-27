@@ -108,6 +108,19 @@ Vary identifies request headers that affect the representation and therefore par
 
 Consult [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html) for normative HTTP caching behavior; do not infer security from a cache directive without reviewing the complete response and deployment.
 
+### CDN and edge-cache behavior
+
+A CDN is a shared cache distributed across points of presence (PoPs). It can serve cacheable responses near users and reduce origin traffic, but the effective behavior depends on both HTTP semantics and provider configuration. Some deployments add an origin shield or regional cache between edge PoPs and the origin; this can reduce duplicate origin fetches but adds another cache layer whose freshness and failure behavior must be understood.
+
+For each cacheable route, document:
+- **Cache key:** which host, normalized path, query parameters, headers, cookies, and content-encoding dimensions participate. Ignore a dimension only when it cannot change the response; inconsistent normalization between edge and origin can create cache poisoning or representation leaks.
+- **TTL precedence:** how origin `Cache-Control`, shared-cache directives such as `s-maxage`, CDN minimum/default/maximum TTLs, and explicit edge rules interact. A provider override can change origin intent, so review the deployed rule rather than assuming the response header alone determines behavior.
+- **Personalization and authorization:** whether the response is public and representation-independent. Do not shared-cache user-specific or authorization-dependent content unless the key, policy and authorization checks make reuse safe.
+- **Invalidation:** whether purge targets one URL, a set of URLs, a surrogate key/tag, or a whole zone; whether the purge is synchronous or eventually propagated; and what happens when purge delivery fails. Provider APIs and propagation guarantees differ, so verify them against the chosen CDN's documentation.
+- **Failure and revalidation:** how the edge behaves on origin timeout, stale content, validator responses, shield failure and cold start. Stale serving is a policy decision, not automatically safe for every response.
+
+Example: a public product description may be cached at the edge for a bounded period and purged by a product tag after an update. A cart, account page or membership-dependent project response should not share that policy merely because it uses the same CDN. Test the deployed configuration with different query strings, locales, authorization states, purge failures and a stale origin response; inspect cache-status headers without treating them as proof of authorization.
+
 ### Cache design checklist
 
 - What is the source of truth?
