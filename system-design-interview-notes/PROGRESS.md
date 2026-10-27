@@ -2,7 +2,7 @@
 
 ## Current direction
 
-The interview notes are the primary learn-and-revise path. The tutorials remain focused concept references, `real-world-examples/` remains the canonical home for complete design walkthroughs, and `system-design-mastery/` remains a separate first-principles textbook. No content in those three directories was intentionally changed as part of this notes expansion.
+The HLD notes are the primary learn-and-revise path. The tutorials remain focused concept references, `real-world-examples/` remains the canonical home for complete design walkthroughs, and `system-design-mastery/` remains a separate first-principles textbook. No content in those three directories was intentionally changed as part of this notes expansion.
 
 ## Content inventory
 
@@ -10,8 +10,8 @@ The interview notes are the primary learn-and-revise path. The tutorials remain 
 - [x] Existing 12 chapter pages inspected.
 - [x] Tutorials and real-world-example indexes inspected.
 - [x] Mastery landing page inspected to preserve scope boundaries.
-- [x] Chapters 13–17 added for distributed correctness, networking/real-time, specialized infrastructure, interview methodology/estimation, and senior trade-offs/case-study practice.
-- [x] Chapters 1–12 strengthened with scenario practice, interview Q&A, diagrams where useful, and targeted authoritative references.
+- [x] Chapters 13–17 added for distributed correctness, networking/real-time, specialized infrastructure, design workflow/estimation, and senior trade-offs/case-study practice.
+- [x] Chapters 1–12 strengthened with scenario analysis, diagrams where useful, and targeted authoritative references.
 - [x] README and curriculum navigation updated for 17 chapters.
 - [x] Case-study pathways linked to canonical examples rather than copied.
 - [x] Added focused coverage for consistent hashing/rebalancing, multi-region failover, consensus/clocks/fencing, B-tree versus LSM trade-offs, CDC projections, and safe architecture migration.
