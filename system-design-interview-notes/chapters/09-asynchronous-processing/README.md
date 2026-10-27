@@ -76,3 +76,46 @@ Check whether the backlog is caused by a temporary burst, insufficient consumer 
 - Design for duplicate delivery and idempotent effects.
 - Be explicit about ordering scope and completion semantics.
 - Monitor backlog age and consumer lag, not just queue depth.
+
+## Outbox publication and duplicate-safe consumption
+
+```mermaid
+sequenceDiagram
+    participant A as Order service
+    participant DB as Order database
+    participant P as Outbox publisher
+    participant B as Broker
+    participant C as Consumer
+    A->>DB: Transaction: order + outbox row
+    DB-->>A: Commit
+    P->>DB: Read pending outbox row
+    P->>B: Publish event ID E
+    B-->>P: Broker acknowledgement
+    P->>DB: Mark row delivered
+    B->>C: Deliver E
+    C->>DB: Transaction: dedupe E + apply business change
+    DB-->>C: Commit
+    C-->>B: Acknowledge
+```
+
+The publisher can crash after broker acknowledgement but before marking the outbox row delivered, so it may publish the same event again. The consumer must tolerate that duplicate. The outbox prevents losing the intent to publish when the business transaction commits; it does not create a distributed transaction between the database and broker.
+
+## Scenario practice
+
+**Scenario:** A consumer processes an event, commits its database update, then crashes before acknowledging the message. What should happen on redelivery?
+
+**Reasoning:** The broker may deliver the event again. Give the event a stable ID and atomically record that ID with the business mutation in the consumer's local transaction. A duplicate should become a no-op. If the consumer triggers an external side effect, pass an idempotency key to that provider or reconcile ambiguous outcomes.
+
+## Interview questions
+
+### Q1. When should you choose a queue instead of a stream?
+A work queue fits independent tasks that workers claim and acknowledge. A retained event stream fits multiple consumers with independent offsets, replay, and ordered records within defined partitions. Real products can support both patterns; choose from retention, ordering, fan-out, and recovery requirements.
+
+### Q2. Does adding a queue solve overload?
+It can absorb a temporary burst if the backlog is bounded and consumers later catch up. If arrivals persistently exceed successful processing, backlog grows without bound unless capacity increases, work is reduced, or admission control sheds load.
+
+## Further reading
+
+- [Transactional Outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html) — implementation trade-offs and failure window.
+- [Apache Kafka documentation](https://kafka.apache.org/documentation/) — broker-specific delivery and processing semantics.
+
