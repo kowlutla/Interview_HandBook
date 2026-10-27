@@ -34,7 +34,7 @@ flowchart TD
   D --> A
 ```
 
-This is a reinforcing loop: retries intended to improve an individual request's chance of success can increase total load and make the original overload worse. A design should therefore bound retries, use deadlines and backoff with jitter, and avoid retrying non-idempotent operations without a safe deduplication strategy.
+This is a reinforcing loop: retries intended to improve an individual request's chance of success can increase total load and make the original overload worse. Google’s SRE guidance describes this retry-amplification mechanism and recommends randomized exponential backoff, bounded retries, and system-wide overload controls ([Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/)). A design should therefore bound retries, use deadlines and backoff with jitter, and avoid retrying non-idempotent operations without a safe deduplication strategy.
 
 A balancing response might reject or shed low-priority work when saturation crosses a threshold, reducing the work accepted by the system. But feedback has a **delay**: autoscaling may react only after queues and latency have already grown, and aggressive scale-up/scale-down policies can oscillate. Thresholds, cooldowns, queue limits, and measurements should be chosen with these delays in mind.
 
@@ -140,7 +140,7 @@ High cohesion and manageable coupling generally make change safer. Coupling is n
 
 Over-fragmentation creates network calls, distributed transactions, duplicated operational work, and unclear ownership. Under-fragmentation creates entangled code, shared release risk, and competing responsibilities. There is no universal optimal number of components.
 
-A **monolith** is deployed as one application unit; it can still have clear internal modules. A **modular monolith** enforces boundaries inside a shared deployment. **Microservices** split capabilities into independently deployable services and introduce network and operational failure modes. A **distributed system** has components that communicate across a network and must handle independent execution and partial failure. These categories overlap but are not synonyms.
+A **monolith** is deployed as one application unit; it can still have clear internal modules. A **modular monolith** enforces boundaries inside a shared deployment. **Microservices** split capabilities into independently deployable services and introduce network and operational failure modes. A **distributed system** has components that communicate across a network and must handle independent execution and partial failure. These categories overlap but are not synonyms. Martin Fowler’s discussion of [microservice trade-offs](https://martinfowler.com/articles/microservice-trade-offs.html) likewise emphasizes that stronger module boundaries and independent deployment come with distribution and operational costs; neither style is automatically best.
 
 ### A boundary decision checklist
 
@@ -198,7 +198,7 @@ An architecture decision record (ADR) should briefly capture:
 - **Validation:** measurements, experiments, or signals that will test it.
 - **Revisit triggers:** changes in scale, requirements, team structure, or operational evidence that could invalidate it.
 
-An ADR protects against hindsight bias and makes trade-offs visible. It is not a substitute for design detail, code, runbooks, or experiments. Record decisions at the level where they affect future choices; do not create paperwork for every trivial implementation detail.
+An ADR protects against hindsight bias and makes trade-offs visible. It is not a substitute for design detail, code, runbooks, or experiments. Record decisions at the level where they affect future choices; do not create paperwork for every trivial implementation detail. The [Azure Well-Architected guidance on architecture decision records](https://learn.microsoft.com/en-us/azure/well-architected/architect-role/architecture-decision-record) is a useful practitioner reference for recording context, rationale, consequences, and decision status.
 
 ```mermaid
 flowchart TD
@@ -291,7 +291,7 @@ Choose the view based on the question:
 | Trust-boundary view | Where do identities, privileges or trust assumptions change? | Principals, security zones, authentication and authorization enforcement points |
 | Failure / recovery view | What fails together, and how is service restored? | Failure domains, redundancy, promotion, restore paths and degraded modes |
 
-The C4 model is one useful way to describe static software structure at different levels: system context, containers, components and code. In that model, a “container” means an application or data store, not necessarily an operating-system or Docker container. A deployment diagram is a separate view because the same logical structure can be deployed differently in development, staging, one region, or multiple regions.
+The C4 model is one useful way to describe static software structure at different levels: system context, containers, components and code. Its official [diagram guide](https://c4model.com/diagrams) also identifies dynamic and deployment diagrams as supporting views. In that model, a “container” means an application or data store, not necessarily an operating-system or Docker container. A deployment diagram is a separate view because the same logical structure can be deployed differently in development, staging, one region, or multiple regions.
 
 **Logical architecture** describes responsibilities, boundaries and relationships without committing to placement. **Physical architecture** (often represented by a deployment view) maps those logical components to processes, hosts or containers, network zones, regions, storage and replicas. One logical service may have many deployed instances, and one host may run several logical components. Keep the mapping explicit when reasoning about capacity, failure domains, identity and cost; the logical/physical distinction is about the question being answered, not a strict one-to-one mapping.
 
@@ -354,7 +354,7 @@ Consider an illustrative event-registration application used by one product team
 
 ### Step 3: make a conditional decision
 
-Under the stated assumptions, start with a **modular monolith**: separate event, registration, payment-workflow and notification modules behind explicit interfaces, but keep seat allocation and registration persistence in one authoritative transaction boundary. Write a durable state transition and an outbox record together; publish confirmation work asynchronously. Use a stable payment idempotency key and a reconciliation path for uncertain provider outcomes.
+Under the stated assumptions, start with a **modular monolith**: separate event, registration, payment-workflow and notification modules behind explicit interfaces, but keep seat allocation and registration persistence in one authoritative transaction boundary. Write the durable state transition and a **transactional outbox** record together—the outbox is stored in the same database transaction as the business change, then relayed for asynchronous publication ([Chapter 12: Messaging and streams](../12-messaging-streams/README.md) explains the delivery and deduplication boundaries). Use a stable payment idempotency key, meaning the same key identifies retries of the same logical payment operation, and a reconciliation path for uncertain provider outcomes.
 
 This is not a claim that modular monoliths are universally better. It is the simplest candidate that appears to satisfy the current invariants and team constraints without introducing distributed coordination prematurely. The payment idempotency key must identify the logical payment operation and remain stable across retries; persist the association with the registration/workflow state. Confirm the provider's key scope, retention window, and behavior for the same key with a different request payload. If retries may occur after the provider forgets the key, do not assume the key alone prevents a duplicate charge: reconcile against the provider's durable transaction reference or provide an explicit exception/manual-recovery path.
 
