@@ -474,3 +474,11 @@ A targeted read of Chapter 03 found that capacity estimation covered average/pea
 
 - [x] Add explicit DAU-to-RPS, fan-out, read/write split, bandwidth and retention calculations to Chapter 03.
 - [ ] Run the post-edit artifact validation workflow and check relative links after all changes.
+
+
+## Follow-on technical review — 2026-10-28
+
+- Reviewed the structure and section coverage of all 20 canonical chapter files, then made two targeted fundamentals improvements on this branch.
+- Chapter 10 now explicitly separates **safety** from **liveness**, explains the trade-off under partitions, and includes an inventory-allocation example to connect formal properties to a business invariant.
+- Chapter 07 now distinguishes **partitioning**, **sharding**, **replication**, and **vertical partitioning**, including their different scaling effects, key-selection risks, skew/hot partitions, and resharding concerns.
+- These edits address conceptual gaps identified in the first pass; they do not constitute a completed line-by-line technical and source audit of every chapter. Overall acceptance remains provisional until the full review and validation rerun are complete.
