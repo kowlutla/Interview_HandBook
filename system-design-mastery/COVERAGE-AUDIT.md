@@ -561,3 +561,8 @@ Do not describe the textbook as fully technically validated until those checks p
 ## Targeted capacity-estimation correction — 2026-10-28
 
 A targeted Chapter 03 read identified a specific teaching gap: the chapter described workload and peak-rate estimation but did not explicitly show how DAU and per-user actions translate to backend RPS. A new worked section now states DAU, actions per user/day, backend requests per action, active hours and peak factor; calculates daily requests, active-period average and peak RPS, read/write split, response bandwidth, raw daily storage and 90-day retention; and warns that fan-out, retries, payload distribution, indexes, replicas and backups must be accounted for separately. The example arithmetic was independently recalculated. This closes that specific explanatory gap; it does not promote the overall capacity/performance inventory row to Deep because load-test assumptions, other formulas and source alignment still need the full acceptance pass.
+
+
+## Follow-on technical review — 2026-10-28
+
+The first-pass structure review was followed by targeted technical edits: Chapter 10 now teaches safety versus liveness as separate correctness obligations, including the consequences of partitions and the limits of post-hoc reconciliation; Chapter 07 now explicitly distinguishes partitioning, sharding, replication, and vertical partitioning and connects those choices to skew, hot keys, cross-partition operations, and rebalancing. These additions improve core HLD fundamentals but do not upgrade the overall topic-family statuses to Deep. Full chapter-by-chapter claim, example, and source validation remains pending.
