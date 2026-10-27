@@ -598,3 +598,16 @@ A historical CI failure was also inspected: the artifact extractor expected exac
 - **Diagram check:** all five Mermaid flowcharts/subgraphs were manually inspected for declarations, edge forms, delimiters and closure; no syntax issue was found. Automated rendering was not performed because the current branch has no active textbook-validation workflow and the Mermaid renderer could not be installed in this environment. Do not describe this as a successful rendered-diagram/CI check.
 
 The **Architecture foundations** mandatory inventory row remains provisional at the curriculum-family level because that row also depends on related material elsewhere in the textbook. This does not leave a Chapter 01 content defect open; it prevents overclaiming that one chapter's acceptance proves the full cross-chapter family is Deep.
+
+
+## Chapter 09 focused acceptance — 2026-10-28
+
+**Chapter result: focused content acceptance complete; no further Chapter 09 content correction identified.** The review covered the cache benefit calculation; freshness and consistency contracts; stale-fill and invalidation races; cache access/write patterns; stampede, hot-key, outage, eviction and avalanche behavior; HTTP caching; CDN cache keys/TTL/purge behavior; tenant isolation; cache poisoning/deception; revocation/deletion; and the security test matrix.
+
+- **Arithmetic:** 90% of 2,000 lookups/s is 1,800 hits and 200 misses/s; at three database queries per miss, the miss path produces about 600 database queries/s. Correct under the stated assumptions.
+- **Standards and sources:** RFC 9111's HTTP cache rules were cross-checked, including the distinction between `no-store` and `no-cache`, `Vary`, and the restrictions on shared-cache reuse of responses to requests containing `Authorization`. RFC 5861 was opened and now explicitly supports the stale-while-revalidate/stale-if-error discussion; its status as an Informational RFC is stated. Redis eviction documentation, AWS caching best practices, and OWASP's Web Cache Security Cheat Sheet were opened and support the relevant sections.
+- **Correctness and security:** the chapter does not treat TTL as a guarantee of source-relative freshness; it calls out stale fills after invalidation, lagging-replica refill, cache bypass/fallback overload, shared-cache authorization, cross-tenant keys, revocation windows, cache poisoning/deception, and the difference between read caching and a durable write path. No material contradiction was found in the checked Chapter 07/10 context.
+- **Structure/navigation:** 259 lines, 27 headings, no duplicate heading text, all three numbered sections (9.1–9.3), one Mermaid sequence diagram manually syntax-reviewed, and all three relative footer links verified.
+- **External links:** all five unique Further reading URLs opened successfully; no dead reference was identified.
+
+**Validation limit:** the Mermaid diagram was manually inspected but not rendered by an automated Mermaid engine, and no post-edit CI run was available. The Chapter 09 content/source/structure pass is complete, but the book-wide inventory remains provisional until its separate acceptance work is finished.
