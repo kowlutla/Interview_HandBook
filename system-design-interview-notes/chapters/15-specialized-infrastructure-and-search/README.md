@@ -55,18 +55,7 @@ A Bloom filter can say “definitely not present” or “possibly present,” w
 
 ## 15.6 When not to add a specialized component
 
-Do not add Kafka, a graph database, a distributed lock manager, or a separate search cluster just because the technology is common in interviews. First establish the need: replay/fan-out, graph traversal, coordination, or relevance search. Every additional component adds deployment, monitoring, security, capacity, and failure-handling work.
-
-## Interview questions
-
-### Q1. Why not use the search index as the source of truth?
-Search indexes optimize retrieval and may update asynchronously; their schema, refresh behavior, and consistency model may not enforce transactional business invariants. Keep authoritative state in the system designed to enforce those invariants.
-
-### Q2. Why upload files directly to object storage?
-It avoids making application servers proxy large bodies, reducing bandwidth and connection pressure. The trade-off is that authorization, upload completion, validation, malware scanning, and metadata consistency need explicit workflows.
-
-### Q3. Is a Bloom filter a replacement for a database lookup?
-No. A negative can safely skip a lookup under the filter's correctness assumptions, but a positive only means “possibly present.” Verify it against the authoritative data.
+Do not add Kafka, a graph database, a distributed lock manager, or a separate search cluster just because the technology is common in design discussions. First establish the need: replay/fan-out, graph traversal, coordination, or relevance search. Every additional component adds deployment, monitoring, security, capacity, and failure-handling work.
 
 ## Quick revision
 
@@ -82,9 +71,9 @@ No. A negative can safely skip a lookup under the filter's correctness assumptio
 - [Apache Kafka documentation](https://kafka.apache.org/documentation/) — event-log, consumer, and delivery semantics.
 - [Apache Spark Structured Streaming guide](https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html) — stateful streaming, event time, and processing model.
 
-## Scenario practice
+## Scenario analysis
 
-**Scenario:** Product managers want to add a search cluster, event stream, cache, and analytics warehouse to a small application before launch. Which components would you keep?
+**Case:** A small application is proposed with a search cluster, event stream, cache, and analytics warehouse before launch, despite modest initial requirements.
 
 **Reasoning:** Start from user-visible requirements and query patterns. A relational database may be enough for transactional CRUD and modest filtering. Add a search index when full-text relevance or query latency justifies its derived-data lifecycle; add a stream when durable fan-out/replay or decoupled processing is needed; add a warehouse when analytical scans materially interfere with OLTP. For each component, name the owner of authoritative data, the freshness contract, and the failure behavior. Avoid introducing infrastructure without a workload that needs it.
 
@@ -98,7 +87,7 @@ Storage-engine choice is about the workload and implementation, not a universal 
 
 A write-heavy workload with sequential ingestion may favor an LSM-oriented engine, while a workload requiring efficient ordered access and predictable range queries may favor a B-tree-oriented design. Real systems include caching, compression, compaction policies, concurrency control, and other details, so benchmark representative operations before choosing.
 
-### Q4. Why can a write-optimized database have slower reads under some workloads?
+### Read amplification in write-optimized engines
 
 An LSM-based engine may need to consult multiple sorted runs and merge results; compaction and tombstones can add work. Bloom filters and indexes reduce unnecessary reads, while compaction policy trades background I/O and space for read efficiency. Measure the actual workload rather than assuming the storage-engine family determines performance by itself.
 
