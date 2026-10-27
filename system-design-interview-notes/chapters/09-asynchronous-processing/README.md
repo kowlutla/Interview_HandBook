@@ -51,24 +51,6 @@ If producers publish faster than consumers process, backlog grows. Monitor queue
 
 Adding consumers helps only if the broker's partitioning and the downstream dependencies allow more parallelism. A queue can smooth a short burst; it cannot solve a sustained workload where arrival rate exceeds service capacity.
 
-## 9.7 Common interview questions
-
-### Why use asynchronous processing?
-
-It decouples the request path from slower work, absorbs bursts, and allows independent workers to scale. The costs are delayed completion, retry and duplicate handling, more complex observability, and the need to expose status or completion where users need it.
-
-### How do you prevent losing an event after a database update?
-
-A transactional outbox stores the business update and an event record in the same local database transaction. A publisher later sends the event. Since publishing and marking the outbox record can fail in between, consumers should still be idempotent.
-
-### How do you achieve exactly-once processing?
-
-First define the boundary. Broker-level transactional guarantees can help within that broker's supported scope, but external side effects still need idempotency or atomic coordination. In practice, robust systems often combine at-least-once delivery with deduplication and idempotent state changes.
-
-### How do you handle a growing queue?
-
-Check whether the backlog is caused by a temporary burst, insufficient consumer capacity, hot partitions, downstream limits, or poison messages. Scale consumers when parallelism is available, apply backpressure or producer limits, and protect downstream services. If arrivals permanently exceed processing capacity, adding a queue only delays failure.
-
 ## Quick revision
 
 - Use async work for decoupling and buffering, not as automatic complexity.
@@ -100,22 +82,13 @@ sequenceDiagram
 
 The publisher can crash after broker acknowledgement but before marking the outbox row delivered, so it may publish the same event again. The consumer must tolerate that duplicate. The outbox prevents losing the intent to publish when the business transaction commits; it does not create a distributed transaction between the database and broker.
 
-## Scenario practice
+## Scenario analysis
 
-**Scenario:** A consumer processes an event, commits its database update, then crashes before acknowledging the message. What should happen on redelivery?
+**Case:** A consumer commits its database update after processing an event, then crashes before acknowledging the message, so the broker redelivers it.
 
 **Reasoning:** The broker may deliver the event again. Give the event a stable ID and atomically record that ID with the business mutation in the consumer's local transaction. A duplicate should become a no-op. If the consumer triggers an external side effect, pass an idempotency key to that provider or reconcile ambiguous outcomes.
-
-## Interview questions
-
-### Q1. When should you choose a queue instead of a stream?
-A work queue fits independent tasks that workers claim and acknowledge. A retained event stream fits multiple consumers with independent offsets, replay, and ordered records within defined partitions. Real products can support both patterns; choose from retention, ordering, fan-out, and recovery requirements.
-
-### Q2. Does adding a queue solve overload?
-It can absorb a temporary burst if the backlog is bounded and consumers later catch up. If arrivals persistently exceed successful processing, backlog grows without bound unless capacity increases, work is reduced, or admission control sheds load.
 
 ## Further reading
 
 - [Transactional Outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html) — implementation trade-offs and failure window.
 - [Apache Kafka documentation](https://kafka.apache.org/documentation/) — broker-specific delivery and processing semantics.
-
