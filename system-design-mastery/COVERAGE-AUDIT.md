@@ -571,3 +571,17 @@ The first-pass structure review was followed by targeted technical edits: Chapte
 ## Section hierarchy cleanup — 2026-10-28
 
 A structural consistency pass corrected section hierarchy and numbering in Chapters 07, 08, 09, 10, 11, 13, 14, 15, 16, 17 and 18. In particular, Chapters 07, 10 and 11 now have coherent sequential top-level sections; lettered additions in Chapters 08, 09, 13–19 are nested beneath explicit parent sections instead of appearing as peer top-level sections. The change is organizational and does not upgrade technical-acceptance statuses. External source alignment, all example arithmetic, and full cross-chapter semantic review remain open until checked.
+
+
+## Final chapter audit continuation — 2026-10-28
+
+Targeted curriculum reviews of Chapters 15–20 resulted in these changes and decisions:
+
+- **Chapter 15 — Architecture and evolution:** added explicit data ownership/database-per-service trade-offs, saga compensation and outbox/inbox boundaries, service-mesh control/data-plane trade-offs, and end-to-end multi-tenant isolation requirements. The chapter remains Developing pending independent pattern selection and source verification.
+- **Chapter 16 — Security and privacy:** clarified opaque access tokens versus JWTs and the resource server's obligation to follow the issuer-defined validation/introspection model. This is a focused correction, not complete token-profile or security-claim acceptance.
+- **Chapter 17 — Observability and operations:** reviewed signals, cardinality, percentiles, RED/USE, SLO math, alerting, incident command and runbooks. No material content correction was identified in this pass; duplicate reinforcement between sections 17.1 and 17.2 is a candidate for later editorial consolidation.
+- **Chapter 18 — Cloud infrastructure and delivery:** clarified that base64 encoding of Kubernetes Secret values is not encryption and added practical access-control, at-rest protection, exposure and rotation guidance. Provider/distribution-specific behavior still requires verification for a concrete deployment.
+- **Chapter 19 — Advanced cross-cutting reasoning:** added mixed-version serialization/schema compatibility and storage amplification/temporary-capacity reasoning. These improve cross-cutting coverage but do not replace workload/product-specific validation.
+- **Chapter 20 — Client-side/offline/realtime:** reviewed against the curriculum; its replay-to-live handoff, offline durability, conflict/deletion, transport, security and failure-testing coverage was considered adequate for this targeted pass. Product-specific synchronization guarantees and its external source links remain open for independent verification.
+
+A historical CI failure was also inspected: the artifact extractor expected exactly 29 Mermaid blocks but found 30. The exact-count guard was replaced with a nonzero check so additional diagrams are extracted rather than rejected solely because the textbook grew. This script edit has not yet been validated by a completed post-edit CI run. Keep all 21 mandatory inventory families provisional/Developing until the full mechanism/example/trade-off/failure-mode and claim-to-source acceptance is completed.
