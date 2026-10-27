@@ -64,7 +64,7 @@ Data minimization reduces both breach impact and operational complexity. Avoid c
 
 Deletion workflows must account for replicas, caches, derived indexes, event logs, analytics, exports, backups, and legal retention exceptions. Where immediate physical deletion from immutable backups is not feasible, document the policy, access restrictions, expiry timeline, and restoration-time deletion replay.
 
-## 16.1G1 Authorization caching, revocation, and stale privilege
+## 16.1H Authorization caching, revocation, and stale privilege
 
 Authorization decisions are often tempting to cache because policy evaluation or relationship lookup may be expensive. The cache is safe only when its key represents the full decision context and its staleness is acceptable for the operation. Depending on the policy model, relevant dimensions can include subject, action, resource, tenant, resource state, environment attributes, and a policy or relationship version. Omitting a dimension can turn a performance optimization into a cross-user or cross-tenant authorization bypass.
 
@@ -76,13 +76,13 @@ Keep response caching separate from decision caching. A cache hit must not bypas
 
 Test at least: role or membership removal, account disablement, tenant switch, policy-version change, invalidation loss/replay, cache outage, and requests through the actual CDN/proxy/application path. Record the expected maximum revocation delay and alert on violations. See OWASP's [Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) and [Web Cache Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Web_Cache_Security_Cheat_Sheet.html).
 
-## 16.1H Security logging and incident readiness
+## 16.1I Security logging and incident readiness
 
 Security logs should record principal, action, target, outcome, timestamp, correlation context, and policy decision where appropriate, while excluding passwords, access tokens, cryptographic keys, and unnecessary sensitive payloads. Logs need integrity protection, access control, retention, and time synchronization appropriate to the investigation.
 
 Design for credential compromise: revoke or rotate credentials, contain affected workloads, identify actions performed, preserve evidence, and restore trusted configuration. Detection without a practiced response path is incomplete protection.
 
-## 16.1I Security design review checklist
+## 16.1J Security design review checklist
 
 - What are the assets and trust boundaries?
 - Who authenticates each caller, and how are credentials revoked?
@@ -97,7 +97,7 @@ Design for credential compromise: revoke or rotate credentials, contain affected
 
 
 
-## 16.1J OAuth 2.0, OpenID Connect, and token roles in practice
+## 16.1K OAuth 2.0, OpenID Connect, and token roles in practice
 
 OAuth 2.0 is an authorization framework for delegated access. OpenID Connect (OIDC) adds an authentication layer with an ID token and standardized identity claims. JWT is a token representation that may be used for different purposes; a JWT is not automatically an OAuth access token or an OIDC ID token.
 
