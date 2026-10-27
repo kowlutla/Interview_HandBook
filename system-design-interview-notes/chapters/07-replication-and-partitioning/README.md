@@ -50,24 +50,6 @@ Partitioning makes scale-out possible, but queries spanning many shards can requ
 
 Try to align the partition key with common access patterns and transactional ownership. If a use case requires frequent global joins or atomic multi-entity updates, that is an important input to the data model and database choice.
 
-## 7.6 Common interview questions
-
-### What is the difference between replication and partitioning?
-
-Replication creates multiple copies of the same data; partitioning divides the dataset into subsets. Replication is commonly used for availability, recovery, and reads. Partitioning is commonly used to distribute data and load beyond one node's capacity. A system may use both.
-
-### Does a read replica guarantee fresh reads?
-
-No. Asynchronous replicas can lag. If a user must read their own recent write, the system may route that read to the primary, wait for replication to catch up, or use a consistency mechanism supported by the database.
-
-### How do you choose a shard key?
-
-Choose a key with good distribution and cardinality that aligns with common queries and ownership boundaries. Avoid keys that concentrate traffic or data. Evaluate both storage balance and request distribution; they can differ.
-
-### What is a hot shard?
-
-A partition receiving disproportionate traffic or work. It can saturate even when the cluster has spare total capacity. Diagnose the key/range distribution and address the hotspot rather than simply adding nodes.
-
 ## Quick revision
 
 - Replication copies data; partitioning divides it.
@@ -94,19 +76,11 @@ This diagram is intentionally simplified: the exact acknowledgement policy depen
 
 Sharding splits ownership across partitions; replication copies data within or across those partitions. A useful shard key distributes load while supporting common queries. A monotonically increasing key can create a hot range, while a tenant key can overload one partition when a tenant dominates traffic. Rebalancing changes data placement and consumes network and disk capacity, so it must be planned as an operational event.
 
-## Scenario practice
+## Scenario analysis
 
-**Scenario:** Read traffic is high and the primary database is near its read limit, but writes are healthy. Should you shard immediately?
+**Case:** Read traffic is high and the primary database is near its read limit, but write capacity remains healthy; sharding is being considered as the next step.
 
 **Reasoning:** First inspect query plans, indexes, caching opportunities, and whether stale reads are acceptable on read replicas. A read replica can help with read capacity but does not increase primary write throughput and can return stale data. Shard only when a single node remains a limiting factor or dataset placement requires it, because cross-shard queries and rebalancing add complexity.
-
-## Interview questions
-
-### Q1. What is the difference between replication and sharding?
-Replication keeps copies of the same data to improve redundancy, recovery, or read capacity. Sharding divides the dataset across nodes to distribute storage and workload. A system often combines them: each shard has replicas.
-
-### Q2. Does (R+W>N) automatically guarantee linearizability?
-No. It can ensure quorum intersection under the stated replica model, but linearizability depends on the full protocol, write ordering, version handling, concurrent updates, and failover rules.
 
 ## Further reading
 
@@ -127,10 +101,10 @@ A safe rebalancing plan should account for:
 
 Do not describe shard movement as a single atomic copy. It is a migration protocol with a period of overlapping state, and its correctness depends on how writes are ordered and ownership is changed.
 
-### Q3. Why is consistent hashing useful, and what does it not solve?
+### Consistent hashing: benefits and limitations
 
 It limits how many keys need reassignment when the node set changes, which can reduce data movement during scaling. It does not guarantee perfectly even traffic, remove hot keys, or make migration safe by itself. Virtual nodes improve distribution, while hot-key handling and a correct ownership-switch protocol address different problems.
 
-### Q4. How would you choose a shard key?
+### Shard-key selection principles
 
 Start with dominant queries, tenant boundaries, data growth, and write distribution. Prefer keys that route common requests to one shard and distribute workload reasonably evenly. Check for high-volume tenants, time-correlated keys, and queries that would require expensive fan-out. Revisit the key only with a migration plan, because changing it can require substantial data movement.
