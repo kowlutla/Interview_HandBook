@@ -1,11 +1,11 @@
 # 10. Distribution, Failure, and Consistency
 
-## Distribution changes the failure model
+## 10.1 Distribution changes the failure model
 A remote call can be delayed, duplicated by retries, rejected, partially processed, or completed while its response is lost. A caller may not distinguish a slow process from a failed process. Failures are partial: one node can fail while others work, or a process can be alive but unable to reach its database. In asynchronous systems, delay alone cannot prove permanent failure.
 
 State the fault model: crash-stop processes, network loss/delay/partition, disk failure, correlated infrastructure failure, or Byzantine behavior. Most service designs assume non-Byzantine components but still need crash and communication failure handling.
 
-## Safety and liveness: what does “correct” mean?
+## 10.2 Safety and liveness: what does “correct” mean?
 
 Distributed-system guarantees become clearer when separated into **safety** and **liveness**:
 
