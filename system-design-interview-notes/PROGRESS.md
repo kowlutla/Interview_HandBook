@@ -23,6 +23,7 @@ The interview notes are the primary learn-and-revise path. The tutorials remain 
 - [x] All 15 case-study destination paths in Chapter 17 fetched successfully from the current repository.
 - [ ] All relative Markdown links checked mechanically.
 - [ ] All Mermaid blocks rendered with a Mermaid renderer.
+- [x] Markdown code-fence counts checked for balance across the 17 chapter pages (this does not validate Mermaid syntax or rendering).
 - [ ] Numerical examples independently rechecked across every chapter.
 - [ ] Final editorial review for duplication, terminology, and answer length.
 - [ ] Repository diff reviewed to confirm protected directories are unchanged.
