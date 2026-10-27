@@ -12,17 +12,17 @@ The target is a compact set of connected notes, not a fixed chapter count. Merge
 | 4 | [Data Modeling and Databases](chapters/04-data-modeling-and-databases/README.md) | Choose data models and storage systems based on access patterns and constraints. |
 | 5 | [Caching](chapters/05-caching/README.md) | Explain cache-aside and related patterns, invalidation, TTLs, stampedes, and failure behavior. |
 | 6 | [Scaling Traffic](chapters/06-scaling-traffic/README.md) | Explain load balancing, stateless services, horizontal scaling, and bottlenecks. |
-| 7 | [Replication and Partitioning](chapters/07-replication-and-partitioning/README.md) | Explain why they are used, their trade-offs, and common operational challenges. |
+| 7 | [Replication and Partitioning](chapters/07-replication-and-partitioning/README.md) | Explain replication lag, shard-key selection, hot partitions, consistent hashing, and safe rebalancing. |
 | 8 | [Consistency and Transactions](chapters/08-consistency-and-transactions/README.md) | Reason about stale reads, concurrent writes, transactions, and consistency requirements. |
 | 9 | [Asynchronous Processing](chapters/09-asynchronous-processing/README.md) | Choose queues, streams, and background jobs; explain retries, ordering, and idempotency. |
-| 10 | [Reliability and Resilience](chapters/10-reliability-and-resilience/README.md) | Design timeouts, retries, backoff, circuit breakers, rate limits, and graceful degradation. |
+| 10 | [Reliability and Resilience](chapters/10-reliability-and-resilience/README.md) | Design bounded retries, isolation, graceful degradation, RTO/RPO, and multi-region failover without split brain. |
 | 11 | [Security and Multi-Tenancy](chapters/11-security-and-multi-tenancy/README.md) | Cover authentication, authorization, isolation, secrets, and abuse controls at architecture level. |
 | 12 | [Observability and Design Trade-offs](chapters/12-observability-and-trade-offs/README.md) | Use logs, metrics, traces, SLIs/SLOs, and a repeatable method to compare designs. |
-| 13 | [Distributed Systems and Business Correctness](chapters/13-distributed-systems-and-correctness/README.md) | Reason about partial failure, CAP, quorums, delivery semantics, idempotency, sagas, and business invariants. |
+| 13 | [Distributed Systems and Business Correctness](chapters/13-distributed-systems-and-correctness/README.md) | Reason about partial failure, CAP, quorums, delivery semantics, consensus, clocks, fencing, and business invariants. |
 | 14 | [Networking, Request Routing, and Real-Time Systems](chapters/14-networking-and-real-time-systems/README.md) | Trace requests through DNS, edge, proxies, application dependencies, and real-time transports. |
-| 15 | [Specialized Infrastructure](chapters/15-specialized-infrastructure-and-search/README.md) | Choose search, object storage, analytics, probabilistic structures, schedulers, and rate limiters when justified. |
+| 15 | [Specialized Infrastructure](chapters/15-specialized-infrastructure-and-search/README.md) | Choose search, object storage, analytics, probabilistic structures, schedulers, CDC, and storage engines when justified. |
 | 16 | [Interview Method and Estimation Workshop](chapters/16-interview-method-and-estimation-workshop/README.md) | Run a timed interview, estimate workload with units, and diagnose bottlenecks using observable signals. |
-| 17 | [Senior Trade-offs and Case-Study Practice](chapters/17-senior-tradeoffs-and-case-study-path/README.md) | Defend conditional design choices and practise a curated sequence of canonical end-to-end problems. |
+| 17 | [Senior Trade-offs and Case-Study Practice](chapters/17-senior-tradeoffs-and-case-study-path/README.md) | Defend conditional design choices, plan safe migrations, and practise canonical end-to-end problems. |
 
 ## Scope rules
 
