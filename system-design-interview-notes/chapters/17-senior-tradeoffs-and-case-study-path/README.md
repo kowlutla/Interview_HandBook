@@ -59,7 +59,7 @@ The case studies in `real-world-examples/` are canonical. Use this order: first 
 | 12. Analytics | [Metrics monitoring](../../../real-world-examples/038.metrics-monitoring-and-alerting-system.md) | High-cardinality data, ingestion, retention, aggregation | Delayed consumer and storage pressure |
 | 13. Scheduling | [Distributed job scheduler](../../../real-world-examples/041.distributed-job-scheduler.md) | Durable schedules, leases, retries, duplicate execution | Worker crash after side effect |
 | 14. Global systems | [Distributed cache](../../../real-world-examples/039.distributed-cache.md) | Sharding, replication, hot keys, failure modes | Regional cache outage |
-| 15. Collaboration | [Collaborative document editor](../../../real-world-examples/040.collaborative-doc-editor.md) | Real-time fan-out, concurrent edits, reconnect | Offline edits and conflict handling |
+| 15. Collaboration | [Collaborative document editor](../../../real-world-examples/040.collaborative-document-editor.md) | Real-time fan-out, concurrent edits, reconnect | Offline edits and conflict handling |
 
 **Repository link check note:** These paths are curated against the canonical case-study index; validate exact filenames against the current default branch before relying on the path list. The case studies remain separate; this guide does not duplicate their full designs.
 
