@@ -132,3 +132,9 @@ It narrows the order of magnitude and exposes the assumptions that drive the arc
 ## Quick revision
 
 Clarify → quantify → define ownership → draw → walk flows → find bottlenecks → handle failures → explain trade-offs. State assumptions aloud. A queue buffers bursts, a replica copies data, a shard distributes ownership, and a cache stores a copy—none is a universal scaling fix.
+
+## Further reading
+
+- [Google SRE Book: Service Level Objectives](https://sre.google/sre-book/service-level-objectives/) — connecting user expectations to measurable reliability targets.
+- [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) — a provider's architecture review framework; use it as guidance, not as a universal prescription.
+
