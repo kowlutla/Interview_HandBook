@@ -6,8 +6,6 @@ This is an independent textbook for learning to reason about software systems: t
 ## Begin your journey
 - **[Roadmap](ROADMAP.md)** — the learning sequence and prerequisites.
 - **[Curriculum](CURRICULUM.md)** — the topic map, scope rationale, and coverage checks.
-- **[Coverage audit](COVERAGE-AUDIT.md)** — initial chapter-by-chapter gap map and the standard for marking a topic deeply covered.
-- **[Progress](PROGRESS.md)** — honest implementation and quality status.
 - **[Glossary](GLOSSARY.md)** — precise shared terminology.
 - **[Research library](references/README.md)** — standards, foundational papers, and technical documentation.
 - **[Writing and verification standard](EDITORIAL-STANDARD.md)** — how claims, examples, diagrams, and reviews are handled.
