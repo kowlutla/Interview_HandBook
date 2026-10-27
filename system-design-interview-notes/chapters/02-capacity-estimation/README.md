@@ -127,3 +127,35 @@ They should be directionally correct, transparent, and useful for decisions. Exp
 
 - [Little's Law (overview)](https://en.wikipedia.org/wiki/Little%27s_law)
 - [Google SRE Book: Handling Overload](https://sre.google/sre-book/handling-overload/)
+
+## Worked concurrency example
+
+Little's Law is (L = \lambda W): average work in the system equals throughput multiplied by average time in the system, when the system is stable and units match. At 600 requests/second and 0.2 seconds average response time, average in-flight requests are approximately (600 \times 0.2 = 120). This is not a thread-pool sizing rule: tail latency, bursts, queueing, and time spent holding scarce resources matter.
+
+```mermaid
+flowchart LR
+    A[Daily volume] --> B[Divide by 86,400]
+    B --> C[Average RPS]
+    C --> D[Apply stated peak factor]
+    D --> E[Peak RPS estimate]
+    E --> F[Load test and identify bottleneck]
+```
+
+## Scenario practice
+
+**Scenario:** A service averages 1,000 requests/second, but traffic spikes to 5,000 requests/second for short periods. Is provisioning for average traffic enough?
+
+**Reasoning:** Not if the latency/availability objective must hold during the spike. Estimate the duration and burst shape, determine whether queues are acceptable, and measure per-instance capacity under realistic dependencies. Keep headroom or autoscale early enough; autoscaling cannot react instantly to every spike. If the database saturates first, adding API instances can worsen the incident.
+
+## Interview questions
+
+### Q1. Why estimate peak traffic instead of using only average RPS?
+Averages hide bursts that drive queueing and tail latency. Peak estimates guide headroom, admission control, and whether asynchronous buffering is useful, but the peak factor must be justified by the workload.
+
+### Q2. How do you turn RPS into a server count?
+Do not divide by a generic requests-per-server constant. Benchmark representative requests at the required latency and error rate, include dependency limits and failure headroom, then validate the result under load.
+
+## Further reading
+
+- [Google SRE Book: Handling Overload](https://sre.google/sre-book/handling-overload/) — overload behavior and graceful protection.
+
