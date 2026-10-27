@@ -18,7 +18,7 @@ The interview notes are the primary learn-and-revise path. The tutorials remain 
 
 - [ ] Full topic-by-topic audit against every requirement in the execution brief.
 - [ ] Independent technical review of all 17 chapters and all claims.
-- [ ] All case-study destination paths verified.
+- [x] All 15 case-study destination paths in Chapter 17 fetched successfully from the current repository.
 - [ ] All relative Markdown links checked mechanically.
 - [ ] All Mermaid blocks rendered with a Mermaid renderer.
 - [ ] Numerical examples independently rechecked across every chapter.
@@ -28,7 +28,7 @@ The interview notes are the primary learn-and-revise path. The tutorials remain 
 ## Known review findings and limitations
 
 - The new chapters include worked estimates, failure paths, trade-off tables, and Mermaid diagrams, but diagram syntax has not yet been rendered by a dedicated Mermaid renderer.
-- The case-study pathway was checked against the canonical index. Some initially drafted filenames did not match the repository's exact filenames and were corrected where identified; the entire link set still needs a mechanical link check.
+- The 15 curated case-study links in Chapter 17 were checked by fetching each exact destination. The wider set of relative links across all existing chapters has not yet been mechanically checked.
 - The existing 12 chapters have been inspected for scope and content, but a complete line-by-line technical correction pass across all 17 chapters is not claimed here.
 - No claim is made that the full 23-module inventory has passed acceptance. This tracker should only be updated after each outstanding check is actually performed.
 
