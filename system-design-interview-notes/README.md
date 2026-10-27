@@ -1,18 +1,18 @@
-# System Design Interview Notes
+# System Design HLD Notes
 
-A practical, interview-focused guide to the fundamentals of High-Level Design (HLD).
+A practical, concept-focused guide to the fundamentals of High-Level Design (HLD).
 
-The goal is not to document every distributed-systems topic. It is to build the mental models needed to clarify requirements, choose suitable components, reason about trade-offs, and explain an architecture clearly in an interview.
+The goal is not to document every distributed-systems topic. It is to build the mental models needed to clarify requirements, choose suitable components, reason about trade-offs, and understand how an architecture behaves.
 
-> **Editorial rule:** Every section must help the reader understand a concept, make a design decision, or answer an interview question. Keep the explanation detailed enough to build understanding, but short enough to revise.
+> **Editorial rule:** These are reference notes, not a question bank. Every section should explain a concept, design decision, mechanism, trade-off, failure mode, or worked example.
 
 ## How to use these notes
 
 1. Learn the concept and the problem it solves.
 2. Understand the basic flow before memorizing terminology.
 3. Focus on when to use a technique, when not to use it, and its trade-offs.
-4. Practise answering the interview questions aloud.
-5. Use the quick revision section before interviews.
+4. Apply the concepts to the worked scenarios and end-to-end case studies.
+5. Use the quick-revision section to revisit the core concepts.
 
 ## Chapter format
 
@@ -23,7 +23,6 @@ Most topics use this structure, adapting it when a section would add no value:
 - **Key choices** — patterns or options and when each fits.
 - **Trade-offs and failure modes** — the most important costs, limitations, and risks.
 - **Example** — one realistic example, only where it improves understanding.
-- **Interview questions** — direct questions with explanatory answers.
 - **Quick revision** — a compact recap.
 
 ## Chapters
@@ -43,8 +42,8 @@ Most topics use this structure, adapting it when a section would add no value:
 13. [Distributed Systems and Business Correctness](chapters/13-distributed-systems-and-correctness/README.md)
 14. [Networking, Request Routing, and Real-Time Systems](chapters/14-networking-and-real-time-systems/README.md)
 15. [Specialized Infrastructure: Search, Files, Analytics, and Coordination](chapters/15-specialized-infrastructure-and-search/README.md)
-16. [HLD Interview Method and Estimation Workshop](chapters/16-interview-method-and-estimation-workshop/README.md)
-17. [Senior Trade-offs and Case-Study Practice Path](chapters/17-senior-tradeoffs-and-case-study-path/README.md)
+16. [HLD Design Workflow and Estimation Workshop](chapters/16-interview-method-and-estimation-workshop/README.md)
+17. [Senior Design Trade-offs and Case-Study Reference](chapters/17-senior-tradeoffs-and-case-study-path/README.md)
 
 ## Case-study learning path
 
@@ -62,4 +61,4 @@ This guide focuses on HLD fundamentals. Deep implementation tutorials, exhaustiv
 
 ## Status
 
-Seventeen chapters now form the learning path, including dedicated material on distributed correctness, networking and real-time flows, specialized infrastructure, interview execution, and senior trade-offs. Content expansion is not the same as complete verification: consult [PROGRESS.md](PROGRESS.md) for checks actually performed. The existing `system-design-mastery/`, `tutorials/`, and `real-world-examples/` content remains a separate resource.
+Seventeen chapters now form the learning path, including dedicated material on distributed correctness, networking and real-time flows, specialized infrastructure, design workflow, estimation, and senior trade-offs. Content expansion is not the same as complete verification: consult [PROGRESS.md](PROGRESS.md) for checks actually performed. The existing `system-design-mastery/`, `tutorials/`, and `real-world-examples/` content remains a separate resource.
