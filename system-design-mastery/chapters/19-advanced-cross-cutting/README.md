@@ -45,6 +45,22 @@ This is a planning approximation, not a guarantee that a concrete implementation
 A standard Bloom filter does not support safe arbitrary deletion because clearing a bit may cause false negatives for another item that set the same bit. Counting Bloom filters or rebuilding are alternatives, each with additional memory or operational cost. Bloom filters should reduce expensive authoritative lookups, not replace the source of truth.
 
 
+## 19.2A Serialization and schema evolution during deployment
+
+Serialization is not only a CPU or payload-size choice: it defines how independently deployed producers and consumers interpret data. Evaluate encoding cost, payload size, schema discoverability, compatibility rules, unknown-field behavior, and the ability to inspect or replay historical messages. A compact binary format does not automatically provide compatibility, and a schema registry does not guarantee that a change is safe for every deployed reader.
+
+During a rolling deployment, old and new producers and consumers may coexist. Check the actual compatibility direction required by the rollout: can the new reader consume old data, can the old reader consume new data, and can the current consumer replay retained historical events? Adding a field can still break consumers that reject unknown fields or assume a closed schema; changing meaning, units, enum behavior, nullability or defaults can be breaking even when the field type appears unchanged.
+
+Use explicit compatibility policy, representative old/new schema tests, and staged expand-and-contract changes. For event logs, validate not just the current producer-consumer pair but the retained history that may be replayed later. Measure serialization CPU and payload size on realistic data, because compression and encoding trade network/storage cost against CPU and latency.
+
+## 19.2B Storage amplification and temporary capacity
+
+Logical data size is not the same as provisioned storage required. A capacity model may need to account for indexes, replicas, WAL or logs, compaction overlap, tombstones, snapshots, backups, and temporary space used during migration or rebuild. The factors vary by storage engine and workload; do not apply one universal multiplier without measurements.
+
+For an LSM-based store, compaction can temporarily retain old and new files at once, so peak disk use can exceed the steady-state footprint. Heavy write amplification can also consume I/O bandwidth and CPU, increasing foreground tail latency even when disk capacity remains available. Index builds, shard rebalancing, restore, and backfills can create similar temporary demand.
+
+Plan for peak operational states, not only steady-state data volume. Measure disk headroom, compaction backlog, write/read amplification where exposed, restore and rebuild duration, and the impact of maintenance on latency. Bound concurrent rebuilds and migrations, and verify that the system has enough free space to complete them; a full disk can prevent the cleanup or compaction needed to recover.
+
 ## 19.3 Distributed scheduling and logical execution
 
 Schedulers must define what happens when a job is delayed, missed, duplicated, retried, or running longer than its interval. A lease can coordinate ownership but does not alone prevent a stale worker from committing effects after lease expiry. Use idempotent effects, fencing/version checks, unique execution records, and explicit catch-up policy as appropriate.
