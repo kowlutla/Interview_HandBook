@@ -557,3 +557,7 @@ This tree audit establishes file organization only. It does not promote any curr
 - Whole-book consistency and prerequisite review beyond the previously documented focused checks.
 
 Do not describe the textbook as fully technically validated until those checks pass. The content-frozen scope remains appropriate: fix concrete correctness, navigation or validation defects, but do not create more chapters or expand content merely to chase an unbounded completeness target.
+
+## Targeted capacity-estimation correction — 2026-10-28
+
+A targeted Chapter 03 read identified a specific teaching gap: the chapter described workload and peak-rate estimation but did not explicitly show how DAU and per-user actions translate to backend RPS. A new worked section now states DAU, actions per user/day, backend requests per action, active hours and peak factor; calculates daily requests, active-period average and peak RPS, read/write split, response bandwidth, raw daily storage and 90-day retention; and warns that fan-out, retries, payload distribution, indexes, replicas and backups must be accounted for separately. The example arithmetic was independently recalculated. This closes that specific explanatory gap; it does not promote the overall capacity/performance inventory row to Deep because load-test assumptions, other formulas and source alignment still need the full acceptance pass.
