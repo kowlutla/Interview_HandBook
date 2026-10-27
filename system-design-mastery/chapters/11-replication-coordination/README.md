@@ -47,7 +47,7 @@ flowchart TD
 
 Consensus algorithms differ in their exact rules, but the critical distinction is between receiving a command, replicating a log entry, committing it, applying it, and acknowledging the client. These are not interchangeable events.
 
-## 11.5A Consensus, replication, and transactions are different problems
+## 11.5 Consensus, replication, and transactions are different problems
 
 These concepts are related but should not be conflated:
 - **Replication** keeps copies of data or state on multiple nodes.
@@ -58,7 +58,7 @@ These concepts are related but should not be conflated:
 
 A replicated database may use consensus internally, but that does not mean a transaction spanning two independent databases is atomic. A saga can coordinate business steps without consensus over one global state. Select the mechanism based on the invariant that must be preserved.
 
-## 11.5B Quorums, terms, and epochs
+## 11.6 Quorums, terms, and epochs
 
 A quorum is a set of participants sufficient for a protocol decision. Majority quorums intersect in a fixed membership set, which helps prevent incompatible decisions from both being accepted. The protocol must also define what a vote means, which state is persisted before responding, how old terms are rejected, and how membership changes occur.
 
@@ -66,7 +66,7 @@ A **term** or **epoch** is a monotonically advancing generation used to distingu
 
 A lease based only on elapsed time has assumptions about clocks, pauses, and renewal. Fencing is stronger when the resource enforces it, because a stale process can resume after believing its lease is still valid.
 
-## 11.5C Failure recovery and durable protocol state
+## 11.7 Failure recovery and durable protocol state
 
 Consensus protocols rely on durable state such as terms, votes, and log entries. Restarting a node must not erase state whose persistence is required by the algorithm. Storage ordering and acknowledgement semantics are part of correctness, not merely performance tuning.
 
@@ -74,7 +74,7 @@ After restart, a node may need to recover its log, compare its state with peers,
 
 Operational procedures should never manually edit protocol metadata or independently promote a replica unless the system's documented recovery procedure explicitly supports it.
 
-## 11.5D Split brain, fencing, and failover
+## 11.8 Split brain, fencing, and failover
 
 Split brain means more than two processes both claiming to be leaders. The dangerous condition is that multiple authorities can accept incompatible writes to the same logical resource. A safe failover path must ensure that an old authority cannot continue committing after a new authority takes over.
 
