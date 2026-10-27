@@ -88,3 +88,11 @@ Only that a particular check passed at that moment. A shallow process check may 
 - Connection pools are capacity limits, not just performance optimizations.
 - A WebSocket is a live channel, not durable storage.
 - Design reconnect, replay, backpressure, and fan-out as first-class paths.
+
+## Further reading
+
+- [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110) — HTTP request/response semantics.
+- [RFC 9000: QUIC Transport Protocol](https://www.rfc-editor.org/rfc/rfc9000) — transport behavior underlying HTTP/3.
+- [RFC 6455: The WebSocket Protocol](https://www.rfc-editor.org/rfc/rfc6455) — WebSocket framing and handshake.
+- [MDN: Server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) — browser-facing SSE behavior.
+
