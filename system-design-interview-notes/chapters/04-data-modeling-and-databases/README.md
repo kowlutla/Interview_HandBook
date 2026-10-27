@@ -63,28 +63,6 @@ When a workflow crosses independent services or databases, one local transaction
 
 A relational database is a strong default for many business applications, but not a universal answer. Specialized storage is justified when it materially improves a required workload.
 
-## 4.7 Common interview questions
-
-### When would you choose SQL over NoSQL?
-
-Choose SQL when relationships, joins, constraints, and transactional invariants are central. Consider a non-relational model when its data shape and access patterns fit a specialized workload better. “NoSQL scales, SQL does not” is an oversimplification; scalability depends on the product, schema, workload, and operating model.
-
-### What is the difference between normalization and denormalization?
-
-Normalization reduces duplicated facts and update anomalies. Denormalization deliberately duplicates or precomputes information to improve particular reads. Denormalization trades simpler/faster reads for additional storage and consistency work.
-
-### Why are indexes not always beneficial?
-
-Indexes speed up suitable queries but consume memory and storage and add work to inserts, updates, and deletes. Indexes should be based on observed query patterns and verified with query plans and realistic load.
-
-### When is cursor pagination better than offset pagination?
-
-Cursor pagination is often preferable for large or frequently changing datasets because it can avoid scanning and skipping many rows. It requires a deterministic ordering and a cursor that captures the position, usually with a unique tie-breaker. Offset pagination can be perfectly adequate for small, stable result sets.
-
-### Should every service have its own database?
-
-Independent ownership can reduce coupling, but separate databases increase operational and cross-service consistency complexity. The principle is that each service should own its data contract and writes; physical database separation is an architectural choice, not a rule that must be applied without considering the system.
-
 ## Quick revision
 
 - Start with access patterns and invariants.
@@ -117,21 +95,12 @@ flowchart TD
 
 This is a shortlist, not an automatic selector. Operational maturity, query needs, consistency, migration cost, retention, and data ownership can outweigh a database category's theoretical fit. Search indexes and analytical stores are commonly derived from an authoritative source rather than used to enforce transactional invariants.
 
-## Scenario practice
+## Scenario analysis
 
-**Scenario:** A team proposes a document database because its product schema changes frequently, but core operations require unique usernames, account balances, and atomic updates across related records. What do you evaluate?
+**Case:** A team proposes a document database for a frequently changing product schema, while core operations require unique usernames, account balances, and atomic updates across related records.
 
 **Reasoning:** Separate flexible attributes from hard invariants. A relational store may still support evolving schemas while providing unique constraints and transactions. Choose based on actual queries and transaction boundaries, not the frequency of adding optional fields. If multiple stores are introduced, document which one owns each fact and how derived copies are refreshed.
-
-## Interview questions
-
-### Q1. What should drive database selection?
-Access patterns, data relationships, transaction invariants, consistency/freshness, scale, retention, and operational constraints. Start with the simplest database that meets those requirements and prove the need before introducing polyglot persistence.
-
-### Q2. Why not use a search engine as the primary database?
-Search engines optimize indexing and retrieval and may update asynchronously. They generally are not the right authority for multi-record business invariants. Keep authoritative writes in a store that can enforce the required correctness, then update search as a derived view.
 
 ## Further reading
 
 - [PostgreSQL documentation: Indexes](https://www.postgresql.org/docs/current/indexes.html) — index choices and query implications.
-
