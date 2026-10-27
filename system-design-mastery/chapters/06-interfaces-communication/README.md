@@ -85,7 +85,7 @@ A method being idempotent does not mean every implementation is free from side e
 
 Use HTTP status codes consistently. Distinguish malformed input, unauthenticated requests, forbidden operations, missing resources, conflicts, failed preconditions, rate limiting, and server errors. Do not expose internal stack traces or secrets in error bodies. Error responses should be stable enough for clients to react without parsing human-readable text.
 
-## 6.10A Conditional requests and optimistic concurrency
+### 6.10A Conditional requests and optimistic concurrency
 
 HTTP conditional requests can prevent stale overwrites. An entity tag (ETag) can identify a representation version. A client may send an If-Match condition with the version it previously read; the server applies the update only if the current version matches, otherwise it returns a precondition failure.
 
@@ -93,7 +93,7 @@ This is an API-level form of optimistic concurrency control. The check and mutat
 
 Conditional GET requests using If-None-Match can avoid transferring an unchanged representation. Validators must represent the intended resource version and authorization scope; they are not authorization credentials.
 
-## 6.10B Pagination contracts and stable traversal
+### 6.10B Pagination contracts and stable traversal
 
 Offset pagination often uses LIMIT and OFFSET. Large offsets can require the engine to scan and discard many rows. Concurrent inserts or deletes can shift page boundaries, causing duplicates or omissions across requests.
 
@@ -101,7 +101,7 @@ Keyset pagination uses a stable sort key and a cursor representing the last obse
 
 Cursor pagination improves traversal under many workloads but does not automatically provide a consistent snapshot. If the product requires a snapshot across pages, the API needs a snapshot/version strategy or a documented weaker contract.
 
-## 6.10C API evolution and compatibility matrix
+### 6.10C API evolution and compatibility matrix
 
 Compatibility is directional:
 - A new consumer reading old producer data may fail if it assumes newly added fields always exist.
@@ -111,31 +111,31 @@ Compatibility is directional:
 
 Prefer additive changes with safe defaults, preserve existing meanings, and deploy tolerant readers before producers emit new forms. For event streams, consider retained historical messages as well as current traffic. For public APIs, document deprecation policy and use telemetry to determine whether old versions are still used.
 
-## 6.10D API security and resource governance
+### 6.10D API security and resource governance
 
 Authentication answers who is calling; authorization answers what the caller may do. Enforce object-level authorization for every resource identifier, not just at a list endpoint or UI. Validate input structure and semantics, constrain payload sizes and query complexity, and avoid reflecting untrusted content into logs or responses.
 
 Rate limits should be designed around identity and cost. A request count alone may not protect a GraphQL query that expands into hundreds of database operations. Use query depth/complexity limits, pagination caps, concurrency bounds, and per-tenant budgets where needed. Return a documented throttling response and, where appropriate, a retry hint without promising that every client should retry immediately.
 
-## 6.10E Choosing RPC, REST, GraphQL, and asynchronous commands
+### 6.10E Choosing RPC, REST, GraphQL, and asynchronous commands
 
 REST is often useful for durable resource-oriented contracts and broad client interoperability. RPC is useful for explicit operation contracts and typed internal communication. GraphQL can reduce over-fetching across related data but makes query-cost enforcement, caching, and field-level authorization more involved. Messaging is useful when completion can be delayed and producer availability should not be coupled to consumer availability.
 
 A common hybrid is an HTTP command endpoint that returns an operation identifier and an accepted status, with a status resource or event stream for completion. The contract must distinguish accepted for processing from completed successfully, define duplicate submissions, and explain how callers discover terminal failures.
 
-## 6.10F WebSockets, SSE, and reconnect correctness
+### 6.10F WebSockets, SSE, and reconnect correctness
 
 Long-lived connections introduce lifecycle concerns beyond message format. Clients disconnect, proxies time out idle connections, servers restart, and networks change. Define heartbeat behavior, reconnect backoff, authentication renewal, per-connection resource limits, and what happens to messages produced while a client is offline.
 
 Server-Sent Events can use event IDs and reconnection semantics, but the server needs a retention/replay strategy if clients must catch up. WebSockets provide bidirectional frames but do not automatically supply durable delivery, ordering across reconnects, or backpressure. If missing a message is unacceptable, pair the connection with a durable cursor or message history.
 
-## 6.10G End-to-end deadline budgeting
+### 6.10G End-to-end deadline budgeting
 
 A request deadline should cover queue wait, connection acquisition, processing, downstream calls, serialization, and response transit. If an upstream caller has 800 ms remaining, a downstream call cannot safely be given a fresh 800 ms budget after 500 ms has already elapsed.
 
 Propagate a deadline or remaining budget, reserve time for cleanup and response generation, and avoid retries that cannot finish before the deadline. Client cancellation may not cancel remote work already running, so servers should stop unnecessary work where cancellation is supported and preserve correctness if cancellation arrives after commit.
 
-## 6.10H Communication contract review checklist
+### 6.10H Communication contract review checklist
 
 - Is the response acceptance, completion, or a durable operation result?
 - Which methods and operations are safe or idempotent?
