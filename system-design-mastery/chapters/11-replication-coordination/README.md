@@ -6,13 +6,13 @@ A leader coordinates writes or a replicated state machine. Election chooses a ca
 Consensus algorithms such as Raft and Paxos coordinate agreement despite specified failures. Guarantees depend on assumptions including non-Byzantine participants, durable state, quorum membership and correct implementation. Raft separates leader election, log replication and safety; it is not simply the node with the most votes. See [Raft resources](https://raft.github.io/).
 
 
-## 11.1A Replicated state machine model
+## 11.2 Replicated state machine model
 
 A common use of consensus is to replicate an ordered log of commands. If replicas apply the same deterministic commands in the same committed order from the same initial state, their state machines can converge to the same state. Consensus chooses which log entries are committed; application logic still must be deterministic and side effects must be handled carefully.
 
 A command may be appended to a leader's local log before it is committed. A client acknowledgment should reflect the protocol's commit rule, not merely local receipt. If a leader fails, a new leader must be elected according to rules that preserve committed entries. Acknowledging before the required replication point can lose data after failover.
 
-## 11.1B Raft at a conceptual level
+## 11.3 Raft at a conceptual level
 
 Raft divides the problem into leader election, log replication and safety:
 
@@ -26,7 +26,7 @@ Raft divides the problem into leader election, log replication and safety:
 
 A term acts as an epoch that helps distinguish stale leadership. Majority intersection is central to safety, but not the whole proof: voting restrictions, log freshness, commit rules and membership transitions are also necessary. The original Raft paper explains the complete algorithm and assumptions: [Ongaro and Ousterhout](https://web.stanford.edu/~ouster/cgi-bin/papers/raft-atc14.pdf).
 
-## 11.1C Paxos and consensus guarantees
+## 11.4 Paxos and consensus guarantees
 
 Paxos describes agreement through proposers, acceptors and learners, with phases that establish a proposal number and then attempt acceptance. Its safety depends on quorum intersection and rules requiring later proposers to preserve previously accepted values. Multi-Paxos amortizes leadership/phase work for a sequence of decisions.
 
