@@ -1,6 +1,6 @@
 # 8. Consistency and Transactions
 
-Consistency describes which values a read is allowed to observe relative to writes. Transactions describe how a group of operations behaves as a unit. In interviews, state the required user-visible behavior first; then choose the simplest mechanism that satisfies it.
+Consistency describes which values a read is allowed to observe relative to writes. Transactions describe how a group of operations behaves as a unit. State the required user-visible behavior first; then choose the simplest mechanism that satisfies it.
 
 ## 8.1 Strong and eventual consistency
 
