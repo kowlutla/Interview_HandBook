@@ -21,13 +21,13 @@ For a file-sharing service, examples might include:
 These describe **how well the system must work** or the constraints it must satisfy.
 
 Common examples:
-- **Latency:** How quickly should a request complete?
-- **Availability:** How often should the service be usable?
-- **Durability:** Once data is accepted, how likely is it to survive failures?
-- **Consistency:** How fresh must reads be after writes?
-- **Scale:** How much traffic and data must the system handle?
-- **Security and privacy:** Who may access which data?
-- **Cost:** What operational and infrastructure cost is acceptable?
+- **Latency:** Target response time and tail-latency expectations.
+- **Availability:** Required proportion of time the service remains usable.
+- **Durability:** Required probability that accepted data survives failures.
+- **Consistency:** Required freshness of reads after writes.
+- **Scale:** Expected traffic volume and data size.
+- **Security and privacy:** Access controls and data-protection expectations.
+- **Cost:** Acceptable operational and infrastructure expenditure.
 
 Do not treat every quality attribute as equally important. Ask which are critical and where trade-offs are acceptable.
 
