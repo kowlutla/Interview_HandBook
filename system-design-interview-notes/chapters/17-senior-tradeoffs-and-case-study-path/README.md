@@ -86,3 +86,28 @@ A user updates an account setting and immediately sees the old value.
 - Replicas primarily address redundancy/read scaling; shards distribute data and load.
 - Queues buffer bursts, but sustainable throughput must match arrival rate.
 - Full case studies live in `real-world-examples/`; use the notes to practise the method, not duplicate the solution.
+
+## A repeatable decision path
+
+```mermaid
+flowchart TD
+    A[State requirement and invariant] --> B[Estimate workload and failure domain]
+    B --> C[Choose simplest mechanism that meets it]
+    C --> D[Name cost and failure mode]
+    D --> E{Does a constraint remain unmet?}
+    E -->|No| F[Keep the design simple and define monitoring]
+    E -->|Yes| G[Add or change one component]
+    G --> D
+```
+
+## Interview questions
+
+### Q1. How do you explain a trade-off without sounding indecisive?
+Make a recommendation under explicit assumptions, explain the mechanism and its cost, then state which changed requirement would reverse the decision. Conditional reasoning is a strength: it shows that architecture follows constraints rather than personal preference.
+
+### Q2. When should you introduce sharding?
+When a single data node remains a real storage, throughput, or isolation bottleneck after query/index optimization and appropriate vertical scaling. Before sharding, define the partition key, query patterns, cross-shard operations, rebalancing plan, and failure model. Sharding early adds operational complexity without guaranteed benefit.
+
+### Q3. What should a case-study answer include if time is limited?
+Prioritize requirements, a rough workload estimate, APIs/entities, architecture, one read and one write flow, the likely bottleneck, and one important failure/correctness path. Then state trade-offs and next steps. Do not spend the whole round drawing boxes or listing every possible component.
+
