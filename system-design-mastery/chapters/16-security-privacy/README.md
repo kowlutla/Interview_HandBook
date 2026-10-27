@@ -108,6 +108,8 @@ Keep the token roles separate:
 
 For browser-based and native public clients, Authorization Code with PKCE is the common modern pattern; the client must validate state and, in OIDC, nonce as appropriate to the flow. Client Credentials is for a confidential client acting as itself, not a substitute for end-user authentication. Avoid legacy flows unless a documented constraint requires them.
 
+An access token is not necessarily a JWT. It may be an opaque value whose meaning is resolved by the authorization server or an introspection endpoint. The resource server must follow the issuer's documented token profile: validate a signed token locally when that is the defined model, or use the defined introspection/validation mechanism for opaque tokens. Do not decode a token and treat its contents as trusted without verifying it, and do not assume that every token can be validated with a JWT library alone.
+
 Scopes are not a complete authorization decision. The resource server may still need object-level, tenant-level and relationship checks. Token validation also needs key rotation, trusted issuer metadata, algorithm allow-lists, clock-skew policy, and failure behavior when keys cannot be refreshed. Do not log raw tokens.
 
 
