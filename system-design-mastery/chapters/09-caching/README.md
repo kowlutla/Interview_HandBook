@@ -197,7 +197,7 @@ A related cache-deception problem occurs when an attacker tricks a cache into st
 
 A TTL defines when an entry becomes stale according to a particular cache's clock and policy; it does not guarantee immediate invalidation at the source. Freshness windows should be derived from the business meaning of the data. A product description may tolerate minutes of staleness; an authorization decision or account balance may require stronger controls or no shared caching.
 
-**Stale-while-revalidate** allows a cache to serve a stale response while refreshing it asynchronously for a bounded interval. This can reduce latency and origin load during refresh, but users may temporarily see old content. **Stale-if-error** can allow stale content to be served during an origin failure under a defined policy. Neither is universally safe: a stale public article differs from a revoked credential, current inventory count or permission check.
+**Stale-while-revalidate** allows a cache to serve a stale response while refreshing it asynchronously for a bounded interval. This can reduce latency and origin load during refresh, but users may temporarily see old content. **Stale-if-error** can allow stale content to be served during an origin failure under a defined policy. These are HTTP cache-control extensions described in [RFC 5861](https://www.rfc-editor.org/rfc/rfc5861.html), an Informational RFC rather than an Internet Standards Track specification; support and behavior should be verified for the cache implementation in use. Neither is universally safe: a stale public article differs from a revoked credential, current inventory count or permission check.
 
 Document:
 - Maximum permitted staleness by data class.
@@ -245,7 +245,8 @@ Record the cache key/policy decision, response status and cache status for each 
 
 
 ## Further reading
-- [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html).
+- [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html) — HTTP cache storage, reuse, freshness, validation and shared-cache rules.
+- [RFC 5861 — HTTP Cache-Control Extensions for Stale Content](https://www.rfc-editor.org/rfc/rfc5861.html) — `stale-while-revalidate` and `stale-if-error` (Informational RFC).
 - [Redis eviction documentation](https://redis.io/docs/latest/develop/reference/eviction/).
 - [AWS Caching Best Practices](https://aws.amazon.com/caching/best-practices/) — cacheability, TTLs and thundering-herd considerations.
 - [OWASP Web Cache Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Web_Cache_Security_Cheat_Sheet.html) — shared-cache risks, key design and tenant isolation.
