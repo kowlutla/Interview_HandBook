@@ -115,6 +115,13 @@ A saga is not equivalent to a global transaction: other requests may observe int
 
 At-least-once delivery can repeat a step. Store a message or operation identity with the business effect in the same transactional boundary, or use an equivalent durable protocol that closes the crash window. A broker's exactly-once feature applies only to its documented scope; it does not automatically make arbitrary database writes, emails, payments, or external API calls happen exactly once. Name the boundary and define reconciliation for uncertain outcomes.
 
+### Transactional outbox and inbox
+
+A database update followed by a separate broker publish has a dual-write failure window: the database commit may succeed while publishing fails, or publishing may succeed before the process crashes and the database transaction rolls back. A transactional outbox closes the first atomicity gap by writing the business change and an event record in the same local database transaction. A relay publishes pending outbox records asynchronously; because a relay can crash after publishing but before marking a record sent, delivery is normally at least once and consumers must tolerate duplicates.
+
+An inbox or deduplication record lets a consumer recognize a repeated message. To prevent duplicate business effects, persist the message identity and apply the consumer's database mutation in the same transaction where possible. A unique constraint on the message ID can enforce deduplication under concurrency. If the effect is an external API call that cannot participate in that transaction, use the provider's idempotency mechanism when available and retain reconciliation for uncertain outcomes.
+
+Neither pattern makes the broker, database and arbitrary external side effects one global transaction. Define event identity, ordering requirements, retry and poison-message handling, outbox retention/cleanup, relay lag monitoring, and recovery after partial failure. The outbox guarantees that committed local state has a durable event to publish; it does not by itself guarantee immediate publication or exactly-once delivery.
 ## 11.11 Distributed lock decision checklist
 
 Before introducing a distributed lock, ask:
