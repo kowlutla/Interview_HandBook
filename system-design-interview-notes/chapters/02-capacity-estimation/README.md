@@ -1,8 +1,8 @@
 # 2. Capacity Estimation
 
-Capacity estimation helps you check whether a proposed architecture is plausible. Interview estimates do not need to be exact; they need clear assumptions, correct units, and enough accuracy to guide decisions.
+Capacity estimation helps you check whether a proposed architecture is plausible. Early design estimates do not need to be exact; they need clear assumptions, correct units, and enough accuracy to guide decisions.
 
-## 2.1 What should you estimate?
+## 2.1 Estimation targets
 
 Start with only the quantities that affect the design:
 
@@ -45,7 +45,7 @@ Be explicit about units:
 - Decimal: 1 GB = 1,000 MB.
 - Binary: 1 GiB = 1,024 MiB.
 
-In interviews, approximate values are fine when the unit convention is consistent.
+For rough design estimates, approximate values are fine when the unit convention is consistent.
 
 ## 2.4 Estimate bandwidth
 
@@ -76,13 +76,13 @@ This estimates average concurrency under stable conditions. It is not by itself 
 
 ## 2.6 Turn estimates into design decisions
 
-Use the numbers to ask useful questions:
-- Can one database instance plausibly handle the write rate and data size?
-- Are reads frequent enough to justify caching?
-- Are payloads large enough for bandwidth or object storage to dominate?
-- Does traffic have peaks that require buffering or autoscaling?
-- Does retained data require partitioning, archival, or expiration?
-- Does the expected latency make synchronous fan-out risky?
+Use the estimates to test the design:
+- Whether one database instance can plausibly handle the write rate and data size.
+- Whether read volume justifies caching.
+- Whether payloads make bandwidth or object storage a dominant concern.
+- Whether traffic peaks require buffering or autoscaling.
+- Whether retained data calls for partitioning, archival, or expiration.
+- Whether the latency budget makes synchronous fan-out risky.
 
 Avoid pretending rough estimates produce exact infrastructure sizing. Actual capacity depends on workload shape, data distribution, query complexity, hardware, implementation, and performance testing.
 
@@ -95,24 +95,6 @@ Avoid pretending rough estimates produce exact infrastructure sizing. Actual cap
 - Multiplying raw data size by an arbitrary overhead factor without explaining why.
 - Assuming a single benchmark translates directly to production capacity.
 - Giving a number without showing the assumptions or arithmetic.
-
-## 2.8 Common interview questions
-
-### Why do capacity estimation before choosing technologies?
-
-It provides a rough scale for evaluating options. A simple database may be enough at one scale, while high write volume, large retained data, or global latency requirements may justify additional techniques. Estimation narrows the design space; it does not replace benchmarking.
-
-### Should we estimate average or peak traffic?
-
-Usually both. Average traffic helps understand overall demand and cost; peak traffic helps reason about saturation, latency, and headroom. For bursty systems, the peak shape and duration matter as well as the peak value.
-
-### What is Little’s Law useful for?
-
-It connects throughput, time in the system, and average concurrency. It helps estimate how many requests may be in flight, but it does not directly tell you how many servers or threads to deploy.
-
-### How accurate should interview estimates be?
-
-They should be directionally correct, transparent, and useful for decisions. Explain assumptions, keep units consistent, and avoid false precision. If a choice depends on an uncertain number, say what measurement or benchmark would validate it.
 
 ## Quick revision
 
@@ -141,21 +123,12 @@ flowchart LR
     E --> F[Load test and identify bottleneck]
 ```
 
-## Scenario practice
+## Scenario analysis
 
-**Scenario:** A service averages 1,000 requests/second, but traffic spikes to 5,000 requests/second for short periods. Is provisioning for average traffic enough?
+**Case:** A service averages 1,000 requests/second but experiences short spikes to 5,000 requests/second; capacity has been planned using only average traffic.
 
 **Reasoning:** Not if the latency/availability objective must hold during the spike. Estimate the duration and burst shape, determine whether queues are acceptable, and measure per-instance capacity under realistic dependencies. Keep headroom or autoscale early enough; autoscaling cannot react instantly to every spike. If the database saturates first, adding API instances can worsen the incident.
-
-## Interview questions
-
-### Q1. Why estimate peak traffic instead of using only average RPS?
-Averages hide bursts that drive queueing and tail latency. Peak estimates guide headroom, admission control, and whether asynchronous buffering is useful, but the peak factor must be justified by the workload.
-
-### Q2. How do you turn RPS into a server count?
-Do not divide by a generic requests-per-server constant. Benchmark representative requests at the required latency and error rate, include dependency limits and failure headroom, then validate the result under load.
 
 ## Further reading
 
 - [Google SRE Book: Handling Overload](https://sre.google/sre-book/handling-overload/) — overload behavior and graceful protection.
-
