@@ -79,3 +79,38 @@ Backpressure tries to regulate work entering a constrained component. Load shedd
 - Autoscaling has reaction delays and cannot fix every bottleneck.
 - Use backpressure, bounded queues, rate limits, and load shedding under overload.
 - Protect downstream dependencies, not just the front-end service.
+
+## Scaling architecture and bottleneck diagnosis
+
+```mermaid
+flowchart LR
+    U[Clients] --> LB[Load balancer]
+    LB --> A1[Stateless instance A]
+    LB --> A2[Stateless instance B]
+    A1 --> DB[(Shared database)]
+    A2 --> DB
+    A1 --> C[(Shared cache)]
+    A2 --> C
+    DB -->|Saturation can cap throughput| BOT[Database bottleneck]
+```
+
+Adding application instances increases concurrency against shared dependencies. If database CPU, connections, locks, or I/O are already saturated, more instances can increase contention rather than throughput. Scale the limiting resource or reduce its work first.
+
+## Scenario practice
+
+**Scenario:** Doubling the application fleet doubles database connections and increases p99 latency. What would you inspect?
+
+**Reasoning:** Check connection-pool sizes across all instances, query latency, lock waits, database CPU/I/O, and connection queueing. Bound the total pool budget against database capacity, optimize expensive queries, and use caching or read replicas only when the access pattern fits. Autoscaling should consider downstream saturation rather than CPU alone.
+
+## Interview questions
+
+### Q1. Why doesn't horizontal scaling always increase throughput?
+A shared dependency or serialized operation can remain the bottleneck. Extra instances may increase contention, connections, and retries. Measure the whole request path and scale or redesign the constrained layer.
+
+### Q2. What makes an application stateless?
+Any healthy instance can handle a request without depending on local session state from a previous request. Persist durable state externally or use signed client tokens where appropriate; still protect shared stores from becoming bottlenecks.
+
+## Further reading
+
+- [Google SRE Book: Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) — overload and dependency protection.
+
