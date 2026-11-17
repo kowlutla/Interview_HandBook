@@ -5,7 +5,7 @@ Page titles/descriptions are read from the pages themselves (h1 and the p.sub li
 The handbook side is manifest-driven (handbook/assets/chapters.js + nav.js) and already generates itself."""
 import os, re, html
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'site')
 QN = os.path.join(ROOT, 'quicknotes')
 
 MODS = [  # id, short title, handbook chapters covered
@@ -140,7 +140,7 @@ def nav_html(cur, pre):
     for mid, mtitle, its in HB_MODS:
         nums = [int(i[0][:2]) for i in its if re.match(r'\d\d-', i[0])]
         if mid == 'm11':
-            body = [link(cases[i[0]], i[0][1:3]) for i in its if i[0] in cases]
+            body = [link(cases[i[0]], 'C' + i[0][1:3]) for i in its if i[0] in cases]
             o.append(group(mtitle, body, [i[0] for i in its]))
         elif nums:
             lo, hi = min(nums), max(nums)
@@ -263,6 +263,8 @@ INT_TOPICS = [  # slug, short title. Order = reading order. Only topics whose pa
     ('distributed-systems', 'Distributed Systems'),
     ('sql-databases', 'SQL and Databases'),
     ('design-patterns-lld', 'Design Patterns and LLD'),
+    ('security-api-design', 'Security and API Design'),
+    ('resume-deep-dive', 'Your Projects: Resume Deep Dive'),
     ('data-engineering', 'Data Engineering (Avro, Iceberg)'),
     ('spark', 'Apache Spark'),
     ('hld-approach', 'HLD: Interview Approach and Estimation'),
@@ -288,10 +290,13 @@ IV_GROUPS = [  # (group title, [slugs]); a group is shown only if it has built p
     ('Spring and Persistence', ['spring-framework', 'spring-boot', 'hibernate-jpa', 'sql-databases']),
     ('Build and Delivery', ['maven-gradle', 'ci-cd', 'docker-kubernetes']),
     ('Messaging, Caching and Search', ['kafka', 'redis-caching', 'elasticsearch']),
-    ('Architecture', ['microservices-rest', 'distributed-systems', 'design-patterns-lld']),
+    ('Architecture', ['microservices-rest', 'distributed-systems', 'design-patterns-lld', 'security-api-design']),
     ('Data Engineering', ['data-engineering', 'spark']),
     ('System Design (HLD)', ['hld-approach', 'hld-networking-api', 'hld-scaling-caching', 'hld-databases', 'hld-replication-sharding', 'hld-distributed-theory', 'hld-async-messaging', 'hld-resilience', 'hld-microservices-arch', 'hld-cross-cutting', 'hld-building-blocks', 'hld-real-world-scenarios', 'hld-design-tradeoffs']),
+    ('Your Experience', ['resume-deep-dive']),
 ]
+_ord = [x for _g, _sl in IV_GROUPS for x in _sl]
+INT_TOPICS.sort(key=lambda t: _ord.index(t[0]) if t[0] in _ord else 999)
 IV_HUBS = {'Java': ('java', 'Java', 'java-'), 'System Design (HLD)': ('hld', 'System Design (HLD)', 'hld-')}  # group -> (hub file/slug, name, topic prefix)
 IV_QN = {'redis-caching': 'q04-caching', 'distributed-systems': 'q07-distributed-theory', 'microservices-rest': 'q10-microservices',
          'kafka': 'q08-async', 'sql-databases': 'q05-data-stores', 'design-patterns-lld': 'q12-algorithms'}
@@ -303,7 +308,7 @@ def iv_nav(cur, pre):
     ctx = ''
     if cur in IV_QN:
         ctx = '<a class="ctx" href="%squicknotes/notes/%s.html">📖 Related Quick Notes sheet</a>' % (site, IV_QN[cur])
-    o = ['<a class="brand" href="%sindex.html">Interview Book</a>' % pre,
+    o = [('<a class="brand" href="%sindex.html">Interview Book</a>' % pre) if cur else '<div class="brand">Interview Book</div>',
          '<div class="tagline">Questions with model answers, diagrams and real scenarios</div>',
          '<div class="qlinks">%s<a href="%sindex.html">🏠 Home</a><a href="%ssearch.html">🔍 Search the whole site</a></div>' % (ctx, site, site)]
     titles = dict(INT_TOPICS)
@@ -373,8 +378,18 @@ for slug, title in INT_TOPICS:
                      sum(iv_stats[s]['q'] for s, _ in parts), sum(iv_stats[s]['svg'] for s, _ in parts)))
     else:
         mods.append(('topics/%s.html' % slug, title, iv_stats[slug]['sub'], iv_stats[slug]['q'], iv_stats[slug]['svg']))
-iv_cards = '\n'.join('<a class="card" href="%s"><span class="n">Topic %02d</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d questions, %d diagrams</span></a>'
-                     % (h, i + 1, esc(t), esc(d), q, g) for i, (h, t, d, q, g) in enumerate(mods))
+def card_label(h):
+    """Home-page card number = the sidebar number(s) of the topic(s) behind the card."""
+    if not h.startswith('topics/'):
+        pre = [hb[2] for hb in IV_HUBS.values() if hb[0] + '.html' == h][0]
+        ns = [i + 1 for i, (sl, _t) in enumerate(INT_TOPICS) if sl.startswith(pre)]
+        return 'Topics %02d to %02d' % (ns[0], ns[-1])
+    sl = h.split('/')[1][:-5]
+    return 'Topic %02d' % ([i for i, (a, _t) in enumerate(INT_TOPICS) if a == sl][0] + 1)
+
+
+iv_cards = '\n'.join('<a class="card" href="%s"><span class="n">%s</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d questions, %d diagrams</span></a>'
+                     % (h, card_label(h), esc(t), esc(d), q, g) for (h, t, d, q, g) in mods)
 for hb in IV_HUBS.values():
     JAVA_PARTS = HUB_PARTS[hb[0]]
     if not JAVA_PARTS: continue

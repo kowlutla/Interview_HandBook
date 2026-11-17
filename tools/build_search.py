@@ -1,7 +1,7 @@
 """Builds search-index.js (one record per h2 section of every page). Run after content changes:
-python -I C:/Users/kmangali/HLD/tools/build_search.py"""
+python -I tools/build_search.py"""
 import os, re, json, html
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'site')
 SKIP = {'index.html', '404.html', 'search.html'}
 recs = []
 

@@ -1,10 +1,10 @@
-"""Whole-site link and anchor checker.  Run: python -I C:/Users/kmangali/HLD/tools/check_site.py
+"""Whole-site link and anchor checker.  Run: python -I tools/check_site.py
 Checks every href/src in every .html under the site root: file exists, and #anchor exists in target page.
 Skips external (http/https/mailto) links and nav-generated anchors on handbook pages (built by nav.js)."""
 import os, re, sys
 from html.parser import HTMLParser
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'site')
 
 
 class P(HTMLParser):

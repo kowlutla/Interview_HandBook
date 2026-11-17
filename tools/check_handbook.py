@@ -5,7 +5,7 @@ required skeleton, links to other chapters resolve to ids in assets/chapters.js,
 import re, sys, os
 from html.parser import HTMLParser
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'site', 'handbook')
 manifest = open(os.path.join(ROOT, 'assets', 'chapters.js'), encoding='utf-8').read()
 IDS = set(re.findall(r'id: "([^"]+)"', manifest))
 VOID = {'meta', 'link', 'br', 'hr', 'img', 'input', 'path', 'line', 'rect', 'circle', 'polygon', 'polyline', 'ellipse', 'stop'}
@@ -29,7 +29,7 @@ class P(HTMLParser):
         else: s.bad.append((t, s.getpos()[0]))
 
 def check(path):
-    src = open(path, encoding='utf-8').read()
+    src = open(os.path.join(ROOT, path), encoding='utf-8').read()
     p = P(); p.feed(src)
     errs = []
     if p.bad: errs.append('unbalanced end tags (first 3): %s' % p.bad[:3])

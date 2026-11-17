@@ -4,7 +4,7 @@ Checks: balanced tags, forbidden patterns, handbook links resolve to real files,
 import re, sys, os
 from html.parser import HTMLParser
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'site', 'quicknotes')
 VOID = {'meta', 'link', 'br', 'hr', 'img', 'input', 'path', 'line', 'rect', 'circle', 'polygon', 'polyline', 'ellipse', 'stop'}
 FORBIDDEN = ['inner' + 'HTML', 'insertAdjacent' + 'HTML', 'outer' + 'HTML', 'document.' + 'write', 'ev' + 'al(', '<script']
 
