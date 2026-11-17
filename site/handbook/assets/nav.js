@@ -83,8 +83,8 @@
   }
   nav.setAttribute('aria-label', 'Site contents');
   nav.textContent = '';
-  var brand = el('a', 'brand', 'System Design Handbook');
-  brand.href = base + 'index.html';
+  var brand = pageId === 'index' ? el('div', 'brand', 'System Design Handbook') : el('a', 'brand', 'System Design Handbook');
+  if (pageId !== 'index') brand.href = base + 'index.html';
   nav.appendChild(brand);
   nav.appendChild(el('div', 'tagline', 'System design, explained from the ground up'));
 

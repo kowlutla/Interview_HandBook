@@ -114,7 +114,7 @@ def nav_html(cur, pre):
     """Sidebar that mirrors the Handbook: same module names and order, same case titles.
     pre = relative prefix from the page to the quicknotes root ('' for index, '../' for sub pages)"""
     hb = pre + '../handbook/'
-    o = ['<a class="brand" href="%sindex.html">System Design Quick Notes</a>' % pre,
+    o = [('<a class="brand" href="%sindex.html">System Design Quick Notes</a>' % pre) if cur else '<div class="brand">System Design Quick Notes</div>',
          '<div class="tagline">Lookup sheets for the day before the interview</div>',
          qlinks_html(cur, pre)]
     mods = [x for x in items if x['kind'] == 'mod']
