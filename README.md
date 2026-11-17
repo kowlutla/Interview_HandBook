@@ -1,4 +1,4 @@
-# Interview Prep
+# Interview HandBook
 
 A static website for senior engineering interview preparation: a System Design Handbook, Quick Notes, and an Interview Book (37 topics, Java to security and your own project stories). Pure HTML, inline SVG diagrams, no external dependencies.
 
@@ -8,6 +8,7 @@ A static website for senior engineering interview preparation: a System Design H
 | `site/` | The published website (handbook, quicknotes, interview, search, home). |
 | `tools/` | Build and check scripts (Python, standard library only). |
 | `authoring/` | Writing guides used to produce the pages. |
+| `reference-material/` | Source books, course PDFs and notes. Not part of the site. |
 
 ## Run locally
 ```
@@ -26,3 +27,5 @@ python -I tools/check_interview.py topics/<page>.html   # per-page checks (also 
 
 ## Publish
 `.github/workflows/pages.yml` builds, checks and deploys `site/` to GitHub Pages on every push to `main`. In the repo settings, set Pages source to "GitHub Actions".
+
+Live site: https://kowlutla.github.io/Interview_HandBook/
