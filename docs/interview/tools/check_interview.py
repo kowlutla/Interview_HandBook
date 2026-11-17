@@ -12,7 +12,7 @@ LEVELS = ('lvl b', 'lvl i', 'lvl s')
 
 class P(HTMLParser):
     def __init__(s):
-        super().__init__(); s.st = []; s.bad = []; s.ids = set(); s.hrefs = []; s.svg = 0; s.iq = 0; s.h2 = 0; s.lvl = 0; s.scn = 0; s.fig = 0
+        super().__init__(); s.st = []; s.bad = []; s.ids = set(); s.hrefs = []; s.svg = 0; s.iq = 0; s.h2 = 0; s.lvl = 0; s.scn = 0; s.fig = 0; s.ia = 0; s.rem = 0; s.old = 0
     def handle_starttag(s, t, a):
         d = dict(a)
         if 'id' in d:
@@ -25,6 +25,10 @@ class P(HTMLParser):
         if t == 'span' and (d.get('class') or '') in LEVELS: s.lvl += 1
         if t == 'details' and 'scn' in (d.get('class') or '').split(): s.scn += 1
         if t == 'h2': s.h2 += 1
+        c = (d.get('class') or '').split()
+        if t == 'p' and c[:1] == ['ia']: s.ia += 1
+        if t == 'p' and c[:1] == ['rem']: s.rem += 1
+        if c[:1] in (['why'], ['fu']): s.old += 1
         if t not in VOID: s.st.append((t, s.getpos()[0]))
     def handle_startendtag(s, t, a): pass
     def handle_endtag(s, t):
@@ -54,7 +58,10 @@ def check(path):
     for need in ('../../handbook/assets/style.css', '../../quicknotes/assets/quick.css', '../assets/interview.css', 'class="qn"'):
         if need not in src: errs.append('missing skeleton piece: ' + need)
     words = len(re.sub(r'<[^>]+>', ' ', src).split())
-    if words < 6000: errs.append('too short: %d words (minimum 6000)' % words)
+    if words < 3500: errs.append('too short: %d words (minimum 3500)' % words)
+    if p.old: errs.append('%d old-format boxes (class why / fu) still present: remove them, promote good follow-ups to separate questions' % p.old)
+    if p.ia < p.iq: errs.append('%d questions but only %d direct answers (every question needs <p class="ia">)' % (p.iq, p.ia))
+    if p.rem < p.iq * 0.8: errs.append('only %d remember lines for %d questions (want one per question)' % (p.rem, p.iq))
     if p.svg < 6: errs.append('only %d SVG diagrams (want at least 6)' % p.svg)
     if p.iq < 40: errs.append('only %d questions <details class="iq"> (want at least 40)' % p.iq)
     if p.lvl < p.iq: errs.append('%d questions but %d difficulty badges (every question needs one)' % (p.iq, p.lvl))

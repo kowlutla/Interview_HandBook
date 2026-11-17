@@ -35,21 +35,37 @@ The reader is a SENIOR SOFTWARE ENGINEER with 5 to 10 years of experience, inter
 7. `If you only have an hour` list: the 12 questions to read first (link with `<a href="#qid">`).
 8. `Cheat sheet`: command/decision tables.
 
-## Question markup (exact)
+## ANSWER FORMAT v2 (the user rejected v1; this section overrides anything above that conflicts)
+The user's feedback on v1: the "What the interviewer is testing" lines and "Likely follow-ups" boxes are not wanted; answers were not straight, did not sound like answering an interviewer, and the explanation was not up to the mark. They want answers that are detailed, easy to read AND easy to remember, with real technical depth and diagrams, but NOT tutorial length.
+
+Every question is written like this:
+1. **Direct answer first** (`<p class="ia">`): 2 to 4 spoken sentences that answer exactly what was asked, in first person where natural ("I would...", "It works like this..."). A candidate could say this out loud and stop, and it would already be a good answer. No preamble, no "it depends" opening, no restating the question. If the honest answer is "it depends", say the decision rule in the same breath ("use A when X, B when Y").
+2. **Go deeper** (normal `<p>`, `<ul>`, small table or `<pre><code>`): the technical depth a senior would add if the interviewer keeps probing: the mechanism, the numbers/defaults, the trade-off, the failure mode, a tiny concrete example. 3 to 8 sentences or a short bullet list. Plain words, one idea per sentence, define jargon in a few words. Explain WHY before HOW.
+3. **Diagram** (`<figure class="diagram">`) wherever a picture beats words: flows, lifecycles, comparisons, timelines, architectures, memory layouts. Keep it clear and uncluttered. Not every question needs one, but a page should have plenty (15+ for big topics).
+4. **Remember line** (`<p class="rem"><b>Remember:</b> ...</p>`): ONE short line, a rule of thumb, mnemonic or contrast ("Merge keeps history, rebase rewrites it: never rebase what others have"). Every question has one.
+5. Optional `<div class="mistake"><b>Watch out:</b> ...</div>` only when there is a real, common trap. Skip it otherwise.
+
+Do NOT write: `class="why"` lines, `class="fu"` follow-up boxes, or "What the interviewer is testing". If a follow-up is worth knowing, make it its OWN question right after the parent (phrased as the interviewer would actually ask next, e.g. "And what happens to the old commits after a rebase?"), with its own id, badge, direct answer and remember line. Merge near-duplicate questions. Keep the question count high but each answer tight: typical answer 90 to 220 words including the deeper part (diagram questions can be more). Do not pad.
+
+Scenario questions (`iq scn`) keep the shape Situation / Check first / Fix / Prevent, but still start with a `<p class="ia">` that states the one-sentence diagnosis and fix, and end with a `rem` line.
+
+Keep ALL the existing sections: how to use, mental model, question sections, scenarios, rapid-fire table, one-hour list (links must resolve), cheat sheet, and the existing diagrams (reuse them in the right answers; fix any that are unclear). The review is also a CORRECTNESS pass: fix wrong or shaky facts you find, hedge version-specific ones, and list what you are unsure of in your final report.
+
+## Question markup v2 (exact)
 ```html
 <details class="iq" id="q-short-slug">
 <summary>What is the difference between merge and rebase? <span class="lvl b">Basic</span></summary>
 <div class="ans">
-<p class="why"><b>What the interviewer is testing:</b> one sentence.</p>
-<p>Model answer paragraph(s)...</p>
-<pre><code>git rebase main</code></pre>
-<figure class="diagram">...</figure>   <!-- when a picture helps -->
-<div class="fu"><b>Likely follow-ups</b><ul><li>question? short answer.</li></ul></div>
-<div class="mistake"><b>Common mistakes:</b> ...</div>
+<p class="ia">Merge joins two branches with a merge commit and keeps history exactly as it happened. Rebase re-applies my commits on top of the new base, so history becomes a straight line but those commits get new hashes. I rebase my own private branches and merge shared ones.</p>
+<p>Deeper: ...mechanism, numbers, trade-off...</p>
+<figure class="diagram">...</figure>
+<p class="rem"><b>Remember:</b> merge keeps history, rebase rewrites it. Never rebase what others already have.</p>
 </div>
 </details>
 ```
-The level badge goes AFTER the question text. The question number (Q1, Q2...) is added automatically by CSS, never write it by hand. Level span: `lvl b` + text Basic, `lvl i` + Intermediate, `lvl s` + Senior. Scenario questions use `class="iq scn"`. Every question needs a unique id. Not every question needs follow-ups or mistakes boxes, but most should have follow-ups, and every non-trivial one a why line.
+The level badge goes AFTER the question text; the Q-number comes from CSS, never typed. Level span: `lvl b` Basic, `lvl i` Intermediate, `lvl s` Senior. Scenario questions use `class="iq scn"`. Unique ids. The checker now requires one `ia` and (about) one `rem` per question and rejects `why`/`fu`. Minimum words is 3,500 (answers are tighter now).
+
+When you rewrite a page, you may write it in parts (for example one file per section in the job temp dir) and join them, but the final file must be one complete HTML page with the skeleton below. Do NOT write the qnav/qfoot sidebar and pager markers (the build adds them; leave them out). Do not run build_site.py.
 
 ## Diagrams
 At least 10 inline SVG diagrams for a big topic, placed where they teach: object model, branch/merge/rebase pictures (commit dots and arrows), reset modes, remote flows, workflows, recovery timelines. Same vocabulary as the Quick Notes: `<figure class="diagram"><svg viewBox="0 0 W H" role="img" aria-label="...">...</svg><figcaption>how to read it</figcaption></figure>`; classes `box cache db ext hit miss`, lines `arrow arrow-g arrow-r dash`, text `t-sm t-b t-c`. Marker defs `ah`, `ahg`, `ahr` go in the hidden svg at the top of the body (copy from q04). Roomy boxes, no overlapping labels (about 8 px per character at 13px).
