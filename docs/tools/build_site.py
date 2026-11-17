@@ -265,6 +265,19 @@ INT_TOPICS = [  # slug, short title. Order = reading order. Only topics whose pa
     ('design-patterns-lld', 'Design Patterns and LLD'),
     ('data-engineering', 'Data Engineering (Avro, Iceberg)'),
     ('spark', 'Apache Spark'),
+    ('hld-approach', 'HLD: Interview Approach and Estimation'),
+    ('hld-networking-api', 'HLD: Networking, Load Balancing and APIs'),
+    ('hld-scaling-caching', 'HLD: Scaling and Caching'),
+    ('hld-databases', 'HLD: Databases and Storage'),
+    ('hld-replication-sharding', 'HLD: Replication and Sharding'),
+    ('hld-distributed-theory', 'HLD: Distributed Systems Theory'),
+    ('hld-async-messaging', 'HLD: Async, Messaging and Events'),
+    ('hld-resilience', 'HLD: Resilience and High Availability'),
+    ('hld-microservices-arch', 'HLD: Microservices and Architecture'),
+    ('hld-cross-cutting', 'HLD: Security, Observability and Operations'),
+    ('hld-building-blocks', 'HLD: Algorithms and Building Blocks'),
+    ('hld-real-world-scenarios', 'HLD: Real-World Scenarios and Incidents'),
+    ('hld-design-tradeoffs', 'HLD: Design Trade-offs and Judgment'),
 ]
 INT_TOPICS = [t for t in INT_TOPICS if os.path.exists(os.path.join(IV, 'topics', t[0] + '.html'))]
 
@@ -277,6 +290,7 @@ IV_GROUPS = [  # (group title, [slugs]); a group is shown only if it has built p
     ('Messaging, Caching and Search', ['kafka', 'redis-caching', 'elasticsearch']),
     ('Architecture', ['microservices-rest', 'distributed-systems', 'design-patterns-lld']),
     ('Data Engineering', ['data-engineering', 'spark']),
+    ('System Design (HLD)', ['hld-approach', 'hld-networking-api', 'hld-scaling-caching', 'hld-databases', 'hld-replication-sharding', 'hld-distributed-theory', 'hld-async-messaging', 'hld-resilience', 'hld-microservices-arch', 'hld-cross-cutting', 'hld-building-blocks', 'hld-real-world-scenarios', 'hld-design-tradeoffs']),
 ]
 IV_QN = {'redis-caching': 'q04-caching', 'distributed-systems': 'q07-distributed-theory', 'microservices-rest': 'q10-microservices',
          'kafka': 'q08-async', 'sql-databases': 'q05-data-stores', 'design-patterns-lld': 'q12-algorithms'}
@@ -316,7 +330,7 @@ def iv_nav(cur, pre):
             body.append('<a class="%s" href="%sjava.html"><span>Java overview</span></a>' % (hub_cls, pre))
         for x in slugs:
             n += 1
-            t = titles[x].split(': ', 1)[-1] if x.startswith('java-') else titles[x]
+            t = titles[x].split(': ', 1)[-1] if x.startswith(('java-', 'hld-')) else titles[x]
             body.append(item(x, t, '%02d' % n))
         is_open = (cur is None and first) or cur in slugs or (gtitle == 'Java' and cur == 'java-hub')
         first = False
