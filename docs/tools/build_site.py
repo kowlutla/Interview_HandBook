@@ -276,7 +276,9 @@ def iv_nav(cur, pre):
          '<div class="tagline">Questions with model answers, diagrams and real scenarios</div>',
          '<div class="qlinks"><a href="%sindex.html">\U0001F3E0 Home</a><a href="%ssearch.html">\U0001F50D Search the whole site</a></div>' % (site, site)]
     body = []
-    for slug, title in INT_TOPICS:
+    java_done = False
+
+    def item(slug, title):
         cls = 'ch current' if slug == cur else 'ch'
         s = ['<a class="%s" href="%stopics/%s.html"><span>%s</span></a>' % (cls, pre, slug, esc(title))]
         if slug == cur:
@@ -285,7 +287,19 @@ def iv_nav(cur, pre):
                 s.append('<div class="onpage">')
                 for hid, ht in heads: s.append('<a href="#%s">%s</a>' % (hid, esc(re.sub(r'<[^>]+>', '', ht).strip())))
                 s.append('</div>')
-        body.append('\n'.join(s))
+        return '\n'.join(s)
+
+    for slug, title in INT_TOPICS:
+        if slug.startswith('java-'):
+            if java_done: continue
+            java_done = True
+            parts = [(s, t.split(': ', 1)[-1]) for s, t in INT_TOPICS if s.startswith('java-')]
+            opened = ' open' if cur == 'java-hub' or cur in [s for s, _ in parts] else ''
+            hub_cls = 'ch current' if cur == 'java-hub' else 'ch'
+            inner = ['<a class="%s" href="%sjava.html"><span>Java overview</span></a>' % (hub_cls, pre)] + [item(s, t) for s, t in parts]
+            body.append('<details%s><summary>Java</summary>\n%s\n</details>' % (opened, '\n'.join(inner)))
+            continue
+        body.append(item(slug, title))
     o.append('<details open><summary>Interview questions</summary>\n%s\n</details>' % '\n'.join(body))
     return '\n'.join(o)
 
@@ -308,9 +322,59 @@ for i, (slug, title) in enumerate(INT_TOPICS):
     write(p, s)
 
 iv_q = sum(v['q'] for v in iv_stats.values())
-iv_cards = '\n'.join('<a class="card" href="topics/%s.html"><span class="n">Topic %02d</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d questions, %d diagrams</span></a>'
-                     % (slug, i + 1, esc(title), esc(iv_stats[slug]['sub']), iv_stats[slug]['q'], iv_stats[slug]['svg'])
-                     for i, (slug, title) in enumerate(INT_TOPICS))
+JAVA_PARTS = [(s, t.split(': ', 1)[-1]) for s, t in INT_TOPICS if s.startswith('java-')]
+mods = []  # (href, title, description, questions, diagrams, unit)
+java_added = False
+for slug, title in INT_TOPICS:
+    if slug.startswith('java-'):
+        if java_added: continue
+        java_added = True
+        mods.append(('java.html', 'Java', 'All Java interview questions in %d parts: %s.' % (len(JAVA_PARTS), ', '.join(t for _, t in JAVA_PARTS)),
+                     sum(iv_stats[s]['q'] for s, _ in JAVA_PARTS), sum(iv_stats[s]['svg'] for s, _ in JAVA_PARTS)))
+    else:
+        mods.append(('topics/%s.html' % slug, title, iv_stats[slug]['sub'], iv_stats[slug]['q'], iv_stats[slug]['svg']))
+iv_cards = '\n'.join('<a class="card" href="%s"><span class="n">Topic %02d</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d questions, %d diagrams</span></a>'
+                     % (h, i + 1, esc(t), esc(d), q, g) for i, (h, t, d, q, g) in enumerate(mods))
+if JAVA_PARTS:
+    java_cards = '\n'.join('<a class="card" href="topics/%s.html"><span class="n">Part %d</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d questions, %d diagrams</span></a>'
+                           % (s, i + 1, esc(t), esc(iv_stats[s]['sub']), iv_stats[s]['q'], iv_stats[s]['svg']) for i, (s, t) in enumerate(JAVA_PARTS))
+    jq = sum(iv_stats[s]['q'] for s, _ in JAVA_PARTS)
+    java_page = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Java | Interview Book</title>
+<link rel="stylesheet" href="../handbook/assets/style.css">
+<link rel="stylesheet" href="../quicknotes/assets/quick.css">
+<link rel="stylesheet" href="assets/interview.css">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+</head>
+<body>
+<div class="layout">
+<nav class="toc" id="toc">
+%s
+</nav>
+<main class="qmain">
+<div class="qn qhome">
+<h1>Java interview questions</h1>
+<p class="sub">Everything about Java in one place, split into %d parts. Work through them in order, or jump to the part you need.</p>
+<div class="stats">
+<div class="stat"><b>%d</b><span>parts</span></div>
+<div class="stat"><b>%d</b><span>questions</span></div>
+</div>
+<div class="grid">
+%s
+</div>
+</div>
+</main>
+</div>
+<script src="../quicknotes/assets/quick.js"></script>
+</body>
+</html>
+''' % (iv_nav('java-hub', ''), len(JAVA_PARTS), len(JAVA_PARTS), jq, java_cards)
+    write(os.path.join(IV, 'java.html'), java_page)
 iv_index = '''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -346,7 +410,7 @@ iv_index = '''<!DOCTYPE html>
 <script src="../quicknotes/assets/quick.js"></script>
 </body>
 </html>
-''' % dict(nav=iv_nav(None, ''), nt=len(INT_TOPICS), nq=iv_q, cards=iv_cards)
+''' % dict(nav=iv_nav(None, ''), nt=len(mods), nq=iv_q, cards=iv_cards)
 if INT_TOPICS: write(os.path.join(IV, 'index.html'), iv_index)
 
 # ---------------- index.html ----------------
@@ -412,6 +476,6 @@ top = '''<!DOCTYPE html>
 </body>
 </html>
 ''' % dict(np=n_pages, hw=round(hand_words / 1000), nm=len(mods), nc=len(cases), tq=tq,
-    ivcard=('<a class="big" href="interview/index.html"><span class="k">Practise</span><span class="t">Interview Book</span><span class="d">Interview questions topic by topic (Git, Java, Spring, Kafka and more) with model answers, diagrams, follow-ups and real production scenarios.</span><span class="m">%d topics, %d questions</span></a>' % (len(INT_TOPICS), iv_q)) if INT_TOPICS else '')
+    ivcard=('<a class="big" href="interview/index.html"><span class="k">Practise</span><span class="t">Interview Book</span><span class="d">Interview questions topic by topic (Git, Java, Spring, Kafka and more) with model answers, diagrams, follow-ups and real production scenarios.</span><span class="m">%d topics, %d questions</span></a>' % (len(mods), iv_q)) if INT_TOPICS else '')
 write(os.path.join(ROOT, 'index.html'), top)
 print('built: %d quicknotes pages, %d words, %d Q&As, %d diagrams; handbook %d pages' % (len(items), tw, tq, ts, n_pages))
