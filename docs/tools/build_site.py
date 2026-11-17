@@ -292,6 +292,7 @@ IV_GROUPS = [  # (group title, [slugs]); a group is shown only if it has built p
     ('Data Engineering', ['data-engineering', 'spark']),
     ('System Design (HLD)', ['hld-approach', 'hld-networking-api', 'hld-scaling-caching', 'hld-databases', 'hld-replication-sharding', 'hld-distributed-theory', 'hld-async-messaging', 'hld-resilience', 'hld-microservices-arch', 'hld-cross-cutting', 'hld-building-blocks', 'hld-real-world-scenarios', 'hld-design-tradeoffs']),
 ]
+IV_HUBS = {'Java': ('java', 'Java', 'java-'), 'System Design (HLD)': ('hld', 'System Design (HLD)', 'hld-')}  # group -> (hub file/slug, name, topic prefix)
 IV_QN = {'redis-caching': 'q04-caching', 'distributed-systems': 'q07-distributed-theory', 'microservices-rest': 'q10-microservices',
          'kafka': 'q08-async', 'sql-databases': 'q05-data-stores', 'design-patterns-lld': 'q12-algorithms'}
 
@@ -325,14 +326,15 @@ def iv_nav(cur, pre):
         slugs = [x for x in slugs if x in titles]
         if not slugs: continue
         body = []
-        if gtitle == 'Java':
-            hub_cls = 'ch current' if cur == 'java-hub' else 'ch'
-            body.append('<a class="%s" href="%sjava.html"><span>Java overview</span></a>' % (hub_cls, pre))
+        hub = IV_HUBS.get(gtitle)
+        if hub:
+            hub_cls = 'ch current' if cur == hub[0] + '-hub' else 'ch'
+            body.append('<a class="%s" href="%s%s.html"><span>%s overview</span></a>' % (hub_cls, pre, hub[0], hub[1]))
         for x in slugs:
             n += 1
             t = titles[x].split(': ', 1)[-1] if x.startswith(('java-', 'hld-')) else titles[x]
             body.append(item(x, t, '%02d' % n))
-        is_open = (cur is None and first) or cur in slugs or (gtitle == 'Java' and cur == 'java-hub')
+        is_open = (cur is None and first) or cur in slugs or (hub is not None and cur == hub[0] + '-hub')
         first = False
         o.append('<details%s><summary>%s</summary>\n%s\n</details>' %(' open' if is_open else '', esc(gtitle), '\n'.join(body)))
     return '\n'.join(o)
@@ -356,20 +358,26 @@ for i, (slug, title) in enumerate(INT_TOPICS):
     write(p, s)
 
 iv_q = sum(v['q'] for v in iv_stats.values())
-JAVA_PARTS = [(s, t.split(': ', 1)[-1]) for s, t in INT_TOPICS if s.startswith('java-')]
+HUB_PARTS = {h[0]: [(s, t.split(': ', 1)[-1]) for s, t in INT_TOPICS if s.startswith(h[2])] for h in IV_HUBS.values()}
+HUB_BY_PREFIX = {h[2]: h for h in IV_HUBS.values()}
 mods = []  # (href, title, description, questions, diagrams, unit)
-java_added = False
+hub_added = set()
 for slug, title in INT_TOPICS:
-    if slug.startswith('java-'):
-        if java_added: continue
-        java_added = True
-        mods.append(('java.html', 'Java', 'All Java interview questions in %d parts: %s.' % (len(JAVA_PARTS), ', '.join(t for _, t in JAVA_PARTS)),
-                     sum(iv_stats[s]['q'] for s, _ in JAVA_PARTS), sum(iv_stats[s]['svg'] for s, _ in JAVA_PARTS)))
+    hk = [p for p in HUB_BY_PREFIX if slug.startswith(p)]
+    if hk:
+        hb = HUB_BY_PREFIX[hk[0]]
+        if hb[0] in hub_added: continue
+        hub_added.add(hb[0])
+        parts = HUB_PARTS[hb[0]]
+        mods.append((hb[0] + '.html', hb[1], 'All %s interview questions in %d parts: %s.' % (hb[1], len(parts), ', '.join(t for _, t in parts)),
+                     sum(iv_stats[s]['q'] for s, _ in parts), sum(iv_stats[s]['svg'] for s, _ in parts)))
     else:
         mods.append(('topics/%s.html' % slug, title, iv_stats[slug]['sub'], iv_stats[slug]['q'], iv_stats[slug]['svg']))
 iv_cards = '\n'.join('<a class="card" href="%s"><span class="n">Topic %02d</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d questions, %d diagrams</span></a>'
                      % (h, i + 1, esc(t), esc(d), q, g) for i, (h, t, d, q, g) in enumerate(mods))
-if JAVA_PARTS:
+for hb in IV_HUBS.values():
+    JAVA_PARTS = HUB_PARTS[hb[0]]
+    if not JAVA_PARTS: continue
     java_cards = '\n'.join('<a class="card" href="topics/%s.html"><span class="n">Part %d</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d questions, %d diagrams</span></a>'
                            % (s, i + 1, esc(t), esc(iv_stats[s]['sub']), iv_stats[s]['q'], iv_stats[s]['svg']) for i, (s, t) in enumerate(JAVA_PARTS))
     jq = sum(iv_stats[s]['q'] for s, _ in JAVA_PARTS)
@@ -379,7 +387,7 @@ if JAVA_PARTS:
 <script src="../theme.js"></script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Java | Interview Book</title>
+<title>%s | Interview Book</title>
 <link rel="stylesheet" href="../handbook/assets/style.css">
 <link rel="stylesheet" href="../quicknotes/assets/quick.css">
 <link rel="stylesheet" href="assets/interview.css">
@@ -392,8 +400,8 @@ if JAVA_PARTS:
 </nav>
 <main class="qmain">
 <div class="qn qhome">
-<h1>Java interview questions</h1>
-<p class="sub">Everything about Java in one place, split into %d parts. Work through them in order, or jump to the part you need.</p>
+<h1>%s interview questions</h1>
+<p class="sub">Everything about %s in one place, split into %d parts. Work through them in order, or jump to the part you need.</p>
 <div class="stats">
 <div class="stat"><b>%d</b><span>parts</span></div>
 <div class="stat"><b>%d</b><span>questions</span></div>
@@ -407,8 +415,8 @@ if JAVA_PARTS:
 <script src="../quicknotes/assets/quick.js"></script>
 </body>
 </html>
-''' % (iv_nav('java-hub', ''), len(JAVA_PARTS), len(JAVA_PARTS), jq, java_cards)
-    write(os.path.join(IV, 'java.html'), java_page)
+''' % (hb[1], iv_nav(hb[0] + '-hub', ''), hb[1], hb[1], len(JAVA_PARTS), len(JAVA_PARTS), jq, java_cards)
+    write(os.path.join(IV, hb[0] + '.html'), java_page)
 iv_index = '''<!DOCTYPE html>
 <html lang="en">
 <head>
