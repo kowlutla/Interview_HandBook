@@ -253,7 +253,7 @@ def iv_nav(cur, pre):
     site = pre + '../'
     o = ['<a class="brand" href="%sindex.html">Interview Book</a>' % pre,
          '<div class="tagline">Questions with model answers, diagrams and real scenarios</div>',
-         '<div class="qlinks"><a href="%sindex.html">\0001F3E0 HOME</a><a href="%ssearch.html">\U0001F50D Search the whole site</a></div>' % (site, site)]
+         '<div class="qlinks"><a href="%sindex.html">\U0001F3E0 Home</a><a href="%ssearch.html">\U0001F50D Search the whole site</a></div>' % (site, site)]
     body = []
     for slug, title in INT_TOPICS:
         cls = 'ch current' if slug == cur else 'ch'
