@@ -240,6 +240,94 @@ qindex = '''<!DOCTYPE html>
            modcards=cards(mods, 'Sheet'), casecards=cards(cases, 'Case'))
 write(os.path.join(QN, 'index.html'), qindex)
 
+# ---------------- interview/ (Interview Book: one page per topic) ----------------
+IV = os.path.join(ROOT, 'interview')
+INT_TOPICS = [  # slug, short title. Order = reading order. Only topics whose page exists are built.
+    ('git', 'Git'),
+]
+INT_TOPICS = [t for t in INT_TOPICS if os.path.exists(os.path.join(IV, 'topics', t[0] + '.html'))]
+
+
+def iv_nav(cur, pre):
+    """pre = relative prefix from the page to the interview root ('' for the index, '../' for topic pages)."""
+    site = pre + '../'
+    o = ['<a class="brand" href="%sindex.html">HLD Interview Book</a>' % pre,
+         '<div class="tagline">Questions with model answers, diagrams and real scenarios</div>',
+         '<div class="qlinks"><a href="%sindex.html">\U0001F3E0 HLD home</a><a href="%ssearch.html">\U0001F50D Search the whole site</a></div>' % (site, site)]
+    body = []
+    for slug, title in INT_TOPICS:
+        cls = 'ch current' if slug == cur else 'ch'
+        s = ['<a class="%s" href="%stopics/%s.html"><span>%s</span></a>' % (cls, pre, slug, esc(title))]
+        if slug == cur:
+            heads = re.findall(r'<h2 id="([^"]+)"[^>]*>(.*?)</h2>', read(os.path.join(IV, 'topics', slug + '.html')), re.S)
+            if heads:
+                s.append('<div class="onpage">')
+                for hid, ht in heads: s.append('<a href="#%s">%s</a>' % (hid, esc(re.sub(r'<[^>]+>', '', ht).strip())))
+                s.append('</div>')
+        body.append('\n'.join(s))
+    o.append('<details open><summary>Interview questions</summary>\n%s\n</details>' % '\n'.join(body))
+    return '\n'.join(o)
+
+
+iv_stats = {}
+for i, (slug, title) in enumerate(INT_TOPICS):
+    p = os.path.join(IV, 'topics', slug + '.html')
+    s = read(p)
+    s = re.sub(r'<!--qnav:start-->.*?<!--qnav:end-->\n?', '', s, flags=re.S)
+    s = re.sub(r'<!--qfoot:start-->.*?<!--qfoot:end-->\n?', '', s, flags=re.S)
+    iv_stats[slug] = dict(q=s.count('<details class="iq'), svg=len(re.findall(r'<svg[^>]*viewBox', s)),
+                          words=len(re.sub(r'<[^>]+>', ' ', s).split()), sub=sub_of(p))
+    pg = ['<div class="pager">']
+    if i > 0: pg.append('<a class="prev" href="%s.html"><span class="lbl">Previous</span>%s</a>' % (INT_TOPICS[i - 1][0], esc(INT_TOPICS[i - 1][1])))
+    if i < len(INT_TOPICS) - 1: pg.append('<a class="next" href="%s.html"><span class="lbl">Next</span>%s</a>' % (INT_TOPICS[i + 1][0], esc(INT_TOPICS[i + 1][1])))
+    pg.append('</div>')
+    head = '<!--qnav:start-->\n<div class="layout">\n<nav class="toc" id="toc">\n%s\n</nav>\n<main class="qmain">\n<!--qnav:end-->\n' % iv_nav(slug, '../')
+    foot = '<!--qfoot:start-->\n%s\n</main>\n</div>\n<script src="../../quicknotes/assets/quick.js"></script>\n<!--qfoot:end-->\n' % ''.join(pg)
+    s = s.replace('<div class="qn">', head + '<div class="qn">', 1).replace('</body>', foot + '</body>', 1)
+    write(p, s)
+
+iv_q = sum(v['q'] for v in iv_stats.values())
+iv_cards = '\n'.join('<a class="card" href="topics/%s.html"><span class="n">Topic %02d</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d questions, %d diagrams</span></a>'
+                     % (slug, i + 1, esc(title), esc(iv_stats[slug]['sub']), iv_stats[slug]['q'], iv_stats[slug]['svg'])
+                     for i, (slug, title) in enumerate(INT_TOPICS))
+iv_index = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HLD Interview Book</title>
+<link rel="stylesheet" href="../handbook/assets/style.css">
+<link rel="stylesheet" href="../quicknotes/assets/quick.css">
+<link rel="stylesheet" href="assets/interview.css">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+</head>
+<body>
+<div class="layout">
+<nav class="toc" id="toc">
+%(nav)s
+</nav>
+<main class="qmain">
+<div class="qn qhome">
+<h1>HLD Interview Book</h1>
+<p class="sub">Interview questions for each topic with model answers, diagrams, follow-up questions and real production scenarios. Every question is marked Basic, Intermediate or Senior, so you can start at your level and move up.</p>
+<div class="stats">
+<div class="stat"><b>%(nt)d</b><span>topics</span></div>
+<div class="stat"><b>%(nq)d</b><span>questions</span></div>
+</div>
+<div class="tl"><b>How to use it:</b> read a question, answer it out loud before you open it, then compare. Use the follow-ups to practise going one level deeper, and the scenario questions to practise thinking under pressure.</div>
+<div class="grid">
+%(cards)s
+</div>
+</div>
+</main>
+</div>
+<script src="../quicknotes/assets/quick.js"></script>
+</body>
+</html>
+''' % dict(nav=iv_nav(None, ''), nt=len(INT_TOPICS), nq=iv_q, cards=iv_cards)
+if INT_TOPICS: write(os.path.join(IV, 'index.html'), iv_index)
+
 # ---------------- HLD/index.html ----------------
 hb = read(os.path.join(ROOT, 'handbook', 'assets', 'chapters.js'))
 n_pages = len(re.findall(r'done: true', hb))
@@ -281,6 +369,7 @@ top = '''<!DOCTYPE html>
 <div class="two2">
 <a class="big" href="handbook/index.html"><span class="k">Part 1: learn</span><span class="t">Handbook</span><span class="d">Complete, from the ground up: every component in depth, microservices, %(nc)d worked case studies, and cheat sheets. Detailed prose with diagrams.</span><span class="m">%(np)d pages, about %(hw)dk words</span></a>
 <a class="big" href="quicknotes/index.html"><span class="k">Part 2: revise</span><span class="t">Quick Notes</span><span class="d">Lookup sheets for the day before: key definitions, tables, numbers, say-aloud scripts, diagrams and detailed interview Q&amp;A in plain words.</span><span class="m">%(nm)d study sheets, %(nc)d case sheets, %(tq)d Q&amp;As</span></a>
+%(ivcard)s
 </div>
 <div class="how"><b>Suggested use:</b> Handbook chapter first, then the matching Quick Notes sheet to lock it in. In the final two days, skip the Handbook and read only the Quick Notes. Every Handbook page has a link to its Quick Notes sheet, and every Quick Notes page links back.</div>
 <h2>Jump straight to</h2>
@@ -297,6 +386,7 @@ top = '''<!DOCTYPE html>
 </div>
 </body>
 </html>
-''' % dict(np=n_pages, hw=round(hand_words / 1000), nm=len(mods), nc=len(cases), tq=tq)
+''' % dict(np=n_pages, hw=round(hand_words / 1000), nm=len(mods), nc=len(cases), tq=tq,
+    ivcard=('<a class="big" href="interview/index.html"><span class="k">Part 3: practise</span><span class="t">Interview Book</span><span class="d">Interview questions topic by topic (Git, Java, Spring, Kafka and more) with model answers, diagrams, follow-ups and real production scenarios.</span><span class="m">%d topics, %d questions</span></a>' % (len(INT_TOPICS), iv_q)) if INT_TOPICS else '')
 write(os.path.join(ROOT, 'index.html'), top)
 print('built: %d quicknotes pages, %d words, %d Q&As, %d diagrams; handbook %d pages' % (len(items), tw, tq, ts, n_pages))
