@@ -18,7 +18,7 @@
   var btn = el('button', null, '☰ Contents'); btn.type = 'button'; btn.setAttribute('aria-expanded', 'false');
   btn.addEventListener('click', function () { var o = document.body.classList.toggle('nav-open'); btn.setAttribute('aria-expanded', o ? 'true' : 'false'); });
   var h = document.querySelector('h1');
-  bar.appendChild(btn); bar.appendChild(el('span', null, h ? h.textContent : 'HLD Quick Notes'));
+  bar.appendChild(btn); bar.appendChild(el('span', null, h ? h.textContent : 'System Design Quick Notes'));
   layout.parentNode.insertBefore(bar, layout);
   var m = document.querySelector('main');
   if (m) m.addEventListener('click', function () { document.body.classList.remove('nav-open'); });

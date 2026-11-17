@@ -83,7 +83,7 @@
   }
   nav.setAttribute('aria-label', 'Site contents');
   nav.textContent = '';
-  var brand = el('a', 'brand', 'HLD Handbook');
+  var brand = el('a', 'brand', 'System Design Handbook');
   brand.href = base + 'index.html';
   nav.appendChild(brand);
   nav.appendChild(el('div', 'tagline', 'System design, explained from the ground up'));
@@ -103,7 +103,7 @@
   }
   var qlinks = el('div', 'qlinks');
   if (qlabel !== 'Open Quick Notes') { var ql = el('a', 'ctx', '⚡ ' + qlabel); ql.href = qhref; qlinks.appendChild(ql); }
-  [['🏠 HLD home', base + '../index.html'], ['🔍 Search the whole site', base + '../search.html']].forEach(function (r) {
+  [['🏠 Home', base + '../index.html'], ['🔍 Search the whole site', base + '../search.html']].forEach(function (r) {
     var a2 = el('a', null, r[0]); a2.href = r[1]; qlinks.appendChild(a2);
   });
   nav.appendChild(qlinks);
@@ -195,7 +195,7 @@
     var btn = el('button', null, '☰ Contents'); btn.type = 'button'; btn.setAttribute('aria-expanded', 'false');
     btn.addEventListener('click', function () { var o = document.body.classList.toggle('nav-open'); btn.setAttribute('aria-expanded', o ? 'true' : 'false'); });
     bar.appendChild(btn);
-    bar.appendChild(el('span', null, current >= 0 ? flat[current].it.t : 'HLD Handbook'));
+    bar.appendChild(el('span', null, current >= 0 ? flat[current].it.t : 'System Design Handbook'));
     layoutEl.parentNode.insertBefore(bar, layoutEl);
     main && main.addEventListener('click', function () { document.body.classList.remove('nav-open'); });
   }

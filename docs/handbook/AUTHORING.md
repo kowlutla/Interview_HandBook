@@ -1,4 +1,4 @@
-# Authoring guide for HLD Handbook pages
+# Authoring guide for System Design Handbook pages
 
 You are writing ONE page of a system design (HLD) interview handbook. General interview audience (senior engineers), not company-specific. Read this whole file, then read the reference page `chapters/12-cdn.html` (and skim `chapters/13-caching-patterns.html`) before writing. Match their depth, tone, structure quality and visual vocabulary.
 
@@ -19,7 +19,7 @@ You are writing ONE page of a system design (HLD) interview handbook. General in
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Chapter NN: Title | HLD Handbook</title>
+<title>Chapter NN: Title | System Design Handbook</title>
 <link rel="stylesheet" href="../assets/style.css">
 </head>
 <body data-page="NN-slug">

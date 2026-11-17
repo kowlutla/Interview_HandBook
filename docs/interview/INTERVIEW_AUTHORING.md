@@ -51,7 +51,7 @@ At least 10 inline SVG diagrams for a big topic, placed where they teach: object
 <script src="../../theme.js"></script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Interview Book: TOPIC | HLD Interview Book</title>
+<title>Interview Book: TOPIC | Interview Book</title>
 <link rel="stylesheet" href="../../handbook/assets/style.css">
 <link rel="stylesheet" href="../../quicknotes/assets/quick.css">
 <link rel="stylesheet" href="../assets/interview.css">

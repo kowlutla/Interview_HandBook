@@ -1,4 +1,4 @@
-# Authoring guide for HLD Quick Notes pages
+# Authoring guide for System Design Quick Notes pages
 
 The reader is a senior engineer revising 1 to 2 days before a system design interview. These pages are a LOOKUP and REVISION layer on top of the full Handbook at `C:/Users/kmangali/HLD/handbook` (read its chapters for facts; do not invent). Pages must be fast to scan, but complete enough that nothing an interviewer commonly asks is missing.
 
@@ -33,7 +33,7 @@ Sections (all short and scannable): 1 Problem in 3 lines and the clarifying ques
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Quick Notes: TITLE | HLD Quick Notes</title>
+<title>Quick Notes: TITLE | System Design Quick Notes</title>
 <link rel="stylesheet" href="../assets/style.css">
 <link rel="stylesheet" href="../assets/quick.css">
 </head>

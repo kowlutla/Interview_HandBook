@@ -1,4 +1,4 @@
-# Authoring guide for HLD Handbook case studies and cheat sheets
+# Authoring guide for System Design Handbook case studies and cheat sheets
 
 First read `AUTHORING.md` completely (quality bar, skeleton, CSS/SVG vocabulary, safe-JS rules, procedure). Everything there applies, with the differences below. Read `chapters/12-cdn.html` for visual style and `chapters/01-interview-framework.html` for the interview framework this page follows.
 

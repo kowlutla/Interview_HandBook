@@ -2,7 +2,7 @@
    dir: folder holding the page. id: file name without .html.
    done:true means the page exists. Only the maintainer flips this flag. */
 window.HLD = {
-  title: "System Design (HLD) Handbook",
+  title: "System Design Handbook",
   modules: [
     { id: "m0", title: "Orientation", dir: "chapters", items: [
       { id: "01-interview-framework", t: "How to Approach a Design Interview", d: "Requirement types, scoping, assumptions, API then data then design then deep dive, time budget", done: true },

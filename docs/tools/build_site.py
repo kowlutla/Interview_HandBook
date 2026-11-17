@@ -1,6 +1,6 @@
-"""Regenerates every navigation piece of the combined HLD site so Handbook and Quick Notes stay in sync.
+"""Regenerates every navigation piece of the combined interview-prep site so Handbook and Quick Notes stay in sync.
 Run from anywhere:  python -I C:\\Users\\kmangali\\HLD\\tools\\build_site.py
-Writes: quicknotes sidebar + prev/next on every page, quicknotes/index.html, HLD/index.html.
+Writes: quicknotes sidebar + prev/next on every page, quicknotes/index.html, index.html.
 Page titles/descriptions are read from the pages themselves (h1 and the p.sub line); short sidebar titles are in MODS below.
 The handbook side is manifest-driven (handbook/assets/chapters.js + nav.js) and already generates itself."""
 import os, re, html
@@ -103,7 +103,7 @@ def qlinks_html(cur, pre):
             for m in HB_MODS:
                 for i in m[2]:
                     if re.match(r'%02d-' % n, i[0]): href, label = '%s%s/%s.html' % (hb, i[2], i[0]), 'Full chapters in the Handbook'
-    rows = [('🏠 HLD home', pre + '../index.html'), ('🔍 Search the whole site', pre + '../search.html')]
+    rows = [('🏠 Home', pre + '../index.html'), ('🔍 Search the whole site', pre + '../search.html')]
     o = '<div class="qlinks">'
     if label != 'Open the Handbook': o += '<a class="ctx" href="%s">📖 %s</a>' % (href, label)
     for t, h in rows: o += '<a href="%s">%s</a>' % (h, t)
@@ -114,7 +114,7 @@ def nav_html(cur, pre):
     """Sidebar that mirrors the Handbook: same module names and order, same case titles.
     pre = relative prefix from the page to the quicknotes root ('' for index, '../' for sub pages)"""
     hb = pre + '../handbook/'
-    o = ['<a class="brand" href="%sindex.html">HLD Quick Notes</a>' % pre,
+    o = ['<a class="brand" href="%sindex.html">System Design Quick Notes</a>' % pre,
          '<div class="tagline">Lookup sheets for the day before the interview</div>',
          qlinks_html(cur, pre)]
     mods = [x for x in items if x['kind'] == 'mod']
@@ -202,7 +202,7 @@ qindex = '''<!DOCTYPE html>
 <script src="../theme.js"></script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HLD Quick Notes</title>
+<title>System Design Quick Notes</title>
 <link rel="stylesheet" href="assets/style.css">
 <link rel="stylesheet" href="assets/quick.css">
 <link rel="icon" href="../favicon.svg" type="image/svg+xml">
@@ -214,7 +214,7 @@ qindex = '''<!DOCTYPE html>
 </nav>
 <main class="qmain">
 <div class="qn qhome">
-<h1>HLD Quick Notes</h1>
+<h1>System Design Quick Notes</h1>
 <p class="sub">Fast lookup sheets for the day or two before an interview. Plain words, diagrams, tables and real interview Q&amp;A. Each sheet matches a group of Handbook chapters, so you can jump to the full explanation when something is unclear.</p>
 <div class="stats">
 <div class="stat"><b>%(nm)d</b><span>study sheets</span></div>
@@ -229,7 +229,7 @@ qindex = '''<!DOCTYPE html>
 <details class="mod" open><summary class="modsum"><h2 id="cases">Case-study sheets</h2><span class="cnt">%(nc)d sheets</span></summary>
 %(casecards)s
 </details>
-<p><a href="../handbook/index.html">Open the full Handbook</a> | <a href="../index.html">HLD home</a></p>
+<p><a href="../handbook/index.html">Open the full Handbook</a> | <a href="../index.html">Home</a></p>
 </div>
 </main>
 </div>
@@ -251,9 +251,9 @@ INT_TOPICS = [t for t in INT_TOPICS if os.path.exists(os.path.join(IV, 'topics',
 def iv_nav(cur, pre):
     """pre = relative prefix from the page to the interview root ('' for the index, '../' for topic pages)."""
     site = pre + '../'
-    o = ['<a class="brand" href="%sindex.html">HLD Interview Book</a>' % pre,
+    o = ['<a class="brand" href="%sindex.html">Interview Book</a>' % pre,
          '<div class="tagline">Questions with model answers, diagrams and real scenarios</div>',
-         '<div class="qlinks"><a href="%sindex.html">\U0001F3E0 HLD home</a><a href="%ssearch.html">\U0001F50D Search the whole site</a></div>' % (site, site)]
+         '<div class="qlinks"><a href="%sindex.html">\0001F3E0 HOME</a><a href="%ssearch.html">\U0001F50D Search the whole site</a></div>' % (site, site)]
     body = []
     for slug, title in INT_TOPICS:
         cls = 'ch current' if slug == cur else 'ch'
@@ -296,7 +296,7 @@ iv_index = '''<!DOCTYPE html>
 <script src="../theme.js"></script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HLD Interview Book</title>
+<title>Interview Book</title>
 <link rel="stylesheet" href="../handbook/assets/style.css">
 <link rel="stylesheet" href="../quicknotes/assets/quick.css">
 <link rel="stylesheet" href="assets/interview.css">
@@ -309,7 +309,7 @@ iv_index = '''<!DOCTYPE html>
 </nav>
 <main class="qmain">
 <div class="qn qhome">
-<h1>HLD Interview Book</h1>
+<h1>Interview Book</h1>
 <p class="sub">Interview questions for each topic with model answers, diagrams, follow-up questions and real production scenarios. Every question is marked Basic, Intermediate or Senior, so you can start at your level and move up.</p>
 <div class="stats">
 <div class="stat"><b>%(nt)d</b><span>topics</span></div>
@@ -328,7 +328,7 @@ iv_index = '''<!DOCTYPE html>
 ''' % dict(nav=iv_nav(None, ''), nt=len(INT_TOPICS), nq=iv_q, cards=iv_cards)
 if INT_TOPICS: write(os.path.join(IV, 'index.html'), iv_index)
 
-# ---------------- HLD/index.html ----------------
+# ---------------- index.html ----------------
 hb = read(os.path.join(ROOT, 'handbook', 'assets', 'chapters.js'))
 n_pages = len(re.findall(r'done: true', hb))
 hand_words = 0
@@ -343,7 +343,7 @@ top = '''<!DOCTYPE html>
 <script src="theme.js"></script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HLD: System Design Interview Prep</title>
+<title>Interview Prep: System Design and Core Topics</title>
 <link rel="stylesheet" href="handbook/assets/style.css">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <style>
@@ -364,14 +364,18 @@ top = '''<!DOCTYPE html>
 </head>
 <body>
 <div class="top">
-<h1>System Design (HLD) Interview Prep</h1>
-<p class="lead">Two parts of one set. Learn each topic properly in the Handbook, then revise from the Quick Notes in the last day or two. Both follow the same order, and every study sheet names the Handbook chapters it condenses.</p>
+<h1>Interview Prep</h1>
+<p class="lead">One place to prepare for senior engineering interviews. Start with <b>System Design</b> (learn it in the Handbook, revise it in the Quick Notes), then practise topic by topic in the <b>Interview Book</b>: Git today, with Java, Spring, Kafka and more being added.</p>
+<h2>System Design</h2>
 <div class="two2">
-<a class="big" href="handbook/index.html"><span class="k">Part 1: learn</span><span class="t">Handbook</span><span class="d">Complete, from the ground up: every component in depth, microservices, %(nc)d worked case studies, and cheat sheets. Detailed prose with diagrams.</span><span class="m">%(np)d pages, about %(hw)dk words</span></a>
-<a class="big" href="quicknotes/index.html"><span class="k">Part 2: revise</span><span class="t">Quick Notes</span><span class="d">Lookup sheets for the day before: key definitions, tables, numbers, say-aloud scripts, diagrams and detailed interview Q&amp;A in plain words.</span><span class="m">%(nm)d study sheets, %(nc)d case sheets, %(tq)d Q&amp;As</span></a>
+<a class="big" href="handbook/index.html"><span class="k">Learn</span><span class="t">System Design Handbook</span><span class="d">Complete, from the ground up: every component in depth, microservices, %(nc)d worked case studies, and cheat sheets. Detailed prose with diagrams.</span><span class="m">%(np)d pages, about %(hw)dk words</span></a>
+<a class="big" href="quicknotes/index.html"><span class="k">Revise</span><span class="t">System Design Quick Notes</span><span class="d">Lookup sheets for the day before: key definitions, tables, numbers, say-aloud scripts, diagrams and detailed interview Q&amp;A in plain words.</span><span class="m">%(nm)d study sheets, %(nc)d case sheets, %(tq)d Q&amp;As</span></a>
+</div>
+<h2>Interview Book</h2>
+<div class="two2">
 %(ivcard)s
 </div>
-<div class="how"><b>Suggested use:</b> Handbook chapter first, then the matching Quick Notes sheet to lock it in. In the final two days, skip the Handbook and read only the Quick Notes. Every Handbook page has a link to its Quick Notes sheet, and every Quick Notes page links back.</div>
+<div class="how"><b>Suggested use:</b> for system design, read the Handbook chapter first, then the matching Quick Notes sheet to lock it in; in the final two days read only the Quick Notes. For everything else, work through the Interview Book topic by topic: answer each question out loud before you open it.</div>
 <h2>Jump straight to</h2>
 <div class="quick">
 <a href="quicknotes/notes/q13-delivery-playbook.html">Last-hour cheat sheet</a>
@@ -387,6 +391,6 @@ top = '''<!DOCTYPE html>
 </body>
 </html>
 ''' % dict(np=n_pages, hw=round(hand_words / 1000), nm=len(mods), nc=len(cases), tq=tq,
-    ivcard=('<a class="big" href="interview/index.html"><span class="k">Part 3: practise</span><span class="t">Interview Book</span><span class="d">Interview questions topic by topic (Git, Java, Spring, Kafka and more) with model answers, diagrams, follow-ups and real production scenarios.</span><span class="m">%d topics, %d questions</span></a>' % (len(INT_TOPICS), iv_q)) if INT_TOPICS else '')
+    ivcard=('<a class="big" href="interview/index.html"><span class="k">Practise</span><span class="t">Interview Book</span><span class="d">Interview questions topic by topic (Git, Java, Spring, Kafka and more) with model answers, diagrams, follow-ups and real production scenarios.</span><span class="m">%d topics, %d questions</span></a>' % (len(INT_TOPICS), iv_q)) if INT_TOPICS else '')
 write(os.path.join(ROOT, 'index.html'), top)
 print('built: %d quicknotes pages, %d words, %d Q&As, %d diagrams; handbook %d pages' % (len(items), tw, tq, ts, n_pages))
