@@ -27,7 +27,7 @@ Do NOT copy the old Q&A in `C:/Users/kmangali/Personal Repos/Interview-Preparati
 ## Question markup (exact)
 ```html
 <details class="iq" id="q-short-slug">
-<summary><span class="lvl b">Basic</span>What is the difference between merge and rebase?</summary>
+<summary>What is the difference between merge and rebase? <span class="lvl b">Basic</span></summary>
 <div class="ans">
 <p class="why"><b>What the interviewer is testing:</b> one sentence.</p>
 <p>Model answer paragraph(s)...</p>
@@ -38,7 +38,7 @@ Do NOT copy the old Q&A in `C:/Users/kmangali/Personal Repos/Interview-Preparati
 </div>
 </details>
 ```
-Level span: `lvl b` + text Basic, `lvl i` + Intermediate, `lvl s` + Senior. Scenario questions use `class="iq scn"`. Every question needs a unique id. Not every question needs follow-ups or mistakes boxes, but most should have follow-ups, and every non-trivial one a why line.
+The level badge goes AFTER the question text. The question number (Q1, Q2...) is added automatically by CSS, never write it by hand. Level span: `lvl b` + text Basic, `lvl i` + Intermediate, `lvl s` + Senior. Scenario questions use `class="iq scn"`. Every question needs a unique id. Not every question needs follow-ups or mistakes boxes, but most should have follow-ups, and every non-trivial one a why line.
 
 ## Diagrams
 At least 10 inline SVG diagrams for a big topic, placed where they teach: object model, branch/merge/rebase pictures (commit dots and arrows), reset modes, remote flows, workflows, recovery timelines. Same vocabulary as the Quick Notes: `<figure class="diagram"><svg viewBox="0 0 W H" role="img" aria-label="...">...</svg><figcaption>how to read it</figcaption></figure>`; classes `box cache db ext hit miss`, lines `arrow arrow-g arrow-r dash`, text `t-sm t-b t-c`. Marker defs `ah`, `ahg`, `ahr` go in the hidden svg at the top of the body (copy from q04). Roomy boxes, no overlapping labels (about 8 px per character at 13px).
