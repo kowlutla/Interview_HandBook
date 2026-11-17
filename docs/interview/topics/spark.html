@@ -154,6 +154,16 @@
 <line class="arrow-g" x1="272" y1="169" x2="328" y2="169" marker-end="url(#ahg)"/><line class="arrow-g" x1="452" y1="169" x2="508" y2="169" marker-end="url(#ahg)"/>
 <text class="t-sm" x="20" y="226">Disk is touched only at shuffles, cache spills and the final write.</text>
 </svg><figcaption>The saving comes from pipelining steps inside one stage and not materialising each step on a distributed file system.</figcaption></figure>
+<p><b>The problem it solves.</b> Data too big for one machine has to be split across many, and a real job is rarely one step: you read, clean, join, aggregate, then maybe repeat the aggregate with different inputs. In MapReduce every step is its own job, and between jobs the result is written to HDFS (three replicas, disk and network) and read back. Machine learning loops or multi-stage ETL pay that toll again and again.</p>
+<p><b>What Spark does differently.</b></p>
+<ol>
+<li>You describe the whole pipeline first. Spark sees all the steps before running any of them.</li>
+<li>Consecutive steps that do not need data from other machines (filter, map, select) are fused and run in one pass over each chunk of data, so intermediate results are never stored.</li>
+<li>Data goes to disk only when it must move between machines (a shuffle), when a cache spills, or at the final write.</li>
+<li>One engine and one API serve SQL, DataFrames, streaming and ML, so you do not stitch together separate systems.</li>
+</ol>
+<p><b>Tiny example.</b> "Read logs, keep errors, count per service, join with the owner table, write." In MapReduce that is several jobs with HDFS writes between them. In Spark it is one job with two stages: stage 1 reads, filters and partially counts; one shuffle; stage 2 finishes the count, joins and writes.</p>
+<p><b>When Spark is the wrong tool.</b> Small data (a laptop and pandas or a database is faster, because Spark has startup and scheduling overhead), low-latency lookups of single rows (use a database or key-value store), and sub-millisecond event processing (micro-batch Spark is not built for that). Be fair to MapReduce in an interview: its disk-based design is still robust for huge, simple, one-pass jobs. Spark's win is a richer programming model plus removing the disk tax between steps.</p>
 <p class="rem"><b>Remember:</b> MapReduce = disk after every step. Spark = one plan, memory between steps, disk only at shuffles.</p>
 </div>
 </details>
@@ -167,6 +177,23 @@
 <pre><code>spark-submit --master yarn --deploy-mode cluster \
   --num-executors 10 --executor-cores 4 --executor-memory 8g \
   --class com.acme.Etl app.jar 2026-11-17</code></pre>
+<p><b>Picture it as a manager and workers.</b> The driver is the project manager holding the plan. Executors are the workers, each with a few hands (cores) and a desk (memory). The cluster manager is the facilities office: it gives you rooms and workers when you ask, then steps out of the way. It does not know what your job does.</p>
+<p><b>What happens at startup.</b></p>
+<ol>
+<li><code>spark-submit</code> starts the driver (location depends on deploy mode).</li>
+<li>The driver registers with the cluster manager and asks for N executors of a given size.</li>
+<li>The cluster manager launches executor JVMs on worker nodes.</li>
+<li>Executors connect back to the driver directly. From now on tasks go driver to executor and results flow back, with no manager in between.</li>
+</ol>
+<p><b>Why client versus cluster matters.</b> In client mode the driver is a process on your edge node or laptop. It streams logs to your terminal, which is convenient, but the executors talk to it constantly, so a slow or flaky network between you and the cluster slows the job, and if you close the laptop the job dies. In cluster mode the cluster starts the driver inside itself (on YARN, in the ApplicationMaster container; on Kubernetes, in a driver pod). The submit command can return, and the driver sits close to the executors. That is why schedulers such as Airflow use cluster mode.</p>
+<table>
+<tr><th></th><th>Client mode</th><th>Cluster mode</th></tr>
+<tr><td>Driver runs on</td><td>The submitting machine</td><td>A node inside the cluster</td></tr>
+<tr><td>Interactive shell or notebook</td><td>Yes (needs this mode)</td><td>No</td></tr>
+<tr><td>Survives the submitter dying</td><td>No</td><td>Yes</td></tr>
+<tr><td>Typical use</td><td>Development, notebooks</td><td>Production batch and streaming</td></tr>
+</table>
+<p><b>Pitfalls.</b> Driver memory and executor memory are set separately (<code>--driver-memory</code>). A job that calls <code>collect</code> or broadcasts a big table needs a larger driver. Executors that die are replaced (dynamic allocation can also add or remove them), but a dead driver cannot be replaced, so streaming jobs run in cluster mode with a supervisor that restarts the application and recovers from the checkpoint.</p>
 <p class="rem"><b>Remember:</b> driver plans and schedules, executors compute, cluster manager only lends machines.</p>
 </div>
 </details>
@@ -176,6 +203,17 @@
 <div class="ans">
 <p class="ia">The driver takes the logical plan I built, optimizes it, turns it into a physical plan, and the DAG scheduler cuts it into stages at every shuffle. For each stage the task scheduler creates one task per partition and sends the tasks to executors. Executors run them, write shuffle output or return results, and the next stage starts when the previous one finishes.</p>
 <p>The scheduler prefers to put a task on a node that already holds its input block (data locality) to avoid moving data. A failed task is retried, 4 attempts by default. When the last stage completes, the action returns. If I never call an action, none of this happens, which is why a bug in a transformation can surface only at the action.</p>
+<p><b>Walk-through with an example.</b> Take <code>orders.filter(amount &gt; 100).groupBy("country").count().write.parquet(out)</code>.</p>
+<ol>
+<li><b>Action.</b> <code>write</code> is the action. Until now only a plan (a tree of operators) existed.</li>
+<li><b>Optimize.</b> Catalyst resolves column names, pushes the <code>amount &gt; 100</code> filter into the Parquet scan, prunes columns to just <code>amount</code> and <code>country</code>, and picks a physical plan: scan, partial hash aggregate, <code>Exchange</code> (shuffle by country), final hash aggregate, write.</li>
+<li><b>Cut into stages.</b> The DAG scheduler cuts at the Exchange: stage 0 is scan + partial aggregate, stage 1 is final aggregate + write.</li>
+<li><b>Create tasks.</b> If the input has 80 file splits, stage 0 has 80 tasks. Stage 1 has one task per shuffle partition (200 by default, fewer if AQE coalesces).</li>
+<li><b>Schedule.</b> The task scheduler hands tasks to free cores, preferring executors that already hold the data block (locality: process-local, node-local, rack-local, then any). If no local slot frees up in about 3 seconds (<code>spark.locality.wait</code>), it settles for a farther one.</li>
+<li><b>Run and shuffle.</b> Stage 0 tasks write shuffle files to local disk and report their location to the driver. When all 80 are done, stage 1 tasks fetch their slices.</li>
+<li><b>Finish.</b> Stage 1 tasks write the output files and a commit step makes them visible. The driver marks the job done and the action returns.</li>
+</ol>
+<p><b>Failures on the way.</b> A failed task is simply rerun, up to 4 times. If a shuffle file is lost (the executor holding it died), the scheduler reruns the needed tasks of the previous stage. If one task is very slow, speculation (off by default) can launch a duplicate. The Spark UI shows exactly this structure under Jobs, Stages and SQL, which is the first place to look when something is slow.</p>
 <p class="rem"><b>Remember:</b> action, then plan, then stages at shuffles, then one task per partition.</p>
 </div>
 </details>
@@ -195,6 +233,16 @@
 <tr><td>Languages</td><td>All</td><td>All</td><td>Scala, Java</td></tr>
 </table>
 <div class="mistake"><b>Watch out:</b> "Datasets are always better because they are typed" is wrong. A typed lambda like <code>ds.filter(p =&gt; p.age &gt; 18)</code> is a black box: Catalyst cannot push it down to Parquet and each row becomes an object first. <code>df.filter("age &gt; 18")</code> can be pushed down.</div>
+<p><b>Why the distinction exists.</b> The RDD was Spark's first API (2010s): a distributed list of objects plus functions you wrote. It is flexible, but Spark cannot see inside your lambda, so it cannot rearrange or skip any work. DataFrames came later with a schema, so Spark knows "this column is an int, that one is a string" and can plan around that.</p>
+<p><b>What the schema buys you, concretely.</b> Take <code>df.select("name").filter("age &gt; 18")</code> over Parquet.</p>
+<ul>
+<li><b>Column pruning:</b> only the <code>name</code> and <code>age</code> columns are read from disk.</li>
+<li><b>Predicate pushdown:</b> the age filter is checked against Parquet row-group statistics, so whole chunks are skipped.</li>
+<li><b>Compact storage:</b> Tungsten stores rows as bytes. An RDD of Java objects holds each row as many small objects with headers and pointers, which costs several times more memory and more garbage collection.</li>
+</ul>
+<p>With an RDD of <code>Person</code> objects and <code>rdd.filter(_.age &gt; 18).map(_.name)</code>, Spark reads every full row, builds every object, and calls your code. Same answer, much more work.</p>
+<p><b>Where Dataset fits.</b> A <code>Dataset[Person]</code> gives compile-time types: a typo like <code>p.agee</code> fails to compile, while <code>df("agee")</code> fails at run time. The price is that lambdas are opaque and each row must be decoded to an object. A common compromise is to use DataFrame operations for the heavy lifting and convert to a typed Dataset only at the edges.</p>
+<p><b>When I still use an RDD.</b> Truly unstructured data parsed by custom code, fine control over partitioning (<code>partitionBy</code> with a custom partitioner), or legacy code. Even then I try to get to a DataFrame as soon as the data has a shape.</p>
 <p class="rem"><b>Remember:</b> RDD = objects, DataFrame = table Spark understands, Dataset = DataFrame plus types. Prefer the one the optimizer can see into.</p>
 </div>
 </details>
@@ -208,6 +256,20 @@
          .filter($"day" === "2026-11-16")       // still nothing
 x.count()                                       // job 1 runs now
 x.write.parquet("/out/x")                       // job 2: recomputes from scratch</code></pre>
+<p><b>Why it is designed this way.</b> If Spark ran each step the moment you wrote it, it would materialise a full intermediate result after every call (a 1 TB filter output, then a 1 TB select output). By waiting, it can look at the entire chain and execute it as one optimized plan. Think of writing a shopping list versus walking to the shop once per item.</p>
+<p><b>Classification.</b></p>
+<table>
+<tr><th>Transformations (lazy, return a new DataFrame)</th><th>Actions (run a job)</th></tr>
+<tr><td><code>select, filter, withColumn, join, groupBy().agg(), union, distinct, repartition</code></td><td><code>count, show, collect, take, first, foreach, write, toPandas</code></td></tr>
+</table>
+<p><b>What it means in practice.</b></p>
+<ul>
+<li><b>Each action is a separate job that starts from the source.</b> In the snippet above, <code>count()</code> reads and filters the files; <code>write</code> then reads and filters them again. Two actions, double the work. Fix: <code>cache()</code> the result, or restructure so one action does everything.</li>
+<li><b>Errors appear late.</b> A wrong column name is caught at analysis time (when you build the DataFrame), but a bad cast or a division by zero in the data appears only when the action runs, possibly deep inside a task on an executor.</li>
+<li><b>Debugging.</b> To see what a DataFrame holds, you must run an action: <code>df.show(5)</code>, and <code>df.explain()</code> shows the plan without running it.</li>
+<li><b>Timing code is misleading.</b> Wrapping a transformation in a timer measures nothing. Time the action.</li>
+</ul>
+<p>Not everything is lazy: <code>read</code> with schema inference scans files immediately, <code>spark.sql("create table ...")</code> and similar commands run eagerly, and <code>orderBy</code>/<code>sort</code> runs a small sampling job at plan time to choose range boundaries.</p>
 <p class="rem"><b>Remember:</b> transformations build the plan, actions run it, and each action recomputes unless cached.</p>
 </div>
 </details>
@@ -217,6 +279,17 @@ x.write.parquet("/out/x")                       // job 2: recomputes from scratc
 <div class="ans">
 <p class="ia">collect() pulls every row from all executors into the driver's memory as one local array. With big data the driver runs out of memory or hits <code>spark.driver.maxResultSize</code> (1 GB by default) and the whole job dies, even though the cluster has plenty free. I use <code>show(n)</code>, <code>take(n)</code> or <code>limit(n)</code> to look at samples, <code>write</code> to save results, and aggregate first so only a small answer comes back.</p>
 <p><code>toPandas()</code> has the same problem, so apply it only to small aggregated results (and enable Arrow to speed it up). To walk through a large result on the driver without holding it all, <code>toLocalIterator()</code> pulls one partition at a time. Raising driver memory only moves the limit: one machine never scales with the data. Other causes of driver OOM are broadcasting a large table (it passes through the driver), hundreds of thousands of tasks, and a huge plan built in a loop.</p>
+<p><b>Why it fails, step by step.</b> Suppose 200 executors hold 50 GB of results in total. <code>collect()</code> makes every task send its rows to the driver, which deserializes them into one in-memory array. The driver has maybe 4 to 8 GB of heap, so it either exceeds <code>spark.driver.maxResultSize</code> (job aborted with a clear message) or throws <code>OutOfMemoryError</code> (driver dies, application dies). It is a single machine being asked to hold what a cluster held.</p>
+<p><b>What to do for each real need.</b></p>
+<table>
+<tr><th>I want to...</th><th>Use</th></tr>
+<tr><td>Look at some rows</td><td><code>df.show(20)</code>, <code>df.limit(100).collect()</code></td></tr>
+<tr><td>Save the result</td><td><code>df.write...</code> (executors write in parallel, no driver involved)</td></tr>
+<tr><td>Get one number</td><td>Aggregate on the cluster, then <code>first()</code> / <code>collect()</code> on a one-row result</td></tr>
+<tr><td>Loop over everything in Python or Scala</td><td><code>foreachPartition</code> (runs on executors), or <code>toLocalIterator()</code> if the driver truly must see it</td></tr>
+<tr><td>Hand data to pandas or a plotting library</td><td>Aggregate or sample first, then <code>toPandas()</code></td></tr>
+</table>
+<p><b>The rule behind it.</b> The cluster scales with data, the driver does not. If your code does a loop on the driver over a collected result, it is almost always better written as a distributed operation (join, groupBy, window, mapPartitions). A common interview probe: "driver OOM but executors are fine, what do you look at?" Answer: collect/toPandas, a large broadcast, too many tasks (each task result is tracked on the driver), or a very large logical plan built in a loop.</p>
 <p class="rem"><b>Remember:</b> the driver is one small machine. Reduce on the cluster, write on the cluster, bring back only small results.</p>
 </div>
 </details>
@@ -230,6 +303,10 @@ x.write.parquet("/out/x")                       // job 2: recomputes from scratc
 val bad = spark.sparkContext.longAccumulator("badRows")
 df.foreach { r =&gt; if (r.isNullAt(0)) bad.add(1) }   // action: counted once
 println(bad.value)</code></pre>
+<p><b>Broadcast variables, in detail.</b> When a function you pass to <code>map</code> uses a local variable, Spark copies it into the serialized task, so every task carries its own copy. With 5,000 tasks and a 200 MB lookup map that is a terabyte of traffic. <code>sc.broadcast(value)</code> sends it once per executor (using a torrent-like transfer between executors, so the driver is not the only sender), stores it in executor memory, and tasks read <code>lookup.value</code>. It is read-only, so there are no consistency problems. Call <code>lookup.destroy()</code> or <code>unpersist()</code> when finished to free memory. In DataFrame code you rarely write this by hand: the <code>broadcast()</code> join hint does it for a table.</p>
+<p><b>Accumulators, in detail.</b> Tasks run in different JVMs, so a plain <code>var count</code> incremented in a lambda changes only a local copy and the driver sees 0. An accumulator is a special variable whose "add" is sent back to the driver and merged. The driver can read <code>.value</code>, tasks cannot.</p>
+<p><b>Why the guarantee is weak.</b> Spark guarantees each task's update is applied exactly once only for updates inside actions (such as <code>foreach</code>). In a transformation (such as <code>map</code>), if the task is retried, if a speculative copy runs, or if the stage is recomputed because the data was not cached, the add happens again. So a "bad rows" counter may show 1,050 for 1,000 bad rows. Fine for monitoring, wrong for logic like "stop if more than 1% bad".</p>
+<p><b>Rule of thumb.</b> Broadcast for read-only data you would otherwise ship repeatedly. For counting inside the pipeline with reliable results, compute it with DataFrame aggregation (<code>count(when(cond, 1))</code>) instead of an accumulator.</p>
 <p class="rem"><b>Remember:</b> broadcast = ship big read-only data once per executor. Accumulator = write-only counter, trustworthy only in actions.</p>
 </div>
 </details>
@@ -263,6 +340,15 @@ println(bad.value)</code></pre>
 <line class="arrow-r" x1="562" y1="188" x2="738" y2="68" marker-end="url(#ahr)"/><line class="arrow-r" x1="562" y1="188" x2="738" y2="128" marker-end="url(#ahr)"/><line class="arrow-r" x1="562" y1="188" x2="738" y2="188" marker-end="url(#ahr)"/>
 <text class="t-sm" x="470" y="240">Every parent feeds every child: shuffle.</text>
 </svg><figcaption>Green arrows stay inside a partition. Red arrows cross the network and mean a new stage.</figcaption></figure>
+<p><b>The one question to ask.</b> "To compute output partition k, how many input partitions do I need?" If the answer is one (or a fixed small set that lives together), it is narrow. If the answer is "a piece of every input partition", it is wide.</p>
+<p><b>Why it matters.</b></p>
+<ul>
+<li><b>Speed:</b> narrow steps run inside one task on one machine with no network. A chain such as <code>filter</code>, then <code>map</code>, then <code>select</code> becomes one loop over each partition.</li>
+<li><b>Stages:</b> every wide dependency forces Spark to wait until all parent tasks finish and the shuffle files exist, so it starts a new stage there.</li>
+<li><b>Recovery:</b> if a partition is lost, a narrow child needs one parent partition recomputed; a wide child may need all of them.</li>
+</ul>
+<p><b>Worked example.</b> <code>df.filter(...).select(...).groupBy("k").sum("v").filter("sum(v) &gt; 10")</code>. The first filter and select are narrow. <code>groupBy</code> is wide: the rows for key "A" are spread over all input partitions and must be brought together. The final filter is narrow again. So the job has two stages with one shuffle between.</p>
+<p><b>A subtle point.</b> Wide transformations do a partial aggregation on the map side before the shuffle (so the shuffle carries per-key sums, not raw rows). This is why <code>groupBy().sum()</code> is much cheaper than it looks. Also, <code>union</code> is narrow (it just concatenates partition lists), and <code>coalesce</code> is narrow.</p>
 <p class="rem"><b>Remember:</b> narrow = stays inside a partition. Wide = rows cross the network = shuffle = stage boundary.</p>
 </div>
 </details>
@@ -286,6 +372,21 @@ println(bad.value)</code></pre>
 <rect class="hit" x="560" y="156" width="110" height="30" rx="6"/><text class="t-c t-sm" x="615" y="176">task 2</text>
 <line class="arrow" x1="352" y1="148" x2="388" y2="148" marker-end="url(#ah)"/><line class="arrow" x1="502" y1="148" x2="538" y2="148" marker-end="url(#ah)"/>
 </svg><figcaption>Stage 1 cannot begin until every task of stage 0 has written its shuffle output.</figcaption></figure>
+<p><b>A numbers example.</b> You read 10 GB of Parquet (about 80 splits of 128 MB), filter, group by country, and write. Result:</p>
+<ul>
+<li>1 action (<code>write</code>) = 1 job.</li>
+<li>1 shuffle (the groupBy) = 2 stages.</li>
+<li>Stage 0 = 80 tasks (one per input split). Stage 1 = up to 200 tasks (one per shuffle partition), or fewer if AQE merges small ones.</li>
+<li>With 40 cores in the cluster, stage 0 runs in two waves of 40 tasks (80 / 40), and each task is retried independently if it fails.</li>
+</ul>
+<p><b>Why this model matters for debugging.</b> The Spark UI is organised exactly this way. A slow job becomes "which stage is slow?", then "which tasks in that stage?". If task durations are even, the stage is simply big (add parallelism or reduce work). If one task is far longer than the rest, it is skew. If there are fewer tasks than cores, parallelism is too low.</p>
+<p><b>Common confusions.</b></p>
+<ul>
+<li>Several actions mean several jobs, and each re-runs the plan unless data is cached. Skipped stages in the UI show shuffle output being reused from an earlier job.</li>
+<li>Stages are cut by shuffles, not by the number of transformations. Ten narrow steps are still one stage.</li>
+<li>Independent stages (for example the two inputs of a join) can run at the same time. A stage that depends on another waits.</li>
+<li>A task is a unit of failure and retry. A stage failing means a task failed four times, or a shuffle fetch failed repeatedly.</li>
+</ul>
 <p class="rem"><b>Remember:</b> action = job, shuffle = stage boundary, partition = task.</p>
 </div>
 </details>
@@ -308,6 +409,24 @@ println(bad.value)</code></pre>
 <line class="arrow-r" x1="432" y1="90" x2="638" y2="80" marker-end="url(#ahr)"/><line class="arrow-r" x1="432" y1="150" x2="638" y2="160" marker-end="url(#ahr)"/><line class="arrow-r" x1="432" y1="220" x2="638" y2="240" marker-end="url(#ahr)"/>
 <text class="t-sm" x="450" y="290">Every reduce task fetches from every map output over the network.</text>
 </svg><figcaption>Rows are routed by hash(key) modulo the number of reduce partitions. Disk and network are touched on both sides.</figcaption></figure>
+<p><b>Why a shuffle exists at all.</b> Some operations need all rows of a key in one place. To sum sales per country, every "IN" row, wherever it is stored, must meet at one task. Data is spread by how it was stored, not by key, so rows must be moved. That movement is the shuffle.</p>
+<p><b>The mechanism, with a tiny example.</b> 3 map tasks, 2 reduce partitions, key = country, partition = <code>hash(country) mod 2</code>.</p>
+<ol>
+<li>Map task 1 holds rows (IN, 5), (US, 3), (IN, 2). It first combines locally: IN 7, US 3.</li>
+<li>It sorts its output by target partition and writes one data file plus one index file. Say IN goes to partition 0 and US to partition 1.</li>
+<li>When all map tasks are done, reduce task 0 asks every map output for its slice of partition 0 and fetches them (local ones from disk, remote over the network, handled by the external or built-in shuffle service).</li>
+<li>Reduce task 0 merges what it received: IN 7 + IN 4 + ... and produces the final totals.</li>
+</ol>
+<p><b>Where the cost comes from.</b></p>
+<table>
+<tr><th>Cost</th><th>Why</th></tr>
+<tr><td>Serialization</td><td>Every row is turned into bytes and back</td></tr>
+<tr><td>Disk</td><td>Map output is always written to local disk first, so it survives and can be fetched</td></tr>
+<tr><td>Network</td><td>Up to M x R fetches; mostly small reads, which hurt on slow disks</td></tr>
+<tr><td>Barrier</td><td>No reduce task starts until every map task finishes, so the slowest map task sets the pace</td></tr>
+<tr><td>Memory</td><td>Reduce side sorts or aggregates in memory and spills if it does not fit</td></tr>
+</table>
+<p><b>What an interviewer probes next.</b> "How do you tell a shuffle is the problem?" Stage page: large Shuffle Write and Shuffle Read, spill, fetch-wait time. "How do you cut it?" Less data (filter and select first), map-side combine, broadcast joins, fewer wide operations chained, bucketing. "What if a shuffle file is lost?" The map stage is rerun for that part, which is why executor loss late in a job hurts (and why an external shuffle service or dynamic allocation with shuffle tracking matters).</p>
 <p class="rem"><b>Remember:</b> shuffle = disk + network + serialization + a wait. Fewer, smaller, balanced shuffles.</p>
 </div>
 </details>
@@ -317,6 +436,17 @@ println(bad.value)</code></pre>
 <div class="ans">
 <p class="ia">Shuffles come from <code>groupBy</code>, <code>join</code> (except broadcast), <code>distinct</code>, <code>repartition</code>, <code>orderBy</code>, window functions with <code>partitionBy</code>, and <code>intersect</code> or <code>except</code>. I reduce them by filtering and selecting columns before the shuffle, broadcasting the small side of a join, aggregating on the map side, and using bucketed tables for joins I do often.</p>
 <p>Prefer aggregations that combine partially before shuffling (DataFrame <code>agg</code>, RDD <code>reduceByKey</code>) over ones that ship every value (<code>groupByKey</code>). Chain operations on the same key so Spark shuffles once, not three times. Do not stack <code>distinct</code> and <code>groupBy</code> on the same key. Check the result with <code>df.explain()</code> and count the <code>Exchange</code> nodes.</p>
+<p><b>Go through them by reason.</b> Operations that need rows with the same key together: <code>groupBy</code>, <code>join</code>, <code>distinct</code> (it is a group by all columns), <code>window</code> with <code>partitionBy</code>, <code>intersect</code>, <code>except</code>. Operations that reorder globally: <code>orderBy</code>. Operations whose job is to move data: <code>repartition</code>. A plain <code>select</code>, <code>filter</code>, <code>withColumn</code>, <code>union</code> never shuffle.</p>
+<p><b>Reduction tactics with examples.</b></p>
+<ol>
+<li><b>Filter and select first.</b> Fewer rows and narrower rows mean smaller shuffle files. Catalyst often does this for you, but not across UDFs or when you write the filter after a join of two derived tables.</li>
+<li><b>Broadcast the small side</b> of a join: zero shuffle for the big table.</li>
+<li><b>Aggregate before joining.</b> If you join 1 billion events to a table and then sum per user, aggregate events per user first (maybe 10 million rows), then join.</li>
+<li><b>Reuse one partitioning.</b> If you do <code>groupBy("user")</code> and then a join on "user", Spark can often reuse the first partitioning and skip the second shuffle when the plan allows it. Chaining operations on the same key helps.</li>
+<li><b>Bucket</b> both tables on the join key (details in the bucketing question) for joins you run daily.</li>
+<li><b>Avoid unnecessary <code>repartition</code>, <code>distinct</code>, <code>orderBy</code></b>: a global sort just to write sorted output is an expensive shuffle.</li>
+</ol>
+<p><b>How to prove it.</b> Run <code>df.explain()</code> before and after. Each <code>Exchange hashpartitioning(...)</code> or <code>Exchange rangepartitioning(...)</code> is a shuffle. <code>BroadcastExchange</code> is a broadcast, not a shuffle of the big side. In the SQL tab of the UI the "data size total" on each Exchange node shows how many bytes moved.</p>
 <p class="rem"><b>Remember:</b> filter early, select few columns, broadcast small tables, combine before you shuffle.</p>
 </div>
 </details>
@@ -326,6 +456,22 @@ println(bad.value)</code></pre>
 <div class="ans">
 <p class="ia">reduceByKey applies the combine function inside each map partition first, so each map task sends at most one record per key across the network. groupByKey sends every single (key, value) pair and builds the full list of values for each key in memory, which is slow and can run a task out of memory on a hot key.</p>
 <p>It is the same idea as a Hadoop combiner. A word count over a billion words ships one count per word per partition instead of a billion pairs. The combine function must be associative and commutative, because partial results merge in any order. DataFrame <code>groupBy().agg(sum(...))</code> already does partial aggregation, so the problem mostly exists in the RDD API. Use <code>aggregateByKey</code> when the result type differs from the value type, and <code>groupByKey</code> only when you truly need all values together.</p>
+<p><b>Tiny example.</b> Word count over 3 partitions. Partition 1 holds [a, a, a, b], partition 2 holds [a, b, b], partition 3 holds [a, a].</p>
+<ul>
+<li><b>groupByKey:</b> sends all 9 pairs across the network. The reducer for "a" receives six 1s from three machines, builds the list [1,1,1,1,1,1] in memory, then sums it.</li>
+<li><b>reduceByKey(_ + _):</b> each partition first merges its own pairs: (a,3),(b,1) | (a,1),(b,2) | (a,2). Only 5 pairs travel. The reducer adds 3 + 1 + 2.</li>
+</ul>
+<p>Now scale to a billion words with 20,000 distinct words and 1,000 partitions: groupByKey ships a billion records, while reduceByKey ships at most 20,000 x 1,000 = 20 million.</p>
+<p><b>Why memory also matters.</b> groupByKey builds the entire value list per key on one task. If a key has a hundred million values, that task runs out of memory, which is a classic cause of "executor OOM on a hot key". reduceByKey keeps only a running accumulator per key.</p>
+<p><b>Which function to pick.</b></p>
+<table>
+<tr><th>Need</th><th>Use</th></tr>
+<tr><td>Sum, max, min, count, where the result type equals the value type</td><td><code>reduceByKey</code></td></tr>
+<tr><td>Result type differs (e.g. average needs (sum, count))</td><td><code>aggregateByKey</code> or <code>combineByKey</code></td></tr>
+<tr><td>Truly need every value (rare)</td><td><code>groupByKey</code>, carefully</td></tr>
+<tr><td>You are using DataFrames</td><td><code>groupBy().agg(...)</code>; the optimizer already does the partial aggregation</td></tr>
+</table>
+<p><b>Edge case.</b> Not every aggregate can combine partially. <code>collect_list</code>, <code>percentile_approx</code> (uses sketches, so it can), and exact median cannot be merged trivially; for those, expect more data in the shuffle and more memory per key.</p>
 <p class="rem"><b>Remember:</b> combine on the map side first. reduceByKey ships summaries, groupByKey ships everything.</p>
 </div>
 </details>
@@ -337,6 +483,15 @@ println(bad.value)</code></pre>
 <p>For file input, Spark makes partitions of about <code>spark.sql.files.maxPartitionBytes</code> (128 MB), so 10 GB of Parquet gives roughly 80 partitions. After a shuffle the count is <code>spark.sql.shuffle.partitions</code> (default 200). That default is wrong at both ends: 200 tiny tasks for a small job, and 5 GB per task for a 1 TB shuffle. With AQE on, set the number high and let it coalesce small partitions. Check actual sizes in the stage page of the UI (min, median, max of shuffle read).</p>
 <pre><code>df.rdd.getNumPartitions
 spark.conf.set("spark.sql.shuffle.partitions", "800")</code></pre>
+<p><b>Where partitions come from.</b> Reading files: Spark packs file bytes into splits of up to <code>maxPartitionBytes</code> (128 MB); several small files can share one partition. After a shuffle: <code>spark.sql.shuffle.partitions</code>. After <code>repartition(n)</code> or <code>coalesce(n)</code>: n. From a JDBC read without options: 1. From Kafka: one per topic partition.</p>
+<p><b>Why 100 to 200 MB.</b> Think of each task as needing working memory about the size of its partition (often 2 to 3 times more once rows are decoded and sorted). With 4 GB of execution memory shared by 4 running tasks, each has about 1 GB, so partitions of 100 to 200 MB fit comfortably. Much bigger and tasks spill to disk or fail. Much smaller (say 1 MB) and the scheduler spends more time launching tasks than the tasks spend working (each task costs on the order of tens of milliseconds of overhead).</p>
+<p><b>Worked example.</b> A 1 TB shuffle on a cluster with 400 cores.</p>
+<ul>
+<li>Default 200 partitions: 5 GB per task. Tasks spill heavily or crash, and only 200 of 400 cores are used.</li>
+<li>Set to 8,000: about 128 MB per task, 20 waves of 400 tasks. Healthy.</li>
+<li>Set to 80,000: about 12 MB per task, big scheduling and shuffle-fetch overhead (80,000 x 80,000 fetch pairs).</li>
+</ul>
+<p><b>Both ends of the failure.</b> Too few: idle cores, spills, OOM and long single tasks. Too many: scheduler overhead, many tiny output files, and many small shuffle fetches. With AQE (on by default from 3.2) I set the initial count generously (or via <code>spark.sql.adaptive.coalescePartitions.initialPartitionNum</code>) and AQE merges small neighbours to the advisory size, so the setting becomes "high enough", not "exactly right".</p>
 <p class="rem"><b>Remember:</b> aim for 100 to 200 MB per partition and a few partitions per core. 200 is a default, not an answer.</p>
 </div>
 </details>
@@ -358,6 +513,18 @@ spark.conf.set("spark.sql.shuffle.partitions", "800")</code></pre>
 <line class="arrow-r" x1="532" y1="60" x2="728" y2="85" marker-end="url(#ahr)"/><line class="arrow-r" x1="532" y1="60" x2="728" y2="165" marker-end="url(#ahr)"/><line class="arrow-r" x1="532" y1="180" x2="728" y2="85" marker-end="url(#ahr)"/><line class="arrow-r" x1="532" y1="180" x2="728" y2="165" marker-end="url(#ahr)"/>
 <text class="t-sm" x="460" y="228">Costly. Balanced sizes.</text>
 </svg><figcaption>Coalesce glues partitions; repartition rebuilds them from scratch.</figcaption></figure>
+<p><b>Why two calls?</b> Reducing partitions is a common need (fewer output files) and it is often possible without moving data, so Spark offers a cheap method for that case. Doing a full shuffle for every change would be wasteful.</p>
+<p><b>How each works.</b> <code>coalesce(2)</code> on 4 partitions simply assigns P1+P2 to one task and P3+P4 to another. There is no hash, no network, but the new partitions are as uneven as the old ones (if P1 was 10x bigger, the merged partition stays big). <code>repartition(2)</code> hashes (or round-robins) every row to one of 2 new partitions through a shuffle, so sizes come out even, at the cost of moving all the data.</p>
+<table>
+<tr><th></th><th>coalesce(n)</th><th>repartition(n)</th></tr>
+<tr><td>Shuffle</td><td>No (narrow)</td><td>Yes (full)</td></tr>
+<tr><td>Can increase partitions</td><td>No (it has no effect)</td><td>Yes</td></tr>
+<tr><td>Partition sizes</td><td>Can stay uneven</td><td>Roughly even</td></tr>
+<tr><td>By column</td><td>No</td><td>Yes: <code>repartition(n, col)</code> co-locates equal keys</td></tr>
+<tr><td>Typical use</td><td>Fewer output files from balanced data</td><td>More parallelism, even out skew, group rows by key before a write</td></tr>
+</table>
+<p><b>The classic trap, explained.</b> Because <code>coalesce</code> has no shuffle boundary, Spark pipelines everything above it into the same tasks. So <code>df.heavyJoin().coalesce(1).write...</code> runs the whole heavy computation in one task, on one core. <code>repartition(1)</code> adds a stage boundary: the heavy work stays parallel, then one task writes. If you need a single output file, that is usually the right trade.</p>
+<p><b>Other uses.</b> <code>repartition(col)</code> before <code>partitionBy(col)</code> on write avoids a tiny file from every task for every value (see the small files question). <code>repartitionByRange(n, col)</code> gives sorted ranges, useful before writing sorted data. In SQL, the <code>REBALANCE</code> hint lets AQE size the partitions for you.</p>
 <p class="rem"><b>Remember:</b> coalesce glues (no shuffle, only fewer). repartition rebuilds (shuffle, any number, even).</p>
 </div>
 </details>
@@ -377,6 +544,25 @@ spark.conf.set("spark.sql.shuffle.partitions", "800")</code></pre>
 <text class="t-c t-sm" x="495" y="240">1 s</text><text class="t-c t-sm" x="585" y="240">1 s</text><text class="t-c t-sm" x="675" y="240">11 min</text><text class="t-c t-sm" x="765" y="240">11 min</text>
 <text class="t-sm" x="460" y="266">Same work, split across cores, in parallel.</text>
 </svg><figcaption>Skew is about the longest bar, not the average. Fixing it means making the longest bar shorter.</figcaption></figure>
+<p><b>Why skew hurts so much.</b> A stage finishes when its slowest task does. If 199 tasks take 10 seconds and one takes 45 minutes, the job takes 45 minutes and 199 cores sit idle. Adding machines changes nothing. Skew also causes the worst memory failures, since that one task may hold more data than fits.</p>
+<p><b>How it arises.</b> Hash partitioning sends all rows with the same key to the same task. If one key (null, "unknown", a default id, a very large customer or a bot user) holds 30% of the rows, that task gets 30% of the data. It is not a bug in Spark; it is how key grouping works.</p>
+<p><b>Detecting it.</b></p>
+<ol>
+<li>Spark UI stage page: the summary table shows min, 25th, median, 75th and max of task duration and shuffle read. Max far above the median means skew.</li>
+<li>Find the culprit key: <code>df.groupBy("key").count().orderBy(desc("count")).show(10)</code>.</li>
+<li>Check for nulls first; they are the most common hot key.</li>
+</ol>
+<p><b>Fixes, with the reasoning.</b></p>
+<table>
+<tr><th>Fix</th><th>When it fits</th></tr>
+<tr><td>Filter or fix junk keys</td><td>The hot key is null, empty or a placeholder (inner joins never match null anyway)</td></tr>
+<tr><td>AQE skew join (on by default with AQE)</td><td>Sort-merge joins; splits a big partition into pieces and replicates the other side's matching piece</td></tr>
+<tr><td>Broadcast the other side</td><td>One side is small; no shuffle, so no skew</td></tr>
+<tr><td>Isolate hot keys</td><td>A few known keys: broadcast-join those, normal join the rest, union</td></tr>
+<tr><td>Salting</td><td>AQE cannot help (aggregations, outer joins on the skewed side)</td></tr>
+<tr><td>Pre-aggregate</td><td>Many rows per key can be combined first</td></tr>
+</table>
+<p><b>Pitfalls.</b> Speculative execution does not help, since the copy gets the same big partition. Raising executor memory only delays the crash. Skewed aggregations (not joins) are not fixed by AQE's skew-join feature, so you salt them in two steps: aggregate by (key, salt), then by key.</p>
 <p class="rem"><b>Remember:</b> a stage lasts as long as its slowest task. Skew is about the longest bar, not the average.</p>
 </div>
 </details>
@@ -391,6 +577,18 @@ val bigS   = big.withColumn("salt", (rand() * N).cast("int"))
 val smallS = small.withColumn("salt", explode(array((0 until N).map(lit): _*)))
 val joined = bigS.join(smallS, Seq("customer_id", "salt")).drop("salt")</code></pre>
 <div class="mistake"><b>Watch out:</b> salting both sides randomly (rows no longer match), forgetting to drop the salt, and replicating the whole small table when only a few keys are hot.</div>
+<p><b>The idea in plain words.</b> The problem is that one key means one task. Salting makes the key less unique on purpose: rows for the hot key "ACME" become "ACME#0", "ACME#1", ... "ACME#15", which hash to 16 different tasks. To keep the join correct, the other side must also have all 16 variants so every salted row still finds its match.</p>
+<p><b>Worked example.</b> <code>big</code> has 100 million rows, 40 million of them for customer "ACME". <code>small</code> has one row per customer. With N = 16:</p>
+<ol>
+<li>Each <code>big</code> row gets a random salt 0..15. ACME's 40 million rows spread to about 2.5 million per salt value.</li>
+<li>Each <code>small</code> row is exploded into 16 copies, one per salt. ACME's single row becomes 16 rows.</li>
+<li>Join on (customer_id, salt). Each ACME salt group is a separate partition holding 2.5 million big rows and 1 small row.</li>
+<li>Drop the salt column from the result.</li>
+</ol>
+<p>The big table's total work is unchanged; it is just spread. The small table grows 16 times (cheap if it is small, expensive if it is not).</p>
+<p><b>Salting an aggregation.</b> Aggregations are easier because nothing needs replicating: first <code>groupBy(key, salt).sum(v)</code>, then <code>groupBy(key).sum(sum_v)</code>. The first step spreads the hot key; the second combines 16 partial sums per key, which is tiny. This works for sum, count, min, max. Averages need sum and count carried separately.</p>
+<p><b>Salting only the hot keys.</b> To avoid growing the whole small table, use salt N only for keys known to be hot and salt 0 (a single copy) for all others, via <code>when(col in hotKeys, rand*N).otherwise(0)</code> on the big side and an exploded set only for hot keys on the small side. More code, much less data.</p>
+<p><b>Choosing N.</b> Aim for hot-key rows divided by N to be near a normal partition size. Too small leaves skew, too big wastes replication and shuffle. Check with the UI after the change; the longest task should now be close to the median.</p>
 <p class="rem"><b>Remember:</b> spread the hot key on the big side, replicate the other side across all salts.</p>
 </div>
 </details>
@@ -411,6 +609,15 @@ val joined = bigS.join(smallS, Seq("customer_id", "salt")).drop("salt")</code></
 <line class="arrow-g" x1="652" y1="95" x2="708" y2="45" marker-end="url(#ahg)"/><line class="arrow-g" x1="652" y1="105" x2="708" y2="115" marker-end="url(#ahg)"/><line class="arrow-g" x1="652" y1="115" x2="708" y2="185" marker-end="url(#ahg)"/>
 <path class="arrow dash" d="M95 72 L95 30 L565 30 L565 68" fill="none" marker-end="url(#ah)"/><text class="t-sm" x="250" y="24">repeat for each shuffle</text>
 </svg><figcaption>AQE trades a plan made from guesses for one corrected with measurements, one stage at a time.</figcaption></figure>
+<p><b>The problem AQE solves.</b> Before a query runs, Spark must guess sizes from table statistics, and the guess is often wrong: after a filter and a join, "this side is about 5 GB" might really be 8 MB, or one partition might hold a hot key. The static plan, including 200 shuffle partitions, is fixed up front. AQE waits: shuffle stages are materialised, their real sizes are known, and the plan for the remaining stages is rebuilt.</p>
+<p><b>The three features, each with an example.</b></p>
+<ol>
+<li><b>Coalescing shuffle partitions.</b> You set 2,000 shuffle partitions to be safe, but a stage outputs only 3 GB. Instead of 2,000 tiny tasks, AQE merges neighbouring partitions up to the 64 MB advisory size, giving about 50 tasks.</li>
+<li><b>Join strategy switch.</b> The plan said sort-merge join because the estimate for the right side was 2 GB. After the filter below it actually produced 6 MB. AQE converts the join to a broadcast hash join at run time. The big side's shuffle may already have been written by then, but the sort and the network fetch of the big side are saved (it is read locally), and the rest of the plan benefits from the cheaper join.</li>
+<li><b>Skew join.</b> After the shuffle, a partition of 5 GB against a median of 80 MB is split into smaller pieces, each joined with a copy of the matching other-side partition, so many tasks share the hot key.</li>
+</ol>
+<p><b>Key settings.</b> <code>spark.sql.adaptive.enabled</code>, <code>coalescePartitions.enabled</code>, <code>skewJoin.enabled</code>, <code>advisoryPartitionSizeInBytes</code>, and <code>autoBroadcastJoinThreshold</code> (AQE applies it to the real sizes it measured).</p>
+<p><b>Limits to mention.</b> It only reacts at shuffle boundaries, so a query with no shuffle gets nothing. Skew handling applies to joins, not aggregations. In practice streaming micro-batches typically do not get AQE. Plans in <code>explain</code> look like <code>AdaptiveSparkPlan isFinalPlan=false</code> before the run, and the final plan is visible in the UI SQL tab after.</p>
 <p class="rem"><b>Remember:</b> AQE = re-plan after each shuffle with real sizes: coalesce, switch to broadcast, split skew.</p>
 </div>
 </details>
@@ -437,6 +644,17 @@ val joined = bigS.join(smallS, Seq("customer_id", "salt")).drop("salt")</code></
 <rect class="box" x="300" y="280" width="260" height="46" rx="8"/><text class="t-c t-b" x="430" y="308">Sort-merge join (default)</text>
 <line class="arrow" x1="430" y1="248" x2="430" y2="278" marker-end="url(#ah)"/><text class="t-sm" x="440" y="268">no</text>
 </svg><figcaption>Real Spark also prefers sort-merge over shuffle hash unless <code>spark.sql.join.preferSortMergeJoin</code> is false or a hint is given.</figcaption></figure>
+<p><b>Understand each strategy as a trade.</b></p>
+<table>
+<tr><th>Strategy</th><th>How it works</th><th>Needs</th><th>Cost</th></tr>
+<tr><td>Broadcast hash join</td><td>Copy the small table to every executor, build a hash map, stream the big table past it</td><td>Small side fits in memory everywhere</td><td>No shuffle of the big side; fastest</td></tr>
+<tr><td>Sort-merge join</td><td>Shuffle both sides by key, sort each partition, merge the two sorted streams</td><td>Equality condition, sortable keys</td><td>Two shuffles and two sorts; robust, can spill</td></tr>
+<tr><td>Shuffle hash join</td><td>Shuffle both sides, build a hash map of the smaller side in each partition</td><td>Smaller side's partition fits in memory</td><td>Two shuffles, no sort</td></tr>
+<tr><td>Broadcast nested loop / cartesian</td><td>Compare every pair of rows</td><td>Nothing (for non-equality conditions such as <code>a.x &lt; b.y</code>)</td><td>Quadratic; avoid</td></tr>
+</table>
+<p><b>The selection logic in order.</b> Spark first looks for a hint on either side (broadcast, merge, shuffle_hash, shuffle_replicate_nl). With no hint, if the condition is an equality and one side is estimated under <code>autoBroadcastJoinThreshold</code>, it broadcasts. Otherwise for equality it uses sort-merge (shuffle hash only if you set <code>preferSortMergeJoin=false</code>, or AQE judges a side small enough per partition). Non-equality conditions need a nested loop and Spark broadcasts one side if it can.</p>
+<p><b>Which side may be broadcast.</b> For an inner join either side. For a left outer join only the right side can be broadcast, because the left side's unmatched rows must be preserved by whichever task owns them. Right outer: only the left side. Full outer: neither (in common versions).</p>
+<p><b>Practical advice.</b> Look at <code>explain</code> and trust it over memory of the rules. If a join you expect to broadcast does not, check that statistics exist (table stats, or the source is a file with known size) and that the estimate is under the threshold. Raise the threshold carefully (100 to 500 MB is common on large executors) and watch driver memory. Use a hint for derived tables whose size Spark cannot estimate well.</p>
 <p class="rem"><b>Remember:</b> small side, broadcast. Two big sides, sort-merge. Non-equality, slow nested loop.</p>
 </div>
 </details>
@@ -449,6 +667,23 @@ val joined = bigS.join(smallS, Seq("customer_id", "salt")).drop("salt")</code></
 <pre><code>import org.apache.spark.sql.functions.broadcast
 val out = orders.join(broadcast(countries), Seq("country_code"), "left")
 out.explain()   // look for BroadcastHashJoin</code></pre>
+<p><b>Walk through a broadcast join.</b> Big table: 2 billion orders. Small table: 50,000 countries.</p>
+<ol>
+<li>Spark runs the small side's plan and collects the result to the driver.</li>
+<li>The driver turns it into a hash map in memory and broadcasts it to every executor (executors share it among their tasks).</li>
+<li>Each task on the big side reads its partition of orders and looks up each row in the local hash map. No row of the big table leaves its machine.</li>
+<li>Output rows are produced in place, so the big side needs no shuffle and no sort.</li>
+</ol>
+<p><b>Failure modes explained.</b></p>
+<ul>
+<li><b>Driver or executor OOM:</b> a 100 MB Parquet file can expand to 1 GB as decoded rows plus a hash table, and the driver holds it too while collecting. Symptoms: <code>OutOfMemoryError</code> on the driver during the broadcast, or on executors.</li>
+<li><b>Timeout:</b> the default <code>spark.sql.broadcastTimeout</code> is 300 seconds. If the small side comes from a slow subquery or a busy database, the build can time out. Cache or materialise it first.</li>
+<li><b>Table too big for the threshold:</b> if you force a broadcast of a table that is really 5 GB, it will either fail or cause heavy network traffic since 5 GB goes to each executor.</li>
+<li><b>Missing statistics:</b> Spark cannot know a table's size without stats (or a known file size), so it falls back to sort-merge. Fix with <code>ANALYZE TABLE t COMPUTE STATISTICS</code> or add the hint.</li>
+<li><b>Wrong side for outer joins:</b> broadcasting the preserved side is not supported, so the hint is ignored and Spark picks another strategy.</li>
+</ul>
+<p><b>Making the small side smaller.</b> <code>select</code> only the join key and needed columns, filter rows out, and deduplicate. A two-column lookup table is far smaller than the 40-column dimension.</p>
+<p><b>If it is too big to broadcast but still much smaller than the other side:</b> try the shuffle-hash hint (avoids sorting the big side), bucket both tables, or filter the big side first (semi-join with the keys of the small side).</p>
 <p class="rem"><b>Remember:</b> broadcast removes the big-side shuffle. Shrink first, and watch driver and executor memory.</p>
 </div>
 </details>
@@ -458,6 +693,15 @@ out.explain()   // look for BroadcastHashJoin</code></pre>
 <div class="ans">
 <p class="ia">Both inputs are shuffled so equal keys land in the same partition, then each partition is sorted by the key. A task walks through the two sorted streams together, like merging two sorted lists, and emits the matches. It needs only a few rows in memory at a time and the sort can spill to disk, so it does not fail on memory the way a hash join can. That is why it is the default for two large tables.</p>
 <p>The costs are two shuffles and two sorts. If both tables are bucketed and sorted by the join key with the same bucket count, Spark skips the shuffle and sort entirely. The join is sensitive to skew, because all rows of one key must meet in one task. Shuffle hash join beats it when one side is much smaller, since it avoids sorting the large side, but that hash table must fit in memory per partition.</p>
+<p><b>Why sorting makes joining cheap in memory.</b> If both inputs are sorted by key, you only need to look at the current row on each side, like merging two sorted decks of cards. You never have to hold a whole side in a hash table.</p>
+<p><b>Steps, with a mini example.</b> Orders has key values [1,1,2,5] in a partition, customers has [1,2,3,5] in the same partition.</p>
+<ol>
+<li><b>Shuffle:</b> both sides are hash-partitioned by the join key into the same number of partitions, so a given key exists in one partition for each table.</li>
+<li><b>Sort:</b> within each partition, each side is sorted by key (external sort that can spill to disk).</li>
+<li><b>Merge:</b> two pointers move forward. Key 1 on both: output the 2 order rows times 1 customer row. Then 2 matches. 3 exists only on the right, so an inner join skips it. 5 matches. Pointers never go back, except to replay a group of equal keys.</li>
+</ol>
+<p><b>Why it is robust.</b> Memory use is bounded by the largest group of equal keys, not by table size, and sorting spills. This is why Spark prefers it over hash joins: hash joins can fail with out-of-memory when a partition's hash table is too big.</p>
+<p><b>Costs and when to avoid.</b> Two full shuffles and two sorts are slow for big data. It suffers from skew because one key's rows must meet in one task. Avoid by broadcasting a small side, or by bucketing both tables by the key with the same bucket count (and sorting them): then Spark sees matching distribution and ordering, and the plan has no Exchange or Sort. In <code>explain</code> look for <code>SortMergeJoin</code> with <code>Sort</code> and <code>Exchange</code> children.</p>
 <p class="rem"><b>Remember:</b> shuffle, sort, merge. Slow but safe for any size, and bucketing can remove the first two steps.</p>
 </div>
 </details>
@@ -467,6 +711,16 @@ out.explain()   // look for BroadcastHashJoin</code></pre>
 <div class="ans">
 <p class="ia">The big ones are duplicate keys, null keys, filtering after an outer join, and a missing join condition. Duplicate keys on both sides multiply rows (many-to-many), so a join that should give a million rows can give a billion. Null never equals null in SQL, so null keys are dropped in an inner join. A WHERE filter on the right side after a left join silently turns it into an inner join. A missing condition gives a cartesian product.</p>
 <p>My habits: check key uniqueness with <code>groupBy(key).count()</code> before joining. Use the null-safe operator <code>&lt;=&gt;</code> (<code>eqNullSafe</code>) if nulls should match. Put right-side filters of an outer join in the ON condition, not in WHERE. Join on <code>Seq("id")</code> to avoid two columns with the same name. Since Spark 3.0 implicit cartesian products are allowed by default, so Spark will not stop me, and I look for <code>CartesianProduct</code> in the plan. For "exists" and "not exists" checks I use <code>left_semi</code> and <code>left_anti</code> joins, which return only left columns and never multiply rows.</p>
+<p><b>The mistakes, each with a concrete case.</b></p>
+<ol>
+<li><b>Duplicate keys multiply rows.</b> If an order id appears twice in <code>payments</code> (a retry), joining orders to payments gives two rows per order and the revenue sum doubles. Cause: the key was assumed unique but is not.</li>
+<li><b>Null keys never match.</b> <code>null = null</code> is unknown, not true, so rows with a null key disappear in an inner join and get no match in a left join. If nulls should match, use <code>a.k &lt;=&gt; b.k</code> (null-safe equality) in SQL or <code>eqNullSafe</code> in the API.</li>
+<li><b>Filter after outer join.</b> <code>orders LEFT JOIN returns r ON ... WHERE r.status = 'ok'</code> drops every order with no return, since the unmatched side is null and the filter rejects null. It behaves like an inner join. To keep the left rows, move the condition into the ON clause.</li>
+<li><b>Missing condition gives a cartesian product.</b> 1 million rows by 1 million rows is 10^12 combinations. Check the plan for <code>CartesianProduct</code> or <code>BroadcastNestedLoopJoin</code>.</li>
+<li><b>Ambiguous columns.</b> After <code>a.join(b, a("id") === b("id"))</code> there are two <code>id</code> columns, and selecting <code>id</code> fails or picks wrongly. Join on <code>Seq("id")</code> to get one.</li>
+<li><b>Join type choice.</b> "Rows in A that have a match in B" is <code>left_semi</code> (no duplication even if B has many matches). "Rows in A with no match in B" is <code>left_anti</code>. Both return only A's columns and are cheaper than join-then-filter or <code>NOT IN</code> (which has dangerous null behaviour: if the subquery returns any null, <code>NOT IN</code> returns nothing).</li>
+</ol>
+<p><b>Defensive habits.</b> Check <code>count(*)</code> versus <code>count(distinct key)</code> on the side that should be unique, and compare row counts before and after a left join: for a left join with a unique right side, the counts must match.</p>
 <p class="rem"><b>Remember:</b> before a join ask "is the key unique, and what about nulls?". Use semi and anti joins for exists checks.</p>
 </div>
 </details>
@@ -477,6 +731,17 @@ out.explain()   // look for BroadcastHashJoin</code></pre>
 <p class="ia">Partitioning (<code>partitionBy("date")</code>) splits a table into folders by column value, so queries that filter on that column skip whole folders. Bucketing (<code>bucketBy(64, "user_id")</code>) hashes a column into a fixed number of files, so two tables bucketed the same way on the join key can be joined with no shuffle. Partition for filters on low-cardinality columns, bucket for repeated joins and aggregations on a high-cardinality key.</p>
 <p>The catches with bucketing: it needs a metastore table (<code>saveAsTable</code>), every writer must respect the same bucket spec and count, and it can create many small files (buckets times write tasks). Many teams now rely on table formats (Iceberg, Delta) with their own layout features such as hidden partitioning and clustering instead.</p>
 <pre><code>df.write.bucketBy(64, "user_id").sortBy("user_id").saveAsTable("events_b")</code></pre>
+<p><b>Start from the problem.</b> A sort-merge join shuffles both tables every time it runs. If you join <code>events</code> to <code>users</code> on <code>user_id</code> daily, that is the same shuffle, repeated, forever. Bucketing pays that shuffle once, at write time.</p>
+<p><b>How it works.</b> <code>bucketBy(64, "user_id")</code> assigns each row to bucket <code>hash(user_id) mod 64</code> and writes each task's rows into per-bucket files (optionally sorted within the file with <code>sortBy</code>). The bucket spec is stored in the metastore. When Spark joins two tables bucketed the same way (same column and the same bucket count; newer versions can optionally coalesce counts that are multiples of each other), it knows bucket k of one table matches bucket k of the other, so it joins them pairwise with no Exchange, and if they are also sorted, no Sort either. It also helps <code>groupBy(user_id)</code>, <code>distinct</code> and window functions on that column.</p>
+<table>
+<tr><th></th><th>partitionBy</th><th>bucketBy</th></tr>
+<tr><td>Physical layout</td><td>One folder per value</td><td>Fixed number of files per folder, by hash</td></tr>
+<tr><td>Best for</td><td>Filters (pruning), low cardinality (date, country)</td><td>Joins and aggregations, high cardinality (user_id)</td></tr>
+<tr><td>Number of groups</td><td>Grows with data</td><td>Fixed up front</td></tr>
+<tr><td>Needs a metastore table</td><td>No</td><td>Yes (<code>saveAsTable</code>)</td></tr>
+</table>
+<p>They combine: <code>partitionBy("date").bucketBy(64, "user_id")</code> gives date pruning plus bucket joins within each date.</p>
+<p><b>Costs.</b> Writing is slower (a shuffle and sort at write time). Every writer must use the same bucket count and hash or the benefit silently disappears. Choosing the count is awkward: too few gives big buckets, too many creates many small files (files = write tasks x buckets, unless you repartition by the bucket column first). Reading is only faster when the join key matches the bucket column. Because of these frictions, many teams use broadcast joins and AQE and reserve bucketing for a few big, stable, repeatedly joined tables.</p>
 <p class="rem"><b>Remember:</b> partitioning prunes folders for filters. Bucketing pre-shuffles files for joins.</p>
 </div>
 </details>
@@ -498,6 +763,18 @@ out.explain()   // look for BroadcastHashJoin</code></pre>
 <line class="arrow" x1="122" y1="98" x2="148" y2="98" marker-end="url(#ah)"/><line class="arrow" x1="262" y1="98" x2="288" y2="98" marker-end="url(#ah)"/><line class="arrow" x1="422" y1="98" x2="448" y2="98" marker-end="url(#ah)"/><line class="arrow" x1="582" y1="98" x2="608" y2="98" marker-end="url(#ah)"/><line class="arrow" x1="732" y1="98" x2="758" y2="98" marker-end="url(#ah)"/>
 <text class="t-sm" x="150" y="160">Catalog and statistics feed the analysis and the cost model.</text><text class="t-sm" x="150" y="180">AQE (Spark 3) re-plans again after each shuffle.</text>
 </svg><figcaption>Catalyst works on a tree of operators and rewrites it with small rules until nothing improves.</figcaption></figure>
+<p><b>Why an optimizer at all.</b> You write what you want ("revenue per country for last week"), not how. Many different execution plans give the same answer, and some are 100 times cheaper. Catalyst searches for a cheaper equivalent plan using rewrite rules, the way a database optimizer does.</p>
+<p><b>The phases with an example.</b> Query: <code>SELECT country, sum(amount) FROM orders JOIN users USING(user_id) WHERE day = '2026-11-16' GROUP BY country</code>.</p>
+<ol>
+<li><b>Parse:</b> text becomes an unresolved tree. Names such as <code>orders</code> and <code>amount</code> are just strings.</li>
+<li><b>Analysis:</b> looks names up in the catalog, attaches types, resolves <code>amount</code> to <code>orders.amount</code>. Typos fail here ("cannot resolve column").</li>
+<li><b>Logical optimization:</b> rules rewrite the tree. The <code>day</code> filter is pushed below the join, straight to the scan of <code>orders</code>. Unused columns are dropped (column pruning). Constants are folded (<code>1 + 2</code> becomes <code>3</code>). Adjacent filters or projections are merged.</li>
+<li><b>Physical planning:</b> turns logical operators into concrete ones and chooses strategies: broadcast hash join versus sort-merge, hash aggregate versus sort aggregate. A cost model uses table statistics when available.</li>
+<li><b>Code generation:</b> chains of operators in one stage are compiled into a single Java function (Tungsten, see below).</li>
+</ol>
+<p><b>What it cannot see through.</b> A UDF, a typed lambda or <code>mapPartitions</code> is a black box: Catalyst cannot push filters across it, drop columns it uses, or reorder around it. That is why built-in functions are preferred.</p>
+<p><b>Statistics matter.</b> Join choices and reordering use table and column statistics (<code>ANALYZE TABLE ... COMPUTE STATISTICS FOR COLUMNS</code>) when cost-based optimization is enabled. Without them, Spark estimates from file sizes. AQE then corrects the estimates at run time.</p>
+<p><b>To see all stages:</b> <code>df.explain(true)</code> prints parsed, analyzed, optimized logical and physical plans.</p>
 <p class="rem"><b>Remember:</b> parse, analyze, optimize (pushdown, pruning), plan physically, generate code.</p>
 </div>
 </details>
@@ -514,6 +791,27 @@ out.explain()   // look for BroadcastHashJoin</code></pre>
 </ul>
 <pre><code>df.explain("formatted")                  // Spark 3.0+: readable, numbered nodes
 spark.sql("EXPLAIN COST SELECT ...")      // adds statistics</code></pre>
+<p><b>How to read one.</b> A physical plan is a tree printed with the final operator on top and the scans at the bottom. Data flows upward, so read from the bottom. Short sample:</p>
+<pre><code>== Physical Plan ==
+*(2) HashAggregate(keys=[country], functions=[sum(amount)])
++- Exchange hashpartitioning(country, 200)
+   +- *(1) HashAggregate(keys=[country], functions=[partial_sum(amount)])
+      +- *(1) Project [country, amount]
+         +- *(1) Filter (day = 2026-11-16)
+            +- FileScan parquet [country,amount,day]
+                 PartitionFilters: [day = 2026-11-16], PushedFilters: [], ReadSchema: struct&lt;country,amount&gt;</code></pre>
+<p>Reading it bottom up: scan reads only 3 columns and, thanks to <code>PartitionFilters</code>, only that day's folder. A partial aggregate runs in stage 1, then one <code>Exchange</code> (the single shuffle) by country, then the final aggregate in stage 2. The <code>*(1)</code> and <code>*(2)</code> are whole-stage codegen groups, which map to stages.</p>
+<p><b>Red flags and what they mean.</b></p>
+<ul>
+<li><b>Empty PartitionFilters on a partitioned table:</b> full scan (function around the partition column, or wrong column).</li>
+<li><b>Empty PushedFilters:</b> the filter could not go to the file reader, e.g. it uses a UDF, a cast, or a complex expression.</li>
+<li><b>ReadSchema with many columns:</b> something upstream selects everything, or a UDF takes the whole row.</li>
+<li><b>SortMergeJoin where one side is tiny:</b> missing statistics or a broadcast hint needed.</li>
+<li><b>Many Exchange nodes:</b> redundant shuffles, such as <code>distinct</code> after <code>groupBy</code> on the same key.</li>
+<li><b>BatchEvalPython / ArrowEvalPython:</b> Python UDF stage; code generation is broken at this point.</li>
+<li><b>CartesianProduct / BroadcastNestedLoopJoin:</b> missing equality condition.</li>
+</ul>
+<p><b>Plan versus reality.</b> The plan shows intent. The SQL tab of the UI adds actual row counts and sizes per node, which tells you where a join exploded or a filter did not filter. With AQE the final plan only exists after the run.</p>
 <p class="rem"><b>Remember:</b> scan filters, Exchange count, join type, opaque nodes. Bottom up.</p>
 </div>
 </details>
@@ -523,6 +821,15 @@ spark.sql("EXPLAIN COST SELECT ...")      // adds statistics</code></pre>
 <div class="ans">
 <p class="ia">Tungsten is the engine-level speed work behind DataFrames. It stores rows as compact binary bytes instead of Java objects, which cuts memory and garbage collection, and it uses whole-stage code generation: Spark generates one tight Java loop for a chain of operators (scan, filter, project, aggregate) instead of calling one operator after another per row. That gives several times speedup on CPU-bound work.</p>
 <p>The older "Volcano" style makes a virtual function call per operator per row. The generated code keeps values in CPU registers and avoids that. It also explains why Python UDFs and typed lambdas are slow: they break the generated code and force each row to be converted to an object. Off-heap memory is optional (<code>spark.memory.offHeap.enabled</code>), the binary format works on-heap too.</p>
+<p><b>Two problems it fixes.</b> (1) Java objects are bloated. A row of three fields as Java objects can cost over 100 bytes with headers, pointers and boxing; as packed bytes it needs maybe 30. More objects also means more garbage collection. (2) The classic row-at-a-time "Volcano" model chains operators with virtual calls: each row asks the filter for the next row, which asks the scan, and so on. Per-row call overhead dominates when the real work is a comparison.</p>
+<p><b>What Tungsten does.</b></p>
+<ul>
+<li><b>Binary row format (UnsafeRow):</b> fields are laid out in a byte array with a null bitmap. It can be compared and hashed directly, with no deserialization, and can live on-heap or off-heap.</li>
+<li><b>Cache-friendly algorithms:</b> hash maps and sorts that work on the binary data and pack keys and pointers together so the CPU cache is used well.</li>
+<li><b>Whole-stage code generation:</b> Spark writes one Java method for a whole stage of narrow operators, compiles it at run time (with Janino), and runs a tight loop like a hand-written one.</li>
+</ul>
+<p><b>Mini picture.</b> For scan, filter <code>age &gt; 18</code>, project <code>name</code>, the generated code is essentially <code>while (scan.hasNext()) { row = scan.next(); if (row.age &gt; 18) output(row.name); }</code>. No intermediate objects, no per-operator calls.</p>
+<p><b>How you see and break it.</b> In <code>explain</code>, operators prefixed by <code>*(n)</code> are in a code-generated stage. A Python UDF, an RDD conversion or a typed lambda breaks the chain, because the data has to be turned into objects. Very wide plans (hundreds of columns or deeply nested expressions) can exceed the JVM method size limit, and Spark then falls back to the slower interpreted path for that stage. A vectorised Parquet reader and columnar caches are related ideas for scanning many values per call.</p>
 <p class="rem"><b>Remember:</b> Tungsten = binary rows + one generated loop per stage. Opaque code breaks the loop.</p>
 </div>
 </details>
@@ -536,6 +843,20 @@ spark.sql("EXPLAIN COST SELECT ...")      // adds statistics</code></pre>
   val conn = Db.connect()           // created on the executor, once per partition
   try it.map(r =&gt; lookup(conn, r)).toList.iterator finally conn.close()
 }</code></pre>
+<p><b>Why serialization appears everywhere.</b> Spark runs your code on other machines, so anything that crosses a machine boundary is turned into bytes: (a) the function you pass to <code>map</code> and everything it references (the closure), (b) shuffled records, (c) broadcast values, (d) cached data in serialized form, (e) results returned to the driver.</p>
+<p><b>What "Task not serializable" really says.</b> Spark tried to serialize your closure and found an object inside it that is not <code>java.io.Serializable</code>. Typical culprits:</p>
+<ul>
+<li>A JDBC connection, HTTP client, or logger captured from the driver. These hold sockets and cannot be copied to another machine anyway.</li>
+<li>A method call or field access inside a class: <code>rdd.map(x =&gt; x * factor)</code> where <code>factor</code> is a field captures <code>this</code>, the whole outer object, including its non-serializable members.</li>
+</ul>
+<p><b>Fixes, in order of preference.</b></p>
+<ol>
+<li>Copy needed fields to local values first: <code>val f = this.factor; rdd.map(_ * f)</code>.</li>
+<li>Create resources on the executor: open the connection inside <code>mapPartitions</code> or <code>foreachPartition</code>, once per partition, and close it there (the example in the answer). Never one connection per row, and never one captured from the driver.</li>
+<li>Make the class <code>Serializable</code> only if it is cheap and safe to copy.</li>
+<li>Use a Scala <code>object</code> (a static, created per JVM) for helpers.</li>
+</ol>
+<p><b>Java versus Kryo.</b> Java serialization writes class descriptions and is slow and large. Kryo uses compact class ids and is typically several times faster and smaller. Set <code>spark.serializer</code> to Kryo and register your classes with <code>spark.kryo.classesToRegister</code>; <code>spark.kryo.registrationRequired=true</code> catches unregistered classes. Shuffles of simple types already use Kryo internally. DataFrames avoid the issue for data because rows use Tungsten's binary format; but a UDF closure is still serialized with Java serialization.</p>
 <p class="rem"><b>Remember:</b> closures travel to executors. Create connections there, never capture them. Kryo for RDD speed.</p>
 </div>
 </details>
@@ -549,6 +870,19 @@ spark.sql("EXPLAIN COST SELECT ...")      // adds statistics</code></pre>
 val up = udf((s: String) =&gt; if (s == null) null else s.trim.toUpperCase)
 // better: built-ins, fully optimizable
 df.withColumn("n", upper(trim($"name")))</code></pre>
+<p><b>What the cost really is.</b> In a built-in expression, the engine works on packed binary rows inside generated code. A Scala UDF forces Spark to convert each row's fields into JVM objects, call your function, and convert the result back; also, the optimizer can no longer push filters or prune columns through it, and it cannot tell whether the function is deterministic or null-safe. A Python UDF adds a second process: rows are serialized, sent over a socket to a Python worker, processed one by one, and sent back. That serialization usually costs far more than the function itself.</p>
+<p><b>Pandas UDF (vectorized).</b> Spark converts batches of rows to Apache Arrow (a columnar in-memory format shared by the JVM and Python), hands your function a <code>pandas.Series</code> for each batch, and takes a Series back. Transfer is columnar and bulk, and your function can use vectorised pandas or NumPy. It typically gives a large speedup over row-at-a-time Python UDFs, though still slower than a built-in.</p>
+<p><b>Example of replacing a UDF.</b></p>
+<pre><code># slow: Python UDF
+@udf("string")
+def tier(a): return "high" if a &gt; 1000 else "low"
+df.withColumn("t", tier("amount"))
+
+# fast and optimizable: built-in
+from pyspark.sql import functions as F
+df.withColumn("t", F.when(F.col("amount") &gt; 1000, "high").otherwise("low"))</code></pre>
+<p><b>When a UDF is the right call.</b> Logic that truly cannot be written with built-ins (a proprietary parser, an ML model, a library call). Then: pandas UDF if in Python; Scala or Java UDF for JVM libraries; load heavy resources once per task (<code>mapInPandas</code>, an iterator-style pandas UDF, or a lazily initialised static) rather than per row.</p>
+<p><b>Other traps.</b> Mark deterministic functions deterministic (default) so the optimizer can reuse them; handle nulls explicitly; do not do network calls row by row inside a UDF without batching and timeouts.</p>
 <p class="rem"><b>Remember:</b> built-in beats pandas UDF beats Scala UDF beats Python UDF.</p>
 </div>
 </details>
@@ -560,6 +894,17 @@ df.withColumn("n", upper(trim($"name")))</code></pre>
 <p>A window without <code>partitionBy</code> sends all data to one task, and Spark warns about it. A very big group (skew) also lands in one task. <code>row_number</code> is always unique, <code>rank</code> leaves gaps after ties, <code>dense_rank</code> does not. The typical use is "latest record per key" or "top N per group".</p>
 <pre><code>val w = Window.partitionBy("customer_id").orderBy($"updated_at".desc)
 val latest = df.withColumn("rn", row_number().over(w)).filter($"rn" === 1).drop("rn")</code></pre>
+<p><b>What problem windows solve.</b> <code>groupBy</code> collapses rows: ten orders per customer become one row. Often you need to keep every row but add something that depends on its neighbours: the previous order's amount, the running total, the rank within the customer, the latest row. Window functions give each row a view over a "window" of related rows.</p>
+<p><b>The three parts.</b> <code>partitionBy</code> chooses which rows belong together (per customer). <code>orderBy</code> orders them inside the group. The optional <b>frame</b> (<code>rowsBetween</code> or <code>rangeBetween</code>) limits which neighbours count; with an <code>orderBy</code> the default frame is "from the start of the partition to the current row", which gives running totals.</p>
+<p><b>Example data.</b> Orders of customer C1: day 1 amount 10, day 2 amount 30, day 3 amount 20.</p>
+<table>
+<tr><th>day</th><th>amount</th><th>row_number by day</th><th>lag(amount)</th><th>running sum</th></tr>
+<tr><td>1</td><td>10</td><td>1</td><td>null</td><td>10</td></tr>
+<tr><td>2</td><td>30</td><td>2</td><td>10</td><td>40</td></tr>
+<tr><td>3</td><td>20</td><td>3</td><td>30</td><td>60</td></tr>
+</table>
+<p><b>Cost and mechanism.</b> To compute this, Spark shuffles by the partition key so each customer is in one task, sorts each group by the order key, then streams through computing values. So a window needs one shuffle plus a sort, and one group must fit in one task. Pitfalls: no <code>partitionBy</code> moves everything to one partition (one core); a huge or hot group causes skew and memory trouble; several windows with different partition keys cause several shuffles, while windows with the same partition and order spec share one.</p>
+<p><b>Choosing the function.</b> Latest record per key: <code>row_number</code> ordered by timestamp descending, keep 1 (add a tie-breaker column so the result is deterministic). Top N per group: <code>row_number</code> or <code>dense_rank</code> and filter <code>&lt;= N</code>. Ties: <code>rank</code> gives 1,1,3; <code>dense_rank</code> gives 1,1,2; <code>row_number</code> gives 1,2,3 (arbitrary among ties). When only the max is needed, a groupBy with <code>max_by</code> or a struct trick (<code>max(struct(ts, value))</code>) avoids sorting everything.</p>
 <p class="rem"><b>Remember:</b> window = shuffle by partition key + sort inside. Always give it a partitionBy.</p>
 </div>
 </details>
@@ -578,6 +923,17 @@ val latest = df.withColumn("rn", row_number().over(w)).filter($"rn" === 1).drop(
 <tr><td>JSON, CSV</td><td>Text, row</td><td>Landing raw data, exchange</td><td>Size, speed, no real types</td></tr>
 </table>
 <p>The usual pattern: land raw data as it arrives, then convert to Parquet, often inside a table format (Delta, Iceberg) that adds updates. Gzip-compressed CSV or JSON is not splittable, so one file becomes one task. For CSV and JSON give an explicit schema instead of <code>inferSchema</code>: inference costs an extra pass and the guessed types can change day to day.</p>
+<p><b>Row versus column storage, with an example.</b> A table of 100 million rows with 50 columns. A query needs the sum of <code>amount</code> where <code>country = 'IN'</code>. A row format (CSV, Avro, JSON) stores each row's 50 values together, so you must read every byte. Parquet stores all <code>amount</code> values in a block, all <code>country</code> values in another, so you read 2 of the 50 columns (about 4% of the bytes).</p>
+<p><b>Inside a Parquet file.</b> The file is split into row groups (commonly 128 MB or so). Each row group has one column chunk per column, divided into pages. Each column chunk records min, max and null counts. Pages are encoded (dictionary, run-length, delta) and then compressed (Snappy is the common default in Spark, zstd or gzip compress harder). The footer holds the schema and all the statistics.</p>
+<p><b>What you gain.</b></p>
+<ul>
+<li><b>Column pruning:</b> read only needed columns.</li>
+<li><b>Predicate pushdown:</b> a row group whose <code>amount</code> max is below your filter is skipped without reading its data.</li>
+<li><b>Compression:</b> same-typed, similar values compress 3 to 10 times better than text. A country column with 200 distinct values becomes tiny dictionary ids.</li>
+<li><b>Splittable:</b> row groups give parallelism even when a compression codec is used inside.</li>
+</ul>
+<p><b>When another format is better.</b> Avro for messages and write-heavy row-at-a-time pipelines, schema evolution with a registry (Kafka). JSON or CSV only for raw landing or human exchange. ORC is equivalent to Parquet in idea and common in Hive shops. Parquet by itself cannot update rows in place; use Delta or Iceberg for that.</p>
+<p><b>Practical advice.</b> Sort or cluster data by commonly filtered columns when writing, so min/max statistics are tight and pushdown skips more. Avoid very many tiny files and extremely wide nested schemas. Beware schema merge: <code>mergeSchema</code> across thousands of files costs a lot, and a column that changed type between files can produce read errors.</p>
 <p class="rem"><b>Remember:</b> columnar + compressed + statistics = Parquet. Give text formats an explicit schema.</p>
 </div>
 </details>
@@ -590,6 +946,11 @@ val latest = df.withColumn("rn", row_number().over(w)).filter($"rn" === 1).drop(
 <pre><code>spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 df.repartition($"date")
   .write.mode("overwrite").partitionBy("date").parquet("s3://b/events/")</code></pre>
+<p><b>What is on disk.</b> <code>partitionBy("date")</code> writes <code>/events/date=2026-11-16/part-0001.parquet</code>. The value lives in the folder name, not in the file. When you later run <code>WHERE date = '2026-11-16'</code>, Spark lists and reads only that folder (partition pruning), turning a scan of years into one day.</p>
+<p><b>The file-count pitfall, worked out.</b> You have 200 write tasks and 365 dates in the data. Each task holds rows from many dates, and each task writes one file per date it holds. Worst case: 200 x 365 = 73,000 files of a few KB. Fix: <code>repartition($"date")</code> first, which shuffles so all rows of one date sit in one task, giving about one file per date (or <code>repartition(n, $"date")</code> for more files per date; add a salt column if one date is huge).</p>
+<p><b>Overwrite behaviour.</b> The default <code>partitionOverwriteMode</code> is static: <code>mode("overwrite")</code> deletes everything under the path, then writes. Reprocessing one day would delete all other days. With <code>dynamic</code>, only the partitions present in the new DataFrame are replaced, which is what a daily backfill wants. With table formats, <code>replaceWhere</code> or MERGE give safer control.</p>
+<p><b>Choosing the column.</b> Good: date (query filters on it, bounded cardinality). Bad: user_id (millions of folders, listing becomes the bottleneck), or any column nobody filters on (only costs files). Rule of thumb: each partition folder should hold at least hundreds of MB to a few GB. Several levels (<code>date</code>, <code>country</code>) multiply the folder count.</p>
+<p><b>Query side.</b> Pruning needs a filter on the raw partition column. Wrapping it in a function (<code>to_date(date_str)</code>) can defeat pruning. The partition column's values come from folder names, so types are inferred (a "007" may become the int 7); declare the schema if that matters.</p>
 <p class="rem"><b>Remember:</b> partition by a low-cardinality filter column, repartition by it first, and use dynamic overwrite.</p>
 </div>
 </details>
@@ -609,6 +970,17 @@ df.repartition($"date")
 <line class="arrow-g" x1="432" y1="130" x2="520" y2="84" marker-end="url(#ahg)"/>
 <text class="t-sm" x="30" y="190">Aim for output files of about 128 MB to 1 GB, and prevent by controlling the writer partition count.</text>
 </svg><figcaption>Fix the writer so you do not need compaction, and compact anyway for streams that append often.</figcaption></figure>
+<p><b>Why small files hurt, in concrete terms.</b></p>
+<ul>
+<li><b>Listing:</b> on S3 or HDFS, listing 200,000 files is slow, and the driver does it before planning (a long "nothing running" gap at job start).</li>
+<li><b>Tasks:</b> each file costs open/close latency, footer reads and a share of task scheduling. Reading 10,000 files of 2 MB takes far longer than 20 files of 1 GB, though the bytes are the same.</li>
+<li><b>Compression and statistics:</b> tiny Parquet files have poor compression and weak row-group statistics.</li>
+<li><b>Metadata:</b> HDFS NameNode memory, metastore partition entries and table-format manifests all grow with file count.</li>
+</ul>
+<p><b>Where they come from.</b> (1) Writing with many tasks and few rows each. (2) <code>partitionBy</code> where every task holds every value. (3) Streaming appends: a micro-batch every 10 seconds with 200 shuffle partitions makes up to 200 files per batch. (4) Late data trickling into old partitions.</p>
+<p><b>Prevent at write time.</b> Control the number of tasks writing: <code>coalesce(n)</code> if data is balanced, <code>repartition(n)</code> or <code>repartition(col)</code> otherwise. Decide n as data size divided by target file size (say 256 MB). <code>maxRecordsPerFile</code> caps file size from above only. AQE's coalescing reduces shuffle partitions automatically before the write. For streaming, use a longer trigger, fewer shuffle partitions, or write to a table format with auto-compaction.</p>
+<p><b>Repair after the fact.</b> Compaction: read a partition, repartition to the right file count, write to a new location, then swap (never overwrite the same path you are reading in a single plan without staging). With Delta use <code>OPTIMIZE</code>; Iceberg has <code>rewrite_data_files</code>. Schedule it per partition after it stops receiving data.</p>
+<p><b>Trade-off.</b> Files that are too big (many GB) limit parallelism and make updates costly. Between 128 MB and 1 GB is typical, adjusted to your read patterns.</p>
 <p class="rem"><b>Remember:</b> fix the writer's partition count first, compact for streaming appends. Aim for 128 MB to 1 GB files.</p>
 </div>
 </details>
@@ -644,6 +1016,18 @@ df.repartition($"date")
 enriched.count()                  // fills the cache (a full pass)
 enriched.write.parquet("/out/a")  // reads from cache
 enriched.unpersist()</code></pre>
+<p><b>What caching really does.</b> Every action rebuilds a DataFrame from the source. If the pipeline contains an expensive join and you use the result twice, the join runs twice. <code>cache()</code> marks the plan so that, the first time its partitions are computed, they are kept on the executors. Later actions read the stored blocks instead of recomputing.</p>
+<p><b>Good and bad candidates.</b></p>
+<table>
+<tr><th>Cache it</th><th>Do not cache it</th></tr>
+<tr><td>A result used by 2 or more actions or branches</td><td>Data used once</td></tr>
+<tr><td>Iterative algorithms (ML loops, graph passes)</td><td>Data that is cheap to recompute (a simple filtered read)</td></tr>
+<tr><td>A small-to-medium result of an expensive join or aggregation</td><td>Data far larger than executor memory (spills or evicts, may be slower than recompute)</td></tr>
+<tr><td>Interactive exploration of one dataset</td><td>Raw input just before a single write</td></tr>
+</table>
+<p><b>Storage levels.</b> <code>MEMORY_ONLY</code>: deserialized objects, fastest, but a partition that does not fit is not stored and is recomputed. <code>MEMORY_AND_DISK</code>: overflow goes to disk. <code>_SER</code> variants: stored as bytes, smaller, more CPU. <code>DISK_ONLY</code>, and <code>_2</code> for two replicas. For DataFrames, the cache is stored in a columnar compressed form, so it is usually smaller than the object form.</p>
+<p><b>Checkpoint versus cache.</b> Cache is a performance hint kept on executors; if an executor is lost, those blocks are recomputed from lineage, and lineage is kept. <code>checkpoint()</code> writes the data to reliable storage (HDFS or S3) and truncates lineage, giving fault tolerance and a short plan for long iterative jobs. It costs a full write. <code>localCheckpoint()</code> truncates lineage but stores on executors only (faster, not fault tolerant).</p>
+<p><b>Pitfalls.</b> Forgetting <code>unpersist</code> (memory leaks across a long job). Caching a DataFrame then changing a source file underneath: you get stale data. The first action pays the full cost, so one-off use is a net loss. Check the Storage tab of the UI: fraction cached and sizes. If "fraction cached" is below 100% with MEMORY_ONLY, you are recomputing partially.</p>
 <p class="rem"><b>Remember:</b> cache only what is expensive and reused. It is lazy, it takes execution memory, and it is not a backup.</p>
 </div>
 </details>
@@ -664,6 +1048,27 @@ enriched.unpersist()</code></pre>
 <line class="arrow dash" x1="462" y1="180" x2="470" y2="180"/>
 <rect class="miss" x="660" y="60" width="160" height="200" rx="8"/><text class="t-c t-b" x="740" y="140">Overhead</text><text class="t-c t-sm" x="740" y="162">max(384 MB, 10%)</text><text class="t-c t-sm" x="740" y="182">off-heap, native,</text><text class="t-c t-sm" x="740" y="200">Python workers</text>
 </svg><figcaption>OutOfMemoryError is a heap problem. "Container killed for exceeding memory limits" is an overhead problem. They have different fixes.</figcaption></figure>
+<p><b>Why this matters.</b> Almost every executor failure and spill is a memory-budget question, and the answer depends on which region ran out. Knowing the layout tells you which knob to turn.</p>
+<p><b>Walk the numbers.</b> Executor heap 10 GB (<code>spark.executor.memory=10g</code>).</p>
+<ol>
+<li>Reserved: about 300 MB, untouchable.</li>
+<li>Usable: 10 GB minus 0.3 GB = about 9.7 GB.</li>
+<li>Unified region: 60% of usable, about 5.8 GB, shared by execution and storage.</li>
+<li>Storage protected share: 50% of the unified region, about 2.9 GB, which execution cannot evict.</li>
+<li>User memory: the other 40%, about 3.9 GB, for your own data structures, UDF objects and Spark's metadata.</li>
+<li>Overhead (outside the heap): max(384 MB, 10% of 10 GB) = 1 GB. The container request is about 11 GB.</li>
+</ol>
+<p><b>Execution versus storage.</b> Execution memory is used while a task runs: shuffle buffers, hash tables for joins and aggregations, sort buffers. It is freed at task end. Storage memory holds cached blocks and broadcast values. If execution needs more, it takes unused storage space, and can evict cached blocks above the protected share. If storage needs room, it can use free execution space but cannot kick out execution that is in use. So heavy caching can squeeze shuffles into spilling, and a huge shuffle can evict your cache.</p>
+<p><b>Per-task share.</b> If the executor has 4 running tasks, each can get between 1/8 and 1/4 of the execution pool. That is why fewer cores per executor means more memory per task, which is a quick fix for spills.</p>
+<p><b>Which error means which region.</b></p>
+<table>
+<tr><th>Symptom</th><th>Region</th><th>Fix</th></tr>
+<tr><td>OOM in a task, "Java heap space"</td><td>Execution or user memory</td><td>Smaller partitions, fewer cores per executor, fix skew, more heap</td></tr>
+<tr><td>Cache evicted, recomputation</td><td>Storage</td><td>Use MEMORY_AND_DISK, cache less, more memory</td></tr>
+<tr><td>Container killed / OOMKilled</td><td>Overhead</td><td>Raise <code>memoryOverhead</code>; for PySpark the Python workers count here</td></tr>
+<tr><td>Long GC pauses</td><td>Heap pressure</td><td>Fewer objects (use DataFrames), smaller heap per executor, tune GC</td></tr>
+</table>
+<p>Off-heap memory (<code>spark.memory.offHeap.enabled</code> and <code>offHeap.size</code>) adds a separate execution and storage region outside the heap, counted on top for container sizing.</p>
 <p class="rem"><b>Remember:</b> heap OutOfMemoryError = heap problem. "Container killed" = overhead problem. Different fixes.</p>
 </div>
 </details>
@@ -677,6 +1082,23 @@ enriched.unpersist()</code></pre>
 <li><b>Container killed:</b> raise <code>spark.executor.memoryOverhead</code> (and <code>spark.executor.pyspark.memory</code> for Python).</li>
 </ul>
 <p>Before changing numbers I check the UI: which stage, was it the big task (skew) or all tasks, how large was the shuffle read per task. Adding memory does not help when one key holds more data than any single task can handle.</p>
+<p><b>Triage step by step.</b></p>
+<ol>
+<li><b>Read the exact message.</b> Heap space, GC overhead limit exceeded, or the cluster manager killing the container (YARN "Container killed ... exceeding memory limits", Kubernetes OOMKilled with exit code 137). These point to different regions of the memory model.</li>
+<li><b>Find the stage and the task shape.</b> In the stage page, do all tasks fail or only the biggest? Compare the failing task's shuffle read to the median. One huge task means skew; all large means partitions too big.</li>
+<li><b>Look for known memory hogs in the code:</b> <code>groupByKey</code>, <code>collect_list</code> / <code>collect_set</code> on big groups, a very wide window frame, exploding arrays, a large broadcast, caching too much, a UDF building big objects.</li>
+<li><b>Fix the cause</b> (see the table) and re-measure.</li>
+</ol>
+<table>
+<tr><th>Cause</th><th>Fix</th></tr>
+<tr><td>Partitions too big</td><td>More shuffle partitions or <code>repartition</code>; target 100 to 200 MB</td></tr>
+<tr><td>Skewed key</td><td>AQE skew join, salting, filter junk keys</td></tr>
+<tr><td>Too many cores per executor sharing one heap</td><td>Fewer cores, same total executors</td></tr>
+<tr><td>Collection aggregates on big groups</td><td>Replace with real aggregation, or limit group size</td></tr>
+<tr><td>Python workers or native memory (Arrow, off-heap, parquet buffers)</td><td>Raise <code>memoryOverhead</code> (about 10 to 20 percent, more for PySpark) or <code>spark.executor.pyspark.memory</code></td></tr>
+<tr><td>Cache crowding execution</td><td>Unpersist, serialized storage level, or less caching</td></tr>
+</table>
+<p><b>Why "just add memory" is the last resort.</b> If one key holds 30 GB of rows, no executor size handles it, and a bigger heap also means longer GC pauses and more waste across the cluster. Finding why tasks are big gives permanent fixes. A related driver-side check: a driver OOM is a different problem (collect, broadcast, huge plan).</p>
 <p class="rem"><b>Remember:</b> heap OOM: make tasks smaller. Container kill: raise overhead. Diagnose before adding memory.</p>
 </div>
 </details>
@@ -686,6 +1108,22 @@ enriched.unpersist()</code></pre>
 <div class="ans">
 <p class="ia">My starting rule is about 4 to 5 cores per executor, then divide the node memory among its executors, leaving some for the operating system and roughly 10% for overhead. Then I adjust from evidence in the UI: spill and GC time say more memory per task, idle cores say more partitions or fewer cores per executor. Capacity planning of the whole cluster belongs to the platform team.</p>
 <p>Why 4 to 5: a single-core executor wastes memory on duplicated overhead and cannot share broadcasts. Very many cores per executor share one heap (more garbage collection, less memory per task) and compete for I/O throughput. This is a rule of thumb, not a law. Example: a 16-core, 64 GB node can hold three executors of 5 cores, each about 19 GB in total, so roughly 17 GB heap plus 2 GB overhead. Memory per task is about executor memory times 0.6 divided by cores.</p>
+<p><b>Why not one core per executor, or one executor per node?</b></p>
+<ul>
+<li><b>Tiny executors (1 core):</b> every executor has its own JVM overhead and its own copy of broadcast data, there is little room for memory sharing between tasks, and you get many connections to the driver and shuffle service.</li>
+<li><b>Giant executors (30+ cores, 200 GB):</b> many tasks contend for one heap, so garbage collection pauses grow (large heaps scan slowly), HDFS client throughput per executor tops out (commonly cited around 5 concurrent streams), and a single lost executor loses a lot of work and cached data.</li>
+<li><b>Middle (4 to 5 cores, 8 to 32 GB):</b> a balance between those.</li>
+</ul>
+<p><b>Worked sizing.</b> Node: 16 cores, 64 GB, running YARN. Reserve 1 core and 1 GB for the OS and node daemons: 15 cores and about 63 GB usable. With 5 cores per executor you get 3 executors per node. Memory per executor is about 63/3 = 21 GB total, which includes the overhead (10% means heap about 19 GB, overhead about 2 GB); you might round down to be safe: <code>--executor-cores 5 --executor-memory 18g</code> with overhead 2 GB. Each running task then gets roughly (18 GB x 0.6 x 0.95) / 5, about 2 GB of execution memory share, if all 5 slots are busy.</p>
+<p><b>Then tune with evidence.</b></p>
+<table>
+<tr><th>You see</th><th>Try</th></tr>
+<tr><td>Spill, OOM, long GC</td><td>Fewer cores per executor, or more memory</td></tr>
+<tr><td>Cores idle, few tasks</td><td>More partitions (not more executors)</td></tr>
+<tr><td>Python-heavy job gets OOMKilled</td><td>Raise overhead</td></tr>
+<tr><td>Slow startup, wide stage</td><td>More executors, dynamic allocation</td></tr>
+</table>
+<p>Dynamic allocation (<code>spark.dynamicAllocation.enabled</code>) grows and shrinks the executor count with the backlog of tasks; on YARN it uses the external shuffle service, and on Kubernetes shuffle tracking, so shuffle files survive when executors are removed. The platform team decides quotas; as a developer, I ask for executors that fit well on their nodes and justify the numbers from the UI.</p>
 <p class="rem"><b>Remember:</b> medium executors (4 to 5 cores), leave room for overhead, tune from spill, GC and idle cores.</p>
 </div>
 </details>
@@ -695,6 +1133,26 @@ enriched.unpersist()</code></pre>
 <div class="ans">
 <p class="ia">I start with the Spark UI, not config changes. First which stage takes the time. Then inside that stage the task metrics: max versus median (skew), spill, GC time, shuffle read size, and idle cores (too few partitions). Then the SQL tab: pushed filters, join strategy, where the big Exchange sits. Only after I know the cause do I change one thing at a time and compare.</p>
 <p>Cause to action: skew means AQE, salting or isolating hot keys. A big shuffle means broadcast, filter and select earlier, or bucketing. Spill or OOM means more partitions or more memory per task. Slow reads mean fewer small files, partition pruning, and Parquet. Slow Python means replacing UDFs. Idle executors between stages point to scheduling delay or a slow external system (JDBC, API). Also check the first minutes: a driver busy listing millions of files or analysing a huge plan looks like "nothing running".</p>
+<p><b>Why a fixed order.</b> Guessing at configs (raise memory, add executors, change 5 settings at once) wastes hours and often hides the real problem. A repeatable path finds the bottleneck once.</p>
+<ol>
+<li><b>Which job and stage?</b> Spark UI, Jobs tab, sort stages by duration. The slow stage is your target, usually one or two stages out of many.</li>
+<li><b>Inside the stage, task distribution.</b> Summary metrics: duration, GC time, spill, shuffle read, input size, each by quartile. Compare max to median.
+<ul><li>Max far above median: skew.</li><li>All tasks heavy with spill: partitions too big.</li><li>Few tasks, idle cores: too few partitions.</li><li>High GC: object-heavy code or small heap per task.</li><li>Fast tasks but large gaps: scheduling, slow external system or driver work.</li></ul></li>
+<li><b>SQL tab for that stage's plan.</b> Scan size and pushed filters; join type; where the biggest Exchange is; any Python or opaque operator; rows after each step.</li>
+<li><b>Pick one change that matches the cause</b> (table below), make only that change, rerun on the same data, compare stage time and spill.</li>
+<li><b>Repeat</b> until the stage is no longer the dominant cost, or the remaining cost is inherent.</li>
+</ol>
+<table>
+<tr><th>Cause found</th><th>Typical change</th></tr>
+<tr><td>Skew</td><td>AQE skew join, salting, isolate or filter hot keys</td></tr>
+<tr><td>Huge shuffle</td><td>Filter and select earlier, broadcast join, pre-aggregate, bucket</td></tr>
+<tr><td>Spill or OOM</td><td>More partitions, fewer cores per executor, more memory</td></tr>
+<tr><td>Slow read</td><td>Parquet, partition pruning, fewer small files, pushed filters</td></tr>
+<tr><td>Python slow</td><td>Built-ins or pandas UDF</td></tr>
+<tr><td>Too few tasks</td><td>Repartition, raise shuffle partitions</td></tr>
+<tr><td>Driver-bound</td><td>Avoid collect, reduce file count and plan size</td></tr>
+</table>
+<p><b>Also check the non-Spark side:</b> a slow JDBC source or sink, S3 throttling, noisy neighbours on shared clusters. And confirm you are comparing like with like: data volume changes day to day, so check input size before blaming code.</p>
 <p class="rem"><b>Remember:</b> stage, then task skew and spill, then plan, then fix one thing. Measure before tuning.</p>
 </div>
 </details>
@@ -716,6 +1174,17 @@ enriched.unpersist()</code></pre>
 <line class="arrow-g dash" x1="305" y1="162" x2="305" y2="198" marker-end="url(#ahg)"/><line class="arrow-g dash" x1="535" y1="198" x2="535" y2="162" marker-end="url(#ahg)"/>
 <path class="arrow dash" d="M765 90 L765 40 L305 40 L305 88" fill="none" marker-end="url(#ah)"/><text class="t-sm" x="420" y="32">next trigger: repeat</text>
 </svg><figcaption>Each micro-batch is a small batch job. Offsets are written first, so a restart can replay exactly the same range.</figcaption></figure>
+<p><b>The core idea.</b> Imagine the input stream as a table where new rows are appended forever. You write an ordinary query over that table (<code>select</code>, <code>groupBy</code>, joins). Spark's job is to keep the result table correct as rows arrive, without recomputing everything each time.</p>
+<p><b>What happens each micro-batch, with an example.</b> Query: count orders per country from a Kafka topic, trigger every 10 seconds.</p>
+<ol>
+<li>Spark asks Kafka for the latest offsets and decides batch 17 covers offsets 5000 to 5400 per partition.</li>
+<li>It writes that planned range to the checkpoint's offsets log, before processing.</li>
+<li>It runs the query over only those 400 new rows per partition, as a normal batch job (stages, shuffle, tasks). The running counts per country come from the state store and are updated with the new rows.</li>
+<li>It writes results to the sink, then records "batch 17 committed" in the commit log.</li>
+<li>Repeat. If the app crashes between steps 2 and 4, on restart Spark sees batch 17 planned but not committed and re-runs the same range, so the sink must tolerate a repeat of that batch (idempotent or transactional).</li>
+</ol>
+<p><b>Why this design.</b> Reusing the batch engine gives Catalyst, Tungsten and the same APIs for free, and micro-batches make exactly-once reasoning simple, since each batch is a deterministic function of a recorded offset range. The price is latency of at least about a few hundred milliseconds from batch overhead.</p>
+<p><b>Related ideas.</b> The older DStream API operated on RDDs without schema or event-time support and is legacy. Continuous processing (experimental) trades guarantees for about 1 ms latency. For true event-at-a-time low latency or complex event time, Flink is often compared; for hour-level freshness a scheduled <code>availableNow</code> job is enough. Batch and streaming code share logic, but streaming has restrictions: no arbitrary <code>sort</code> on an unbounded stream (outside complete-mode aggregates), limited <code>distinct</code>, and actions like <code>count()</code> or <code>show()</code> need <code>writeStream</code> instead.</p>
 <p class="rem"><b>Remember:</b> a stream is an unbounded table, processed as a series of small batch jobs with checkpointed offsets.</p>
 </div>
 </details>
@@ -729,6 +1198,22 @@ enriched.unpersist()</code></pre>
   .trigger(Trigger.AvailableNow())
   .option("checkpointLocation", "/chk/orders")
   .format("parquet").start("/lake/orders")</code></pre>
+<p><b>Output modes, with the same example.</b> Query: orders per country, new orders arrive.</p>
+<table>
+<tr><th>Mode</th><th>Writes each batch</th><th>Allowed when</th><th>Example result</th></tr>
+<tr><td>append</td><td>Only rows that will never change again</td><td>Non-aggregating queries; aggregates with a watermark (window closed)</td><td>A finished 5-minute window row, once</td></tr>
+<tr><td>update</td><td>Rows changed in this batch</td><td>Aggregations; sinks that can upsert</td><td>"IN: 107" replaces "IN: 100"</td></tr>
+<tr><td>complete</td><td>The entire result table</td><td>Aggregations only; result must be small</td><td>All countries, every batch</td></tr>
+</table>
+<p>Why append waits for the watermark: without it, Spark cannot know that a window's count is final, so it cannot append it. This surprises people who see no output for a while.</p>
+<p><b>Triggers.</b></p>
+<ul>
+<li><b>Default:</b> start the next batch immediately when the previous finishes. Lowest latency, but under light traffic it creates many tiny batches and tiny files.</li>
+<li><b><code>processingTime("1 minute")</code>:</b> a batch at most every interval; a good way to trade latency for bigger batches and fewer files.</li>
+<li><b><code>availableNow</code>:</b> process everything that arrived since the last run, in one or more batches (respecting rate limits), then stop. Great for scheduled incremental ingestion, and it respects <code>maxOffsetsPerTrigger</code>, unlike the deprecated <code>once</code>, which forced one giant batch.</li>
+<li><b>Continuous:</b> experimental low latency, rarely used.</li>
+</ul>
+<p><b>Decision rule.</b> Need seconds-level freshness: processing-time trigger on a long-running cluster. Freshness of an hour or more, or cost matters: availableNow on a schedule. Either way keep the same checkpoint folder, so each run picks up where the last stopped.</p>
 <p class="rem"><b>Remember:</b> mode = what rows to write, trigger = when to run. AvailableNow = streaming code as incremental batch.</p>
 </div>
 </details>
@@ -738,6 +1223,25 @@ enriched.unpersist()</code></pre>
 <div class="ans">
 <p class="ia">The checkpoint is a folder on reliable storage that records which input offsets each batch covered, which batches committed, and the state store files. On restart Spark reads it and continues from the next range, so no data is lost or processed twice (given a replayable source and an idempotent sink). If I delete it, the query starts over from the source's starting offsets and the state is gone. One checkpoint folder per query, never shared.</p>
 <p>After deletion, a Kafka source starts from <code>startingOffsets</code> (latest by default, so I may skip data, or earliest, so I may reprocess everything). When I change the query, some changes are compatible (adding a filter), but changing grouping keys, the state schema, or the number of shuffle partitions of a stateful query breaks recovery. State is stored per partition and that count is fixed in the checkpoint. Then I need a new checkpoint and a backfill plan.</p>
+<p><b>What is inside the folder.</b></p>
+<ul>
+<li><code>offsets/</code>: for each batch id, the input range planned (written before the batch runs).</li>
+<li><code>commits/</code>: batch ids that finished successfully.</li>
+<li><code>state/</code>: snapshots and delta files of the state store, per operator and per partition.</li>
+<li><code>metadata</code>: the query id.</li>
+</ul>
+<p><b>Recovery logic.</b> On start, Spark compares the last offsets entry with the last commit. If they match, it plans the next batch. If offsets is ahead of commits by one, the last batch was interrupted, so it re-runs exactly that range, and reloads state to the last committed version. This is the basis of the exactly-once story.</p>
+<p><b>What happens in common situations.</b></p>
+<table>
+<tr><th>Event</th><th>Result</th></tr>
+<tr><td>Normal restart, same code</td><td>Continues from the next offset, state restored</td></tr>
+<tr><td>Checkpoint deleted</td><td>Starts from <code>startingOffsets</code> with empty state; may reprocess everything or skip a gap</td></tr>
+<tr><td>Add a filter or change a stateless transformation</td><td>Usually fine</td></tr>
+<tr><td>Change aggregation keys, add a new stateful operator, change number of shuffle partitions in a stateful query, change the sink type</td><td>Fails to restart, or silently wrong; need a new checkpoint</td></tr>
+<tr><td>Spark version upgrade</td><td>Usually compatible within documented limits; check release notes for state format changes</td></tr>
+<tr><td>Two queries use one folder</td><td>Corruption; always one checkpoint per query</td></tr>
+</table>
+<p><b>Operational advice.</b> Put the checkpoint on reliable storage (HDFS, S3, ADLS), never on local disk. Keep it with the output so backups and migrations stay consistent. When a stateful change is unavoidable, start a new checkpoint at a known offset and backfill the gap with a batch job, checking for overlaps and duplicates. Old files are cleaned automatically (<code>minBatchesToRetain</code>), but the folder grows with state size.</p>
 <p class="rem"><b>Remember:</b> the checkpoint is the query's memory. Lose it and you lose position and state. Stateful changes need a new one.</p>
 </div>
 </details>
@@ -760,6 +1264,17 @@ enriched.unpersist()</code></pre>
 <text class="t-sm" x="420" y="90">still open</text>
 <text class="t-sm" x="30" y="226">Watermark = 12:22 minus 10 min = 12:12. An event stamped 12:07 arriving now belongs to a closed window and is dropped.</text>
 </svg><figcaption>Spark needs the watermark to know when a window can never change again.</figcaption></figure>
+<p><b>Why two clocks.</b> A phone records a click at 12:03 while offline and uploads it at 12:30. Processing time says 12:30; event time says 12:03. Business questions ("clicks per 5-minute window") want event time, but then late data is possible, which processing time never has.</p>
+<p><b>The dilemma a watermark resolves.</b> When can the 12:00-12:05 window be called done? Never, strictly, because an event could still show up. But waiting forever means keeping state forever. The watermark is a promise: "I assume no data older than max-event-time minus delay will arrive." That lets Spark finalise windows and free their state.</p>
+<p><b>Worked timeline</b> (delay 10 minutes, windows 5 minutes).</p>
+<ol>
+<li>Events arrive up to 12:22. Watermark = 12:22 - 10 = 12:12.</li>
+<li>Windows ending at or before 12:12 (12:00-12:05, 12:05-12:10) are final. In append mode they are emitted now; their state is deleted.</li>
+<li>Window 12:10-12:15 is still open (ends after the watermark). An event stamped 12:11 arriving now is still counted.</li>
+<li>An event stamped 12:07 arrives. Its window is closed, so it is dropped silently. (Dropping is by window state; non-aggregating queries are not affected.)</li>
+</ol>
+<p><b>Rules to remember.</b> The watermark only moves forward, and is computed from the data seen, so an idle stream does not advance it (a quiet topic can hold windows open). It is evaluated at the start of the next batch, so output is delayed by about a batch. With multiple input streams the global watermark is by default the minimum of the inputs' watermarks (configurable, <code>spark.sql.streaming.multipleWatermarkPolicy</code>), so one slow stream holds everything back.</p>
+<p><b>Choosing the delay.</b> Measure lateness from your data (the 99th or 99.9th percentile of arrival time minus event time). A larger delay raises completeness, memory and latency; a smaller one does the opposite. Late rows are lost, so compare against a batch recount, or route late rows to a side output if completeness matters.</p>
 <p class="rem"><b>Remember:</b> watermark = max event time minus allowed delay. Behind it, windows close and late rows are dropped.</p>
 </div>
 </details>
@@ -769,6 +1284,19 @@ enriched.unpersist()</code></pre>
 <div class="ans">
 <p class="ia">State is data Spark must remember between batches: running aggregations, the keys seen by <code>dropDuplicates</code>, rows waiting for a match in a stream-stream join, and custom state in <code>flatMapGroupsWithState</code>. It lives in a state store per shuffle partition, backed up to the checkpoint. To bound it I always use a watermark, so old windows and keys expire, and I avoid grouping by an unbounded key (a random request id) without expiry.</p>
 <p>The default state store keeps state in executor heap, so big state means garbage collection pauses and out-of-memory errors. From Spark 3.2 the RocksDB state store keeps state on local disk and off-heap, which scales to far larger state. For deduplication, include the event time column plus a watermark (or <code>dropDuplicatesWithinWatermark</code> in 3.5+). Stream-stream joins need a watermark on both sides and a time-range condition. I watch <code>numRowsTotal</code> of the state operators in <code>query.lastProgress</code>: if it only goes up, state is not expiring. Stateless operations (<code>select</code>, <code>filter</code>, stream-to-static joins) hold no state.</p>
+<p><b>What counts as state.</b> Anything Spark must remember across batches because a later batch needs it: partial aggregates (running sum per key), seen keys for deduplication, one side of a stream-stream join waiting for a match, and your custom state in <code>flatMapGroupsWithState</code>. Stateless queries (<code>select</code>, <code>filter</code>, <code>map</code>) need none.</p>
+<p><b>How it is stored and protected.</b> State is partitioned like the shuffle (one store per partition per operator), held in executor memory (default provider) or in RocksDB (3.2+), and each batch writes a delta file to the checkpoint; periodic snapshots allow fast recovery.</p>
+<p><b>Why unbounded state kills jobs.</b> Take <code>groupBy(userId).count()</code> with 50 million distinct users. Without a watermark or timeout, every user ever seen stays in state. Heap use rises, GC gets longer, batch time grows, eventually executors die and the restart is slow because loading state takes ages. The symptom is a job that is fine for weeks and then degrades.</p>
+<p><b>Bounding techniques.</b></p>
+<table>
+<tr><th>Operator</th><th>How state expires</th></tr>
+<tr><td>Windowed aggregation</td><td>Watermark: windows older than it are dropped</td></tr>
+<tr><td>dropDuplicates</td><td>Include the event-time column and a watermark so old keys are dropped</td></tr>
+<tr><td>Stream-stream join</td><td>Watermarks on both sides plus a time-range join condition</td></tr>
+<tr><td>flatMapGroupsWithState</td><td>Set a timeout (event time or processing time) and remove state yourself</td></tr>
+<tr><td>Global running count per user (no window)</td><td>No natural expiry; use TTL logic in custom state or a state-aware table design</td></tr>
+</table>
+<p><b>Monitoring.</b> In <code>lastProgress.stateOperators</code> watch <code>numRowsTotal</code>, <code>memoryUsedBytes</code> and for RocksDB the store metrics. A steadily rising total with a watermark in place means the grouping keys are not tied to event time. Use RocksDB for large state, and size shuffle partitions up front: the partition count of stateful operators cannot change without a new checkpoint.</p>
 <p class="rem"><b>Remember:</b> every stateful query must say how its state expires: watermark or timeout. RocksDB for big state.</p>
 </div>
 </details>
@@ -784,6 +1312,16 @@ enriched.unpersist()</code></pre>
   .option("maxOffsetsPerTrigger", 200000)
   .load()
 val parsed = raw.select(from_json($"value".cast("string"), schema).as("o")).select("o.*")</code></pre>
+<p><b>How a batch reads Kafka.</b> The driver asks Kafka for the latest offsets per partition, computes the range since the last batch for each, and creates one Spark task per Kafka partition (or splits, if <code>minPartitions</code> is set). Each task reads its offset range using a Kafka consumer cached on the executor.</p>
+<p><b>The columns you get.</b> <code>key</code> and <code>value</code> (binary), <code>topic</code>, <code>partition</code>, <code>offset</code>, <code>timestamp</code>, <code>timestampType</code>. You cast <code>value</code> to a string and parse (JSON with <code>from_json</code>, Avro with a schema or a registry integration).</p>
+<p><b>Offsets, the key difference from a normal consumer.</b> A plain Kafka consumer commits offsets to the broker's consumer group. Spark does not: it records offsets in its own checkpoint, and sets its own group ids internally. Consequences:</p>
+<ul>
+<li>Consumer-lag dashboards based on committed group offsets do not show Spark's progress. Monitor with <code>lastProgress</code> (<code>endOffset</code> versus <code>latestOffset</code>) or by computing lag from the metrics.</li>
+<li>Restarting with a new checkpoint ignores where the old query stopped; use <code>startingOffsets</code> (a JSON of exact offsets works) for deliberate positioning.</li>
+<li>Changing the topic's partition count mid-flight is supported for new partitions (picked up), but plan it.</li>
+</ul>
+<p><b>Rates and safety options.</b> <code>maxOffsetsPerTrigger</code> bounds batch size, so a restart after downtime does not make a 100x batch that runs out of memory. <code>failOnDataLoss</code> (default true) fails the query if offsets it needs were deleted by retention or a topic was recreated. Turn it off only if skipping is acceptable. <code>kafka.*</code> options pass through to the client (security settings such as SASL or SSL).</p>
+<p><b>Parallelism cap.</b> 12 partitions mean at most 12 read tasks, even with 100 cores. Fix by repartitioning after the read for downstream work, or increasing topic partitions (a Kafka design decision), or <code>minPartitions</code> to split ranges.</p>
 <p class="rem"><b>Remember:</b> offsets live in the Spark checkpoint, not in Kafka. Parallelism is capped by topic partitions.</p>
 </div>
 </details>
@@ -796,6 +1334,24 @@ val parsed = raw.select(from_json($"value".cast("string"), schema).as("o")).sele
 <pre><code>df.writeStream.foreachBatch { (batch: DataFrame, batchId: Long) =&gt;
   upsertToTable(batch, batchId)      // MERGE on a key, safe to run twice
 }.option("checkpointLocation", "/chk/orders").start()</code></pre>
+<p><b>Break the claim into two halves.</b> Delivery of input is "at-least-once" (after a crash a batch may be re-read). The effect on the output is "exactly-once" only if re-running a batch does not change the result. Structured Streaming provides the machinery for that; the sink must cooperate.</p>
+<p><b>The three ingredients.</b></p>
+<ol>
+<li><b>Replayable source.</b> Kafka, files and Kinesis can re-deliver the same offsets or file list. A raw socket cannot.</li>
+<li><b>Deterministic, recorded batch boundaries.</b> The offsets are written to the checkpoint before processing, so a retry of batch N reads exactly the same records. (If the transformation itself is non-deterministic, e.g. calls <code>rand()</code> or an external lookup that changes, the retry can produce different output.)</li>
+<li><b>Idempotent or transactional sink.</b> Writing batch N twice must equal writing it once.</li>
+</ol>
+<p><b>Sink by sink.</b></p>
+<table>
+<tr><th>Sink</th><th>Guarantee</th><th>Why</th></tr>
+<tr><td>File sinks (Parquet etc.)</td><td>Exactly-once</td><td>A metadata log lists committed files per batch; readers using that log ignore leftover files from failed attempts</td></tr>
+<tr><td>Delta, Iceberg</td><td>Exactly-once</td><td>Atomic commits; batch id recorded to skip duplicates (e.g. Delta <code>txnAppId</code> and version options)</td></tr>
+<tr><td>Kafka sink</td><td>At-least-once</td><td>A re-run batch republishes; consumers dedupe by key</td></tr>
+<tr><td>foreachBatch to a database</td><td>Your responsibility</td><td>Use upsert or MERGE keyed by business key, or record the batch id in the same transaction as the data</td></tr>
+<tr><td>foreach / console / memory</td><td>No guarantee (debug sinks)</td><td>-</td></tr>
+</table>
+<p><b>A failure walkthrough.</b> Batch 17 writes 400 rows to Postgres, then the app crashes before the commit log entry. On restart Spark runs batch 17 again with the same 400 rows. With <code>INSERT</code> you now have 800 rows. With <code>INSERT ... ON CONFLICT (order_id) DO UPDATE</code>, you still have 400. Alternatively, store <code>batchId</code> in a progress table in the same transaction, and skip a batch that is already recorded.</p>
+<p><b>Things no guarantee covers.</b> Emails, API calls and any side effect inside transformations; end-to-end exactly-once across systems also needs the downstream consumer to read committed data only.</p>
 <p class="rem"><b>Remember:</b> replayable source + checkpointed offsets + idempotent sink = effectively exactly-once.</p>
 </div>
 </details>
@@ -816,6 +1372,16 @@ val parsed = raw.select(from_json($"value".cast("string"), schema).as("o")).sele
 <line class="arrow" x1="142" y1="95" x2="188" y2="95" marker-end="url(#ah)"/><line class="arrow" x1="312" y1="95" x2="358" y2="95" marker-end="url(#ah)"/><line class="arrow" x1="482" y1="95" x2="528" y2="95" marker-end="url(#ah)"/><line class="arrow" x1="672" y1="95" x2="718" y2="95" marker-end="url(#ah)"/>
 <path class="arrow-g dash" d="M600 122 L600 170 L80 170 L80 122" fill="none" marker-end="url(#ahg)"/><text class="t-sm" x="190" y="192">recompute only partition 3 by replaying its parents</text>
 </svg><figcaption>No copies are stored. The recipe is stored, and the missing piece is cooked again.</figcaption></figure>
+<p><b>Why not replicate like HDFS?</b> Intermediate data is huge and mostly short-lived. Storing three copies of every intermediate result would multiply memory and I/O. Because Spark's transformations are deterministic functions of their inputs, it keeps a small description instead: "partition 3 of this dataset = filter(map(partition 3 of the file))".</p>
+<p><b>Recovery walkthrough.</b> A job has stages A (read, map) then B (aggregate). An executor dies when stage B is half done.</p>
+<ol>
+<li>The driver notices heartbeats stopped, marks the executor lost, and reschedules its running tasks elsewhere.</li>
+<li>If those tasks need shuffle output that lived on the dead executor's disk, the fetch fails. The scheduler marks that map output lost and re-runs only the map tasks that produced it (stage A, specific partitions).</li>
+<li>When the map outputs exist again, the reduce tasks run and the job finishes. Other completed work stays valid.</li>
+</ol>
+<p><b>Narrow versus wide recomputation.</b> Rebuilding a narrow partition replays one chain on one parent partition. Rebuilding a wide partition needs slices from many parents, so a failure late in a long job with a lost shuffle can mean rerunning large chunks of earlier stages. The external shuffle service (or shuffle tracking on Kubernetes) keeps shuffle files alive when an executor exits, which avoids this in many cases.</p>
+<p><b>When lineage becomes a liability.</b> Iterative jobs (loops of 100 iterations that keep adding transformations) create very long lineage: planning slows, memory on the driver grows, a stack overflow can happen when serializing the plan, and a failure replays everything. Use <code>checkpoint()</code> every N iterations; it saves data reliably and starts a new short lineage. Also, a non-deterministic source (a changing table, <code>rand()</code> without seed, a file overwritten mid-job) can make the recomputed partition differ from the first run, silently corrupting results. Prefer snapshots or table-format time travel as input.</p>
+<p><b>What lineage does not protect.</b> The driver (a driver crash ends the app; streaming recovers using the checkpoint on restart) and external side effects.</p>
 <p class="rem"><b>Remember:</b> Spark stores the recipe, not copies. A lost piece is cooked again from its parents.</p>
 </div>
 </details>
@@ -825,6 +1391,17 @@ val parsed = raw.select(from_json($"value".cast("string"), schema).as("o")).sele
 <div class="ans">
 <p class="ia">For DataFrame and SQL code the language barely matters, because Python only builds the plan and the JVM executes it with Catalyst and Tungsten. The slowdown appears when Python code runs on the executors: plain Python UDFs, RDD lambdas and <code>toPandas</code>. Then every row crosses from the JVM to a Python worker process and back. So I use PySpark with built-ins and pandas UDFs for most pipelines, and Scala or Java for performance-critical custom logic and shared libraries.</p>
 <p>Executors start Python worker processes next to the JVM, so PySpark needs more memory overhead. Scala is the native language: typed Datasets, new APIs first, no serialization boundary for UDFs. Java is fully supported but its Dataset API is more verbose (encoders, explicit lambda types). For Java builds, mark Spark as <code>provided</code> scope so the cluster's jars are used, and watch for dependency clashes (Guava, Jackson).</p>
+<p><b>Where the Python code actually runs.</b> In PySpark, your <code>df.filter(...).groupBy(...)</code> calls go through a bridge (Py4J) to the JVM driver, which holds the real plan. The executors run JVM code. Nothing about the language slows down the data plane, so a pure DataFrame job in Python and Scala produce the same plan and run at essentially the same speed.</p>
+<p><b>When Python enters the data path.</b> Whenever a function must run per row or per batch inside Python: a plain UDF, an RDD <code>map</code> with a lambda, <code>mapInPandas</code>, <code>applyInPandas</code>. Spark then starts Python worker processes on each executor and moves data between JVM and Python. Costs: serialization of every value, process memory outside the JVM heap (so more <code>memoryOverhead</code>), no whole-stage codegen across that step.</p>
+<table>
+<tr><th>Case</th><th>Speed</th></tr>
+<tr><td>DataFrame or SQL with built-ins (any language)</td><td>Same</td></tr>
+<tr><td>pandas UDF in Python</td><td>Moderately slower than built-in, uses Arrow</td></tr>
+<tr><td>Plain Python UDF or RDD lambdas</td><td>Often many times slower</td></tr>
+<tr><td>Scala or Java UDF</td><td>Faster than Python UDF, still an optimizer black box</td></tr>
+</table>
+<p><b>Other factors in the choice.</b> Team skills and the ML ecosystem (pandas, scikit-learn, notebooks) favour Python. Typed Datasets, access to internal APIs, custom data sources and connectors, and shared libraries favour Scala or Java. New features sometimes appear in Scala first. Debugging errors in PySpark shows long Java stack traces plus Python ones. Packaging differs (wheels, conda environments, zip files versus fat jars).</p>
+<p><b>Interview-safe answer.</b> "Same engine; write DataFrame code, avoid Python UDFs, and the language is not the bottleneck. I use Scala or Java where I need typed APIs, custom connectors or maximum control."</p>
 <p class="rem"><b>Remember:</b> same engine either way. Slowness is Python code on executors, not the language of the driver.</p>
 </div>
 </details>
@@ -834,6 +1411,26 @@ val parsed = raw.select(from_json($"value".cast("string"), schema).as("o")).sele
 <div class="ans">
 <p class="ia">Plain Parquet folders have no transactions. A failed job leaves half the files, readers see partial writes, and updating or deleting a row means rewriting files by hand. Table formats add a metadata layer (a transaction log or manifests) that gives atomic commits, row-level MERGE, UPDATE and DELETE, schema evolution, time travel, and faster planning through file statistics instead of directory listing.</p>
 <p>They also make streaming sinks and idempotent reruns much easier. Delta came from Databricks, Iceberg from Netflix (many engines support it), Hudi from Uber (strong at upserts and incremental pulls). The cost is another dependency and table maintenance: compaction, snapshot expiry and vacuum. For a developer, the answer to "how do I safely rerun a job without duplicates" is often "write with MERGE or overwrite into a table format".</p>
+<p><b>What goes wrong with plain Parquet folders.</b></p>
+<ul>
+<li><b>No atomic writes:</b> a job that fails halfway leaves some files. Readers may see partial data, and a rerun appends duplicates.</li>
+<li><b>No row-level change:</b> to delete one user's rows (GDPR) you rewrite entire files and folders by hand.</li>
+<li><b>Concurrent writers collide:</b> two jobs overwriting a partition race.</li>
+<li><b>Slow planning:</b> listing millions of files on object storage is slow.</li>
+<li><b>Schema evolution is manual</b> and risky across files.</li>
+</ul>
+<p><b>The fix: a metadata layer.</b> The table is still Parquet data files, plus a log. Delta keeps an ordered transaction log (JSON actions plus checkpoints) of "add file X, remove file Y". Iceberg keeps snapshots that point to manifest lists and manifests listing data files with statistics. Hudi keeps a timeline plus indexes. A reader reads the log to learn the exact file list for a version, so it sees a consistent snapshot. A writer adds new files and then commits by atomically adding a log entry (with optimistic concurrency checks), so a failed job commits nothing.</p>
+<p><b>What you get.</b></p>
+<table>
+<tr><th>Capability</th><th>Example use</th></tr>
+<tr><td>ACID commits, isolation</td><td>Readers never see half-written output</td></tr>
+<tr><td>MERGE / UPDATE / DELETE</td><td>Upsert CDC changes by key; delete a user</td></tr>
+<tr><td>Time travel</td><td>Query yesterday's version, roll back a bad write</td></tr>
+<tr><td>Schema evolution</td><td>Add or rename columns safely</td></tr>
+<tr><td>File-level statistics and pruning</td><td>Skip files without listing directories</td></tr>
+<tr><td>Streaming source and sink</td><td>Exactly-once streaming writes, incremental reads</td></tr>
+</table>
+<p><b>Costs and choice.</b> Row-level updates are implemented as copy-on-write (rewrite files; fast reads) or merge-on-read (write delete or delta files, merge when reading; fast writes). You must run maintenance: compaction, expiring old snapshots, removing orphan files (<code>VACUUM</code> in Delta). Pick by ecosystem: Delta if Databricks-centred, Iceberg for multi-engine (Spark, Trino, Flink, Snowflake), Hudi for heavy upsert and incremental pull workloads. Check the sibling Data Engineering page for deeper Iceberg coverage.</p>
 <p class="rem"><b>Remember:</b> table format = Parquet files + transaction log. Atomic writes, upserts, time travel.</p>
 </div>
 </details>
@@ -843,9 +1440,70 @@ val parsed = raw.select(from_json($"value".cast("string"), schema).as("o")).sele
 <div class="ans">
 <p class="ia">Running the job twice for the same input must give the same output with no duplicates and no gaps. So I parameterize by a business date or batch id (not "now"), read a clearly defined input slice, make the output deterministic, and write with an overwrite of the exact partition or a MERGE on a business key rather than a blind append.</p>
 <p>Concretely: avoid unseeded <code>rand</code>, <code>current_timestamp</code> in keys and unordered <code>first</code>. Use <code>partitionOverwriteMode=dynamic</code> or a table-format MERGE. Write to a staging location, then commit or swap. Keep external side effects out of tasks, or make them idempotent with a key. Deduplicate the input on a natural key with <code>row_number</code> when the source can deliver repeats. Record each run in a control table to detect double runs. Then test the rerun path: run twice and compare counts and checksums.</p>
+<p><b>Why this is a design question.</b> Failures and reruns are normal: a node dies, someone reruns a day for a bug fix, the scheduler retries. A job that is not safe to repeat turns every retry into a data-quality incident.</p>
+<p><b>The checklist, each with the reason.</b></p>
+<ol>
+<li><b>Take the logical time as a parameter</b> (<code>--date 2026-11-16</code>), not <code>current_date()</code>. A rerun the next day would otherwise read different data.</li>
+<li><b>Read an immutable, well-defined input slice.</b> Reading "everything in the folder" while another process writes to it makes reruns differ. Prefer partitioned landing data or a table snapshot / time-travel version.</li>
+<li><b>Deterministic transformation.</b> Avoid unseeded <code>rand()</code>, <code>uuid()</code> as keys, <code>current_timestamp()</code> in business keys, <code>first()</code>/<code>collect_list</code> over unordered data, and window functions with ties and no tie-breaker. Derive surrogate keys by hashing business columns.</li>
+<li><b>Write so repeat = replace.</b> Overwrite exactly the partition for that date (dynamic partition overwrite) or MERGE on the business key. Never blind <code>append</code> for reprocessable data.</li>
+<li><b>Atomic publish.</b> Write to a staging path or temp table, validate, then swap or commit (table format commit, or rename of a partition). A half-written output must not be visible.</li>
+<li><b>Dedupe the input.</b> Upstream retries create duplicates; keep one row per natural key with <code>row_number</code> over (key order by ingestion time desc).</li>
+<li><b>Contain side effects.</b> API calls, emails and database inserts inside tasks can run twice (retries, speculation). Use idempotency keys or move them out of the Spark job.</li>
+<li><b>Record runs</b> (control table: run id, date, row counts, status) and skip or flag duplicates.</li>
+</ol>
+<p><b>Example write.</b></p>
+<pre><code>spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+daily.write.mode("overwrite").partitionBy("date").parquet(out)   // rerun for one date replaces only that date</code></pre>
+<p><b>Prove it.</b> In tests, run the job twice on the same input and assert identical row counts, key uniqueness and a checksum; also run a day, then a backfill of that day, and compare.</p>
 <p class="rem"><b>Remember:</b> same input slice, deterministic transform, overwrite or merge. Test it by running twice.</p>
 </div>
 </details>
+
+<details class="iq" id="q-speculation-retries">
+<summary>What is speculative execution, and what do task and stage retries mean for your code? <span class="lvl s">Senior</span></summary>
+<div class="ans">
+<p class="ia">Speculation launches a duplicate copy of a task that is running much slower than its peers, and takes whichever copy finishes first. It helps with a sick node but not with skew. Separately, failed tasks are retried (4 attempts by default) and lost shuffle data triggers stage reruns, so any task can run more than once. My code must tolerate that: no non-idempotent side effects inside tasks.</p>
+<p><b>Why it exists.</b> A stage waits for its slowest task. Sometimes a task is slow not because of its data but because its machine is slow (a failing disk, a noisy neighbour, a stuck network). Spark can detect this: with <code>spark.speculation=true</code>, once a quantile of tasks (default 75%) in a stage has finished, tasks running longer than a multiple (default 1.5) of the median are candidates. Spark starts a second copy on another executor. The first copy to finish wins and the other is killed.</p>
+<p><b>When it helps and when it hurts.</b></p>
+<table>
+<tr><th>Situation</th><th>Effect of speculation</th></tr>
+<tr><td>One bad node slows some tasks</td><td>Helps a lot</td></tr>
+<tr><td>Data skew (one huge partition)</td><td>No help: the copy gets the same huge partition and also runs long; it wastes cores</td></tr>
+<tr><td>Tasks write to an external system (database, API)</td><td>Dangerous: both copies may perform the side effect</td></tr>
+<tr><td>Output to files through the commit protocol</td><td>Safe: only the winning attempt's files are committed</td></tr>
+<tr><td>Cluster already tight on resources</td><td>Adds load; can slow others</td></tr>
+</table>
+<p><b>Retry levels.</b> Task failure (exception, executor lost): rerun up to <code>spark.task.maxFailures</code> times (4). Fetch failure (a shuffle file is gone): the map stage tasks that produced it are re-run, and the reduce stage is retried (stage attempts are limited, a few by default). Executor loss: tasks reschedule elsewhere, and the cluster manager launches a replacement. Driver loss: the application ends (a supervisor must restart it).</p>
+<p><b>What this means for your code.</b> A task function can execute twice for the same partition, even for a successful job. So: make external writes idempotent, treat accumulators in transformations as approximate, avoid reading mutable external state in tasks, and be careful with non-determinism (a retried task with <code>rand()</code> may produce different rows; a shuffle with random keys can then lose or duplicate rows in rare retry cases, so seed or sort first).</p>
+<p class="rem"><b>Remember:</b> speculation fixes slow machines, not slow data. Any task can run twice, so make side effects idempotent.</p>
+</div>
+</details>
+
+<details class="iq" id="q-jdbc-parallel">
+<summary>How do you read a large database table into Spark in parallel, and what can go wrong? <span class="lvl i">Intermediate</span></summary>
+<div class="ans">
+<p class="ia">A plain JDBC read uses one connection and one task, so it is slow and leaves the cluster idle. I give Spark a numeric (or date) partition column with lower and upper bounds and a partition count, and Spark issues that many range queries in parallel. I choose an indexed, evenly spread column and keep the count within what the database can serve.</p>
+<p><b>How it works.</b> With <code>partitionColumn=id, lowerBound=1, upperBound=10000000, numPartitions=10</code>, Spark makes 10 queries: <code>WHERE id &lt; 1000001 OR id IS NULL</code>, <code>WHERE id &gt;= 1000001 AND id &lt; 2000001</code>, ... up to <code>WHERE id &gt;= 9000001</code>. The bounds only decide the strides; rows outside the bounds still land in the first or last partition, so they are not lost, but they can make those partitions huge.</p>
+<pre><code>val df = spark.read.format("jdbc")
+  .option("url", jdbcUrl).option("dbtable", "orders")
+  .option("partitionColumn", "id").option("lowerBound", 1)
+  .option("upperBound", 10000000).option("numPartitions", 10)
+  .option("fetchsize", 10000).load()</code></pre>
+<p><b>Pitfalls.</b></p>
+<ul>
+<li><b>Skewed column:</b> if ids are clustered, some partitions get most rows. Use a more even column, a hash expression, or a custom list of predicates (<code>spark.read.jdbc(url, table, predicates, props)</code>).</li>
+<li><b>Too many connections:</b> 200 partitions means 200 concurrent queries on a production database. Cap <code>numPartitions</code> and run against a replica.</li>
+<li><b>Unindexed column:</b> every range query scans the table.</li>
+<li><b>Small fetch size:</b> some drivers default to a small fetch size, causing many round trips; set <code>fetchsize</code>.</li>
+<li><b>Pushdown:</b> filters and column selection are pushed to the database for simple expressions; a subquery in <code>dbtable</code> or <code>query</code> can pre-filter on the database side.</li>
+<li><b>Consistency:</b> parallel range queries run at different moments, so a changing table can give an inconsistent snapshot; snapshot or use a replica for exact results.</li>
+</ul>
+<p>For repeated large extracts, prefer change data capture into Kafka or a table format over repeated full JDBC pulls.</p>
+<p class="rem"><b>Remember:</b> JDBC read = 1 task unless you set partitionColumn, bounds and numPartitions. Parallel for Spark, load for the database.</p>
+</div>
+</details>
+
 
 <h2 id="scenarios">10. Real-life scenarios</h2>
 <p>Every answer follows the same shape: situation, what you check first, the fix, and how you prevent it next time. Say that shape aloud in the interview. It shows you work calmly under pressure.</p>
@@ -860,6 +1518,10 @@ val parsed = raw.select(from_json($"value".cast("string"), schema).as("o")).sele
 df.filter($"customer_id".isNull).count()</code></pre>
 <p><b>Fix:</b> filter null or placeholder keys before the join (they never match in an inner join). Make sure AQE and <code>skewJoin.enabled</code> are on. Broadcast the other side if it is small. Otherwise salt the hot keys, or join hot keys separately with a broadcast join and union the result. AQE skew handling needs the partition to be above 5 times the median and 256 MB, so salting is the fallback.</p>
 <p><b>Prevent:</b> a data-quality check on the top-key share, an alert on max-to-median task time, and cleaning nulls and defaults at ingest.</p>
+<p><b>The thought process an interviewer wants to hear.</b> "One task is slow, the rest are done" is the signature of skew, not of a cluster-wide problem. So I do not touch memory or executor counts first. I confirm with numbers, find the key, and pick the cheapest fix for that key.</p>
+<p><b>Worked numbers.</b> Stage page: median task 6 s, max task 2 hours, max shuffle read 38 GB versus median 0.3 GB. The top-key query shows customer_id = NULL has 40% of the rows (a new upstream bug started sending nulls). Because an inner join never matches nulls, filtering them out before the join is correct and instantly removes the skew; the stage drops back to minutes. If the key is real (one large legitimate customer), then try AQE skew handling (check it is enabled, and that the partition is above the 5x median and 256 MB thresholds), then broadcast if the other side is small, then salting for the hot key only.</p>
+<p><b>Why the job got slower "suddenly".</b> Data volume or key distribution changed, not the code. That is why I add an alert on max-to-median task time or a daily top-key share check, so the next regression is a ticket instead of a 3 AM page.</p>
+<p><b>Side note on a trap.</b> Increasing <code>spark.sql.shuffle.partitions</code> does not fix this: all rows of the hot key still hash to a single partition.</p>
 <p class="rem"><b>Remember:</b> one task runs forever means skew. Find the hot key, then filter, AQE, broadcast or salt.</p>
 </div>
 </details>
@@ -872,6 +1534,9 @@ df.filter($"customer_id".isNull).count()</code></pre>
 <p><b>Check first:</b> the exact error (heap versus "container killed"), which stage, and whether only the big tasks fail (skew) or all of them (partitions too big). Check shuffle read per task and the partition count, and grep the code for <code>groupByKey</code> and <code>collect_list</code>.</p>
 <p><b>Fix:</b> (1) raise shuffle partitions so tasks are about 100 to 200 MB, or let AQE size them. (2) Replace <code>groupByKey</code> or <code>collect_list</code> with a real aggregation. (3) Fix skew. (4) Fewer cores per executor so each task has more memory. (5) Only then raise <code>spark.executor.memory</code>. If the message is "killed by YARN for exceeding memory limits", raise <code>spark.executor.memoryOverhead</code> instead.</p>
 <p><b>Prevent:</b> watch spill and GC time for every new job, and test with a peak-day volume.</p>
+<p><b>Reasoning.</b> A heap OOM during a groupBy means a task's share of memory was too small for the data it received. Possible reasons: partitions too big (few partitions for the volume), skew (one key's rows too many), or the aggregation itself builds large objects (<code>collect_list</code>, <code>groupByKey</code>), or too many cores share one heap.</p>
+<p><b>Example.</b> A 2 TB table is grouped with the default 200 partitions: 10 GB per task, with 4 tasks sharing an 8 GB executor heap. Each task has about 1 GB of execution memory. Even with spilling, hash aggregation of 10 GB cannot fit and the task dies. Setting 10,000 partitions (about 200 MB each) and using 3 cores per executor lets each task work in a few hundred MB and the job passes. No memory increase needed.</p>
+<p><b>Sequence I follow.</b> Read the error text and class (heap versus container killed). Check which tasks fail (all or the big ones). Fix partitions or skew. Replace collection aggregates. Reduce cores per executor. Add memory last. If the cause is "container killed", change overhead instead, which is outside the heap. After the fix, check spill and GC in the stage page to confirm that the margin is healthy, not just barely passing.</p>
 <p class="rem"><b>Remember:</b> smaller tasks first, more memory last. Read the error to pick heap or overhead.</p>
 </div>
 </details>
@@ -887,6 +1552,10 @@ df.filter($"customer_id".isNull).count()</code></pre>
   .write.option("maxRecordsPerFile", 5000000)
   .partitionBy("date").mode("overwrite").parquet(out)</code></pre>
 <p><b>Prevent:</b> a check on file count and average file size at the end of the job. For streaming, a longer trigger interval plus scheduled compaction.</p>
+<p><b>Why 200,000 files from one job.</b> Say the job runs 2,000 write tasks and each holds rows of about 100 dates (data arrives mixed). Each task writes up to 100 files. That is 200,000 small files per run. It is the product of tasks and distinct partition values.</p>
+<p><b>Fix with numbers.</b> If the day's data is 60 GB and you want about 256 MB files, you need about 240 files per run. With <code>partitionBy("date")</code> and 30 dates: <code>repartition(30 * 8, $"date")</code> hashes each date to a few tasks (8 files per date), giving 240 files. If one date is much bigger than the others, add a salt column so the large date spreads across more tasks (hash on date and salt).</p>
+<p><b>Cleaning the backlog.</b> Compact old partitions in a separate job that reads one date at a time, repartitions to the right count, and writes to a temp location, then swaps (or run <code>OPTIMIZE</code> / <code>rewrite_data_files</code> in a table format). Do it off-peak, because compaction itself reads all those small files, and throttle it to avoid hammering object storage.</p>
+<p><b>Verify.</b> After the change: file count and average file size per partition (SQL on the table's files or a storage listing), plus the query's task count and listing time. Keep this check as part of the pipeline.</p>
 <p class="rem"><b>Remember:</b> files per partition value = write tasks holding it. Repartition by the partition column.</p>
 </div>
 </details>
@@ -899,6 +1568,10 @@ df.filter($"customer_id".isNull).count()</code></pre>
 <p><b>Check first:</b> shuffle read per task. If it is 3 GB per task with 200 partitions, no task can hold its data. Check cores per executor and memory per task. One much bigger task points to skew.</p>
 <p><b>Fix:</b> raise <code>spark.sql.shuffle.partitions</code> or lower the AQE advisory size. Select only the needed columns before the shuffle so rows are narrower. Use fewer cores per executor or more executor memory. Compare spill and total time after each change.</p>
 <p><b>Prevent:</b> set partitions relative to data volume, not a fixed 200, and let AQE coalesce.</p>
+<p><b>What spill means.</b> Aggregations and sorts keep data in memory buffers. When the buffer exceeds the task's memory share, Spark sorts and writes the data to local disk as a chunk and starts again, then merges all chunks at the end. It works, but the cost is disk I/O plus extra serialization, often making a stage several times slower. "Spill (Memory)" is the size of the data in memory format, "Spill (Disk)" is the on-disk (compressed) size.</p>
+<p><b>Example.</b> Shuffle read is 3 GB per task (200 partitions of 600 GB). A task has about 1 GB of execution memory. It spills about 2 GB, perhaps several times. Moving to 3,000 partitions gives 200 MB per task, which fits, and spill drops to zero. Stage time falls from 40 to 8 minutes.</p>
+<p><b>Order of fixes.</b> (1) More, smaller partitions (or lower the AQE advisory size). (2) Check skew, because a single huge task will spill however many partitions you set. (3) Select only the needed columns and drop wide unused columns before the shuffle. (4) Fewer cores per executor so each task gets more memory. (5) More executor memory or a higher <code>memory.fraction</code> only as a last step. (6) Faster local disks (SSD) soften the cost if spill is unavoidable.</p>
+<p><b>Not every spill is a problem.</b> A small spill on a stage that is not the bottleneck can be ignored. Judge by time and by comparing runs.</p>
 <p class="rem"><b>Remember:</b> spill = task bigger than its memory. Smaller tasks beat bigger heaps.</p>
 </div>
 </details>
@@ -911,6 +1584,19 @@ df.filter($"customer_id".isNull).count()</code></pre>
 <p><b>Check first:</b> the breakdown in <code>durationMs</code> (read, state, write, commit). Is one stage slow, and is it skew? How many Kafka partitions and cores do I have? Did input grow, or did batch time grow for the same input (slow sink, growing state)?</p>
 <p><b>Fix:</b> if reading is the limit, add topic partitions and cores. If the sink is slow (a database), batch the writes or use a faster sink. If state grows, add or shorten the watermark, or switch to RocksDB. Use <code>maxOffsetsPerTrigger</code> so a catch-up does not create one gigantic batch. Lower the shuffle partitions for small batches (200 is often too many).</p>
 <p><b>Prevent:</b> alert on lag trend and batch duration over trigger interval, keep headroom (run at 50 to 60% capacity), and replay a busy day in testing.</p>
+<p><b>Principle.</b> The system is stable only if the processing rate is at least the input rate. Lag growth means the batch time exceeds the arrival interval, so each batch is bigger than the last (a feedback loop), and it needs to be broken at the slowest phase.</p>
+<p><b>Read the progress report.</b> In <code>query.lastProgress</code>: <code>inputRowsPerSecond</code> versus <code>processedRowsPerSecond</code> (the second must be higher), <code>batchId</code> spacing, and the <code>durationMs</code> map: <code>addBatch</code> (the actual work), <code>getBatch</code>, <code>queryPlanning</code>, <code>walCommit</code>, <code>commitOffsets</code>. Large <code>addBatch</code> means processing or sink is slow. Large <code>walCommit</code> means the checkpoint storage (for example S3) is slow.</p>
+<p><b>Cases.</b></p>
+<table>
+<tr><th>Observation</th><th>Likely cause</th><th>Action</th></tr>
+<tr><td>Source stage tasks few, cores idle</td><td>Few Kafka partitions</td><td>More partitions on the topic, or repartition after read</td></tr>
+<tr><td>One task slow in the shuffle stage</td><td>Skew on a key</td><td>Salting, filter hot keys</td></tr>
+<tr><td>Sink phase long</td><td>Slow database or small-file writes</td><td>Batch inserts, larger triggers, fewer files, faster sink</td></tr>
+<tr><td>Batch time grows over days at constant input</td><td>State growth</td><td>Watermark, RocksDB, state TTL</td></tr>
+<tr><td>Small input but 200 tasks per batch</td><td>Shuffle partitions too many for small batches</td><td>Lower <code>shuffle.partitions</code> (stateful queries need a new checkpoint to change it)</td></tr>
+<tr><td>Spike after downtime</td><td>One giant catch-up batch</td><td><code>maxOffsetsPerTrigger</code></td></tr>
+</table>
+<p>Also check GC, executor loss and Kafka broker throughput. Plan capacity for peak, not average.</p>
 <p class="rem"><b>Remember:</b> input rate above process rate means lag. Find which phase of the batch is slow.</p>
 </div>
 </details>
@@ -923,6 +1609,16 @@ df.filter($"customer_id".isNull).count()</code></pre>
 <p><b>Check first:</b> the sink type. A retried task that inserts into a database inserts again. A speculative copy runs the side effect twice. Rerunning the whole job with <code>append</code> for the same date doubles it. A <code>foreachBatch</code> without the batch id repeats a batch after restart. The source itself (Kafka at-least-once producers) may deliver repeats.</p>
 <p><b>Fix:</b> overwrite exact partitions, or MERGE on a business key into a table format, or upsert on a primary key in the database. In <code>foreachBatch</code> use the batch id. Turn off speculation for non-idempotent sinks. Deduplicate on a key (<code>row_number</code> window or <code>dropDuplicates</code>). On S3, make sure a proper committer or table format is used.</p>
 <p><b>Prevent:</b> the rerun test (run twice, compare) and a unique-key check at the end of the pipeline.</p>
+<p><b>Which writes are safe on their own.</b> Spark's file output committer writes task output to temporary locations and promotes only the committed attempt, so a failed, retried or speculative task does not duplicate files. (On object stores, use a committer designed for it, or a table format, since plain rename-based commit is not atomic there.) So when duplicates show up, look beyond plain file writes.</p>
+<p><b>Sources of duplicates, with an example each.</b></p>
+<ul>
+<li><b>Task inserts into a database:</b> <code>foreachPartition</code> sends <code>INSERT</code>s. The task fails after 800 of 1,000 rows and retries, and now 800 rows exist twice. Fix with an upsert on a key or write in one transaction per task attempt.</li>
+<li><b>Speculation:</b> two copies of a task both call an API. Disable speculation for that job or make the call idempotent.</li>
+<li><b>Job rerun with append:</b> the nightly job is rerun after a partial failure and appends the same day again. Fix with overwrite of that date or MERGE.</li>
+<li><b>Streaming restart:</b> <code>foreachBatch</code> re-runs the last batch. Use the batch id or a MERGE.</li>
+<li><b>Upstream duplicates:</b> the source is at-least-once, so the same event arrives twice. Deduplicate on an event id.</li>
+</ul>
+<p><b>Backstop.</b> Even with all of the above, add a final uniqueness assertion on the business key (count versus count distinct) and fail the run before publishing if it is violated. Catching duplicates early is cheaper than correcting downstream reports.</p>
 <p class="rem"><b>Remember:</b> retries are normal. Make every write idempotent: overwrite the partition or merge on a key.</p>
 </div>
 </details>
@@ -935,6 +1631,18 @@ df.filter($"customer_id".isNull).count()</code></pre>
 <p><b>Check first:</b> <code>explain("formatted")</code> on the scan. Is <code>PartitionFilters</code> empty? Common causes: <code>date_format(event_date, ...)</code> or a cast around the column, a filter only on <code>event_ts</code> (a different column), a value that comes from a subquery or join (needs dynamic partition pruning, Spark 3+, which works only for some join shapes), or folder names that are not <code>key=value</code>.</p>
 <p><b>Fix:</b> filter directly on <code>event_date = '2026-11-16'</code>, add the partition filter beside the timestamp filter, or read the specific path. Select only needed columns and check <code>PushedFilters</code> for Parquet pushdown.</p>
 <p><b>Prevent:</b> document the partition column and its type, and review plans of new queries on large tables.</p>
+<p><b>Why pruning is picky.</b> Spark prunes partitions by evaluating the filter against partition column values (known from folder names) at planning time. It can do this only when the predicate is a simple comparison on the partition column itself with a constant. When the column is wrapped in a function or cast, Spark would have to evaluate the function for each folder name, and in many cases it does not.</p>
+<p><b>Examples.</b></p>
+<table>
+<tr><th>Predicate</th><th>Prunes?</th></tr>
+<tr><td><code>event_date = '2026-11-16'</code></td><td>Yes</td></tr>
+<tr><td><code>event_date BETWEEN '2026-11-10' AND '2026-11-16'</code></td><td>Yes</td></tr>
+<tr><td><code>date_format(event_date, 'yyyy-MM') = '2026-11'</code></td><td>Typically no; rewrite as a range</td></tr>
+<tr><td><code>event_ts &gt;= '2026-11-16'</code> (a regular column, partition is event_date)</td><td>No; add the matching <code>event_date</code> condition</td></tr>
+<tr><td><code>event_date IN (SELECT d FROM small)</code></td><td>Not at planning time; dynamic partition pruning may handle it for join shapes (broadcast side, 3.0+)</td></tr>
+</table>
+<p><b>How to diagnose.</b> <code>explain("formatted")</code> on the scan: <code>PartitionFilters: [isnotnull(event_date), (event_date = 2026-11-16)]</code> means pruning works; <code>[]</code> means it does not. The UI's scan node shows "number of partitions read" versus total.</p>
+<p><b>Related causes.</b> Type mismatch (comparing a string partition to an int); a view that hides the partition column behind an expression; reading the table by path with the base path option mixed up so the partition column is not recognised; table statistics or metastore partition listing slow on very many partitions.</p>
 <p class="rem"><b>Remember:</b> prune on the raw partition column. Wrap it in a function and Spark reads everything.</p>
 </div>
 </details>
@@ -947,6 +1655,15 @@ df.filter($"customer_id".isNull).count()</code></pre>
 <p><b>Check first:</b> key uniqueness on each side with <code>groupBy(key).count().filter(count &gt; 1)</code>. Look for default values ("", "N/A", 0) that many rows share, and for a missing condition that became a cartesian product (<code>CartesianProduct</code> or <code>BroadcastNestedLoopJoin</code> in the plan).</p>
 <p><b>Fix:</b> keep the latest row per key with <code>row_number</code>. Filter junk keys. Add the missing condition columns (a date or tenant id). If many-to-many is intended, pre-aggregate before it. Add pipeline assertions: dimension key is unique, and a left join does not return more rows than the left side.</p>
 <p><b>Prevent:</b> uniqueness checks at dimension ingest and a post-join count guard.</p>
+<p><b>Arithmetic of an explosion.</b> A join returns, per key, left_count x right_count rows. If order 42 appears 3 times in orders (reprocessed feeds) and 5 times in shipments, you get 15 rows for it. At scale, one default key such as "unknown" held by 200,000 rows on each side makes 40 billion rows alone. So a few keys dominate the output.</p>
+<p><b>Diagnosis flow.</b></p>
+<ol>
+<li>Compare row counts: inputs versus output. Anything above the expected is multiplication.</li>
+<li>For each side compute <code>count(*)</code> against <code>count(distinct key)</code>; find keys with count above 1: <code>groupBy(key).count().filter("count &gt; 1")</code>.</li>
+<li>Sort the duplicates by count to find the junk keys (empty strings, 0, "N/A", -1).</li>
+<li>Check the plan for a missing condition (CartesianProduct, BroadcastNestedLoopJoin). A forgotten date or tenant column in a multi-column key is a frequent reason.</li>
+</ol>
+<p><b>Fixes.</b> Deduplicate the side that is supposed to be unique, choosing a rule (latest by timestamp via <code>row_number</code>). Remove placeholder keys before joining. Join on the complete key. If many-to-many is genuinely needed, aggregate one side to the grain you need before joining, so you multiply less. As protection, assert after the join that the row count did not increase for a left join with a unique right side, and fail the job if it does, instead of filling the disk.</p>
 <p class="rem"><b>Remember:</b> output far bigger than inputs means duplicate keys. Check uniqueness before every join.</p>
 </div>
 </details>
@@ -959,6 +1676,17 @@ df.filter($"customer_id".isNull).count()</code></pre>
 <p><b>Check first:</b> the source of 20. Twenty gzip CSV files give exactly one task per file because gzip is not splittable. An earlier <code>coalesce(20)</code> or <code>repartition(20)</code> may still be in the plan. <code>spark.sql.shuffle.partitions</code> may be set low. A JDBC read without partition options gives one task. Also check the Executors tab that I actually got the executors I asked for.</p>
 <p><b>Fix:</b> for non-splittable files, repartition right after the read so later steps are parallel (the read itself stays at 20 tasks), and convert to Parquet long term. Remove the early coalesce or move it just before the write. Raise shuffle partitions to 2 to 4 times the cores, or leave it to AQE with a high start. For JDBC, set <code>partitionColumn</code>, <code>lowerBound</code>, <code>upperBound</code> and <code>numPartitions</code> (an indexed, evenly spread column, and a number the database can handle).</p>
 <p><b>Prevent:</b> look at task counts on the first run of any new job.</p>
+<p><b>Principle.</b> Spark can run at most as many tasks at the same moment as there are partitions in the stage. 20 partitions can use at most 20 cores, however many exist. So find out why the partition count is 20.</p>
+<p><b>Investigate in this order.</b></p>
+<ol>
+<li><b>Which stage?</b> If it is the first (read) stage, the input is the cause. If it is a later one, the shuffle partition setting or an earlier repartition is.</li>
+<li><b>Input is 20 big non-splittable files</b> (gzip CSV or JSON, some binary formats): one task per file, no way to split. Check file names and compression. Remedy: after the read, <code>repartition(2000)</code> to parallelise everything downstream, and in the longer term write splittable formats (Parquet, or bzip2/LZO with an index) from the source.</li>
+<li><b>A hard-coded <code>coalesce(20)</code> or <code>repartition(20)</code></b> left in the code from an earlier time. Removing it or moving it to the end (just before the write) restores parallelism.</li>
+<li><b>Low <code>spark.sql.shuffle.partitions</code></b> set in the job or cluster defaults, with AQE merging more aggressively than needed (check the advisory partition size and min partition settings).</li>
+<li><b>JDBC without partition options</b> (one task) or a source with one partition (small Kafka topic).</li>
+</ol>
+<p><b>Verify resources too.</b> In the Executors tab check that you actually received the executors you requested (dynamic allocation and quota may have given fewer), and that tasks are not waiting on scheduling or locality delay.</p>
+<p><b>Target.</b> Two to four tasks per core, each with about 100 to 200 MB, as in the partitions question.</p>
 <p class="rem"><b>Remember:</b> parallelism = partitions. Few tasks and idle cores means find who capped the partition count.</p>
 </div>
 </details>

@@ -127,6 +127,17 @@
 <summary>What is the difference between row-oriented and column-oriented storage, and when do you pick each? <span class="lvl b">Basic</span></summary>
 <div class="ans">
 <p class="ia">A row format stores all fields of one record together; a columnar format stores all values of one column together. I use row formats (Avro, JSON, a normal database) for transactions and messages, where I read or write whole records. I use columnar formats (Parquet, ORC) for analytics, where a query touches a few columns of millions of rows.</p>
+<p><b>Start from the problem.</b> A disk (or an S3 object) is read in bytes, one after another. Whatever sits next to each other on disk is cheap to read together. So the real question is: what do I want to read together, a whole record or a whole column?</p>
+<p><b>Take a table of 100 million orders with 50 columns.</b> Two very different jobs touch it:</p>
+<ul>
+<li><b>Job A (transactional):</b> "show me order 12345", "insert this new order", "change its status". One row, all 50 fields, a few times per millisecond. You want all 50 fields of one row packed side by side, so one read returns everything.</li>
+<li><b>Job B (analytical):</b> "total <code>amount</code> per <code>city</code> for last month". It needs 2 of the 50 columns but for 100 million rows. If the file is stored row by row, you drag the other 48 columns off disk and throw them away. That is about 25 times more bytes than needed.</li>
+</ul>
+<p>A row layout is ideal for job A, a column layout is ideal for job B. That is the whole topic.</p>
+<p><b>Why the column layout also compresses better.</b> Look at one column in isolation: <code>city</code> is "Pune, Pune, Pune, Delhi, Pune ...". Four distinct values in 100 million rows. A dictionary (Pune=0, Delhi=1) turns each city into a tiny number, and run-length encoding turns "0,0,0" into "0 x 3". An <code>order_id</code> that grows 1, 2, 3 can be stored as deltas (+1, +1, +1). Mixed row data (a string, then a number, then a date) cannot be squeezed like this. Typical result: columnar files are several times smaller than the same data as JSON or CSV.</p>
+<p><b>Skipping with statistics.</b> A columnar file keeps min and max per column block. A query <code>WHERE amount &gt; 1000</code> reads the footer, sees that a block has max 900, and never opens it.</p>
+<p><b>When to choose which (decision rule).</b> If the access pattern is "one record at a time, write often" use rows (a normal database, Avro on Kafka). If it is "many records, few columns, mostly read" use columns (Parquet or ORC in a lake, a warehouse). Many systems use both: events arrive as Avro rows, then a pipeline rewrites them in big batches as Parquet.</p>
+<p><b>Pitfalls the interviewer may probe:</b> "Why not just use Parquet everywhere?" Because you cannot append one row cheaply or read one record fast; each write must build whole column blocks, so you buffer and write in batches. "SELECT * on Parquet?" It loses the advantage, since it reads every column.</p>
 <p>Columnar wins on scans for three reasons. First, column pruning: "sum of amount per city" reads two columns and skips the other fifty. Second, compression: one column holds one type and similar values (repeated cities, steadily growing ids), so dictionary, run-length and delta encodings shrink it a lot. Third, statistics: each column chunk stores min and max, so a filter like <code>amount &gt; 1000</code> can skip whole blocks without reading them. The cost is point work: reading one full row touches every column block, and a single-row insert is expensive, so columnar files are written in big batches.</p>
 <figure class="diagram"><svg viewBox="0 0 860 250" role="img" aria-label="Same four rows stored row by row on the left and column by column on the right. A query for the amount column reads one block on the right but every row on the left.">
 <text class="t-b" x="20" y="22">Row layout (Avro, OLTP)</text>
@@ -150,6 +161,18 @@
 <summary>Compare CSV, JSON, Avro, Protobuf and Parquet. How do you choose? <span class="lvl b">Basic</span></summary>
 <div class="ans">
 <p class="ia">I pick by role. JSON for public APIs and logs, Avro (or Protobuf) for messages on Kafka and ingestion files, and Parquet for analytics tables. CSV only for small human exports. A normal pipeline reads Avro or JSON events from Kafka and writes Parquet tables for analysts.</p>
+<p><b>Why there are so many formats.</b> Each one answers a different question: who reads this, how often, and how much does the structure change? There is no best format, only a good match to the job.</p>
+<p><b>Walk through each one with the same record</b> <code>{"id":7,"name":"Asha","amount":120.5}</code>:</p>
+<ul>
+<li><b>CSV</b> <code>7,Asha,120.5</code>. Smallest in effort, but nothing says whether 7 is a number or text, a comma inside a name breaks the row, and there is no nesting. Fine for a small export to Excel; a bad idea as a pipeline contract.</li>
+<li><b>JSON</b> repeats <code>"id"</code>, <code>"name"</code>, <code>"amount"</code> in every record, so a million records repeat the field names a million times. Parsing text is slow, and a field can be a number in one record and a string in the next. Its strength is that humans and every language can read it, so it suits APIs and logs.</li>
+<li><b>Avro</b> stores only the values (7, "Asha", 120.5) in a compact binary form; the field names and types live once in a schema. Small, fast, and the schema rules make safe evolution possible.</li>
+<li><b>Protobuf</b> is similar but identifies each field by a number in a <code>.proto</code> file (<code>id = 1; name = 2</code>). It is the natural pairing with gRPC and has excellent code generation.</li>
+<li><b>Parquet</b> regroups many records into columns, so it is not something you send message by message; it is something you write in batches and scan later.</li>
+</ul>
+<p><b>The practical pipeline</b> most teams end up with: app emits JSON or Avro to Kafka, a job validates it against a schema, and a batch or streaming job writes Parquet files into the lake (usually managed by Iceberg). Analysts then query the Parquet.</p>
+<p><b>Decision rule.</b> Ask three questions: (1) Is a human or an outside client reading it? JSON. (2) Is it a message or an event that must evolve safely? Avro or Protobuf. (3) Is it a big table scanned by queries? Parquet. If a team already runs gRPC everywhere, Protobuf on Kafka is also reasonable, but data tools (Spark, Hive, the lake) historically have the best support for Avro and Parquet.</p>
+<p><b>Pitfall:</b> storing raw JSON in the lake "because it is flexible". It works until volume grows; queries get slow and expensive, and nobody remembers what each field means. Convert to a typed, columnar format early.</p>
 <p>CSV has no types and no nesting, and quoting bugs are common. JSON is self-describing text with nesting, but it repeats field names in every record, is slow to parse and loosely typed. Avro is a compact binary row format where a schema is required, which gives safe evolution. Protobuf is also binary rows, but fields are identified by number, which makes it the usual choice for gRPC; for Kafka I pick Avro if the data ends up in a lake, and Protobuf if services already use gRPC. Parquet is columnar, so it gives the best scan speed and size for analytics but is poor for row writes and point updates.</p>
 <table>
 <tr><th></th><th>JSON</th><th>Avro</th><th>Protobuf</th><th>Parquet</th></tr>
@@ -167,6 +190,23 @@
 <summary>How is a Parquet file organised inside? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">A Parquet file is split into row groups (horizontal slices of rows). Inside a row group each column is stored as a column chunk, and each chunk is cut into pages. At the end of the file is a footer with the schema and, for every column chunk, offsets and min, max and null-count statistics. A reader reads the footer first, decides which row groups and columns it needs, and reads only those byte ranges.</p>
+<p><b>Why such a layered layout?</b> Parquet must satisfy two opposing wishes: keep each column together (for pruning and compression) and still allow big files to be processed in parallel. The answer is to cut the table into horizontal slices first (row groups), and inside each slice store column by column.</p>
+<p><b>The four levels, from big to small:</b></p>
+<ol>
+<li><b>File.</b> One object on S3 or HDFS, wrapped in the 4-byte marker <code>PAR1</code> at both ends.</li>
+<li><b>Row group.</b> A horizontal slice, for example 1 million rows (sized by bytes, commonly about 128 MB). All columns for those rows live inside it. A query engine can hand one row group to one worker, so this is the unit of parallel reading.</li>
+<li><b>Column chunk.</b> Inside a row group, all values of one column, stored contiguously. This is what lets you read just the <code>amount</code> column.</li>
+<li><b>Page.</b> A column chunk is cut into pages (about 1 MB). Each page is encoded (dictionary, run-length, delta) and then compressed (Snappy, Zstd, and so on) independently, so a reader can decode just a page. A dictionary page, if used, comes first in the chunk.</li>
+</ol>
+<p><b>How a reader works step by step.</b> Suppose you run <code>SELECT sum(amount) FROM t WHERE amount &gt; 1000</code> on a 1 GB file on S3:</p>
+<ol>
+<li>Read the last few bytes to get the footer length, then read the footer (a few KB to a few MB) with a range request. Do not download the file.</li>
+<li>From the footer, find each row group's <code>amount</code> chunk and its min and max. Row group 1 has max 900, so skip it entirely. Row group 2 has min 5000 and may match, so keep it.</li>
+<li>Read only the byte range of the <code>amount</code> chunk of row group 2, decompress, decode, filter, sum.</li>
+</ol>
+<p>Result: a few MB read out of 1 GB. The same layout is also why a Parquet file cannot be written in a pure streaming fashion: the writer buffers a row group in memory, writes it, and only at the end can it write the footer (it needs all offsets).</p>
+<p><b>Nested data.</b> Parquet can store structs, lists and maps in a columnar way using repetition and definition levels (small integers recording nesting and nulls). You do not need the details, but know that nested fields are stored as separate leaf columns, so reading <code>address.city</code> does not read the rest of <code>address</code>.</p>
+<p><b>Tuning knobs and pitfalls.</b> A row group that is too small means many tiny reads and weak statistics; too large means high writer memory and less parallelism. Very wide tables with huge string columns make the footer large. Many tiny Parquet files are worse than the internals suggest, because every file pays for a footer read (the small files problem later on this page).</p>
 <p>Row groups are typically around 128 MB by default in common writers, and a row group is the unit of parallelism: one task can take one row group. Pages are about 1 MB by default and are encoded and compressed on their own. The footer is at the end because the writer streams data and only knows sizes when it finishes; the file starts and ends with the magic bytes <code>PAR1</code>. This layout works well on S3, because the reader can fetch just the footer and just the needed column chunks with range requests.</p>
 <figure class="diagram"><svg viewBox="0 0 860 330" role="img" aria-label="Parquet file layout: magic bytes, row group 1 and row group 2 each with column chunks made of pages, then footer with schema and statistics, then magic bytes.">
 <rect class="ext" x="20" y="20" width="820" height="34" rx="6"/><text class="t-c t-b" x="430" y="42">PAR1 (magic bytes)</text>
@@ -189,6 +229,27 @@
 <summary>What are predicate and projection pushdown, and why does sorting the data matter? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">Projection pushdown means the engine tells the reader which columns it needs, so only those column chunks are read. Predicate pushdown means the filter goes into the reader, which uses min and max statistics to skip files, row groups and pages that cannot match. It only works well when the data is clustered: if every file holds a bit of every customer, min and max span everything and nothing can be skipped.</p>
+<p><b>Two ideas, two different savings.</b></p>
+<ul>
+<li><b>Projection pushdown</b> means "read only the columns I selected". It saves bytes by skipping columns. A table with 50 columns where you select 3 reads about 3/50 of the data.</li>
+<li><b>Predicate pushdown</b> means "apply the WHERE filter as close to the storage as possible, ideally before reading the data". It saves bytes by skipping whole rows groups, pages or files.</li>
+</ul>
+<p>"Pushdown" literally means the query planner pushes the instruction down into the storage reader instead of loading everything into the engine and filtering afterwards.</p>
+<p><b>A worked example.</b> A table of 1 billion events stored in 1000 files, filter <code>WHERE event_date = '2026-11-17'</code>.</p>
+<ul>
+<li><b>Unsorted:</b> each file holds events from every day, so every file's min is Nov 1 and max is Nov 30. The statistics say "may contain Nov 17" for every file, so nothing is skipped and 1000 files are read.</li>
+<li><b>Clustered by date:</b> each file covers one day (or a narrow range). The file stats say "min = max = Nov 17" for 30 files and other dates for the rest. 970 files are skipped without being opened.</li>
+</ul>
+<p>The same data and the same query differ by a factor of 30 purely because of how the data was laid out. That is why sorting matters: min/max statistics only help when values are <b>clustered</b>.</p>
+<p><b>The levels of skipping, coarse to fine:</b></p>
+<ol>
+<li>Partition pruning and table metadata (Iceberg manifests carry per-file min, max) drop whole files.</li>
+<li>Parquet footer statistics drop row groups.</li>
+<li>The Parquet page index (newer) drops pages inside a row group.</li>
+<li>Bloom filters (optional, newer) answer "is this exact value possibly here?" for equality filters on columns like <code>user_id</code>, where min and max are useless because ids are random. A bloom filter can say "definitely not", which skips the chunk; a "maybe" still reads it.</li>
+</ol>
+<p><b>How to get clustering.</b> Sort the data on the common filter column when writing or during compaction (Iceberg supports a table sort order and a sort-based compaction strategy; a multi-column Z-order style clustering helps when you filter on several columns). Choose the column by looking at what queries actually filter on.</p>
+<p><b>Pitfalls.</b> (1) Wrapping the column in a function, <code>WHERE date(ts) = ...</code> or <code>lower(name) = ...</code>, often stops the engine from comparing against stats; filter on the raw column (<code>ts &gt;= X AND ts &lt; Y</code>). (2) Comparing with a mismatched type (string versus int) can cast the column and disable pushdown. (3) Random ids as a sort key give you nothing. (4) Check the query plan: engines show "files scanned" or "bytes read", which is the real proof.</p>
 <p>Skipping happens at several levels: table metadata skips whole files (Iceberg manifests hold per-file stats), the footer skips row groups, and the optional page index skips pages. For equality filters on high-cardinality columns such as ids, newer Parquet versions also support bloom filters ("this value is definitely not here"). So I sort or cluster data on the column that queries filter on, usually during compaction: then each file covers a narrow range and a lookup opens one or two files. Filters that wrap the column in a function (<code>lower(name) = 'x'</code>) usually cannot use the stats, so filter on the raw column.</p>
 <p class="rem"><b>Remember:</b> stats only skip what is clustered. Sort on the filter column and keep filters on the raw column.</p>
 </div>
@@ -198,8 +259,34 @@
 <summary>Can you update a row inside a Parquet file? How do table formats get around that? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">No, not in place. Parquet files are written once, compressed in blocks, and the footer holds offsets, so changing a value would shift bytes. Object stores such as S3 also cannot modify part of an object. So every update is a rewrite: table formats either rewrite the affected files (copy-on-write) or write small delete files and merge them at read time (merge-on-read), and then switch the table metadata to the new file list atomically.</p>
+<p><b>Why a Parquet file cannot be edited.</b> Three reasons stack up. (1) Column values are encoded and compressed in pages, so changing one value changes the page size and shifts everything after it. (2) The footer stores absolute byte offsets of every chunk, so any shift breaks the map. (3) On S3, an object is replaced as a whole; there is no "overwrite bytes 100 to 200". So even if Parquet allowed it, the store would not.</p>
+<p><b>What you do instead, step by step</b> (example: change order 42 from PENDING to SHIPPED, where the order lives in <code>file-A</code> with 1 million rows):</p>
+<ol>
+<li><b>Copy-on-write:</b> read <code>file-A</code>, produce <code>file-A2</code> identical except order 42, write it as a brand new object. Record in the table metadata "table now = A2 instead of A". Old file A is untouched, and is deleted later by cleanup.</li>
+<li><b>Merge-on-read:</b> leave <code>file-A</code> alone. Write a tiny delete file saying "order 42 in file A is dead" and a new small data file with the new version of order 42. Readers combine them while reading.</li>
+</ol>
+<p>In both cases the visible change is a single atomic step, switching which files form the table. That is what the table format (Iceberg, Delta, Hudi) provides; plain Parquet in a folder has no such step.</p>
+<p><b>Consequence for design.</b> Updates are expensive per row (you rewrite a file to change one row), so batch them. A job that updates one row at a time in a lake will crawl and create thousands of tiny files. The next questions on copy-on-write versus merge-on-read explain the trade-off.</p>
+<p><b>What an interviewer probes next:</b> "so how does a lakehouse do UPDATE and DELETE at all?" Answer: a SQL MERGE or DELETE becomes new files plus a metadata swap, and old versions stay readable until snapshots expire.</p>
 <p>Old files are not touched, so readers that started earlier still see a consistent view. That immutability is the root of snapshots, time travel and compaction later on this page.</p>
 <p class="rem"><b>Remember:</b> immutable files mean "update" is write new files, then swap the pointer.</p>
+</div>
+</details>
+
+<details class="iq" id="q-parquet-encoding">
+<summary>How does Parquet make data small? What are dictionary, run-length and delta encoding, and how do they relate to compression? <span class="lvl i">Intermediate</span></summary>
+<div class="ans">
+<p class="ia">Parquet first encodes each column's values using a scheme that fits the data (dictionary, run-length, delta, bit-packing), then compresses the encoded page with a general codec such as Snappy or Zstd. Encoding exploits the structure of one column; the codec squeezes whatever repetition is left. Because each column holds one type of similar values, this works far better than on mixed rows.</p>
+<p><b>Encodings with tiny examples.</b></p>
+<ul>
+<li><b>Dictionary:</b> the column <code>city</code> has 100 million values but 300 distinct ones. Store the 300 strings once (the dictionary page) and then store each value as a small integer index (9 bits is enough). The index list is tiny and fast to compare. Writers fall back to plain encoding if the dictionary grows too large (high-cardinality column such as a UUID).</li>
+<li><b>Run-length (RLE) and bit-packing:</b> a sorted or repetitive column like <code>[Pune x 5000, Delhi x 3000]</code> becomes "5000 times 0, 3000 times 1". Sorting the data before writing makes this much more effective, a second reason to sort.</li>
+<li><b>Delta:</b> for increasing numbers or timestamps such as <code>1000, 1001, 1003, 1004</code> store the first value and the small differences <code>+1, +2, +1</code>.</li>
+</ul>
+<p><b>Compression codecs, the trade-off.</b> Snappy is very fast with a moderate ratio (the long-time default in many engines); Zstd gives a better ratio at a modest CPU cost and is often the best default today; gzip compresses well but is slower; none is only for special cases. A choice of codec changes storage cost and CPU time, not what the data means, and it can be set per file or per column.</p>
+<p><b>Why it matters to you.</b> A table that is 10 times smaller means 10 times fewer bytes over the network, which is where the query time goes. Sorting by a low-cardinality column or by a filter column improves encoding and skipping together. And the effect of the encoding is why Parquet is poor at tiny files: each small file repeats its own dictionaries and footers.</p>
+<p><b>Pitfalls.</b> Very high-cardinality string columns (hashes, UUIDs) compress poorly whatever you do; consider storing them as fixed binary. Over-compressing hot data can make queries CPU bound. Unsure about defaults: they vary by engine and version, so check your writer's settings.</p>
+<p class="rem"><b>Remember:</b> encode per column (dictionary, RLE, delta), then compress the page. Sorted, low-cardinality columns shrink the most.</p>
 </div>
 </details>
 
@@ -209,6 +296,16 @@
 <summary>What is Apache Avro, and what does a schema look like? <span class="lvl b">Basic</span></summary>
 <div class="ans">
 <p class="ia">Avro is a compact, row-oriented binary format where every piece of data is described by a schema written in JSON. The data itself has no field names or type tags, only the values in schema order, so it is small. It is the usual choice for Kafka messages and for event files that must change over time.</p>
+<p><b>The problem Avro solves.</b> JSON is flexible but wasteful and loose; hand-written binary formats are compact but break when a field is added. Avro aims for both: compact bytes and a defined, evolvable structure. Its trick is to separate the <b>schema</b> (the description of the structure) from the <b>data</b> (just the values).</p>
+<p><b>How the bytes look.</b> Take the record <code>{orderId: 7, customer: "Asha", coupon: null}</code> with the schema below. Avro writes the values in schema order with no names and no type markers: the long 7 (variable-length "zigzag" encoding, one byte), then the string as a length (4) followed by the 4 UTF-8 bytes, then the union index that says "branch 0 = null". About 8 bytes in total, against roughly 50 for the JSON text. A million such records save a lot of space and parsing time.</p>
+<p><b>The price.</b> The bytes are not self-describing. If you read them with a different or lost schema you get garbage or an error. So the schema must always travel or be findable with the data. Two common ways:</p>
+<ul>
+<li><b>Avro data file (container file):</b> the schema is stored once in the file header, followed by blocks of records, with sync markers so the file can be split for parallel reads. Used for files, Hadoop and the Iceberg manifest files.</li>
+<li><b>Single messages on Kafka:</b> the schema is stored in a registry, and each message carries only a small id (next questions).</li>
+</ul>
+<p><b>Types, quick tour.</b> Primitives: null, boolean, int, long, float, double, bytes, string. Complex: record (a named set of fields), enum, array, map (string keys), union (one of several types, written as a JSON array), fixed (fixed-size bytes). Logical types add meaning on top of a physical type: <code>decimal</code> over bytes, <code>date</code> over int (days since epoch), <code>timestamp-millis</code> over long, <code>uuid</code> over string.</p>
+<p><b>Optional field idiom.</b> There is no "nullable" flag; you write a union <code>["null","string"]</code> with default <code>null</code>. Adding such a field is the standard way to evolve a schema safely.</p>
+<p><b>Generic versus specific.</b> In Java you may read records as a generic map-like object (flexible, no code generation) or generate classes from the schema (type safe). Either way the Avro library does the encoding. Compared with Protobuf: Avro needs the writer schema at read time and matches fields by name, Protobuf matches by field number and can be decoded without the schema (but you lose the names).</p>
 <p>Because the bytes carry no description, you cannot decode them without the schema they were written with. A string is a length plus UTF-8 bytes; an int uses a variable-length encoding so small numbers take one byte. The schema lives either in the file header (Avro data files) or in a registry with only a small id sent per message. Types: primitives (null, boolean, int, long, float, double, bytes, string) and complex ones (record, enum, array, map, union, fixed). An optional field is a union with null. Code generation is optional: you can use a generic record or generate Java classes.</p>
 <pre><code>{
   "type": "record", "name": "Order", "namespace": "com.shop.events",
@@ -227,6 +324,17 @@
 <summary>Explain reader schema versus writer schema. How does Avro schema resolution work? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">The writer schema is the one the bytes were written with. The reader schema is the one my code wants today. Avro needs both: it decodes using the writer schema, then maps the result to the reader schema by field name. Fields the reader does not know are skipped; fields the writer did not have get the reader's default, and if there is no default the read fails.</p>
+<p><b>Why two schemas?</b> Imagine events written a year ago when an order had <code>id</code> and <code>name</code>. Today your code expects <code>id</code>, <code>name</code> and <code>country</code>. The old bytes were written without a country; your code wants one. Avro's answer is: keep the schema that was used to write (writer schema), declare what you want now (reader schema), and let a resolution step translate between them. Nothing in the old data has to be rewritten.</p>
+<p><b>The resolution rules, simply:</b></p>
+<ol>
+<li>Decode the bytes strictly using the <b>writer</b> schema (it is the only description that matches the bytes).</li>
+<li>For each field in the <b>reader</b> schema: if the writer had a field with that name (or an alias), take its value (applying a type promotion if allowed). If the writer did not have it, use the reader's <code>default</code>. If there is no default, resolution fails with an error.</li>
+<li>Fields the writer had but the reader does not list are skipped (the decoder knows how many bytes to skip, because it has the writer schema).</li>
+</ol>
+<p><b>Concrete example.</b> Writer v1: <code>{id: long, name: string, nickname: string}</code>. Reader v2: <code>{id: long, name: string, country: string = "unknown"}</code>. Reading the v1 bytes: id and name are mapped, nickname is skipped, country is filled with "unknown". If v2 had declared <code>country</code> without a default, every v1 record would fail to read.</p>
+<p><b>Where each schema comes from in practice.</b> The reader schema is compiled into your application (or loaded from your config); the writer schema comes from the file header or from the registry via the id in the message. That is also why Avro schema changes must be thought of as "what will old data and old code do?".</p>
+<p><b>Renames and type changes.</b> A rename looks like "remove field a, add field b", which fails or loses data, unless the reader declares <code>"aliases": ["a"]</code> on the new name. Allowed promotions (writer to reader): int to long, float or double; long to float or double; float to double; string and bytes to each other. Narrowing (long to int) is never allowed.</p>
+<p><b>Pitfalls.</b> Reading with the same schema as the writer works with no resolution, which hides mistakes until the first evolution; test with old data. Also remember default values are only used for missing fields at read time, not stored in the old bytes.</p>
 <p>That is why adding a field with a default is the standard safe change, and why old files stay readable forever as long as you keep the writer schema with the data. A rename needs an <code>aliases</code> entry on the new name. A few type promotions are allowed (int to long, float or double; float to double; string and bytes to each other).</p>
 <figure class="diagram"><svg viewBox="0 0 860 260" role="img" aria-label="Writer schema v1 with id and name, reader schema v2 with id, name and country default unknown. Bytes written with v1 are decoded using v1 then projected to v2, filling the default.">
 <rect class="ext" x="20" y="30" width="230" height="86" rx="8"/><text class="t-c t-b" x="135" y="54">Writer schema v1</text><text class="t-c t-sm" x="135" y="76">id: long</text><text class="t-c t-sm" x="135" y="94">name: string</text>
@@ -248,6 +356,23 @@
 <summary>What are backward, forward and full compatibility? Which changes are safe? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">The words describe what the new schema can do. Backward compatible: consumers on the NEW schema can read data written with the OLD one. Forward compatible: consumers on the OLD schema can read data written with the NEW one. Full is both. In practice, if every field I add or remove has a default, the change is full compatible.</p>
+<p><b>First, why this matters.</b> In a real company, producers and consumers are deployed by different teams on different days. For some period, old and new versions of code run at the same time, and old and new messages sit in the same topic. Compatibility rules say which schema changes survive that mixing.</p>
+<p><b>The two directions, in plain words.</b></p>
+<ul>
+<li><b>Backward compatible:</b> new code can read old data. Think "backward in time": I upgrade the reader, it must still understand yesterday's messages.</li>
+<li><b>Forward compatible:</b> old code can read new data. Think "forward in time": an old reader must cope with tomorrow's messages.</li>
+<li><b>Full:</b> both at once. Safest, nobody has to care about deployment order.</li>
+</ul>
+<p>A trap: the names describe the direction of the <b>data</b>, not who deploys first. So BACKWARD usually means "upgrade the consumers first" (they can read both old and new), and FORWARD means "upgrade the producers first" (old consumers must tolerate new data).</p>
+<p><b>Why the table results look as they do.</b> Use the resolution rules from the previous question:</p>
+<ul>
+<li><b>Add a field with a default:</b> a new reader reading old data fills the default (backward ok). An old reader reading new data just skips the unknown field (forward ok). So full.</li>
+<li><b>Add a field without a default:</b> new reader on old data has nothing to fill and fails (not backward). Old readers skip it (forward ok).</li>
+<li><b>Remove a field without a default:</b> new reader no longer asks for it (backward ok). Old reader asks for a field that new data lacks and has no default (forward fails).</li>
+<li><b>Remove a field that has a default:</b> old reader falls back to its own default, so both work.</li>
+</ul>
+<p><b>The rule of thumb to say aloud:</b> "Only add or remove fields that have defaults; never rename or change a type without an alias or a promotion; add enum symbols at the end and set an enum default." With that, you stay full compatible.</p>
+<p><b>Pitfall:</b> compatibility checked only against the latest version. A chain of individually compatible steps can still break old data (see the transitive question). Also, "compatible" only means the data can be decoded; the meaning can still change (a field that used to hold dollars now holds cents), which no tool detects. That is what data contracts and review are for.</p>
 <p>Backward is what you need when you upgrade consumers first or replay old data from a topic. Forward is what you need when producers upgrade first and old consumers still run. Adding a field without a default is forward only (old readers ignore it, but a new reader cannot fill it for old data). Removing a field without a default is backward only. Renames and incompatible type changes are breaking unless you use aliases or allowed promotions. For enums, add new symbols at the end and give the enum a <code>default</code> symbol so old readers do not fail on an unknown one.</p>
 <table>
 <tr><th>Change</th><th>Backward</th><th>Forward</th><th>Full</th></tr>
@@ -266,6 +391,18 @@
 <summary>What is a Schema Registry and how does it work with Kafka and Avro? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">A schema registry is a small service that stores schemas, gives each one a numeric id, and keeps versions per subject (for Kafka, normally <code>&lt;topic&gt;-value</code>). The producer registers its schema, gets an id, and writes each message as a magic byte, a 4-byte schema id and the Avro bytes. The consumer reads the id, fetches the schema once, caches it, and decodes. The registry also rejects a new schema that breaks the subject's compatibility rule, so breakage fails the producer deploy instead of crashing consumers at night.</p>
+<p><b>The problem.</b> Avro bytes are useless without the writer schema. Sending the full schema (often 1 to 5 KB) with each Kafka message of 200 bytes would be absurd. Storing it only in the producer's code means consumers cannot decode old messages, and nobody stops a producer from changing it. A schema registry is a shared, versioned, checked place to keep schemas.</p>
+<p><b>How a message flows, step by step.</b></p>
+<ol>
+<li>At startup (or on the first send) the producer's serializer sends its schema to the registry under a <b>subject</b>, by default <code>orders-value</code> for the value of topic <code>orders</code>.</li>
+<li>The registry checks it against the subject's compatibility rule. If it breaks the rule, registration is rejected and the producer fails, before any bad data exists. If it is accepted, the registry returns a global numeric id (say 7), or the existing id if the same schema is already registered.</li>
+<li>The serializer writes each message as: byte 0 (magic), 4 bytes with id 7, then the Avro bytes.</li>
+<li>A consumer reads the message, sees id 7, asks the registry once for schema 7, caches it, and decodes. From then on no registry calls for that id.</li>
+</ol>
+<p><b>What the registry gives you:</b> small messages, a single source of truth, version history (v1, v2, v3 of the subject), a compatibility gate, and a place to find "what does this topic contain?". It is the technical half of a data contract.</p>
+<p><b>Subject naming.</b> The default (TopicNameStrategy) gives one schema lineage per topic. Other strategies (record name or topic plus record name) allow several event types in one topic, which is useful to keep ordering between related events, but makes compatibility checks per record type.</p>
+<p><b>Operating it.</b> It stores schemas in a Kafka topic (<code>_schemas</code>) and runs as a small cluster with one primary writer; reads are served from memory. Because clients cache, a short outage rarely hurts, but a cold-started consumer or a new schema cannot proceed. Secure it (who can register or change compatibility), and set the compatibility mode explicitly rather than relying on defaults.</p>
+<p><b>Pitfalls.</b> Auto-registering schemas from every producer in production lets accidents through; many teams disable auto-registration and register schemas in CI. Setting compatibility to NONE "to get unblocked" removes the safety net. Also, a consumer that is not using the registry (a script reading raw bytes) must skip the 5-byte header, a classic bug.</p>
 <p>Each message carries only 5 extra bytes instead of a whole schema, and clients cache by id, so the registry is called once per new id, not per message. If the registry is down, already-cached clients keep working; new schemas fail, so run it highly available. Confluent Schema Registry is the best known; others (Apicurio, AWS Glue) do the same job, and most also handle Protobuf and JSON Schema.</p>
 <figure class="diagram"><svg viewBox="0 0 860 280" role="img" aria-label="Producer registers schema with registry and gets id 7, writes messages with magic byte plus id plus Avro bytes to Kafka, consumer reads id and fetches schema from registry.">
 <rect class="box" x="20" y="100" width="150" height="70" rx="8"/><text class="t-c t-b" x="95" y="130">Producer</text><text class="t-c t-sm" x="95" y="150">Avro serializer</text>
@@ -287,6 +424,24 @@
 <summary>What is the difference between BACKWARD and BACKWARD_TRANSITIVE, and which would you choose? <span class="lvl s">Senior</span></summary>
 <div class="ans">
 <p class="ia">Plain BACKWARD checks a new schema only against the latest registered version. BACKWARD_TRANSITIVE checks it against every earlier version. I use the transitive mode when old data stays around or gets replayed (long retention, event sourcing, loading a lake from the start of a topic), because then a consumer must be able to read all versions. BACKWARD is the Confluent default.</p>
+<p><b>What the setting controls.</b> Each time a producer registers a new version, the registry runs a compatibility check. The mode decides (a) the direction (backward, forward, full) and (b) against which earlier versions the new schema is tested: only the latest (plain) or all of them (transitive).</p>
+<p><b>Why plain BACKWARD can still break you.</b> Walk through three versions of an <code>Order</code> schema:</p>
+<ul>
+<li><b>v1:</b> id, name.</li>
+<li><b>v2:</b> adds <code>country</code> with default "unknown". Checked against v1: new reads old, ok.</li>
+<li><b>v3:</b> changes <code>country</code> to be required, no default. Checked only against v2: a v3 reader can read v2 data (v2 always wrote a country), so plain BACKWARD accepts it.</li>
+</ul>
+<p>But v1 messages have no country. A consumer on v3 that replays the topic from the beginning, or a job that loads old files, fails on the first v1 record. BACKWARD_TRANSITIVE would have compared v3 against v1 as well, seen that country has no default, and rejected the change.</p>
+<p><b>Decision rule.</b></p>
+<table>
+<tr><th>Situation</th><th>Choose</th></tr>
+<tr><td>Short retention (days), consumers always near the head, consumers upgraded first</td><td>BACKWARD</td></tr>
+<tr><td>Long retention, replay, event sourcing, loading old data into a lake</td><td>BACKWARD_TRANSITIVE</td></tr>
+<tr><td>Producers must upgrade first (many unknown consumers on old versions)</td><td>FORWARD(_TRANSITIVE)</td></tr>
+<tr><td>Many teams, no control over deployment order</td><td>FULL_TRANSITIVE</td></tr>
+</table>
+<p><b>Breaking changes anyway.</b> Sometimes you really must change meaning or type. Create a new topic or subject (<code>orders-v2</code>), dual-write for a period, migrate consumers one by one, then retire the old one. Do not just set compatibility to NONE.</p>
+<p><b>Pitfalls.</b> The mode is per subject (with a global default), so check what is actually set. Plain mode defaults are easy to forget. Transitive checks get stricter as versions pile up, so schemas should evolve additively and rarely.</p>
 <p>Example: v1 has no <code>country</code>, v2 adds it with a default, v3 drops that default. v3 is compatible with v2, but it cannot read v1 data, and a replay will crash it. Upgrade order follows the mode: with BACKWARD upgrade consumers first, with FORWARD producers first, with FULL any order. In a multi-team company I prefer FULL (or FULL_TRANSITIVE) because nobody has to coordinate upgrade order. For a truly breaking change, create a new topic or subject, dual-write for a while, migrate consumers, then retire the old one.</p>
 <p class="rem"><b>Remember:</b> transitive means "against all history". Use it whenever old messages can be re-read.</p>
 </div>
@@ -298,6 +453,15 @@
 <summary>What are a data warehouse, a data lake and a lakehouse? Why did the lakehouse appear? <span class="lvl b">Basic</span></summary>
 <div class="ans">
 <p class="ia">A warehouse is managed, structured, SQL-first storage with transactions and good speed, but costly and awkward for raw or unstructured data. A lake is cheap object storage full of open files (Parquet, JSON, images): flexible and cheap, but historically with no transactions, no schema enforcement and no safe updates. A lakehouse puts a table format (Iceberg, Delta, Hudi) on top of the lake files, so you get ACID, schema evolution and time travel on cheap open storage, and many engines can read the same tables.</p>
+<p><b>Take them in the order history produced them.</b></p>
+<ol>
+<li><b>Data warehouse (1990s on).</b> A database built for analytics: structured tables, SQL, transactions, fast queries, central modelling. The problems: storage and compute were expensive and tied together, it handled only structured data well, and data was locked in the vendor's format.</li>
+<li><b>Data lake (2010s).</b> "Just put every file on cheap storage (HDFS, later S3) and decide the structure when you read it." Cheap, handles logs, JSON, images, and many engines can use it. The problems: a "table" is only a folder of files. No transactions, so a reader sees half a write. No safe update or delete, so GDPR and corrections are painful. No schema enforcement, so one bad writer silently changes a column type. Nobody knows which files are current. Teams called the result a data swamp.</li>
+<li><b>Lakehouse (2020s).</b> Keep the cheap open files of the lake, but add a table format (Iceberg, Delta, Hudi), a metadata layer that tracks which files make up the table, with atomic commits. You get the warehouse behaviours (ACID, schema, updates, time travel) on lake storage.</li>
+</ol>
+<p><b>A concrete before and after.</b> Lake only: a nightly job rewrites <code>/sales/dt=2026-11-17/</code>. It first deletes the folder, then writes new files. At 02:03 an analyst's query runs in the middle and sees no data for that day (or half of it). Lakehouse: the job writes new files, then performs one atomic commit "the table is now these files". The analyst sees either the old state or the new state, never in between.</p>
+<p><b>Why not always lakehouse?</b> Operating one means you own catalog, compaction, snapshot cleanup, access control and cost tuning. A managed warehouse hides all that and is often the better answer for a small team with mostly structured data and SQL users. A common modern setup is both: raw and large data in a lakehouse, curated marts in a warehouse that can also read Iceberg tables directly.</p>
+<p><b>Pitfall to mention:</b> "lakehouse" is a pattern, not a product. Ask which table format, which catalog and which engines are involved, because those decide what you can really do.</p>
 <p>Lakes turned into "data swamps" because a table was just a folder: readers saw half-written files, two writers overwrote each other, and nobody knew which files were current. The table format fixes that with a metadata layer. The honest trade-off is that you now own more moving parts (catalog, compaction, cleanup) than with a fully managed warehouse. Many companies run both, and major warehouses can read Iceberg tables too.</p>
 <table>
 <tr><th></th><th>Warehouse</th><th>Lake</th><th>Lakehouse</th></tr>
@@ -314,6 +478,28 @@
 <summary>What is Apache Iceberg, and why use it instead of plain Parquet files in a folder? <span class="lvl b">Basic</span></summary>
 <div class="ans">
 <p class="ia">Iceberg is an open table format: a specification and library that tracks a set of data files (usually Parquet) as one reliable table. It stores exactly which files make up the table at each moment, plus schema, partitioning and per-file statistics. Compared with a folder of Parquet files, it gives atomic commits, safe concurrent writers, schema and partition evolution, row-level updates, time travel, and no slow directory listing.</p>
+<p><b>What problem is it solving?</b> A folder of Parquet files has no concept of "the table right now". Concretely, these things go wrong:</p>
+<ul>
+<li>A reader lists the folder while a job is writing: it reads half the files. (No atomic commit.)</li>
+<li>A job crashes after writing 40 of 100 files: junk files remain and get counted. (No rollback.)</li>
+<li>Two jobs write the same partition: one overwrites the other. (No concurrency control.)</li>
+<li>You rename a column: old files use the old name, so values come back null or from the wrong column. (No stable column identity.)</li>
+<li>A query over 50,000 files first spends a minute listing S3 prefixes. (Listing is slow.)</li>
+<li>You want yesterday's version of the table: it is gone. (No history.)</li>
+</ul>
+<p><b>The idea.</b> Do not discover the table by listing a folder; keep an explicit, versioned list of data files in metadata files. A change is "write new data files, write a new metadata version, atomically point the table at it". All of the problems above follow from that one design.</p>
+<p><b>What you get, with what it means:</b></p>
+<table>
+<tr><th>Feature</th><th>Plain meaning</th></tr>
+<tr><td>Atomic commits</td><td>readers see before or after a write, never half</td></tr>
+<tr><td>Snapshot isolation</td><td>a query keeps one consistent view even while writes continue</td></tr>
+<tr><td>Schema and partition evolution</td><td>change columns or layout as metadata, without rewriting data</td></tr>
+<tr><td>Row-level update and delete</td><td>SQL UPDATE, DELETE, MERGE via new files plus metadata</td></tr>
+<tr><td>Time travel, rollback</td><td>read or restore an earlier snapshot</td></tr>
+<tr><td>Fast planning</td><td>min and max per file are in metadata; no listing, and many files skipped</td></tr>
+</table>
+<p><b>What it is not.</b> It is not a storage engine you deploy and not a query engine. There is no Iceberg server process. You use it through an engine (Spark, Flink, Trino, Hive, Snowflake and others can read it) plus a catalog that stores the pointer. That neutrality is its selling point: the same table can be written by Flink and read by Trino.</p>
+<p><b>Trade-off.</b> You take on table maintenance (compaction, snapshot expiry), and every engine must implement the spec correctly, so version support varies. For a tiny, single-writer, append-only dataset, plain Parquet with partition folders can still be enough.</p>
 <p>With a plain folder, a reader can see half a job, a failed job leaves partial files, two writers can overwrite the same partition, columns are matched by name or position (renames go wrong), and every query lists thousands of objects on S3. Iceberg fixes each of these with metadata and one atomic pointer swap. It is not a file format and not a database: there is no server, just the spec plus client libraries, and engines (Spark, Flink, Trino and others) do the work. The data files stay in open Parquet, so you can migrate an existing table in place.</p>
 <p>Delta Lake and Hudi solve the same problem. Delta is closely tied to Spark and Databricks, Hudi is strong at record-level upserts and incremental pulls, and Iceberg is the most engine-neutral. I choose Iceberg for a multi-engine platform; the details of the others are specialist knowledge.</p>
 <p class="rem"><b>Remember:</b> Iceberg = metadata that says which files are the table. Not a file format, not a server.</p>
@@ -324,6 +510,26 @@
 <summary>Walk me through the Iceberg metadata layers, from catalog down to data files. <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">The catalog maps a table name to the current metadata file. That metadata JSON holds the schema, partition specs and the list of snapshots. Each snapshot points to a manifest list, which points to manifest files, and each manifest lists data files with their partition values and column statistics. To plan a query the engine walks down this tree, pruning at each level, so it opens only a few Parquet files and never lists a directory.</p>
+<p><b>Why a tree and not a single file list?</b> A table can have millions of files. A single list file would have to be rewritten on every commit (slow) and read fully by every query (slow). Splitting it into layers means a commit adds only a little, and a query can discard big parts of the tree early.</p>
+<p><b>What each layer holds and what it is for:</b></p>
+<ol>
+<li><b>Catalog.</b> A tiny directory: <code>db.orders</code> to the location of the current <code>metadata.json</code>. This single pointer is what is swapped atomically at commit. (Hive Metastore, AWS Glue, a database via JDBC, or a REST catalog service.)</li>
+<li><b>Table metadata file (JSON).</b> Table-wide facts: schema versions (with column ids), partition specs, sort order, table properties, the list of snapshots and which one is current. Each commit writes a new numbered file (<code>v12.metadata.json</code>, then v13) and old ones remain for history.</li>
+<li><b>Snapshot.</b> One version of the table. It points to exactly one manifest list.</li>
+<li><b>Manifest list (Avro).</b> Lists the manifest files that belong to this snapshot, with a summary per manifest: how many files, the min and max of each partition column inside it. This lets the planner drop a whole manifest without opening it.</li>
+<li><b>Manifest file (Avro).</b> Lists data files (and delete files), each with: path, partition values, row count, size, and per-column min, max and null counts.</li>
+<li><b>Data files (Parquet usually).</b> The actual rows.</li>
+</ol>
+<p><b>Planning a query, walked through.</b> <code>SELECT ... WHERE event_date = '2026-11-17' AND amount &gt; 1000</code>:</p>
+<ol>
+<li>Ask the catalog for the metadata file, read it, pick the current snapshot.</li>
+<li>Read the manifest list. Keep only manifests whose partition range could contain Nov 17.</li>
+<li>Read those manifests. Keep only files whose partition equals Nov 17 and whose amount max is over 1000.</li>
+<li>Launch tasks on just those files. Inside each, Parquet footer stats skip row groups.</li>
+</ol>
+<p>No directory listing happens at all, and the cost depends on how much matches, not on the table's total size.</p>
+<p><b>What a commit does.</b> An append writes new data files, one new manifest that lists only them, a new manifest list that references the new manifest plus all unchanged old manifests, a new metadata file, then swaps the catalog pointer. Old manifests are reused, which is why commits stay small.</p>
+<p><b>Pitfalls.</b> Very frequent commits create many small manifests (fix with rewrite_manifests). The metadata, not the data, can become the bottleneck for tables with millions of files. Metadata files accumulate until old snapshots are expired (and optionally old metadata cleaned up).</p>
 <p>Two levels (manifest list, then manifests) are there so a new commit can reuse old manifests unchanged and add just one new manifest, which keeps commits small. The manifest list stores partition range summaries, so whole manifests are dropped without opening them. Manifests and the manifest list are Avro files; data files are normally Parquet.</p>
 <figure class="diagram"><svg viewBox="0 0 860 400" role="img" aria-label="Iceberg metadata tree: catalog points to metadata.json, which lists snapshots; current snapshot points to a manifest list, which points to manifests, which point to data files.">
 <rect class="cache" x="320" y="10" width="220" height="50" rx="8"/><text class="t-c t-b" x="430" y="32">Catalog</text><text class="t-c t-sm" x="430" y="50">db.orders to metadata path</text>
@@ -349,6 +555,25 @@
 <summary>What is an Iceberg snapshot, and how does time travel work? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">A snapshot is the complete state of the table after one commit: the set of data files that made up the table at that moment. Every write (append, overwrite, delete, compaction) creates a new snapshot without copying data, because it reuses existing files and manifests. Time travel just starts reading from an older snapshot, so it only needs the old files to still exist.</p>
+<p><b>What a snapshot really is.</b> Not a copy of data. It is a reference to a manifest list, i.e., a precise list of data files, plus a timestamp and a summary ("append, added 12 files, 1.2M rows"). Because data files are immutable, two snapshots can safely share most of their files.</p>
+<p><b>Timeline example.</b></p>
+<table>
+<tr><th>Time</th><th>Operation</th><th>Snapshot</th><th>Files in table</th></tr>
+<tr><td>Mon</td><td>append</td><td>S1</td><td>f1, f2</td></tr>
+<tr><td>Tue</td><td>append</td><td>S2</td><td>f1, f2, f3</td></tr>
+<tr><td>Wed</td><td>compaction</td><td>S3</td><td>f4 (= f1+f2+f3 merged)</td></tr>
+<tr><td>Thu</td><td>bad job deletes rows</td><td>S4</td><td>f5</td></tr>
+</table>
+<p>The files f1, f2, f3 are not deleted on Wednesday: S1 and S2 still need them. Reading "as of Tuesday" simply uses snapshot S2's file list. Rolling back on Thursday means pointing the table's current snapshot at S3 again, which is metadata only and instant.</p>
+<p><b>Why this matters in practice.</b></p>
+<ul>
+<li><b>Reproducibility:</b> a regulator or analyst asks "what did the report show on the 1st?". Query with <code>TIMESTAMP AS OF</code>.</li>
+<li><b>Debugging:</b> compare two snapshots to see which rows a job changed (Iceberg has an incremental read and a changelog view).</li>
+<li><b>Safe operations:</b> before a risky job, note the snapshot id; if it goes wrong, roll back.</li>
+<li><b>Consistent reads:</b> a long query keeps its snapshot, so concurrent writes do not change its results midway.</li>
+</ul>
+<p><b>Tags and branches.</b> A tag is a named pointer to a snapshot you want to keep (for example <code>end-of-quarter</code>), exempt from the normal expiry. A branch is a movable pointer you can write to independently, enabling the write-audit-publish pattern: write to branch <code>audit</code>, run quality checks, then fast-forward <code>main</code> only if they pass.</p>
+<p><b>The cost and the catch.</b> Time travel is only possible while the old files exist. Each snapshot keeps its unique files alive, so storage grows until you run <code>expire_snapshots</code>. Setting a retention (say 7 or 30 days) is a business decision: longer means more history, but more storage and, for privacy deletes, a longer period in which erased data is still recoverable. Also remember that time travel reads the schema of that snapshot (columns dropped later reappear), which is correct but can surprise people.</p>
 <p>It is useful for reproducing a report, auditing, debugging a bad load ("what did the table look like before the job?") and quick rollback. The cost is storage: old data files stay until you expire the snapshots that reference them. Snapshots can also be named: a tag keeps one for audit, and a branch lets you write to a staging copy, check it, and then publish (the write-audit-publish pattern).</p>
 <pre><code>-- Spark SQL
 SELECT * FROM prod.orders TIMESTAMP AS OF '2026-11-01 00:00:00';
@@ -362,6 +587,19 @@ CALL prod.system.rollback_to_snapshot('orders', 4928374982374);</code></pre>
 <summary>How does Iceberg give ACID transactions on object storage with no lock server? <span class="lvl s">Senior</span></summary>
 <div class="ans">
 <p class="ia">Through optimistic concurrency. A writer reads the current metadata, writes its new data files, manifests and a new metadata file, and none of that is visible yet. The commit is one atomic compare-and-swap in the catalog: "move the pointer from v12 to v13, only if it is still v12". If another writer got there first, the swap fails, and the loser re-reads the new state, checks for real conflicts, rebuilds on top of it and retries.</p>
+<p><b>First the vocabulary.</b> ACID means: <b>A</b>tomic (a write is all or nothing), <b>C</b>onsistent (rules hold), <b>I</b>solated (concurrent users do not see each other's half-done work), <b>D</b>urable (committed data survives). Databases get this with locks and logs. Object storage has no locks and no transactions, only immutable objects. So how can a table on S3 be ACID?</p>
+<p><b>Key insight:</b> do all the heavy work invisibly, then make it visible with one tiny atomic operation. Everything a writer produces (data files, manifests, new metadata file) is just unreferenced files until the very last step. If the writer dies, those files are garbage that nobody reads; the table is unchanged (atomicity). The last step is a single compare-and-swap on the catalog pointer.</p>
+<p><b>Commit walkthrough with two writers.</b></p>
+<ol>
+<li>Both writers start from metadata v12. Writer A appends 100 files. Writer B runs a compaction that rewrites files f1 to f20.</li>
+<li>A finishes first: it writes metadata v13 and tells the catalog "set pointer to v13 if it currently is v12". That succeeds.</li>
+<li>B finishes and asks "set pointer to v13b if it currently is v12". The catalog says no, the pointer is v13 now.</li>
+<li>B does not give up and does not lose its data files. It reloads v13 and checks for conflicts: did A's changes touch f1 to f20? A only added new files, so B's rewrite is still valid. B writes v14 (A's files plus its own change) and swaps from v13 to v14. If instead A had deleted f5, B's validation would fail and it would abort (or the job would redo its work).</li>
+</ol>
+<p><b>Isolation for readers.</b> A reader loads the pointer once, and then uses that snapshot for the whole query. New commits create new snapshots; they never modify the one being read. So readers never block writers and never see partial states (snapshot isolation; write operations can be configured for serializable or snapshot validation).</p>
+<p><b>Why optimistic and not locks?</b> Locks need a lock service, hurt performance and risk deadlock or stuck locks when a job dies. Optimistic concurrency assumes conflicts are rare (usually true for append-heavy workloads) and pays only when a conflict happens.</p>
+<p><b>What the catalog must provide.</b> The atomic swap lives in the catalog implementation (a database transaction in Hive or JDBC catalogs, a conditional update in Glue, a server-side check in REST catalogs). S3 historically lacked conditional writes, which is why the plain filesystem catalog is unsafe for concurrent writers there; newer S3 conditional-write support changes that for some setups, but a real catalog is still the normal choice.</p>
+<p><b>Pitfalls and production notes.</b> (1) Many writers committing to the same table cause retry storms; partition the workload or batch commits. (2) Long-running rewrite jobs are the most likely to lose the race and fail validation; run compaction on cold partitions. (3) Retry count and wait are table properties, tune them if you see CommitFailedException. (4) Atomicity is per table, not across tables: updating two tables is two independent commits.</p>
 <p>Atomicity comes from the single pointer swap, isolation from snapshots (a reader keeps the snapshot it started with and is never disturbed), and durability from object storage. Appends rarely conflict with each other, but two jobs that rewrite or delete the same files can: that fails with a validation error. Retries default to a small number (about 4) and are configurable. The atomic step lives in the catalog, not in S3, so use a catalog that supports it (Hive, Glue, JDBC, REST, and similar); a plain file-system catalog is unsafe for concurrent writers on S3.</p>
 <figure class="diagram"><svg viewBox="0 0 860 300" role="img" aria-label="Two writers both start from metadata v12. Writer A commits v13 first. Writer B's swap fails, B refreshes, validates, rebuilds v14 and commits.">
 <rect class="cache" x="330" y="10" width="200" height="50" rx="8"/><text class="t-c t-b" x="430" y="32">Catalog pointer</text><text class="t-c t-sm" x="430" y="50">orders to metadata v12</text>
@@ -380,6 +618,18 @@ CALL prod.system.rollback_to_snapshot('orders', 4928374982374);</code></pre>
 <summary>How does Iceberg handle schema evolution without rewriting data? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">Every column gets a unique, permanent field id, stored in the metadata and in the data files, and the engine maps columns by id, not by name or position. So add, drop, rename and reorder are metadata-only changes and no data is rewritten. Old files simply return null for a newly added column.</p>
+<p><b>The old problem.</b> In a plain Parquet or Hive table, the engine finds a column in a file by its <b>name</b> (or sometimes by <b>position</b>). That breaks in several ways. Rename <code>cust</code> to <code>customer</code>: old files still say <code>cust</code>, so reading them returns null. Drop <code>region</code> and later add a new, different column also called <code>region</code>: old files now answer with the old column's values. Positional mapping breaks when you insert a column in the middle. To be safe you had to rewrite all data.</p>
+<p><b>Iceberg's fix: identity separate from name.</b> When a column is created it gets a unique integer id (1, 2, 3 ...). The table schema says "id 3 is called <code>cust</code>", and every Parquet file written stores the field id next to each column. The engine reads by id:</p>
+<ul>
+<li><b>Rename:</b> id 3 now has the name <code>customer</code>. Old files still carry id 3, so they read correctly. No data changed.</li>
+<li><b>Add column:</b> gets a new id (say 9). Old files have no id 9, so the reader returns null (or the declared default) for them.</li>
+<li><b>Drop column:</b> id 4 is removed from the schema. Old files still hold it, but it is ignored. If you later add a new column with the same name, it gets a new id (10), so the old values can never leak back in ("zombie columns").</li>
+<li><b>Reorder:</b> only the order in the schema metadata changes.</li>
+</ul>
+<p><b>Type changes</b> are limited to lossless promotions: int to long, float to double, decimal precision widening. Anything else (string to int, long to int) needs a new column, a backfill and a switch-over.</p>
+<p><b>Schema evolution and time travel.</b> Each snapshot records the schema id it was written with, so old snapshots keep reading with their own schema.</p>
+<p><b>Compare with Avro.</b> Avro resolves by field <b>name</b> plus aliases and needs defaults; Iceberg resolves by <b>id</b>. Same goal, different mechanism. Iceberg manifests are Avro files, which is why you will meet both.</p>
+<p><b>Pitfalls.</b> Engines and downstream consumers (dashboards, exports) still break on a rename even when the table itself is fine, so a rename is a breaking change for readers by name. Treat evolution as additive when many consumers depend on a table. Also check that a writer does not carry an old schema: Spark sessions with a cached schema or a Flink job started before the change may need a restart or a schema-merge option.</p>
 <p>This avoids the classic bug in plain Parquet or Hive tables, where a name or position mapping returns the wrong column's data after a drop and re-add. Ids are never reused. Type changes are allowed only when safe (int to long, float to double, wider decimal precision); string to int needs a new column and a backfill. Each schema version is kept, so old snapshots stay readable.</p>
 <pre><code>ALTER TABLE prod.orders ADD COLUMN coupon string;
 ALTER TABLE prod.orders RENAME COLUMN cust TO customer;
@@ -392,6 +642,22 @@ ALTER TABLE prod.orders ALTER COLUMN qty TYPE bigint;</code></pre>
 <summary>How do you choose a partitioning strategy for a lake table? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">I partition on the column most queries filter on, usually a time column such as day for event data, and I check that each partition is big enough. Partitions let a query skip whole groups of files. The mistakes are going too fine (partition by user id, or by hour on a small table), which creates millions of tiny files, and too coarse (by year), where every query scans a lot.</p>
+<p><b>What partitioning is for.</b> Splitting a large table into groups so that a query touching one group can ignore the others. In a lake, partitions normally map to groups of files (a folder per day in Hive style; metadata groupings in Iceberg). The engine uses the query's filter to skip every group that cannot match, which is the cheapest speed-up available: files you do not open cost nothing.</p>
+<p><b>Decide in three steps.</b></p>
+<ol>
+<li><b>Find the dominant filter.</b> Look at real queries or ask the users. For events it is almost always a time range, so <code>day(event_time)</code>.</li>
+<li><b>Estimate the partition size.</b> Daily volume 50 GB gives 50 GB per partition, fine. 200 MB per day gives 200 MB per partition, producing small files; use month or no time partition instead. A useful guide: each partition should contain at least hundreds of MB, ideally several GB, spread over files of 128 MB to 1 GB.</li>
+<li><b>Check cardinality and skew.</b> The number of partitions should be thousands, not millions (every partition is metadata the planner must handle). If you also filter by a high-cardinality key such as user_id, add bucket(16, user_id) or sort inside files rather than partitioning by value.</li>
+</ol>
+<p><b>Example.</b> 2 TB per day of clickstream, queries "last 7 days for one customer". Partition by <code>day(ts)</code> (1 partition per day, 2 TB each, plenty), then sort or bucket by customer id so one customer's rows sit in a few files and min/max stats find them. Partition by <code>customer_id</code> would create millions of folders with a few KB each, a catastrophic number of small files.</p>
+<p><b>Too fine versus too coarse.</b></p>
+<table>
+<tr><th></th><th>Too fine (hour, id)</th><th>Too coarse (year)</th></tr>
+<tr><td>Symptom</td><td>millions of tiny files, slow planning</td><td>every query scans big chunks</td></tr>
+<tr><td>Fix</td><td>coarser partition, compaction</td><td>finer partition, plus sort order</td></tr>
+</table>
+<p><b>Skew.</b> Partitioning by country when one country has 80% of rows creates one huge partition and many tiny ones: the big one limits parallelism. Prefer time or a hash bucket for balance.</p>
+<p><b>Pitfalls.</b> Partitioning does not replace sorting; they work at different levels. Changing partition columns in Hive-style tables means rewriting everything, but Iceberg lets you evolve it (next question). Do not partition by columns that change over time (like status), because updating the value would mean moving the row to another partition.</p>
 <p>Rough targets: each partition holds at least a few hundred MB to many GB, and the total number of partitions stays in the thousands, not millions. For a high-cardinality column like <code>user_id</code> do not partition by value: use a bucket transform (hash into N buckets) or sort data inside files so min and max stats work. Watch for skew too: if one country has 80% of the data, partitioning by country does not balance the work. Partitioning prunes folders; sorting narrows min and max within files; use both. In Iceberg you can change the partitioning later, so start simple and measure.</p>
 <p class="rem"><b>Remember:</b> partition by what queries filter on, in chunks big enough to be worth skipping. Never by an id.</p>
 </div>
@@ -401,6 +667,17 @@ ALTER TABLE prod.orders ALTER COLUMN qty TYPE bigint;</code></pre>
 <summary>What is hidden partitioning in Iceberg, and what is partition evolution? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">In Hive-style tables the partition is a folder and an extra column like <code>dt=2026-11-17</code>, and users must filter on it or the query scans everything. In Iceberg you declare a transform of a real column, such as <code>day(event_time)</code>, and Iceberg computes and tracks the partition value itself. A filter on <code>event_time</code> is automatically turned into partition pruning, and nobody can forget or mis-fill a partition column.</p>
+<p><b>The Hive-style problem.</b> To partition a Hive table by day you add an extra column <code>dt</code> and the writer must fill it correctly (<code>dt = '2026-11-17'</code>). Then every query author must remember to filter on <code>dt</code>, not on <code>event_time</code>. If an analyst writes <code>WHERE event_time &gt; '2026-11-17'</code>, the engine does not know that is related to <code>dt</code>, so it scans the entire table. Also a writer can put the wrong value in <code>dt</code> (time zone errors are classic) and queries then silently miss data.</p>
+<p><b>Hidden partitioning.</b> Iceberg stores the partition as a function of an existing column: <code>PARTITIONED BY (day(event_time))</code>. The table has no extra <code>dt</code> column. On write, Iceberg computes <code>day(event_time)</code> itself and records it per file. On read, when a filter mentions <code>event_time</code>, the planner applies the same function to the filter bounds and prunes partitions. The user writes the natural query and still benefits.</p>
+<p><b>Transforms available:</b> <code>year, month, day, hour</code> (on dates and timestamps), <code>bucket(N, col)</code> (hash modulo N, for spreading ids), <code>truncate(W, col)</code> (first W characters or rounding to a width), and <code>identity</code> (the value itself).</p>
+<p><b>Partition evolution step by step.</b> A table is partitioned by <code>month(ts)</code>. Data grows 30x and months are now too big. You run <code>ALTER TABLE t ADD PARTITION FIELD day(ts)</code> (and drop the month field).</p>
+<ol>
+<li>Existing files are untouched and keep partition spec 0 (month).</li>
+<li>New writes use spec 1 (day). Each manifest records which spec its files use.</li>
+<li>A query over both periods is planned in two parts, using month pruning for the old files and day pruning for the new.</li>
+</ol>
+<p>Compare with Hive: changing partition columns means a full rewrite of the table. Iceberg: metadata change, then compact the old data later if you wish.</p>
+<p><b>Pitfalls.</b> Mixed specs make planning slightly more complex and compaction should eventually rewrite old data; check that your engine supports the transform you use; and remember hidden partitioning removes the dt column, so any downstream code that expects it breaks (migrating from Hive tables needs care).</p>
 <p>Transforms include year, month, day, hour, <code>bucket(N, col)</code> and <code>truncate(W, col)</code>. Because layout is metadata, you can also change it: move from monthly to daily partitions with one command. Old files keep the old spec and new files use the new one; each manifest remembers its spec, and the planner prunes each group with its own rules. Nothing is rewritten, though queries spanning both layouts plan a little slower, and you can compact old data into the new layout when convenient.</p>
 <pre><code>CREATE TABLE prod.events (id bigint, user_id bigint, event_time timestamp)
 USING iceberg
@@ -413,6 +690,19 @@ PARTITIONED BY (day(event_time), bucket(16, user_id));</code></pre>
 <summary>Explain copy-on-write versus merge-on-read in Iceberg. <span class="lvl s">Senior</span></summary>
 <div class="ans">
 <p class="ia">Both exist because data files are immutable. Copy-on-write rewrites each data file that holds an affected row: reads stay fast, but one changed row rewrites a whole large file. Merge-on-read leaves data files alone and writes small delete files; writes are cheap, but readers must merge deletes with data until a compaction cleans up. I use copy-on-write for read-heavy tables with infrequent batch updates, and merge-on-read for frequent small updates and CDC.</p>
+<p><b>Why we need two strategies.</b> Since a data file cannot be edited, removing one row from a 512 MB file forces a choice. Do you pay now (rewrite the file) or later (record the deletion and merge on every read)?</p>
+<p><b>Copy-on-write (COW), walked through.</b> You run <code>DELETE FROM orders WHERE id = 42</code>. The engine finds the one file containing id 42, reads all of it, writes a new file without that row, and commits "table = new file instead of old file". Cost: one row changed, 512 MB rewritten (write amplification). Benefit: reads are plain Parquet scans with no extra work. Good for tables that are read a lot and updated in occasional, large batches (nightly corrections).</p>
+<p><b>Merge-on-read (MOR), walked through.</b> Same delete: the engine writes a tiny delete file "file-A, row position 2 is deleted" and commits. Cost: almost nothing. But now every reader of file-A must also open its delete file and filter rows (read amplification), and the number of delete files grows with each change. A later compaction merges them into clean data files. Good for frequent small updates, streaming upserts and CDC.</p>
+<table>
+<tr><th></th><th>Copy-on-write</th><th>Merge-on-read</th></tr>
+<tr><td>Write cost</td><td>high</td><td>low</td></tr>
+<tr><td>Read cost</td><td>low</td><td>higher until compaction</td></tr>
+<tr><td>Maintenance</td><td>less</td><td>must compact regularly</td></tr>
+<tr><td>Best for</td><td>read-heavy, batch updates</td><td>update-heavy, CDC, low latency writes</td></tr>
+</table>
+<p><b>Two kinds of delete file.</b> <b>Position deletes</b> name a file and row position: precise, cheap to apply, but the writer must know where the row is (it has to read the file or index). <b>Equality deletes</b> say "delete rows where order_id = 42": the writer needs no lookup, so streaming jobs love them, but the reader must compare every row of older files against the set of keys, which is costlier. In spec v3, deletion vectors (a compact bitmap per data file) replace position delete files for cheaper reads.</p>
+<p><b>The mode is configurable per operation</b> (properties such as <code>write.delete.mode</code>, <code>write.update.mode</code>, <code>write.merge.mode</code>), so one table can use COW for deletes and MOR for merges.</p>
+<p><b>Pitfalls.</b> A MOR table without scheduled compaction slowly gets slower until someone complains; monitor the number of delete files per data file. COW on a table with frequent trickle updates burns compute and rewrites the same big files again and again. For GDPR-style erasure, MOR delete files only hide rows, so compaction is also needed for physical removal.</p>
 <p>Delete files come in two kinds. A position delete says "in file X, rows 17 and 902 are deleted". An equality delete says "any row with order_id = 42 is deleted", which suits streaming upserts, where the writer does not know file positions. An update is a delete plus a new row. Newer table spec versions replace position deletes with compact deletion vectors, which make merge-on-read reads cheaper. Copy-on-write is typically the default and the mode is a table property.</p>
 <figure class="diagram"><svg viewBox="0 0 860 280" role="img" aria-label="Copy on write rewrites the whole data file without the deleted row. Merge on read keeps the data file and adds a small delete file, applied at read time.">
 <text class="t-b" x="20" y="22">Copy-on-write: delete row 3</text>
@@ -436,6 +726,18 @@ PARTITIONED BY (day(event_time), bucket(16, user_id));</code></pre>
 <summary>What is the small files problem, and what maintenance does an Iceberg table need? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">Small files are data files far below a useful size (say a few MB when the target is a few hundred MB). Every file costs a fixed amount: an object-store request, a footer read, a task launch and a metadata entry, so reading a million 1 MB files is far slower than reading 500 big ones holding the same bytes. The fix is compaction: rewrite many small files into few well-sized ones, on a schedule, plus cleanup of old snapshots.</p>
+<p><b>Why does file size matter so much?</b> Reading a file has a fixed overhead regardless of size: an HTTP request to S3 (tens of milliseconds), opening the footer, planning a task, and a row in the metadata. Reading 1 MB costs almost the same overhead as reading 512 MB. So 1 million files of 1 MB (about 1 TB) can take hours where 2,000 files of 512 MB take minutes, even though the bytes are the same. Compression and min/max statistics are also weaker on tiny files.</p>
+<p><b>Where small files come from, with an example.</b> A Flink job commits to Iceberg every 10 seconds. Each commit writes one or more files for each partition and writes a new snapshot and manifest. After a day: 8,640 commits and often tens of thousands of files of a few MB. Other sources: Spark jobs with 2,000 shuffle partitions writing a 1 GB dataset (2,000 files of 500 KB), very fine partitions, and many writers.</p>
+<p><b>Maintenance toolbox, what each does and when.</b></p>
+<ul>
+<li><b>Compaction</b> (<code>rewrite_data_files</code>, optionally with a sort strategy): read small files, write fewer big ones, commit as a new snapshot. Run on hot partitions often (hourly), cold ones rarely. It can conflict with streaming writes to the same partition, so compact closed partitions or use the engine's partition filter.</li>
+<li><b>Expire snapshots:</b> deletes snapshot metadata older than a retention and data files nobody references. Without this, the pre-compaction small files stay forever, so you pay for both the old and new copies.</li>
+<li><b>Remove orphan files:</b> deletes files in the table location that no snapshot references (written by failed jobs). Always use an age cutoff (days) so you do not delete a file of an in-flight write.</li>
+<li><b>Rewrite manifests:</b> merge many tiny manifests to keep planning fast.</li>
+</ul>
+<p>Example call: <code>CALL prod.system.rewrite_data_files(table =&gt; 'events', where =&gt; 'event_date &lt; current_date')</code> followed by <code>expire_snapshots(older_than =&gt; ...)</code>.</p>
+<p><b>Prevention beats cure.</b> Commit less often (a 1 to 5 minute interval is common; lower latency needs a different design), use coarser partitions, set a sensible number of shuffle partitions (or let adaptive execution coalesce), and use the writer's file-size target and distribution options (for Spark, a write distribution mode to avoid every task writing to every partition).</p>
+<p><b>Pitfalls.</b> Compaction is itself expensive and creates a snapshot, so not "as often as possible". Forgetting expire_snapshots makes compaction look useless in the storage bill. Managed services (some catalogs and vendors) offer automatic compaction; ask whether it is on.</p>
 <p>They come from streaming writes that commit every few seconds, too many shuffle partitions in Spark, and over-partitioning. Prevention: commit every few minutes, not seconds, and choose coarser partitions. Maintenance jobs for an Iceberg table:</p>
 <ul>
 <li><b>Compaction</b> (<code>rewrite_data_files</code>): merge small files toward the target size (default about 512 MB), optionally sort, and apply delete files.</li>
@@ -458,12 +760,42 @@ PARTITIONED BY (day(event_time), bucket(16, user_id));</code></pre>
 </div>
 </details>
 
+<details class="iq" id="q-table-formats-compare">
+<summary>How do Iceberg, Delta Lake and Hudi differ, and how would you choose? <span class="lvl i">Intermediate</span></summary>
+<div class="ans">
+<p class="ia">All three put a transaction log or metadata tree on top of Parquet files to give ACID, time travel, schema evolution and row-level changes on object storage. They differ in design and ecosystem. Iceberg is the most engine-neutral and has strong partition evolution, Delta Lake is the most natural on Spark and Databricks, and Hudi is built around record-level upserts and incremental pulls. I choose by which engines must read and write, and which update pattern dominates.</p>
+<p><b>How they track the table.</b> Delta keeps an ordered transaction log of JSON action files (add file, remove file) in a <code>_delta_log</code> folder, with periodic checkpoint files; the current table is the log replayed. Iceberg keeps a tree of metadata files, snapshot, manifest list, manifests, reached from a catalog pointer, so planning does not replay a log. Hudi keeps a timeline of commits and an index that maps record keys to file groups, which makes upserts fast.</p>
+<table>
+<tr><th></th><th>Iceberg</th><th>Delta Lake</th><th>Hudi</th></tr>
+<tr><td>Core idea</td><td>metadata tree + atomic catalog pointer</td><td>transaction log of actions</td><td>timeline + record-key index</td></tr>
+<tr><td>Strength</td><td>many engines, hidden partitioning, evolution</td><td>Spark/Databricks integration, simplicity</td><td>streaming upserts, incremental queries</td></tr>
+<tr><td>Typical use</td><td>multi-engine platform</td><td>Databricks or Spark-centric shops</td><td>CDC ingestion, near-real-time tables</td></tr>
+</table>
+<p><b>Trend.</b> The formats keep converging (all have deletion vectors or similar, and bridge tools exist so one can expose metadata for another, for example Delta UniForm or Apache XTable). So treat the choice as less permanent than it once was, and base it on the platform: what your cloud services, catalog and query engines support best today.</p>
+<p><b>Decision rule.</b> Need several engines (Spark plus Trino plus Flink plus a warehouse) on the same data: Iceberg. Already on Databricks and mostly Spark: Delta. Heavy CDC upsert pipelines that need record-level indexing and incremental consumption: consider Hudi. Always check the support level of the specific engine version, because features differ by engine.</p>
+<p class="rem"><b>Remember:</b> same goal, three designs. Pick by engine support and update pattern, not by feature lists.</p>
+</div>
+</details>
+
 <h2 id="pipelines">4. Pipelines, streaming and data quality</h2>
 
 <details class="iq" id="q-batch-vs-stream">
 <summary>Batch versus streaming processing: how do you decide? <span class="lvl b">Basic</span></summary>
 <div class="ans">
 <p class="ia">I ask "what does it cost the business if this data is one hour old?". If the answer is "nothing", I use batch (or micro-batch every few minutes): it is simpler, cheaper and easy to re-run and test. I use streaming when seconds matter, for things like fraud alerts, live dashboards or keeping a search index fresh.</p>
+<p><b>Definitions first.</b> <b>Batch</b> processes a finite, bounded set of data that already exists ("all of yesterday's orders") and then stops. <b>Streaming</b> processes an unbounded flow of events as they arrive and never really finishes. Micro-batch sits between: small batches every few seconds or minutes.</p>
+<p><b>The deciding question is latency value, not technology.</b> Ask: "if this number is 1 hour old, who is hurt, and how much?" Examples: a monthly finance report (1 day old is fine, batch), a recommendation model retrained nightly (batch), a fraud decision at payment time (must be milliseconds, streaming or request-time), an ops dashboard (a minute is fine, micro-batch), a search index kept in sync with a database (seconds, streaming CDC).</p>
+<table>
+<tr><th></th><th>Batch</th><th>Streaming</th></tr>
+<tr><td>Latency</td><td>minutes to hours</td><td>milliseconds to seconds</td></tr>
+<tr><td>Complexity</td><td>low: input is fixed, rerun is easy</td><td>high: state, ordering, late data, failure recovery</td></tr>
+<tr><td>Cost</td><td>pay only while running, spot instances fit</td><td>always-on cluster</td></tr>
+<tr><td>Correctness</td><td>easy to rerun and backfill</td><td>must design for retries and late events</td></tr>
+<tr><td>Testing</td><td>simple: fixed input file</td><td>harder: time and ordering</td></tr>
+</table>
+<p><b>Why streaming is harder.</b> In batch you can sort the data and look at all of it. In streaming you must answer "what is the count for 10:00 to 10:05?" while events for that window may still be on their way (late data), must store running state (counts, joins) and survive a crash without losing or double-counting it (checkpoints), and must keep up when traffic spikes (backpressure).</p>
+<p><b>Architectures people mention.</b> <b>Lambda:</b> run a batch path (accurate, slow) and a stream path (fast, approximate) and merge results. It works, but you maintain the same logic twice, and the two can disagree. <b>Kappa:</b> only a streaming path over a replayable log (Kafka); to reprocess, replay the log with new code. Simpler in code, requires a long retention and a capable stream engine. Today, the lakehouse often gives a third option: stream into Iceberg and let batch and streaming engines read the same table.</p>
+<p><b>Rule I use.</b> Start with batch or micro-batch; move to true streaming only when a measured business need requires seconds, and then keep a batch job for reprocessing and corrections. The pitfall is "real-time" requested because it sounds modern: ask for the actual freshness requirement and its cost.</p>
 <p>Batch processes a bounded chunk on a schedule ("every night, process yesterday"). Streaming processes an unbounded flow of events continuously. Streaming costs more in complexity: state, ordering, late events, restarts and exactly-once effects, plus jobs that run all day. Many systems use both: streaming for the freshest slice, batch to reprocess and correct. Engines like Spark and Flink use nearly the same API for both, which narrows the gap. A lambda architecture runs both paths and merges them (two code bases, painful); a kappa architecture uses one streaming path and replays the log to reprocess.</p>
 <p class="rem"><b>Remember:</b> batch unless freshness really pays for the extra complexity.</p>
 </div>
@@ -473,8 +805,36 @@ PARTITIONED BY (day(event_time), bucket(16, user_id));</code></pre>
 <summary>ETL versus ELT: what is the difference and why did ELT become popular? <span class="lvl b">Basic</span></summary>
 <div class="ans">
 <p class="ia">ETL transforms data on a separate processing server before loading only the result into the warehouse. ELT loads raw data first and transforms it inside the lake or warehouse with its own scalable engine (SQL, Spark, dbt). ELT won because cloud storage and compute are cheap and elastic, and keeping raw data means I can change business logic later and re-run without re-extracting from the source.</p>
+<p><b>The two letter orders.</b> E = extract (copy from the source), T = transform (clean, join, aggregate, reshape), L = load (write to the destination). The question is simply where the T runs and when.</p>
+<p><b>ETL (older pattern).</b> A dedicated tool (Informatica, SSIS, a custom Java job) pulls data from sources, transforms it on its own servers, and loads only the finished, modelled result into the warehouse. Reasons it existed: warehouse compute was expensive and fixed, so you did not want to waste it on cleaning, and the warehouse should hold only curated data.</p>
+<p><b>ELT (modern pattern).</b> Copy the raw data into the lake or warehouse first, then transform with SQL (often organised by dbt) or Spark inside it. Reasons it won:</p>
+<ul>
+<li><b>Cheap, elastic storage and compute:</b> keeping raw data costs little, and the warehouse or Spark cluster scales for transformations.</li>
+<li><b>Re-processing:</b> if the definition of "active customer" changes, you re-run the SQL over the stored raw data; with ETL you would have to re-extract from the sources, which may no longer hold the old values.</li>
+<li><b>Simplicity and speed to start:</b> loading raw first means a source can be onboarded quickly, and analysts can start exploring.</li>
+<li><b>One engine, SQL skills:</b> transformations are SQL in the warehouse, versioned and tested like code.</li>
+</ul>
+<p><b>Example.</b> Raw orders arrive as JSON. ELT: load them unchanged into <code>raw.orders</code>, then a dbt model builds <code>clean.orders</code> (types fixed, duplicates removed) and <code>marts.daily_revenue</code>. If the revenue logic changes, only the last model is re-run.</p>
+<p><b>When ETL (or "ETL-ish") is still correct.</b> (1) Privacy and compliance: PII must be masked or dropped before it lands in a broadly accessible store. (2) Huge volume of low-value data where you filter before loading to save cost. (3) The destination cannot transform (an operational system). (4) Streaming transforms in flight (parse, validate, enrich) before writing.</p>
+<p><b>Pitfall.</b> "ELT" does not mean "no modelling". An unmodelled raw dump is the data swamp again. Use layers (raw, cleaned, business-ready) with owners, tests and documentation, as in the medallion question below.</p>
 <p>ETL is still right when data must be masked or filtered before it may land (privacy rules), or when you must shrink huge volumes before loading. A common practical mix: a little "T" before load (drop PII, validate types), and the main modelling after.</p>
 <p class="rem"><b>Remember:</b> ETL = shape then load. ELT = load raw, shape later where the compute is.</p>
+</div>
+</details>
+
+<details class="iq" id="q-medallion">
+<summary>What is the bronze, silver, gold (medallion) layering, and why keep a raw layer? <span class="lvl b">Basic</span></summary>
+<div class="ans">
+<p class="ia">It is a way to organise lake tables by how clean they are. Bronze holds raw data exactly as received. Silver holds cleaned, deduplicated, typed and conformed data. Gold holds business-ready tables such as aggregates and marts for dashboards. Each layer is built from the one before, so any mistake can be fixed and replayed from the layer below.</p>
+<p><b>What goes in each layer, with an example</b> (orders from an app):</p>
+<ul>
+<li><b>Bronze:</b> the Kafka or file payload stored as it arrived, plus ingestion metadata (arrival time, source file, offset). Append-only, no business logic, nothing dropped. Even broken records are kept (or in a quarantine), so you can investigate them.</li>
+<li><b>Silver:</b> one clean row per business entity. Parse JSON into typed columns, fix timestamps to UTC, remove duplicates by order id, apply schema checks, join with reference data (customers). This is what most engineers and data scientists query.</li>
+<li><b>Gold:</b> shaped for a purpose: <code>daily_revenue_by_city</code>, a customer 360 table, features for a model. Aggregated and often denormalised so dashboards are fast and numbers have one agreed definition.</li>
+</ul>
+<p><b>Why this helps.</b> (1) <b>Replayability:</b> if a bug in the silver logic is found, fix the code and rebuild silver from bronze; the source may no longer have the data. (2) <b>Separation of concerns:</b> ingestion is fast and dumb, cleaning is careful, business logic is explicit. (3) <b>Trust:</b> consumers know where to look for raw versus certified numbers. (4) <b>Targeted quality checks and access:</b> bronze may contain PII and be restricted; gold is widely shared.</p>
+<p><b>Costs and pitfalls.</b> Storage is multiplied, and more tables to maintain; layers can become a ritual with no ownership. Keep names and ownership clear, apply quality checks at the silver boundary, and do not skip bronze to save space, because you lose the ability to repair. The names are a convention (Databricks popularised them), not a standard; some teams say raw, staging, curated.</p>
+<p class="rem"><b>Remember:</b> bronze = raw and replayable, silver = clean and conformed, gold = business-ready. Fix bugs by rebuilding from the layer below.</p>
 </div>
 </details>
 
@@ -482,6 +842,25 @@ PARTITIONED BY (day(event_time), bucket(16, user_id));</code></pre>
 <summary>What is Change Data Capture (CDC), and how do you do it? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">CDC captures every insert, update and delete from a source database as a stream of change events, so a lake, cache or search index can follow it. I prefer log-based CDC: it reads the database transaction log (MySQL binlog, PostgreSQL WAL), sees every change in commit order including deletes, and puts almost no load on the tables. Debezium on Kafka Connect is the best-known tool.</p>
+<p><b>Why CDC exists.</b> Systems need to follow a database without hurting it. Examples: copy orders into the lake, update a search index, invalidate a cache, feed other services. Nightly full copies are slow, heavy, and stale. Doing "dual writes" from the app (write to the DB and also to Kafka) can leave them out of sync when one write fails. CDC solves this by turning the database's own record of changes into a stream.</p>
+<p><b>How log-based CDC works.</b> Every serious database writes all changes first to a transaction log (MySQL binlog, PostgreSQL write-ahead log, Oracle redo log) to be crash safe and replicate to standbys. A CDC connector behaves like a replica: it reads that log and turns each committed row change into an event. Debezium runs inside Kafka Connect, first takes a consistent snapshot of the existing table (events marked as reads, op "r"), then streams changes from the log position where the snapshot started.</p>
+<p><b>An event looks like this</b> (simplified):</p>
+<pre><code>{ "op": "u",                       // c=create, u=update, d=delete, r=snapshot read
+  "before": {"id": 42, "status": "PENDING"},
+  "after":  {"id": 42, "status": "SHIPPED"},
+  "source": {"lsn": 91827364, "ts_ms": 1731850000000, "table": "orders"} }</code></pre>
+<p>A delete has <code>before</code> and no <code>after</code>, which is exactly what a polling query can never tell you.</p>
+<p><b>Comparison of approaches.</b></p>
+<table>
+<tr><th></th><th>Log-based</th><th>Query-based (updated_at)</th><th>Trigger-based</th></tr>
+<tr><td>Sees deletes</td><td>yes</td><td>no (unless soft delete)</td><td>yes</td></tr>
+<tr><td>Load on source tables</td><td>very low</td><td>repeated queries</td><td>slows every write</td></tr>
+<tr><td>Latency</td><td>seconds</td><td>poll interval</td><td>low</td></tr>
+<tr><td>Intermediate states</td><td>every change</td><td>only latest at poll time</td><td>every change</td></tr>
+<tr><td>Needs DB feature</td><td>log access</td><td>a reliable updated_at</td><td>triggers</td></tr>
+</table>
+<p><b>Applying CDC downstream.</b> Events for one key must be applied in order, so key the Kafka topic by primary key (same key, same partition). In a lake table use <code>MERGE</code>: if op is delete, remove; else upsert the <code>after</code> image. Keep the log position on each row and only apply newer events, so replays and duplicates do no harm (this makes the sink idempotent).</p>
+<p><b>Pitfalls.</b> Schema changes in the source must flow through (the connector emits schema changes; handle with the registry). Initial snapshots of huge tables take time and can lock or stress the DB. PostgreSQL replication slots hold WAL until consumed: a stopped connector can fill the database disk. Large transactions arrive as one burst. Be aware that events contain real data, including PII, so secure the topics. Tuning details differ by database, so check the connector docs.</p>
 <p>The alternatives are weaker. Query-based CDC polls for <code>updated_at</code> greater than the last seen time: it misses hard deletes, can miss rows updated at the same moment, and loads the database. Trigger-based CDC slows every write. A Debezium event has <code>before</code> and <code>after</code> row images, an op code (create, update, delete, snapshot read) and the log position. Downstream, apply events per key in order with upserts and deletes (<code>MERGE</code>). One operational risk to know: in PostgreSQL an unconsumed replication slot makes the database keep WAL forever and can fill its disk, so monitor slot lag.</p>
 <p class="rem"><b>Remember:</b> log-based CDC = read the DB log, not the tables. Apply per key in order, and watch the lag.</p>
 </div>
@@ -491,6 +870,21 @@ PARTITIONED BY (day(event_time), bucket(16, user_id));</code></pre>
 <summary>Explain at-most-once, at-least-once and exactly-once. Is exactly-once real? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">At-most-once means delivered zero or one time: you can lose data (commit the offset before processing). At-least-once means one or more times: no loss but duplicates after retries (process, then commit). Exactly-once is really exactly-once <em>effect</em>: at-least-once delivery combined with deduplication or idempotent or transactional writes, inside a boundary where I control both sides.</p>
+<p><b>Why this is a question at all.</b> A producer sends a message and waits for an acknowledgement. If no acknowledgement arrives, did the message get lost, or did the acknowledgement get lost? The sender cannot tell. It has only two choices: send again (risk of duplicate) or do not (risk of loss). All delivery semantics come from that choice.</p>
+<ul>
+<li><b>At-most-once:</b> never retry. Fast and simple, but data can be lost. Example: a consumer commits its offset first, then crashes before processing. Fine for metrics you can afford to lose.</li>
+<li><b>At-least-once:</b> retry until acknowledged. Nothing is lost, but the same message may be processed twice. Example: consumer processes, writes the result, crashes before committing the offset, restarts and processes it again. This is the default in most systems.</li>
+<li><b>Exactly-once:</b> each message affects the result exactly one time. A network cannot guarantee delivery once, so this is built from at-least-once plus something that cancels duplicates.</li>
+</ul>
+<p><b>How "exactly-once" is really achieved.</b></p>
+<ol>
+<li><b>Idempotent writes:</b> make a duplicate harmless. <code>MERGE</code> on a key, <code>INSERT ... ON CONFLICT DO NOTHING</code>, or write to <code>file-name = f(offset range)</code> so a retry overwrites with the same bytes. A bank transfer API uses an idempotency key (the second call with the same key returns the first result).</li>
+<li><b>Transactions that commit output and progress together:</b> Kafka transactions write output records and the consumer offsets in one atomic unit (for Kafka-to-Kafka). If the job dies, both roll back and it reprocesses from the old offset with no visible duplicates (consumers must read with read-committed isolation).</li>
+<li><b>Checkpoint plus two-phase commit:</b> Flink snapshots its state and offsets together; a transactional sink pre-commits data and commits it only when the checkpoint completes. After a crash it restarts from the last checkpoint, and uncommitted output is discarded.</li>
+<li><b>Store the offset with the result in the same database transaction</b> (consumer writes rows and the offset in one DB commit).</li>
+</ol>
+<p><b>Worked example.</b> A job reads offsets 100 to 199 and writes totals to a database. Crash after the write, before the commit. On restart it reads 100 to 199 again. Without protection, totals double. If the job writes <code>(batch_id=100-199, total=...)</code> with a unique key on batch_id, the second write is rejected or overwrites identically, and the result is exactly-once in effect.</p>
+<p><b>Where it breaks.</b> The guarantee covers only the parts inside the protocol. Sending an email, calling a payment API, or writing to an external system that is not transactional is still at-least-once; you need idempotency keys there. Also exactly-once costs latency and throughput (transactions, checkpoints), so use it where duplicates truly hurt, not by reflex.</p>
 <p>Over an unreliable network you cannot guarantee a message arrives exactly once, because a lost acknowledgement looks the same as a lost message. Real mechanisms: Kafka's idempotent producer (sequence numbers per partition) and transactions (atomic writes to several partitions plus consumer offsets, for Kafka-to-Kafka flows); Flink checkpoints with a two-phase-commit sink; a checkpointed, idempotent sink in Spark; and an Iceberg <code>MERGE</code> on a key. It breaks at the edge: calling an external API or appending to a plain file has no such guarantee, so use an idempotency key.</p>
 <p class="rem"><b>Remember:</b> exactly-once = at-least-once + idempotent write.</p>
 </div>
@@ -500,6 +894,19 @@ PARTITIONED BY (day(event_time), bucket(16, user_id));</code></pre>
 <summary>What is an idempotent data pipeline, and how do you build one? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">A pipeline is idempotent if running it twice with the same input gives the same final data as running it once. Pipelines are re-run all the time (retries, backfills, replays), so an append-only job turns every retry into duplicates and wrong totals. I make jobs idempotent by overwriting the partition they own, or by upserting with <code>MERGE</code> on a business key, and by passing the run date as a parameter instead of using the wall clock.</p>
+<p><b>Why it matters, with an example.</b> Your nightly job reads yesterday's orders and appends the total to a <code>daily_revenue</code> table. At 03:00 the Airflow task fails at 90% (a network blip), and the retry starts over. If the first run already appended some rows, the table now has duplicates and revenue is overstated. If someone later re-runs last week for a bug fix, it doubles again. Retries, backfills and replays are normal, so a pipeline that gives different results when run twice is a pipeline waiting for an incident.</p>
+<p><b>The definition again.</b> Idempotent means: <code>f(f(x)) = f(x)</code>. The final state is the same after one or many runs with the same input.</p>
+<p><b>Patterns, from simplest to most flexible.</b></p>
+<ol>
+<li><b>Overwrite what you own.</b> The job for date D replaces the whole partition for date D (<code>INSERT OVERWRITE ... PARTITION (dt=D)</code> or Iceberg dynamic overwrite). Running again simply rewrites the same partition. Needs a clear mapping from run to partition.</li>
+<li><b>Upsert on a business key.</b> <code>MERGE INTO target USING source ON t.order_id = s.order_id WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT</code>. Same input twice gives the same table. Needs a stable unique key.</li>
+<li><b>Deterministic output names plus atomic publish.</b> Write to a temp location, then publish with a rename or a table-format commit. A crashed half-write is never visible.</li>
+<li><b>Track processed inputs transactionally.</b> Record (file name or offset range) in the same transaction as the output so already processed inputs are skipped.</li>
+</ol>
+<p><b>Sources of non-determinism to remove:</b> <code>current_date</code> or <code>now()</code> in the query (a backfill for last Tuesday would use today's date; pass the logical run date as a parameter), random ids or UUIDs generated in the job (derive ids from the data, for example a hash of the business key), "first row wins" without ordering, reading a source that changes between runs (read a snapshot, or filter by ingestion time).</p>
+<p><b>Dedup, step by step.</b> Decide what makes two records "the same" (an event id from the producer is best; otherwise a business key such as order_id plus event type). Decide which copy wins (latest <code>updated_at</code>, highest source offset). Add a tie-breaker so ties are resolved the same way on every run. In streaming, remember seen keys in state with a time-to-live bigger than the longest realistic duplicate gap.</p>
+<p><b>How to test it.</b> Run the job twice on the same input and diff the output; kill it in the middle and rerun; run a backfill over a past date. Tools such as Airflow make the logical date available as a template variable so the same code serves the daily run and the backfill.</p>
+<p><b>Pitfalls.</b> Overwrite patterns drop late-arriving rows if you only reprocess the "new" window; partition overwrite replaces the full partition, so the input for it must be complete; side effects (emails, API calls) are not undone by overwriting a table and need their own idempotency keys.</p>
 <p>Other techniques: write to a temporary location and commit atomically (Iceberg and Delta do this), so a half-finished run is invisible; track processed inputs (file names, offsets, event ids) in the same transaction as the output; avoid <code>now()</code>, random ids and "pick any row". For deduplication, define what identifies a record (a producer-generated event id or a business key), keep the latest by event time or source offset, and add a tie-breaker so a re-run picks the same row. In a stream, keep seen ids only for a bounded time, longer than the longest expected duplicate gap. The test is simple: run the job twice and compare the output.</p>
 <pre><code>-- re-runnable: only touches the day it owns
 INSERT OVERWRITE prod.sales_daily PARTITION (dt = '2026-11-17')
@@ -517,6 +924,18 @@ SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY order_id
 <summary>What are event time, processing time and watermarks? How do you handle late data? <span class="lvl s">Senior</span></summary>
 <div class="ans">
 <p class="ia">Event time is when something happened; processing time is when my system saw it, maybe minutes later. I group by event time, so results do not depend on network delay and replays give the same answer. A watermark is the engine's moving estimate "I have probably seen all events up to time T" (highest event time seen minus an allowed lateness). When it passes the end of a window, the window is closed and its state dropped; events older than the watermark are late.</p>
+<p><b>The two clocks.</b> Suppose a phone records a click at 10:00:03 but is in a tunnel and uploads it at 10:07:41. <b>Event time</b> = 10:00:03 (when it happened). <b>Processing time</b> = 10:07:41 (when your job sees it). If you count "clicks per 5-minute window" by processing time, the click lands in the wrong window and the result changes with network delays and with replays (replaying yesterday's log would put everything in "now"). If you count by event time, the click goes to the 10:00 to 10:05 window, which is the true answer and is reproducible.</p>
+<p><b>The new problem.</b> With event time, when is the 10:00 to 10:05 window finished? Another phone might still send a 10:02 event. You cannot wait forever (results never emerge, state grows without bound), and you cannot close at 10:05 wall clock (you would miss late events). You need a rule.</p>
+<p><b>Watermark.</b> The engine tracks the highest event time seen, <code>maxEventTime</code>, and defines <code>watermark = maxEventTime - allowedLateness</code>. It means "I believe no events older than this will still arrive". When the watermark passes a window's end, the engine emits the result and drops its state. With a 2-minute allowed lateness: after seeing an event at 10:07, the watermark is 10:05, so window 10:00 to 10:05 closes. A later event with time 10:03 is late.</p>
+<p><b>Choices for late events:</b></p>
+<ul>
+<li><b>Drop them:</b> simple, slightly undercounts. Fine for approximate metrics.</li>
+<li><b>Larger allowed lateness:</b> more complete but results are delayed and state is bigger.</li>
+<li><b>Side output or late table:</b> collect late events separately, and correct later in batch.</li>
+<li><b>Update the result (retractions or upserts):</b> emit a corrected value for the window when late data arrives, if the sink supports upserts.</li>
+</ul>
+<p>The trade-off is always <b>latency versus completeness versus cost</b>. A common design is a short watermark for a fast provisional view and a batch recomputation for final numbers (see the late-data scenario).</p>
+<p><b>Operational traps.</b> (1) Idle partitions: in Kafka, if one partition has no data, its watermark does not advance and the minimum across partitions stalls the whole job; configure an idle timeout. (2) A single device with a wrong clock sending a timestamp from the future can push the watermark far ahead and make everything else look late; validate timestamps. (3) Watermark semantics differ slightly between Flink and Spark Structured Streaming (Spark uses it to limit state for aggregations and joins), so read your engine's docs.</p>
 <p>For late events I choose among: drop them (simple, counts slightly off), send them to a side output or "late" table for repair, allow more lateness (more delay and more state), or emit corrected results. The trade-off is always latency versus completeness. A batch job that recomputes recent windows from the raw log is a common safety net. One practical trap: an idle Kafka partition does not advance its watermark and can stall the whole job, so configure an idle timeout.</p>
 <figure class="diagram"><svg viewBox="0 0 860 270" role="img" aria-label="Timeline with event time on the x axis. Window 10:00 to 10:05 closes when the watermark reaches 10:05. An on-time event is counted, a very late event goes to a late side output.">
 <line class="arrow" x1="30" y1="150" x2="830" y2="150" marker-end="url(#ah)"/><text class="t-sm" x="640" y="176">event time (when it happened)</text>
@@ -537,6 +956,28 @@ SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY order_id
 <summary>How do you assure data quality in a pipeline? What happens when a check fails? <span class="lvl i">Intermediate</span></summary>
 <div class="ans">
 <p class="ia">I use layers of automated checks and decide the failure action by severity. At ingestion I validate schema, types and required fields. On rows I check not-null, ranges, allowed values, key uniqueness and referential integrity. On the table I check row count versus the usual, freshness and totals reconciled with the source. A critical failure stops the pipeline so bad data never reaches consumers; a minor failure sends the bad rows to a quarantine table with a reason and alerts. I never silently drop rows.</p>
+<p><b>Why this needs design, not just tests.</b> Pipelines usually fail silently: the job succeeds, but half the rows are missing, a currency column is in cents instead of dollars, or a join duplicates rows. Dashboards then show wrong numbers and people lose trust. Data quality is about catching these problems early, before consumers see them, and having a plan for what to do when a check fails.</p>
+<p><b>Types of checks, with examples:</b></p>
+<table>
+<tr><th>Level</th><th>Example checks</th></tr>
+<tr><td>Schema</td><td>expected columns and types present; no unexpected new column</td></tr>
+<tr><td>Row level</td><td>not null on keys, amount greater than or equal to 0, status in an allowed list, valid email format</td></tr>
+<tr><td>Uniqueness and integrity</td><td>order_id unique; every order's customer_id exists in customers</td></tr>
+<tr><td>Table level</td><td>row count within 20% of the 7-day average; no gap in days; max(event_time) not older than 2 hours (freshness)</td></tr>
+<tr><td>Reconciliation</td><td>sum of amount equals the source system's total for that day</td></tr>
+<tr><td>Distribution</td><td>share of nulls or mean of a column suddenly changes (anomaly detection)</td></tr>
+</table>
+<p><b>What to do when a check fails (severity policy).</b></p>
+<ul>
+<li><b>Block (critical):</b> duplicate keys in the revenue table, a count of zero, a failed reconciliation. Stop the pipeline, do not publish, alert the owner. Consumers keep seeing the previous good data, which is better than wrong data.</li>
+<li><b>Quarantine (row level):</b> a few rows with an invalid value. Move those rows to a <code>rejected</code> table with the reason and the source, continue with good rows, and alert if the reject rate crosses a threshold.</li>
+<li><b>Warn (minor):</b> log and notify, publish.</li>
+</ul>
+<p>Never drop bad rows silently: nobody will ever know that 3% of orders vanished.</p>
+<p><b>Write-audit-publish.</b> Write the new data to a place consumers do not read (a staging table, or an Iceberg branch), audit it with the checks, and publish (swap partition, fast-forward the branch) only on success. This gives consumers atomic, verified updates.</p>
+<p><b>Where checks run:</b> dbt tests (not_null, unique, relationships, accepted_values), Great Expectations, Soda, or plain SQL assertions in the orchestrator task. Cheap checks run on every load; expensive reconciliations run daily.</p>
+<p><b>Data contracts.</b> The technical checks catch the symptom; a contract fixes the cause. A data contract is a written, versioned, machine-checkable agreement between the team producing a dataset and the teams consuming it: schema, meaning and units, quality rules, freshness SLA, owner, and how breaking changes are announced. Producers validate against it in CI (for example, a schema registry compatibility check), so a renamed column fails the producer's build, not the consumer's dashboard.</p>
+<p><b>Pitfalls.</b> Too many noisy checks cause alert fatigue and people ignore them; start with a few that map to real incidents. Static thresholds fail on seasonal data (weekend traffic), so compare with the same weekday. Test data in production, not only in staging, since real data is what breaks.</p>
 <p>Tools such as dbt tests, Great Expectations or Soda run these checks. A good pattern is write-audit-publish: write new data where consumers cannot see it (a staging table or an Iceberg branch), run the checks, and publish atomically only if they pass. The people side matters as much: a data contract is an explicit, machine-checkable agreement between the producing team and consumers, covering schema, meaning (currency, tax included?), quality rules, freshness, ownership and how breaking changes are announced. Checked in the producer's CI, it stops "an upstream team renamed a column and a dashboard broke two weeks later".</p>
 <p class="rem"><b>Remember:</b> check early, stop on critical failures, quarantine the rest, and never drop silently.</p>
 </div>
@@ -549,6 +990,17 @@ SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY order_id
 <summary>A producer team removed a field from the Avro schema on a Kafka topic and consumer jobs crashed in production. What do you do? <span class="lvl s">Senior</span></summary>
 <div class="ans">
 <p class="ia">Roll the producer back so new messages use the old schema again, then fix the removal in a compatible way. The root cause is a breaking schema change that got through, so I then enforce compatibility in the registry and the producer's CI.</p>
+<p><b>Why this happens.</b> The producer's registry subject was probably on compatibility NONE, or auto-registration let a new schema through without a check, or the producer bypassed the registry. In Avro terms, the removed field had no default, so consumers still using the old reader schema had nothing to fill for it (forward-incompatible). Whatever the cause, the real lesson is that the compatibility gate was not in place.</p>
+<p><b>Order of actions in the first hour (stop the bleeding, then repair).</b></p>
+<ol>
+<li>Roll back the producer deploy, so no new bad messages are written.</li>
+<li>Check which consumers fail and why (exception messages like "missing default" or "no field named X"). Stop them from crash-looping, since each restart can retry the same bad record and block a partition (a "poison pill").</li>
+<li>Assess the damage in the topic: from which offset do bad-schema messages start, and how many? If consumers can handle both schemas after a quick fix (give the field a default in the reader schema), deploy that and let them continue. Otherwise route bad messages to a dead-letter topic (keep a copy), then skip past them.</li>
+<li>Backfill if any messages were skipped: replay from the saved offset after the fix, using idempotent processing to avoid duplicates.</li>
+<li>Communicate: which dashboards and tables were stale or wrong, between which times.</li>
+</ol>
+<p><b>The right way to remove a field</b> (an expand and contract migration): step 1, make the field optional with a default in the schema and upgrade producers and consumers; step 2, stop writing it; step 3, once no reader depends on it, remove it. Each step is compatible by itself.</p>
+<p><b>Follow-ups to expect.</b> "How would the registry have stopped it?" With BACKWARD or FULL on the subject, removing a field with no default (forward) or adding without default fails at register time. "How do you test consumers?" Contract tests that deserialize sample messages of every schema version. "What about the consumers you do not know about?" Use FULL compatibility and a documented deprecation window, and monitor consumer groups to know who is reading.</p>
 <p><b>Situation:</b> consumers fail with a decoding or "missing field" error right after a producer deploy, and messages with the new schema are mixed in the topic with old ones.</p>
 <p><b>Check first:</b> the registry history for the subject (what changed, did the removed field have a default, what compatibility mode was set; NONE would explain how it got through), which consumer groups fail, and how many bad-schema messages exist.</p>
 <p><b>Fix:</b> (1) roll back the producer. (2) Pause stuck consumers; for messages already written, deploy a consumer that handles the new schema or move them to a dead-letter topic after copying them for replay. Do not blindly reset offsets, that loses data. (3) Re-release the change in two steps: make the field optional with a default and upgrade all consumers, then remove it. (4) Replay from the saved offset.</p>
@@ -561,6 +1013,22 @@ SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY order_id
 <summary>After a job retry, the daily revenue is double what the source system says. Find and fix it. <span class="lvl s">Senior</span></summary>
 <div class="ans">
 <p class="ia">A failed task was retried and appended the rows again, so the job is not idempotent. I would roll the table back to the snapshot before the bad commits, or re-run that day with a partition overwrite from raw data, and then make the job idempotent so it cannot happen again.</p>
+<p><b>The mental model.</b> Revenue exactly doubled, which is a strong clue: the whole day was written twice, not just a few rows. A task partially failing would produce a partial overcount. A full double suggests a complete re-run that appended.</p>
+<p><b>Investigation in order, with the queries.</b></p>
+<ol>
+<li>Confirm the symptom: <code>SELECT sale_date, count(*), sum(amount) FROM sales GROUP BY 1</code> and compare to the source. Ratio 2.0 means a whole duplicate load.</li>
+<li>Prove duplicates: <code>SELECT order_id, count(*) FROM sales WHERE sale_date = '2026-11-17' GROUP BY 1 HAVING count(*) &gt; 1</code>. If rows are exactly identical, it is a double load; if they differ (other timestamp), look for late updates or a join fan-out instead.</li>
+<li>Find the cause: orchestrator history (attempt 1 failed or timed out, attempt 2 succeeded), table snapshot history (<code>SELECT * FROM sales.snapshots</code> shows two append commits with the same run id), and the job code (append mode, no key).</li>
+</ol>
+<p><b>Repair options, from least to most invasive.</b></p>
+<ul>
+<li><b>Rollback to the snapshot before the double append</b> (<code>CALL system.rollback_to_snapshot(...)</code>), valid only if nobody else wrote since; otherwise you lose their changes.</li>
+<li><b>Re-run the day as a partition overwrite from the raw layer.</b> Safe and clean, assumes raw is intact.</li>
+<li><b>Deduplicate in place:</b> write the deduplicated rows to a new table with <code>row_number()</code> over the business key, validate counts and sums against the source, swap, and drop the old.</li>
+</ul>
+<p>Then rebuild the downstream tables (marts, caches, exported reports) for that date and notify the people who saw the wrong number, so decisions made from it can be reviewed.</p>
+<p><b>Making it impossible next time.</b> Change the job to overwrite its partition or merge on <code>order_id</code>; pass the logical date as a parameter; add a uniqueness test on the key; add a reconciliation gate (row count and sum versus source within tolerance) that fails before publishing; and avoid blind "retry" on non-idempotent tasks.</p>
+<p><b>What the interviewer wants to hear:</b> that you separate immediate repair from root cause, that you verify against a source of truth, and that you notify consumers.</p>
 <p><b>Situation:</b> a task timed out halfway, the orchestrator retried, and the second attempt appended all rows again.</p>
 <p><b>Check first:</b> compare counts with the source for that date; run <code>SELECT order_id, count(*) ... HAVING count(*) &gt; 1</code> to confirm exact duplicates; look at the table's snapshot history for two append commits from the same run id.</p>
 <p><b>Fix:</b> on an Iceberg table, <code>rollback_to_snapshot</code> to the one before the bad commits if nothing else has written since, or re-run the day with partition overwrite. If neither works, deduplicate with <code>row_number</code> by business key into a new table, validate totals, then swap. Rebuild downstream tables for the date and tell consumers the numbers were wrong for a period.</p>
@@ -573,6 +1041,17 @@ SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY order_id
 <summary>Mobile events arrive up to two days late and your hourly streaming counts keep changing. What do you design? <span class="lvl s">Senior</span></summary>
 <div class="ans">
 <p class="ia">I run two paths: a streaming job with a short watermark for a fresh but provisional view, and a batch job that recomputes the last few days from the raw table for the final numbers. Every event, including late ones, is kept in the raw layer with both event time and arrival time.</p>
+<p><b>Understand the data first.</b> Mobile devices buffer events when offline and upload later; so the gap between event time and arrival time has a long tail: most events arrive in seconds, some in hours, a few after days. You cannot get both "instant" and "final" for such data, so the design must separate the two.</p>
+<p><b>The design, as a flow.</b></p>
+<ol>
+<li><b>Ingest everything to a raw table</b> (append only) with <code>event_time</code>, <code>ingest_time</code>, and a unique event id. Late events are not special here: they are simply appended.</li>
+<li><b>Streaming job (fast path):</b> event-time windows with a short watermark (for example 15 minutes). It produces a provisional hourly count for dashboards, available within minutes. Events that arrive after the watermark are not lost: they are already in the raw table.</li>
+<li><b>Batch correction job (accurate path):</b> every hour, recompute the last 3 days of hourly counts from the raw table using event time, and replace those partitions (idempotent overwrite or merge). Run a final recompute after 48 hours or whenever your lateness SLA says data is complete.</li>
+<li><b>Serving table:</b> consumers read the corrected table. The newest hours are labelled "provisional" in the UI because they may still rise.</li>
+</ol>
+<p><b>Why not just a 2-day watermark?</b> The streaming job would hold 2 days of state for every window and key (expensive, slow recovery), and results for any hour would appear only after 2 days. The two-path design gives a fast answer and an eventually correct answer cheaply.</p>
+<p><b>Numbers to measure first.</b> Plot the distribution of (ingest time minus event time): if 95% arrive within 5 minutes and 99.9% within 24 hours, choose a 5 to 15 minute watermark and a recompute window of 2 days. Also agree with the business which reports require exactness (billing) versus approximation (a live dashboard).</p>
+<p><b>Pitfalls.</b> Recompute windows must be larger than the lateness tail or the tail never gets corrected. Be careful with double counting if both paths write to the same table; keep streaming output in a separate provisional table and let the batch job own the final one. Alert on late-event rate, because a sudden jump means an app bug or an outage upstream.</p>
 <p><b>Situation:</b> devices buffer events offline and upload later. A 10-minute watermark drops them; an unbounded one never finalises.</p>
 <p><b>Check first:</b> measure the lateness distribution (what percent arrive within 1 minute, 1 hour, 1 day, 2 days) and ask the business which numbers must be exact and when.</p>
 <p><b>Fix:</b> short watermark (say 15 minutes) for the "fresh, approximate" view; write all events to the raw table; an hourly batch recompute for the last 3 days and a final one after 48 hours, using idempotent partition overwrite or merge. Dashboards read the corrected table and label the newest hours "provisional". Events beyond the cutoff go to a late table, with an alert if their rate is unusual.</p>
@@ -585,6 +1064,22 @@ SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY order_id
 <summary>A daily report on an Iceberg table went from 2 minutes to 40 minutes after streaming ingestion was added. What do you check? <span class="lvl s">Senior</span></summary>
 <div class="ans">
 <p class="ia">Almost certainly small files and metadata growth from frequent streaming commits. I check the table's file and snapshot metadata, compact the hot partitions, rewrite manifests and expire snapshots, then lower the commit frequency and schedule compaction.</p>
+<p><b>Reasoning about the symptom.</b> The query and data volume did not change, only the ingestion style. A big slowdown with identical logic points to overhead rather than compute: the number of files, manifests and snapshots grew. A streaming job committing every 10 seconds produces 8,640 commits a day, each adding at least one small file per partition touched, plus a snapshot and a manifest.</p>
+<p><b>Diagnose with numbers instead of guessing.</b> Iceberg exposes its metadata as tables:</p>
+<pre><code>SELECT partition, count(*) AS files, avg(file_size_in_bytes)/1e6 AS avg_mb
+FROM prod.orders.files GROUP BY partition ORDER BY files DESC;
+SELECT count(*) FROM prod.orders.snapshots;
+SELECT count(*) FROM prod.orders.manifests;</code></pre>
+<p>Typical bad picture: 30,000 files per day with an average of 2 MB, thousands of snapshots, and thousands of manifests. In the engine UI you will see many short tasks and a long "planning" phase before any data is read.</p>
+<p><b>Fix, in a safe order.</b></p>
+<ol>
+<li>Compact closed partitions first (<code>rewrite_data_files</code> with a target size around 256 to 512 MB, optionally sorted by the filter column). Avoid the partition being written right now to reduce commit conflicts.</li>
+<li><code>rewrite_manifests</code> to reduce the number of manifests.</li>
+<li><code>expire_snapshots</code> with a retention that suits you (for example 3 to 7 days) so old small files are deleted and metadata shrinks. Remove orphan files.</li>
+<li>Re-run the report and compare: time, number of tasks, bytes read.</li>
+</ol>
+<p><b>Fix the cause, not just the symptom.</b> Increase the streaming commit interval (for example 2 to 5 minutes), coalesce before writing, use a distribution mode so each task writes few files, and schedule compaction (hourly for the hot partition, daily for the rest). If the report only needs hourly freshness, 10-second commits were never required.</p>
+<p><b>Prevention.</b> Alert on average file size, files per partition, and snapshots count; add a runbook. Also consider merge-on-read delete files if the stream does upserts, since they add their own read cost until compacted.</p>
 <p><b>Situation:</b> the query did not change, only the ingestion: a Flink job now commits every 10 seconds.</p>
 <p><b>Check first:</b> query the metadata tables: file count and average size per partition (expect thousands of files of 1 to 5 MB), the number of snapshots per day, and the number of manifests. The engine UI shows many tiny tasks and long planning time.</p>
 <p><b>Fix:</b> run <code>rewrite_data_files</code> on the affected partitions (old ones, to avoid conflicts with streaming), then <code>rewrite_manifests</code> and <code>expire_snapshots</code>. For the cause, raise the commit interval to a few minutes or stage and merge hourly, and schedule compaction.</p>
@@ -597,6 +1092,19 @@ SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY order_id
 <summary>A user asks to be deleted (GDPR erasure). Their data is in an Iceberg lake with years of history. How do you actually delete it? <span class="lvl s">Senior</span></summary>
 <div class="ans">
 <p class="ia">A DELETE alone is not enough, because in an immutable table it only hides the rows. I delete the rows, compact so data files are physically rewritten, expire the old snapshots and remove orphans so time travel cannot bring the data back, and then handle every other copy (derived tables, indexes, backups).</p>
+<p><b>Why a plain DELETE is not enough.</b> Iceberg files are immutable. <code>DELETE</code> creates a new snapshot in which the rows are no longer visible, but the old data files still exist and old snapshots still point at them. Anyone with access can run <code>VERSION AS OF</code> and read the "deleted" person. Backups and derived datasets hold copies too. Regulators expect real erasure within a time limit (typically about one month under GDPR; check your legal team).</p>
+<p><b>The sequence of steps, and why each is needed:</b></p>
+<ol>
+<li><b>Find all the data.</b> Use the PII inventory, the data catalog and lineage to list every table, topic, search index, cache, extract and backup holding this user id. Also decide what must be kept for legal reasons (tax invoices) and anonymise rather than delete those.</li>
+<li><b>Delete the rows</b> in each table: <code>DELETE FROM silver.events WHERE user_id = 'u123'</code>. In copy-on-write, affected files are rewritten without the user. In merge-on-read, delete files merely mask the rows.</li>
+<li><b>Compact</b> (<code>rewrite_data_files</code> with delete files applied) so the physical Parquet files that contained the user are replaced by new ones.</li>
+<li><b>Expire snapshots</b> older than the delete commit, so no snapshot references the old files, then <b>remove orphan files</b>, which physically deletes the original objects. Check also that the object store does not keep versions (S3 versioning) or that lifecycle rules remove them.</li>
+<li><b>Propagate</b> to derived tables (gold aggregates normally do not contain the user, but feature tables or exports do), and to search indexes and caches.</li>
+<li><b>Backups:</b> either they expire within the legal period and you document that, or you restore-and-purge. Write down the policy.</li>
+<li><b>Record proof</b> (what was deleted, when, by whom) without keeping the personal data itself.</li>
+</ol>
+<p><b>Better design for next time.</b> Keep personal data in a small table keyed by a surrogate id; other tables use only the surrogate, so erasure is one delete in one place. Batch requests (run the erasure job daily for all pending users) so compaction cost is shared. Or encrypt per-user data with a per-user key and delete the key (crypto-shredding), which works well for backups and immutable logs.</p>
+<p><b>What an interviewer probes:</b> "what about Kafka topics?" Compacted topics with a tombstone, or short retention, or crypto-shredding; "what about time travel for audits?" That conflicts with erasure, so decide retention up front.</p>
 <p><b>Situation:</b> the user's events, orders and profile are spread across raw, cleaned and gold layers, plus extracts.</p>
 <p><b>Check first:</b> find every place that holds the user id (data catalog, lineage, PII inventory), and check whether the law requires keeping some records, such as invoices, which may need anonymising instead.</p>
 <p><b>Fix:</b> (1) <code>DELETE FROM t WHERE user_id = X</code> on each table: this creates a new snapshot. With copy-on-write the files are rewritten; with merge-on-read only delete files hide the rows. (2) Compact so the data files are rewritten. (3) Expire old snapshots and remove orphan files, since old snapshots still reference the original files. (4) Handle other copies and document backup retention. (5) Keep proof, within the legal deadline.</p>
@@ -610,6 +1118,17 @@ SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY order_id
 <summary>CDC events for the same order arrive out of order and the lake table shows an old status. How do you fix it? <span class="lvl s">Senior</span></summary>
 <div class="ans">
 <p class="ia">Apply changes by source version, not by arrival order. I key the topic by the primary key, dedupe each batch keeping the event with the highest log position, and make the merge conditional so it never moves backwards.</p>
+<p><b>Why this happens.</b> Two updates to the same order (PENDING then SHIPPED) are written in order at the source. Along the way they can be reordered: the topic was not keyed by order id so the updates sit in different partitions and are read by different tasks, or a replay or retry applies an older batch after a newer one. A merge that says "the last row I applied wins" then leaves the older state.</p>
+<p><b>A concrete failure.</b> Events: e1 (lsn 100, PENDING), e2 (lsn 105, SHIPPED). Task 2 processes e2 and writes SHIPPED; task 1, slower, processes e1 and overwrites with PENDING. The lake now disagrees with the source forever, silently.</p>
+<p><b>Fixes in layers:</b></p>
+<ol>
+<li><b>Keep order at the source:</b> produce the topic keyed by the primary key, so all changes of one order go to one partition, processed by one consumer in order. This alone prevents most cases (CDC tools do this by default).</li>
+<li><b>Never rely on arrival order in the merge.</b> Within each micro-batch, deduplicate by key and keep only the event with the highest version (log position, or commit timestamp with a tie-breaker): <code>row_number() OVER (PARTITION BY order_id ORDER BY lsn DESC) = 1</code>.</li>
+<li><b>Make the merge conditional:</b> <code>WHEN MATCHED AND s.lsn &gt; t.lsn THEN UPDATE</code>. A stale event is then a no-op, whether it is late, duplicated or replayed.</li>
+<li><b>Handle deletes:</b> an old insert arriving after a delete could resurrect a row, so keep a tombstone (soft delete with version) for a retention period.</li>
+</ol>
+<p><b>Repairing existing wrong rows.</b> Detect them by comparing with the source (count of rows per status, or checksums by key range). Replay the raw change events for the affected keys with the version-aware merge, or re-snapshot those keys from the source.</p>
+<p><b>Prevention.</b> Store the source version (lsn or ts) in the target table, add an alert comparing target and source aggregates, and test the pipeline by deliberately shuffling and duplicating input events: the final table must not change.</p>
 <p><b>Situation:</b> the lake shows PENDING while the source says SHIPPED, because two updates were applied in the wrong order (parallel tasks, or a replay).</p>
 <p><b>Check first:</b> is the topic keyed by order id, so all changes for one order sit in one partition in order? Does the merge take whichever row it sees last? Does each event carry a version such as the log position or source timestamp?</p>
 <p><b>Fix:</b> in each batch deduplicate by key, keeping the highest log position (timestamp plus offset as tie-breaker), then <code>MERGE ... WHEN MATCHED AND s.lsn &gt; t.lsn THEN UPDATE</code>. Repair the wrong rows by replaying from raw or re-snapshotting the affected keys.</p>

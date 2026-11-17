@@ -138,6 +138,16 @@
 <div class="ans">
 <p class="ia">We cache to make reads faster and to protect the database. A Redis read takes well under a millisecond, while a query with joins can take tens of milliseconds, and most reads never reach the database at all. Good candidates are read-heavy, expensive to compute, and fine to be slightly stale: product catalogs, profiles, config, permission lookups.</p>
 <p>Bad candidates are data that changes on every request, data that must be perfectly fresh (a balance during a transfer), and data read once and never again. A cache also costs you something: staleness, one more component that can fail, and extra code. So before adding one I ask three things: what is the read-to-write ratio, how stale can this be, and what hit rate do I expect? For read-heavy data 90 to 99 percent is common. Below about 80 percent I would question the cache. I measure it with the hit rate (<code>keyspace_hits</code> versus <code>keyspace_misses</code> in <code>INFO stats</code>), p99 latency and database load before and after.</p>
+<p><b>The idea from scratch.</b> A cache is a small, fast copy of data that is slow to get from its original place. The database holds the truth on disk and is shared by everyone, so it is the scarce resource. Every read we answer from memory is a read the database never sees. That is why caching often helps scalability more than raw speed: one database can serve far more users if 95 of every 100 reads stop at the cache.</p>
+<p><b>A worked example.</b> Say a product page needs a 20 ms query and the site gets 2,000 page views per second. Without a cache that is 2,000 queries per second, which is 40 seconds of database work every second, so you would need many connections and replicas. With a 95 percent hit rate only 100 queries per second reach the database, and the other 1,900 reads cost about 0.3 ms each. Notice how sensitive this is: at a 90 percent hit rate the database gets 200 queries per second, twice as much. A few points of hit rate can double the load behind it.</p>
+<table>
+<tr><th>Good candidate</th><th>Poor candidate</th></tr>
+<tr><td>Read far more than written (catalog, profile)</td><td>Changes on almost every request</td></tr>
+<tr><td>Expensive to build (joins, remote API call)</td><td>Cheap to read from the database anyway</td></tr>
+<tr><td>Same item asked for again and again</td><td>Every key read once (the hit rate stays near zero)</td></tr>
+<tr><td>Can be a little old (seconds to minutes)</td><td>Must be exact now (balance, stock at checkout)</td></tr>
+</table>
+<p><b>What an interviewer probes next.</b> They ask what you lose by adding a cache: you now have two copies of the data that can disagree, a new component that can fail, and a cold-start problem (an empty cache after restart sends all traffic to the database). Always say that you would measure the hit rate first rather than add a cache by habit.</p>
 <p class="rem"><b>Remember:</b> cache what is read often, costly to build and allowed to be a bit old. Then measure the hit rate.</p>
 </div>
 </details>
@@ -159,6 +169,16 @@ void update(User u) {
     redis.del("user:" + u.id);             // 2. then invalidate
 }</code></pre>
 <div class="mistake"><b>Watch out:</b> forgetting the TTL, so one missed invalidation lives forever. Also caching "not found" results without a short TTL (see penetration).</div>
+<p><b>Why the application owns the logic.</b> In cache-aside the cache is a dumb store. It never talks to the database; only your code moves data between the two. That is why it is called "aside": the cache sits beside the data path instead of in front of it. It is the default choice because it needs nothing special from the cache or the database.</p>
+<p><b>Walk through one key, <code>user:7</code>.</b></p>
+<ol>
+<li>Request 1 does <code>GET user:7</code> and gets nil (a miss). It reads the row from the database (say 15 ms), stores it with <code>SETEX user:7 300 ...</code> and returns.</li>
+<li>Requests 2 to N in the next five minutes get a hit in under a millisecond. The database sees none of them.</li>
+<li>A profile update writes the database, then deletes <code>user:7</code>. The next read is a miss and loads the new row.</li>
+<li>If nobody updates it, the TTL expires after 300 seconds and the next read refreshes it anyway.</li>
+</ol>
+<p><b>Why "write the database first, then delete".</b> If you delete the cache first, a reader can slip in between the delete and the database write, miss, read the old row and put it back, and then the stale value sits there until the TTL. Deleting after the commit shrinks that window a lot (it does not remove it; see the race question below). Also note that the delete should happen only after the database transaction has committed, otherwise a reader can refill the cache with the pre-commit value.</p>
+<p><b>When to choose something else.</b> If many services would each have to re-implement this code, or you want the loading logic in one place, use a read-through setup (a cache layer or library that loads for you). If you cannot tolerate even a short stale window, cache-aside alone is not enough and you need the safeguards covered in the next few questions.</p>
 <p class="rem"><b>Remember:</b> read: cache, then database, then fill. Write: database first, then delete the key.</p>
 </div>
 </details>
@@ -168,6 +188,17 @@ void update(User u) {
 <div class="ans">
 <p class="ia">Because a delete cannot leave a wrong value behind, but an update can. If two writers update the database and the cache in different orders, the cache can end up holding the older value while the database has the newer one. A delete is safe to repeat and the next read rebuilds the entry from the truth.</p>
 <p>Example: writer 1 sets the database to A, writer 2 sets it to B, but writer 2 writes the cache first and writer 1 second. The cache now says A, the database says B, until the TTL ends. With delete, the worst case is one extra miss. The price of delete is a cache miss right after every write, so for data written very often, deleting wastes the cache; there, a short TTL or a version check on update is better. If the delete itself fails, retry it through a queue and rely on the TTL as the last defence.</p>
+<p><b>Why this is a real design question.</b> After you change the database, the cache copy is wrong and you have two choices: overwrite it with the new value (update) or throw it away (delete). Update looks smarter because it saves the next reader a miss, but it needs the correct final value computed in the right order, and that is hard when two writers run at the same time.</p>
+<p><b>Timeline of the failure with update.</b> Writer 1 and writer 2 are two different requests changing the same product price.</p>
+<ol>
+<li>Writer 1 writes the database: price = 10.</li>
+<li>Writer 2 writes the database: price = 12 (now the newest).</li>
+<li>Writer 2 updates the cache: 12.</li>
+<li>Writer 1, delayed by a GC pause, updates the cache: 10.</li>
+</ol>
+<p>The database says 12, the cache says 10, and the cache will keep saying 10 until the TTL. With delete, step 3 and step 4 both just remove the key, and the next reader loads 12 from the database. The final state is the same no matter how the two deletes are ordered, which is what "idempotent" buys you.</p>
+<p><b>When update is still the right call.</b> If the value is expensive to rebuild and read immediately after the write (for example a computed score shown right after the user submits), delete causes a visible slow read for the first reader. Then you can write the new value in, but guard it: use a version number or timestamp in the value and only write if yours is newer (an atomic compare in a Lua script), or serialize writers per key.</p>
+<p><b>What if the delete itself fails?</b> The database is already updated, so the cache is stale until the TTL. Retry the delete (a small retry loop, or publish an invalidation event that a consumer retries), and keep the TTL as the last line of defence. This is why every cached key should have a TTL.</p>
 <p class="rem"><b>Remember:</b> deleting is idempotent and cannot write a wrong value. Updating can.</p>
 </div>
 </details>
@@ -197,6 +228,17 @@ void update(User u) {
 <line class="arrow" x1="120" y1="226" x2="298" y2="226" marker-end="url(#ah)"/><text class="t-sm" x="150" y="219">2. delete key</text>
 <path class="arrow" d="M65 256 L65 285 L685 285 L685 256" marker-end="url(#ah)" fill="none"/><text class="t-sm" x="280" y="280">1. write database first</text>
 </svg><figcaption>Write-through pays on every write and stays consistent. Write-behind is fastest but can lose data. Cache-aside puts the app in control.</figcaption></figure>
+<p><b>The core question is who does the work and when.</b> There are two jobs: loading data into the cache on reads, and getting writes to the database. The three patterns answer them differently.</p>
+<table>
+<tr><th>Pattern</th><th>Write acknowledged when</th><th>Consistency</th><th>Risk</th><th>Good for</th></tr>
+<tr><td>Cache-aside</td><td>Database write done</td><td>Brief stale window until the delete</td><td>Forgotten or failed invalidation</td><td>General purpose default</td></tr>
+<tr><td>Read-through</td><td>Not about writes; the cache loads on a miss</td><td>Same as cache-aside</td><td>Cache must know how to load</td><td>One place for loading logic</td></tr>
+<tr><td>Write-through</td><td>Cache and database both written</td><td>Cache and database agree</td><td>Every write is as slow as the database</td><td>Read-heavy data that must not be stale</td></tr>
+<tr><td>Write-behind</td><td>Cache written only</td><td>Database lags behind</td><td>Data loss if the cache dies before flushing</td><td>High write rate, loss tolerable</td></tr>
+</table>
+<p><b>Write-behind in more detail.</b> The app increments a view counter 5,000 times per second. Writing each one to the database would melt it. With write-behind the cache absorbs the increments (<code>INCR views:42</code>) and a worker flushes the totals to the database every few seconds, one write per key instead of thousands. The price: if Redis dies (or its AOF window is lost) the unflushed increments vanish, and while the data sits in the cache the database is behind, so any report reading the database is slightly wrong. Combining this with a Redis Stream or list as a durable buffer narrows the loss.</p>
+<p><b>Write-through in more detail.</b> It keeps the cache warm for data just written, so the next read is a hit. But you pay the latency of both stores on every write, and you also cache items that may never be read again. If the cache write succeeds and the database write fails you must roll one back, which is the same dual-write problem as everywhere else in distributed systems.</p>
+<p><b>Say this in an interview.</b> "Redis itself does none of these; they are patterns in the app or a library. I default to cache-aside, use write-behind only for counters where a few seconds of loss is fine, and avoid write-through unless the extra write latency is acceptable."</p>
 <p class="rem"><b>Remember:</b> write-through = consistent but slower. Write-behind = fast but can lose data. Cache-aside = you decide.</p>
 </div>
 </details>
@@ -209,6 +251,20 @@ void update(User u) {
 <pre><code>SET product:42 "{...}" EX 300      # 5 minutes
 TTL product:42                      # seconds left; -1 = no expiry, -2 = no key</code></pre>
 <div class="mistake"><b>Watch out:</b> a plain <code>SET</code> without <code>EX</code> removes the old TTL (unless you use <code>KEEPTTL</code>). Many "keys that never expire" bugs come from this.</div>
+<p><b>Think of TTL as a promise to the user, not a tuning knob.</b> A TTL of 5 minutes means "you might see data that is up to 5 minutes old". So the product owner, not the cache, decides the number. Ask: what is the damage if this is stale? A wrong stock count at checkout is costly; a wrong follower count is not.</p>
+<p><b>Rules of thumb with examples.</b></p>
+<ul>
+<li>Reference data that almost never changes (country list): hours or a day, plus explicit delete on change.</li>
+<li>Product description or profile: 1 to 10 minutes, with a delete on update.</li>
+<li>Feature flags and permission checks: 30 to 60 seconds, so changes (and revocations) take effect quickly.</li>
+<li>Negative results ("id not found"): 30 to 60 seconds, so a newly created record shows up fast.</li>
+<li>Authoritative values like balances: do not cache, or cache for a very short time only for display.</li>
+</ul>
+<p><b>Jitter, explained.</b> If a batch job fills 100,000 keys at 09:00 with a TTL of exactly 600 seconds, they all expire at 09:10:00 and 100,000 requests miss together (an avalanche). Adding a random 0 to 20 percent to each TTL spreads the expiries over two minutes.</p>
+<pre><code>int ttl = 600 + ThreadLocalRandom.current().nextInt(120);
+redis.setex(key, ttl, value);</code></pre>
+<p><b>Sliding versus absolute TTL.</b> Resetting the TTL on every read (a sliding TTL, as sessions do) keeps hot keys alive but means a key that is read constantly can never be refreshed from the source. For cache data I use an absolute TTL. For sessions I use sliding idle timeout plus an absolute maximum.</p>
+<p><b>Follow-up to expect.</b> "What if the TTL is too short?" The hit rate falls and the database works harder. "Too long?" Users see stale data after a missed invalidation. You tune it from the hit rate and the staleness complaints you actually get.</p>
 <p class="rem"><b>Remember:</b> TTL = acceptable staleness, plus a safety net. Always add jitter.</p>
 </div>
 </details>
@@ -218,6 +274,16 @@ TTL product:42                      # seconds left; -1 = no expiry, -2 = no key<
 <div class="ans">
 <p class="ia">Two ways together. Lazy expiry: when a key is read, Redis checks its expiry time and deletes it if it is past, so you never get an expired value. Active expiry: a background job on the main thread samples keys that have a TTL, several times a second, and deletes the expired ones.</p>
 <p>So an expired key that nobody reads can stay in memory for a while until the sampler finds it. The sampler takes about 20 keys per round and repeats immediately if more than about 25 percent were expired, with a time cap so it does not stall requests. The effect: if millions of keys share the same expiry second, Redis spends time deleting them and latency spikes. That is one more reason for TTL jitter. On replicas, keys are not expired independently; the primary sends explicit <code>DEL</code> commands, so replicas stay in step. The expiry is stored as an absolute time, so it survives a restart (time spent down counts).</p>
+<p><b>Why two mechanisms.</b> Imagine Redis had to delete each key exactly at its expiry time. It would need a timer per key, or a sorted structure it scans constantly, which costs CPU and memory for millions of keys. Redis picks a cheaper, approximate design: check on access (so correctness is exact), and clean up in the background (so memory is eventually reclaimed).</p>
+<p><b>How the active cycle behaves.</b> Several times per second (the <code>hz</code> setting, default 10) Redis runs a short cycle on the main thread:</p>
+<ol>
+<li>Pick a random sample of about 20 keys from the set of keys that have a TTL.</li>
+<li>Delete the ones that have expired.</li>
+<li>If more than about a quarter of the sample was expired, assume many more are waiting and repeat, up to a time budget.</li>
+</ol>
+<p>So a key that expired but is never read may use memory for a while. That explains the common question "I set TTLs but memory did not drop": the keys are logically gone (a read returns nil) yet physically still there until sampled. It also explains why <code>INFO keyspace</code> may show keys counted that are already expired.</p>
+<p><b>The mass-expiry problem.</b> Suppose five million keys all expire in the same second. The repeat-while-more-than-25-percent loop keeps running and deleting, eating main-thread time, and commands queue behind it. You see a latency spike with no slow command in the slow log, because the work is internal housekeeping. The fixes are TTL jitter and, on big deletes, lazy freeing (<code>lazyfree-lazy-expire yes</code> so the memory is released by a background thread).</p>
+<p><b>Replication and persistence details.</b> Replicas do not decide expiry themselves (otherwise clocks would diverge); the primary sends a <code>DEL</code> (or <code>UNLINK</code>) when a key expires, so replicas match. A replica may still return a logically expired key in a narrow window before the DEL arrives, though newer versions hide it on reads. RDB and AOF store the absolute expiry timestamp, so if Redis is down past the expiry, the key is gone on load.</p>
 <p class="rem"><b>Remember:</b> lazy on read plus sampling in the background. Same-second expiry means a spike, so use jitter.</p>
 </div>
 </details>
@@ -232,6 +298,17 @@ TTL product:42                      # seconds left; -1 = no expiry, -2 = no key<
 <li><b>Versioned keys:</b> put a version in the key (<code>product:42:v17</code>) so a change creates new keys and old ones age out by TTL. Good for lists and pages.</li>
 </ul>
 <p>The hardest case is collections: a changed product sits inside many cached list pages, and tracking which ones is painful. A short TTL or a version number on the list is usually easier than tracking dependencies. For "read your own writes" (a user edits a profile and must see it now), I bypass the cache for that user for a few seconds, or write the new value straight in. Honest promise to the business: eventual consistency with a bound, never "always fresh".</p>
+<p><b>The hardest problem in caching, restated simply.</b> The cache holds a copy. When the original changes, the copy must change or disappear. Every strategy answers "who notices the change, and how do they tell the cache?"</p>
+<table>
+<tr><th>Strategy</th><th>Who tells the cache</th><th>Freshness</th><th>Weakness</th></tr>
+<tr><td>TTL only</td><td>Nobody; time passes</td><td>Up to the TTL old</td><td>Stale for up to a whole TTL</td></tr>
+<tr><td>Delete on write</td><td>The service that wrote</td><td>Near immediate</td><td>Each writer must remember; misses other writers (batch jobs, admin scripts)</td></tr>
+<tr><td>Event-driven (CDC, queue)</td><td>A consumer of change events</td><td>Seconds</td><td>More moving parts; consumer lag; still needs idempotent deletes</td></tr>
+<tr><td>Versioned keys</td><td>The key itself changes</td><td>Immediate for new readers</td><td>Old versions waste memory until their TTL</td></tr>
+</table>
+<p><b>Versioned keys, with an example.</b> To cache the product list for a category, keep a small counter <code>ver:cat:5</code>. The list key is <code>list:cat:5:v17</code>. Any product change in the category does <code>INCR ver:cat:5</code>, so readers look up v18, miss, and rebuild, while v17 simply expires. You never have to find and delete all the list pages that contained the changed product.</p>
+<p><b>Why events beat in-code deletes for shared tables.</b> If three services and a nightly job all modify the <code>orders</code> table, asking each one to remember cache deletes will fail eventually. Change data capture (reading the database log, for example with Debezium) turns each committed row change into an event, and one consumer deletes the keys. It also keeps changes in commit order, which helps with the race described below.</p>
+<p><b>Say the honest summary.</b> "The cache is eventually consistent. I pick a delete or event for freshness and a TTL for safety, and I tell the business the maximum staleness (for example 60 seconds)."</p>
 <p class="rem"><b>Remember:</b> delete or event for freshness, TTL as the net. Promise "eventually consistent within N seconds".</p>
 </div>
 </details>
@@ -250,6 +327,17 @@ TTL product:42                      # seconds left; -1 = no expiry, -2 = no key<
 <rect class="miss" x="560" y="52" width="260" height="40" rx="6"/><text class="t-c t-sm" x="690" y="76">4. A writes v1 into the cache (stale)</text>
 <text class="t-sm" x="150" y="225">Result: cache = v1, database = v2, until the TTL ends.</text>
 </svg><figcaption>A slow reader can overwrite the fresh state after the writer already invalidated. A TTL, a delayed second delete or a version check limits it.</figcaption></figure>
+<p><b>Why this matters.</b> Many people believe "write DB, then delete cache" is perfectly safe. It is safe in the common case but has one interleaving that is not, and a senior candidate should be able to draw it. The key insight: a reader's miss path is "read database, then write cache" and these two steps are not atomic, so a writer can run entirely between them.</p>
+<p><b>Why it is rare.</b> It needs the reader's database read to start before the write commit, and its cache write to land after the writer's delete. The reader's two steps usually take a millisecond or two, while a database commit often takes longer than a reader's cache write, so the order usually works out. Under heavy load, with a slow replica read or a GC pause in the reader, it does happen, and the result lasts until the TTL, which can be minutes.</p>
+<p><b>Defences compared.</b></p>
+<ul>
+<li><b>TTL:</b> caps the damage. Always on.</li>
+<li><b>Delayed double delete:</b> after the write, delete, wait about as long as one slow read (say 500 ms to 1 s), delete again, usually through a queue or scheduler. It catches the late stale write. It is a heuristic, not a proof.</li>
+<li><b>Version check:</b> store <code>{version, data}</code>. A refill only writes if its version is newer than the stored one, using a Lua script so compare and write are atomic. This is the correct fix, but needs a version column in the database.</li>
+<li><b>Short lease on the refill:</b> the writer sets a tombstone with a short TTL; readers do not refill while a tombstone exists.</li>
+<li><b>CDC as the only invalidator:</b> events come in commit order, so deletes always follow the commit.</li>
+</ul>
+<p><b>The interview point.</b> The honest answer is "cache-aside is not strictly consistent; here is the exact race and here is how I bound it", rather than claiming it is perfect.</p>
 <p class="rem"><b>Remember:</b> a slow reader can refill an old value after the delete. TTL, delayed double delete or version check.</p>
 </div>
 </details>
@@ -269,6 +357,18 @@ TTL product:42                      # seconds left; -1 = no expiry, -2 = no key<
 <text class="t-sm" x="10" y="190">Each miss falls to the next layer. Each layer is slower, bigger, and shared by more users.</text>
 <text class="t-sm" x="330" y="45">Risk: L1 copies differ between instances</text>
 </svg><figcaption>A request travels right until a layer answers. HTTP and CDN caching (Cache-Control, ETag) sit in front of all of this.</figcaption></figure>
+<p><b>What each layer buys you.</b> Each layer is closer to the user, faster, and smaller. The browser and CDN can answer without reaching your servers at all (controlled with <code>Cache-Control</code> and <code>ETag</code>). L1 in the JVM answers in nanoseconds with no network. Redis answers in a fraction of a millisecond and is shared. The database is the truth.</p>
+<table>
+<tr><th>Aspect</th><th>L1 (Caffeine)</th><th>L2 (Redis)</th></tr>
+<tr><td>Latency</td><td>Nanoseconds to microseconds</td><td>About 0.2 to 1 ms (network hop)</td></tr>
+<tr><td>Shared between instances</td><td>No, each JVM has its own</td><td>Yes</td></tr>
+<tr><td>Survives app restart</td><td>No (starts cold)</td><td>Yes</td></tr>
+<tr><td>Capacity</td><td>Small, limited by heap</td><td>Large, limited by Redis memory</td></tr>
+<tr><td>Consistency risk</td><td>High: copies diverge</td><td>Lower: one copy</td></tr>
+</table>
+<p><b>The consistency problem, with numbers.</b> You run 20 instances, each with an L1 TTL of 60 seconds. A product is updated and Redis is invalidated immediately, but each instance still holds its own L1 copy for up to 60 more seconds, so users may see old data depending on which instance serves them (that is the "refresh shows old and new alternately" symptom). Two fixes: keep L1 TTL tiny (1 to 5 seconds), or broadcast invalidations so every instance drops its copy (Redis pub/sub, or Redis client-side caching, where the server tells clients which keys changed).</p>
+<p><b>Why L1 shines for hot keys.</b> A single hot key in Redis lives on one node. A 2-second L1 in each of 50 instances turns thousands of reads per second into at most 25 per second for that key, with a bounded staleness of 2 seconds.</p>
+<p><b>Sizing and eviction.</b> L1 must have a maximum size (entries or weight) or it causes GC pressure and memory errors. Caffeine uses a Window TinyLFU policy: it admits a new entry only if it looks more valuable than the one it would evict, which resists one-time scans that would flush a plain LRU.</p>
 <p class="rem"><b>Remember:</b> L1 = fastest but per-instance and stale-prone. L2 Redis = shared. Keep L1 small and short-lived.</p>
 </div>
 </details>
@@ -306,6 +406,17 @@ TTL product:42                      # seconds left; -1 = no expiry, -2 = no key<
 <line class="arrow dash" x1="620" y1="147" x2="648" y2="150" marker-end="url(#ah)"/>
 <text class="t-sm" x="490" y="215">One rebuild instead of N. Waiters retry the cache for a short time.</text>
 </svg><figcaption>A stampede multiplies one query by the number of waiting callers. A lock or single flight turns it into one query.</figcaption></figure>
+<p><b>The mechanism, with numbers.</b> A hot key is read 2,000 times per second and rebuilding it takes 300 ms. When it expires, in those 300 ms about 600 requests arrive, all see a miss, and all run the same expensive query. The database, now slower under 600 parallel copies, takes 600 ms to answer, which lets 1,200 more requests miss. This feedback loop is why a stampede can take down a database that is perfectly fine at normal load.</p>
+<p><b>Single flight with a lock, step by step.</b></p>
+<ol>
+<li>Reader misses and tries <code>SET lock:product:42 token NX PX 5000</code>.</li>
+<li>The winner loads from the database, writes the cache, and releases the lock (compare-token Lua).</li>
+<li>The losers sleep a short random time (for example 50 ms), then re-read the cache. After a couple of tries they either get the fresh value or, if the wait is too long, fall back to a stale copy or compute it themselves.</li>
+</ol>
+<p>The lock TTL must be longer than the rebuild time but short enough that a crashed winner does not block everyone for long.</p>
+<p><b>Stale-while-revalidate, the smoother option.</b> Store the value with a logical expiry inside it, like <code>{data, softExpiry}</code>, and give the Redis key a much longer physical TTL. When a reader sees the soft expiry has passed, it takes the lock, refreshes in the background, and everybody (including itself) keeps returning the old value meanwhile. Users never wait, and the database sees one query. The price: data can be a little older than the soft expiry.</p>
+<p><b>Probabilistic early refresh (XFetch).</b> Each read decides randomly whether to refresh early, with higher probability as the expiry nears and as the rebuild cost grows. No locks are needed because refreshes are spread out in time.</p>
+<p><b>Which one.</b> Few hot keys with costly rebuilds: stale-while-revalidate or lock. Many keys with moderate cost: jitter plus probabilistic refresh. Always fine to pre-warm a known hot list on a schedule.</p>
 <p class="rem"><b>Remember:</b> one hot key, many rebuilders. Let one rebuild (lock or stale-while-revalidate), the rest wait or read stale.</p>
 </div>
 </details>
@@ -320,6 +431,15 @@ TTL product:42                      # seconds left; -1 = no expiry, -2 = no key<
 <li><b>Bloom filter:</b> a small structure that says "definitely not present" or "maybe present". Load it with all valid ids and answer "not found" without touching cache or database. It has false positives but never false negatives, so no real item is rejected. It must be updated when items are created. Redis offers one through the RedisBloom module (built into Redis 8).</li>
 <li><b>Rate limit</b> abusive clients.</li>
 </ul>
+<p><b>Why normal caching cannot help here.</b> Cache-aside caches what it finds. If the database has no row for <code>id=999999999</code>, there is nothing to cache, so each request misses and hits the database. One client sending random ids at 5,000 requests per second can make the database do 5,000 pointless lookups per second, while your cache hit rate looks fine for real traffic.</p>
+<p><b>Defence layers, cheapest first.</b></p>
+<ol>
+<li><b>Validate input</b> at the edge: ids must match a format and range (a positive number below your max id). This removes junk for free.</li>
+<li><b>Negative caching:</b> on a database miss, store a sentinel like <code>__NULL__</code> for 30 to 60 seconds. Repeated requests for the same missing id are now served from Redis. Problem: attackers use different random ids each time, so this alone does not stop an attack. Also delete the sentinel when the record is created.</li>
+<li><b>Bloom filter:</b> a bit array plus several hash functions. Add all valid ids at load time. Asking "is id X present?" gives "definitely no" or "probably yes". A "definitely no" is answered immediately, with no cache or database call, so random ids never reach the database. With about 10 bits per element you get roughly a 1 percent false-positive rate; a false positive just means one wasted lookup. Standard Bloom filters cannot delete items, so rebuild periodically if ids are removed (or use a cuckoo filter).</li>
+<li><b>Rate limit</b> per IP or key, and alert on a high miss ratio per client.</li>
+</ol>
+<p><b>Penetration versus the neighbours.</b> Penetration is requests for data that does not exist. Stampede is many requests for data that exists but just expired. Avalanche is many keys expiring or the cache dying. They have different fixes, and interviewers like to see you separate them.</p>
 <p class="rem"><b>Remember:</b> missing keys are never cached by normal logic. Validate, cache the null briefly, Bloom filter, rate limit.</p>
 </div>
 </details>
@@ -331,6 +451,22 @@ TTL product:42                      # seconds left; -1 = no expiry, -2 = no key<
 <p>Concretely: add random jitter (base 600 s plus a random 0 to 120 s), stagger warm-up jobs, run Redis with replicas and automatic failover, keep a small local L1 cache, and protect the database with a circuit breaker, a rate limiter or a queue so it degrades instead of collapsing. Have a reduced response ready (stale data or defaults) for when the database is overloaded.</p>
 <pre><code>int ttl = 600 + ThreadLocalRandom.current().nextInt(120);   // jitter
 redis.setex(key, ttl, value);</code></pre>
+<p><b>Two ways an avalanche starts.</b> First, expiry alignment: a deploy, a warm-up job or a cache flush loads a large number of keys with the same TTL, and later they all expire together. Second, cache loss: Redis restarts without persistence, a failover loses the data, or someone runs <code>FLUSHALL</code>, and the hit rate falls from 95 percent to 0 instantly. In both cases the database suddenly gets a large share of the full read traffic, which it was never sized for.</p>
+<p><b>How it differs from a stampede, side by side.</b></p>
+<table>
+<tr><th></th><th>Stampede</th><th>Avalanche</th></tr>
+<tr><td>Keys involved</td><td>One (or very few) hot key</td><td>Many keys at once</td></tr>
+<tr><td>Query shape</td><td>Many copies of the same query</td><td>Many different queries</td></tr>
+<tr><td>Main fix</td><td>One rebuilder (lock or stale-while-revalidate)</td><td>TTL jitter, warm-up, HA, database protection</td></tr>
+</table>
+<p><b>Layers of defence.</b></p>
+<ul>
+<li><b>Prevent alignment:</b> jitter every TTL; load in batches with pauses; never give a whole data set one fixed expiry.</li>
+<li><b>Prevent cache loss:</b> replicas with automatic failover; for caches that are expensive to warm, enable RDB so a restart is not fully cold.</li>
+<li><b>Warm before switching traffic:</b> after a planned flush or a new cluster, pre-load the hottest keys before sending users.</li>
+<li><b>Protect the database:</b> concurrency limit or queue in front of it, circuit breaker, request coalescing, and a degraded response (serve stale or defaults) when it is overloaded.</li>
+</ul>
+<p>The principle: assume the cache will sometimes be empty and design the system so an empty cache means slow, not down.</p>
 <p class="rem"><b>Remember:</b> stampede = one key, many callers. Avalanche = many keys at once. Jitter the TTLs.</p>
 </div>
 </details>
@@ -347,6 +483,14 @@ redis.setex(key, ttl, value);</code></pre>
 <li><b>Counters:</b> split into N sub-counters and sum on read.</li>
 </ul>
 <p>To find hot keys: <code>redis-cli --hotkeys</code> (needs an LFU eviction policy), a brief <code>MONITOR</code> in a quiet window (it is heavy), or client-side metrics. More shards do not help because hashing sends the same key to the same shard every time.</p>
+<p><b>Why scaling out does not fix it.</b> In Cluster each key maps to exactly one slot and so to one master. If one key receives 200,000 reads per second and one node can handle about 100,000 operations per second of that kind, that node saturates while the others are idle. Adding shards moves other keys around but never splits this one.</p>
+<p><b>How key copies work, with a snippet.</b> Instead of one key <code>cfg:home</code>, store eight copies <code>cfg:home:0</code> to <code>cfg:home:7</code>. Their different names hash to different slots, so (with luck) different nodes. Readers pick a random suffix. Writers update or delete all eight.</p>
+<pre><code>int n = ThreadLocalRandom.current().nextInt(8);
+String v = redis.get("cfg:home:" + n);   // reads spread over up to 8 nodes</code></pre>
+<p>For writes: update all copies, accept that for a few milliseconds they differ. For a hot counter use the same idea in reverse: <code>INCR likes:42:{0..7}</code> at random and sum the eight on read (or sum periodically).</p>
+<p><b>The local cache option is usually the best first step.</b> It costs no extra Redis memory and removes the load at the source. A 1 to 5 second TTL in each app instance means Redis sees at most one read per instance per few seconds for that key. The cost is bounded staleness.</p>
+<p><b>Replica reads</b> spread load over a primary and its replicas for that shard, which gives maybe two to three times capacity, not more, and reads may lag.</p>
+<p><b>Detection matters.</b> Hot keys show up as one node with high CPU or network out while the others are quiet. <code>redis-cli --hotkeys</code> works only when an LFU policy is set because it reads the access-frequency counter. In production prefer application-side metrics (count by key prefix) over <code>MONITOR</code>, which can itself slow Redis down.</p>
 <p class="rem"><b>Remember:</b> one key = one node. Spread the reads with L1, key copies or replicas.</p>
 </div>
 </details>
@@ -358,6 +502,18 @@ redis.setex(key, ttl, value);</code></pre>
 <p><code>KEYS pattern</code> is O(N) over all keys; with ten million keys it can freeze the server for seconds. <code>SCAN</code> walks in small steps with a cursor: call it with 0, get a batch plus a new cursor, repeat until the cursor is 0. Each call is quick so others are served. Catch: SCAN may return a key twice, and keys added during the walk may be missed, so the code must be idempotent. <code>HSCAN</code>, <code>SSCAN</code> and <code>ZSCAN</code> do the same inside collections. <code>UNLINK</code> removes the key at once and frees memory in a background thread. Find big keys with <code>redis-cli --bigkeys</code> or <code>MEMORY USAGE key</code>. Also use <code>FLUSHALL ASYNC</code> rather than plain <code>FLUSHALL</code>.</p>
 <pre><code>SCAN 0 MATCH session:* COUNT 500   # returns next cursor + batch; stop at cursor 0
 UNLINK session:big                 # non-blocking delete</code></pre>
+<p><b>The core idea: one thread, so size matters.</b> Redis executes commands one at a time. A command that takes 2 ms is invisible. A command that takes 2 seconds means every other client waits 2 seconds. Cost depends on how much data the command touches, so a huge key turns an ordinary command into a stall.</p>
+<table>
+<tr><th>Risky</th><th>Why</th><th>Safer</th></tr>
+<tr><td><code>KEYS *</code></td><td>Scans every key in one go, O(N)</td><td><code>SCAN</code> in batches</td></tr>
+<tr><td><code>DEL bigkey</code></td><td>Frees millions of elements synchronously</td><td><code>UNLINK</code> (background free)</td></tr>
+<tr><td><code>HGETALL</code>, <code>SMEMBERS</code>, <code>LRANGE 0 -1</code> on huge collections</td><td>Builds and sends a giant reply</td><td><code>HSCAN</code>, <code>SSCAN</code>, paged ranges</td></tr>
+<tr><td><code>FLUSHALL</code></td><td>Deletes everything synchronously</td><td><code>FLUSHALL ASYNC</code></td></tr>
+<tr><td>Huge string value (tens of MB)</td><td>Network and memory copy per read</td><td>Compress or split into chunks</td></tr>
+</table>
+<p><b>How SCAN works, in plain words.</b> You call <code>SCAN 0</code>. Redis looks at a small slice of the key table and returns a cursor (say 4096) plus a handful of keys. You call <code>SCAN 4096</code> and continue until the cursor returns 0. Between calls other clients run, so nothing blocks. The guarantee is that keys present for the whole scan are returned at least once. Keys can repeat, and keys added or removed during the scan may or may not appear. <code>COUNT</code> is only a hint for how much work per call.</p>
+<p><b>Preventing big keys.</b> Cap collection size by design: bucket a huge hash into 1,000 smaller hashes using <code>id mod 1000</code>; trim lists and streams; put a rolling window on sorted sets. A rule of thumb many teams use is to keep values under about 10 KB and collections under about 10,000 elements, although the right limit depends on your latency target.</p>
+<p><b>Cluster angle.</b> A big key also makes slot distribution uneven, since the whole key sits on one node, and resharding must move it as a single unit.</p>
 <p class="rem"><b>Remember:</b> O(N) command on a big key stalls everyone. SCAN, not KEYS. UNLINK, not DEL.</p>
 </div>
 </details>
@@ -369,6 +525,17 @@ UNLINK session:big                 # non-blocking delete</code></pre>
 <div class="ans">
 <p class="ia">Redis is an in-memory data structure server. The data lives in RAM, so operations take microseconds, and unlike a plain cache of opaque blobs it understands types (strings, hashes, lists, sets, sorted sets, streams) with atomic commands on each. It can also persist to disk, replicate, fail over, and shard.</p>
 <p>So it is used as a cache, session store, rate limiter, leaderboard, lock service, simple queue, and sometimes as a primary store for small fast data. Disk is only for persistence and restart; reads never touch it. The caveat is memory: everything must fit in RAM, which is costly at large sizes, and a key has overhead beyond its payload (tens of bytes), so many tiny keys use much more than the raw data. <code>maxmemory</code> caps usage and the eviction policy decides what happens when it is reached.</p>
+<p><b>Think of it as a server for data structures.</b> A plain cache like a hash map in your program stores key to blob and gives you back the blob. Redis is a separate server process, reached over the network, that stores key to typed value. Because it understands the type, it can do work on the server: add to a counter, push to a list, add a member to a sorted set and report its rank. Each of those is one atomic command, so many clients can share the structure safely without locking in the app.</p>
+<p><b>Why memory, and what that implies.</b> RAM access takes about 100 nanoseconds, a network hop inside a data center about a few hundred microseconds, and an SSD read roughly a hundred microseconds or more. Keeping data in RAM means the network, not storage, becomes the main cost, which is why a Redis command typically completes in well under a millisecond. The matching limits: capacity equals RAM (a 64 GB box holds roughly 64 GB minus overhead), cost per GB is higher than disk, and a restart empties memory unless persistence is configured.</p>
+<p><b>What you get on top of the data structures.</b></p>
+<ul>
+<li><b>Expiry and eviction:</b> per-key TTL and memory-limit policies, which is what makes it a cache.</li>
+<li><b>Persistence:</b> RDB snapshots and the AOF log.</li>
+<li><b>Replication, Sentinel and Cluster:</b> copies for reads and failover, and sharding for scale.</li>
+<li><b>Extras:</b> pub/sub, streams, Lua scripting, geo, bitmaps, and modules (search, JSON, Bloom filters; several are bundled in Redis 8).</li>
+</ul>
+<p><b>Common roles with a one-line reason each.</b> Cache (fast, TTL), session store (shared state across stateless servers), rate limiter (atomic counters), leaderboard (sorted set), distributed lock (<code>SET NX PX</code>), lightweight queue (list or stream).</p>
+<p><b>What interviewers want to hear.</b> That you know it is not a database replacement by default: memory bound, async replication, weak durability by default settings. Redis licensing changed in 2024 (a source-available license, then an OSS option added again with Redis 8), and forks like Valkey exist, but the commands and client libraries you use are largely the same.</p>
 <p class="rem"><b>Remember:</b> in-memory, rich types, atomic commands. Not just a cache, but bounded by RAM.</p>
 </div>
 </details>
@@ -391,6 +558,16 @@ UNLINK session:big                 # non-blocking delete</code></pre>
 <line class="arrow dash" x1="620" y1="80" x2="688" y2="48" marker-end="url(#ah)"/><line class="arrow dash" x1="620" y1="110" x2="688" y2="112" marker-end="url(#ah)"/>
 <text class="t-sm" x="200" y="200">A slow command (KEYS, big DEL, long Lua script) makes all clients wait.</text>
 </svg><figcaption>One thread runs all commands in order. That removes locking, but means one slow command delays everyone.</figcaption></figure>
+<p><b>The trade Redis made.</b> Multi-threaded servers must protect shared data with locks. Locks cost CPU (waiting, cache-line bouncing, context switches) and bring bugs like deadlocks. Redis avoids all of that by having exactly one thread touch the data. Every command is naturally atomic and ordered, and the code stays simple.</p>
+<p><b>Is one core enough?</b> A single core running simple in-memory operations can execute on the order of a hundred thousand commands per second (more with pipelining), and the practical limit is usually the network card or the client round trips, not the CPU. Per command the CPU work is tiny: parse, look up in a hash table, do an O(1) or O(log N) operation, write the reply.</p>
+<p><b>How one thread serves thousands of clients.</b> It uses an event loop on top of <code>epoll</code> (or kqueue). The OS tells it which sockets have data, it reads each request, runs it, queues the reply, and moves on. It never blocks waiting for one slow client, because sockets are non-blocking.</p>
+<p><b>Where multiple threads and processes do exist.</b></p>
+<ul>
+<li><b>I/O threads</b> (Redis 6.0 and later, off by default): read and parse requests and write replies in parallel; command execution is still single-threaded. Helps when network I/O is the bottleneck.</li>
+<li><b>Background threads:</b> lazy freeing (<code>UNLINK</code>), closing files, AOF fsync.</li>
+<li><b>Forked child processes:</b> RDB snapshots and AOF rewrites, so the main thread keeps serving.</li>
+</ul>
+<p><b>The consequences to remember.</b> A slow command blocks everyone, so avoid O(N) commands on big data and long Lua scripts. To use many cores, run many Redis processes (a Cluster, or several instances per host, one per core). Some alternatives (such as Dragonfly or KeyDB) are multi-threaded designs, and Memcached is multi-threaded, but they pay in complexity.</p>
 <p class="rem"><b>Remember:</b> in memory, no locks, event loop, efficient structures. One slow command blocks all.</p>
 </div>
 </details>
@@ -405,6 +582,24 @@ v = GET stock:42;  SET stock:42 (v-1)
 # right: one atomic command
 DECR stock:42</code></pre>
 <div class="mistake"><b>Watch out:</b> "Redis is atomic so my code is safe" is the classic wrong claim. Only single commands and scripts are atomic.</div>
+<p><b>What "atomic" means precisely.</b> A command either has not started or has fully finished from every other client's point of view. Nobody can see a counter half incremented or a list half pushed. Redis gets this for free from the single command-execution thread.</p>
+<p><b>The lost-update bug, step by step.</b> Two servers sell the last tickets. Stock is 10.</p>
+<ol>
+<li>Server A: <code>GET stock</code> returns 10.</li>
+<li>Server B: <code>GET stock</code> returns 10.</li>
+<li>A computes 9 and runs <code>SET stock 9</code>.</li>
+<li>B computes 9 and runs <code>SET stock 9</code>.</li>
+</ol>
+<p>Two tickets sold, stock dropped by one. Each command was atomic, but the sequence was not. With <code>DECR stock</code> the read, change and write happen in one command, so the result is 8.</p>
+<p><b>Which tool for which case.</b></p>
+<table>
+<tr><th>Need</th><th>Use</th></tr>
+<tr><td>Simple increment, append, push</td><td>The built-in command (<code>INCRBY</code>, <code>HINCRBY</code>, <code>LPUSH</code>)</td></tr>
+<tr><td>Set only if absent</td><td><code>SET key v NX</code></td></tr>
+<tr><td>Read, decide, then write several keys</td><td>Lua script (or a Function in Redis 7)</td></tr>
+<tr><td>Optimistic retry of a read-modify-write</td><td><code>WATCH</code> then <code>MULTI/EXEC</code></td></tr>
+</table>
+<p><b>What atomic does not give you.</b> It does not give durability (a crash can lose an acknowledged write), it does not give rollback, and across a Cluster it works only inside one slot, so multi-key commands need hash tags. It also does not make your Java code thread-safe; it only protects what happens inside Redis. Mention that a retry after a timeout can run an increment twice, so counters that must be exact need an idempotency key.</p>
 <p class="rem"><b>Remember:</b> one command is atomic, a GET-then-SET is not. Use INCR, Lua or WATCH.</p>
 </div>
 </details>
@@ -417,6 +612,23 @@ DECR stock:42</code></pre>
 <pre><code>Pipeline p = jedis.pipelined();
 for (String k : keys) p.get(k);
 List&lt;Object&gt; replies = p.syncAndReturnAll();</code></pre>
+<p><b>The problem pipelining solves.</b> Each normal command is a round trip: send, wait, receive. If the round trip is 0.5 ms and Redis needs 5 microseconds to run the command, 99 percent of the time is spent waiting on the network. Sending 10,000 commands one by one then takes 5 seconds, almost all of it idle.</p>
+<p><b>How it works.</b> The client writes many commands to the socket back to back without reading. Redis processes them in order and queues replies; the client then reads all replies. The same 10,000 commands may take well under 100 ms. It is the single cheapest throughput win for bulk loads, cache warming and batch reads.</p>
+<table>
+<tr><th></th><th>Pipeline</th><th>MULTI/EXEC</th><th>Lua script</th></tr>
+<tr><td>Fewer round trips</td><td>Yes</td><td>Yes (one EXEC)</td><td>Yes</td></tr>
+<tr><td>Other clients can interleave</td><td>Yes</td><td>No</td><td>No</td></tr>
+<tr><td>Can use earlier results in later commands</td><td>No</td><td>No</td><td>Yes</td></tr>
+<tr><td>Rollback on error</td><td>No</td><td>No</td><td>No (script stops at the error, earlier writes stay)</td></tr>
+</table>
+<p><b>Practical advice.</b></p>
+<ul>
+<li>Batch in chunks (for example 500 to 5,000 commands). An unbounded pipeline makes Redis buffer huge replies in memory and can hit the client output buffer limit.</li>
+<li>In Cluster, group commands by node (clients such as Lettuce do this for you, but cross-slot batching is not transparent in every client).</li>
+<li>Lettuce pipelines automatically across threads on a shared connection, while Jedis needs an explicit pipeline object. Spring's <code>executePipelined</code> wraps it.</li>
+<li>Use <code>MGET</code> and <code>MSET</code> when you only need multiple gets or sets of strings, since they are simpler than a pipeline.</li>
+</ul>
+<p>An interviewer may ask "does pipelining make the commands atomic?" The answer is no; it only reduces latency. If you need isolation, wrap them in <code>MULTI/EXEC</code> or a script.</p>
 <p class="rem"><b>Remember:</b> pipeline = fewer round trips, not atomic. MULTI/EXEC = isolated, no rollback.</p>
 </div>
 </details>
@@ -449,6 +661,24 @@ List&lt;Object&gt; replies = p.syncAndReturnAll();</code></pre>
 <rect class="db" x="230" y="190" width="200" height="60" rx="8"/><text class="t-c t-b" x="330" y="216">Pub/Sub</text><text class="t-c t-sm" x="330" y="236">fire and forget messages</text>
 <text class="t-sm" x="460" y="212">Rule: pick the type whose commands</text><text class="t-sm" x="460" y="232">already do what you need atomically.</text>
 </svg><figcaption>The type is the design. The right one avoids reading data into the app just to sort, count or dedupe it.</figcaption></figure>
+<p><b>How to choose, as a short decision list.</b></p>
+<ul>
+<li>Need one opaque value, a counter, or a lock? String.</li>
+<li>Need a small record whose fields you read or change separately? Hash.</li>
+<li>Need order of insertion and cheap push and pop at the ends? List.</li>
+<li>Need uniqueness and set operations (union, intersection)? Set.</li>
+<li>Need ordering by a number and rank queries? Sorted set.</li>
+<li>Need a durable log that several workers can share? Stream.</li>
+<li>Need yes/no flags per id in huge numbers? Bitmap. Need an approximate unique count? HyperLogLog.</li>
+</ul>
+<p><b>Examples with real commands.</b></p>
+<pre><code>SET page:home:hits 0 ; INCR page:home:hits           # counter
+SADD tags:post:9 redis cache ; SINTER tags:post:9 tags:post:12   # shared tags
+SETBIT active:2026-11-17 1234567 1 ; BITCOUNT active:2026-11-17   # daily active users
+PFADD uniq:2026-11-17 user7 user9 ; PFCOUNT uniq:2026-11-17        # approx unique visitors
+GEOADD shops 77.59 12.97 shopA ; GEOSEARCH shops FROMLONLAT 77.6 12.9 BYRADIUS 5 km</code></pre>
+<p><b>Memory intuition.</b> Redis stores small hashes, sets, lists and sorted sets in a compact encoding (listpack, intset) and switches to a hash table or skip list when they grow past configured limits. So many small collections are very memory efficient, while large ones cost much more per element. <code>OBJECT ENCODING key</code> shows which one is in use.</p>
+<p><b>Common mistakes.</b> Using a list as a set (O(N) membership checks), storing a huge JSON in a string and rewriting it per field change, using a sorted set when plain insertion order would do, and using Pub/Sub where durability is needed. Also, HyperLogLog counts distinct items but cannot list or remove them, and bitmaps need dense numeric ids to be efficient (sparse ids waste memory).</p>
 <p class="rem"><b>Remember:</b> string cache/counter, hash object, list queue, set unique, zset ranking, stream log, HLL approximate count.</p>
 </div>
 </details>
@@ -461,6 +691,19 @@ List&lt;Object&gt; replies = p.syncAndReturnAll();</code></pre>
 <pre><code>HSET user:7 name "Asha" plan "pro" logins 0
 HINCRBY user:7 logins 1
 HGET user:7 plan</code></pre>
+<p><b>Compare the two on the operations that matter.</b></p>
+<table>
+<tr><th>Need</th><th>JSON string</th><th>Hash</th></tr>
+<tr><td>Read the whole object</td><td>1 command, 1 deserialize</td><td><code>HGETALL</code>, map to object</td></tr>
+<tr><td>Read one field</td><td>Must fetch and parse everything</td><td><code>HGET</code>, only that field</td></tr>
+<tr><td>Update one field</td><td>Read, modify, write all (race prone)</td><td><code>HSET</code>, atomic</td></tr>
+<tr><td>Atomic counter inside the object</td><td>Not possible</td><td><code>HINCRBY</code></td></tr>
+<tr><td>Nested objects, arrays</td><td>Natural</td><td>Flatten or encode yourself</td></tr>
+<tr><td>Different TTL per field</td><td>No</td><td>Only in Redis 7.4 and later (check your version)</td></tr>
+</table>
+<p><b>Example decision.</b> A product page cache holds name, description, price, images, reviews summary and is always rendered as a whole: use a JSON string (or compressed JSON for big ones) with one TTL. A shopping cart where each item quantity changes independently: use a hash <code>cart:7</code> with item id as field and quantity as value, so adding an item is one <code>HINCRBY</code> and the whole cart expires together with one <code>EXPIRE</code>.</p>
+<p><b>Memory and speed detail.</b> Small hashes (by default up to 128 fields with values up to 64 bytes, configurable) use a compact encoding that is smaller than the same data as many separate keys, since each top-level key has bookkeeping overhead. Beyond those limits the hash switches to a regular hash table. <code>HGETALL</code> on a huge hash is O(N) and can stall Redis, so use <code>HSCAN</code> for big ones.</p>
+<p><b>RedisJSON option.</b> The JSON module (bundled in Redis 8) lets you read and update paths inside a JSON document on the server (<code>JSON.SET user:7 $.address.city "Pune"</code>), combining both worlds, at the cost of requiring the module.</p>
 <p class="rem"><b>Remember:</b> whole object, one blob: string. Partial updates or counters: hash.</p>
 </div>
 </details>
@@ -470,6 +713,18 @@ HGET user:7 plan</code></pre>
 <div class="ans">
 <p class="ia">A sorted set holds unique members, each with a numeric score, always ordered by score. Internally it is a skip list plus a hash table, so add, remove and rank lookups are O(log N), reading a range is O(log N + M) for M results, and getting one member's score is O(1). That is why it fits leaderboards with millions of players.</p>
 <p>A skip list is layered linked lists: upper layers skip ahead, so search is logarithmic without the rebalancing of a tree. Small sorted sets use a compact listpack instead. Key commands: <code>ZADD</code> (add or update), <code>ZINCRBY</code>, <code>ZRANGE</code> (with <code>REV</code>, <code>BYSCORE</code> in 6.2 and later), <code>ZREVRANK</code>, <code>ZREM</code>, <code>ZREMRANGEBYSCORE</code>, <code>ZCARD</code>. Ties on score are ordered alphabetically by member.</p>
+<p><b>What it is, from scratch.</b> A normal set holds unique members with no order. A sorted set (zset) gives each member a floating-point score and keeps the members ordered by it. Adding an existing member just updates its score. You can ask for "the top 10", "the rank of this member", or "everyone with a score between 100 and 200" and get the answer without sorting anything yourself.</p>
+<p><b>Why two structures inside.</b> The skip list keeps members in score order and supports fast range and rank queries. The hash table maps member to score for O(1) lookups. Using both gives O(1) <code>ZSCORE</code> and O(log N) ordered operations. Memory cost is higher than a plain set, so Redis uses a compact listpack for small zsets (default up to 128 elements) and converts when they grow.</p>
+<p><b>A skip list in one picture.</b> Level 0 is a sorted linked list of all nodes. Level 1 links about every second node, level 2 about every fourth, and so on, chosen randomly when a node is inserted. To find a score you start at the top level, move right while the next node is smaller, and drop down a level when you would overshoot. This halves the search space each level, giving O(log N) without the rebalancing logic of a tree.</p>
+<table>
+<tr><th>Command</th><th>Complexity</th><th>Example use</th></tr>
+<tr><td><code>ZADD</code>, <code>ZINCRBY</code>, <code>ZREM</code></td><td>O(log N)</td><td>Add or update a score</td></tr>
+<tr><td><code>ZSCORE</code></td><td>O(1)</td><td>One player's score</td></tr>
+<tr><td><code>ZRANK</code>, <code>ZREVRANK</code></td><td>O(log N)</td><td>Rank of a player</td></tr>
+<tr><td><code>ZRANGE</code> (by rank or score)</td><td>O(log N + M)</td><td>Top 10, or a time window</td></tr>
+<tr><td><code>ZREMRANGEBYSCORE</code></td><td>O(log N + M)</td><td>Drop entries older than a timestamp</td></tr>
+</table>
+<p><b>Uses beyond leaderboards.</b> Sliding-window rate limiting (score = timestamp), delayed job queues (score = run-at time; workers take the lowest score that is due), time-ordered feeds, and priority queues. <b>Caveat:</b> scores are doubles, so integers above 2^53 lose precision; and one huge zset lives on one node.</p>
 <p class="rem"><b>Remember:</b> skip list plus hash: O(log N) for add, remove and rank. Great for top-N.</p>
 </div>
 </details>
@@ -495,6 +750,23 @@ HGET user:7 plan</code></pre>
 <line class="arrow-r" x1="700" y1="148" x2="700" y2="176" marker-end="url(#ahr)"/><text class="t-sm" x="640" y="142">crash</text>
 <text class="t-sm" x="60" y="215">Each bar is a logged write. fsync once per second: at most about one second of writes can be lost.</text>
 </svg><figcaption>RDB is a series of snapshots with a loss window of minutes. AOF logs each write and, with everysec, loses about one second.</figcaption></figure>
+<p><b>The question persistence answers.</b> Redis keeps data in RAM. If the process or machine dies, RAM is gone. Persistence writes enough to disk to rebuild memory on restart. The two options trade restart speed, file size and how much recent data you can lose.</p>
+<table>
+<tr><th>Aspect</th><th>RDB snapshot</th><th>AOF log</th></tr>
+<tr><td>What is stored</td><td>Compact binary dump of all data</td><td>Every write command, appended</td></tr>
+<tr><td>Data loss window</td><td>Since the last snapshot (minutes)</td><td>About 1 second (everysec), near 0 (always)</td></tr>
+<tr><td>Restart speed</td><td>Fast (load a binary file)</td><td>Slower (replay commands, though Redis can use an RDB preamble)</td></tr>
+<tr><td>File size</td><td>Small</td><td>Larger until rewritten</td></tr>
+<tr><td>Runtime cost</td><td>Fork pauses and copy-on-write memory</td><td>Constant disk writes, fsync cost</td></tr>
+</table>
+<p><b>How a snapshot is made, step by step.</b> The parent calls <code>fork()</code>. The child gets a frozen view of memory (the OS shares pages and copies a page only when the parent modifies it, called copy-on-write) and writes it to a temp file, then renames it over the old file. If the instance is 20 GB and the write rate is high, many pages get copied, so memory use can grow noticeably (in the worst case close to double) and the fork call itself can pause the main thread for tens or hundreds of milliseconds on big heaps. That is the "latency spike every few minutes" cause in the scenarios later.</p>
+<p><b>The three fsync settings.</b> <code>always</code>: fsync after every write, slow, safest. <code>everysec</code>: fsync once per second in a background thread, the usual choice. <code>no</code>: leave flushing to the OS, fastest, loses up to about 30 seconds in the worst case on Linux. The AOF is rewritten in the background when it grows past a size threshold, compressing history into the minimum commands.</p>
+<p><b>How to choose.</b></p>
+<ul>
+<li>Pure cache that can be rebuilt: no persistence, or RDB only so a restart is warm.</li>
+<li>Session or derived data that you would rather not lose: AOF everysec, possibly with RDB too, plus replicas.</li>
+<li>Remember that persistence is not backup: copy RDB files off the host regularly, and test a restore.</li>
+</ul>
 <p class="rem"><b>Remember:</b> RDB = fast restart, lose minutes. AOF everysec = lose about a second. Cache-only: maybe neither.</p>
 </div>
 </details>
@@ -515,6 +787,17 @@ HGET user:7 plan</code></pre>
 <text class="t-sm" x="440" y="70">3. async stream (can lag)</text>
 <text class="t-sm" x="10" y="220">If the primary dies between step 2 and step 3, that write is lost.</text>
 </svg><figcaption>The client gets its answer before the replicas have the write. That is the source of failover data loss.</figcaption></figure>
+<p><b>What replication is for.</b> Three things: a hot standby for failover, extra read capacity, and a source for taking snapshots without loading the primary. It is not a way to make writes safer, because the acknowledgement does not wait for replicas.</p>
+<p><b>The life of a replica, step by step.</b></p>
+<ol>
+<li>The replica sends <code>PSYNC</code> to the primary with its replication id and offset.</li>
+<li>First time (or too far behind): the primary starts a background save, sends the RDB file, and meanwhile buffers new writes. The replica loads the file, then applies the buffered writes. This is a <b>full resync</b>, which is expensive for large data sets (fork, disk or network, memory).</li>
+<li>Afterwards the primary streams every write command to the replica. The replica tracks an offset.</li>
+<li>If the link drops briefly, the replica reconnects and asks to continue from its offset. If that offset is still in the primary's backlog buffer, only the missing part is sent (<b>partial resync</b>); otherwise another full resync happens.</li>
+</ol>
+<p><b>Sizing the backlog.</b> The default backlog is small (1 MB). If the primary does 5 MB of writes per second and the link drops for 10 seconds, the backlog overflows and a full resync follows, possibly repeating if the primary is under pressure. Increase <code>repl-backlog-size</code> for busy primaries.</p>
+<p><b>Read from replicas, with care.</b> Replication lag is normally milliseconds but can grow to seconds under load or during a big resync. If a user writes and immediately reads from a replica, they may not see their own write. Route read-your-own-writes to the primary. Also note that replicas can serve reads of keys that have logically expired in a narrow window, and that heavy slow commands on a replica do not affect the primary but can delay replication apply.</p>
+<p><b>Durability angle.</b> Replicas improve availability, not durability: because the ack does not wait, <code>WAIT</code> or <code>min-replicas-to-write</code> are the only ways to shrink the loss window. If the primary restarts empty without persistence and its replicas reconnect, they will copy the empty data set and also lose everything; so a primary with persistence off should not auto-restart in a way that triggers this.</p>
 <p class="rem"><b>Remember:</b> async replication: fast, but a failover can lose the last writes. Replica reads can be stale.</p>
 </div>
 </details>
@@ -537,6 +820,18 @@ HGET user:7 plan</code></pre>
 <line class="arrow-g dash" x1="510" y1="45" x2="758" y2="148" marker-end="url(#ahg)"/>
 <text class="t-sm" x="20" y="260">Writes acknowledged by the old primary but not yet copied to Replica A are lost.</text>
 </svg><figcaption>Sentinels detect failure by majority, promote a replica, and tell clients the new address.</figcaption></figure>
+<p><b>The problem it solves.</b> With only replication, when the primary dies someone (or something) must notice, choose a replica, promote it, point the other replicas at it, and tell every client. Doing that by hand takes minutes of downtime. Sentinel automates all of it and also serves as the source of "who is the current primary" for clients.</p>
+<p><b>Why three or more Sentinels, and what quorum means.</b> A single Sentinel could be the one that lost its network and wrongly declare the primary dead. Requiring several to agree avoids false failovers. The <code>quorum</code> setting (for example 2 of 3) is how many must agree the primary is down; but to actually run the failover, one Sentinel must be elected leader by a majority of all Sentinels. So with two Sentinels, if one is down no majority exists and no failover can happen. Place the Sentinels on different hosts or zones.</p>
+<p><b>Client side.</b> A Sentinel-aware client (Lettuce, Jedis with Sentinel pool, Spring <code>RedisSentinelConfiguration</code>) is given the Sentinel addresses and a master name. It asks "who is the master of <code>mymaster</code>?" and reconnects when told the answer changed. A plain client configured with a fixed IP will keep talking to the dead primary.</p>
+<table>
+<tr><th>Need</th><th>Sentinel</th><th>Cluster</th></tr>
+<tr><td>Automatic failover</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Data larger than one node</td><td>No</td><td>Yes (sharding)</td></tr>
+<tr><td>Writes above one node's capacity</td><td>No</td><td>Yes</td></tr>
+<tr><td>Multi-key commands everywhere</td><td>Yes</td><td>Only in one slot</td></tr>
+<tr><td>Operational complexity</td><td>Lower</td><td>Higher</td></tr>
+</table>
+<p><b>Failure behaviours worth mentioning.</b> The failover takes seconds (detection time <code>down-after-milliseconds</code>, election, promotion), during which writes fail. Acknowledged writes not yet replicated are lost. A partitioned old primary may keep accepting writes for a while; after it rejoins it becomes a replica and discards them. Setting <code>min-replicas-to-write</code> makes an isolated primary stop accepting writes, which limits that loss.</p>
 <p class="rem"><b>Remember:</b> Sentinel = failover without sharding (3 or more, majority). Cluster = sharding when one node is not enough.</p>
 </div>
 </details>
@@ -560,6 +855,20 @@ HGET user:7 plan</code></pre>
 <line class="arrow dash" x1="670" y1="38" x2="718" y2="38" marker-end="url(#ah)"/><line class="arrow dash" x1="670" y1="128" x2="718" y2="128" marker-end="url(#ah)"/><line class="arrow dash" x1="670" y1="218" x2="718" y2="218" marker-end="url(#ah)"/>
 <text class="t-sm" x="10" y="200">Example: a key lands on one slot,</text><text class="t-sm" x="10" y="220">owned by one master (green arrow).</text><text class="t-sm" x="10" y="250">{user:42}:cart and {user:42}:profile share a slot.</text>
 </svg><figcaption>Each key maps to one of 16384 slots, each slot to exactly one master. Related keys need a shared hash tag to be used together.</figcaption></figure>
+<p><b>The problem and the idea.</b> One node cannot hold more memory than its host has and handles only one core's worth of commands. To scale, split the keys over several masters. A naive <code>hash(key) mod N</code> breaks when N changes (almost every key moves). Redis Cluster instead uses a fixed number of buckets, 16384 hash slots, and assigns slots to nodes. Adding a node means handing over some slots (and the keys in them) rather than rehashing everything.</p>
+<p><b>A request, step by step.</b></p>
+<ol>
+<li>The client computes <code>CRC16("user:42") mod 16384</code>, say 9842.</li>
+<li>Its cached slot map says slot 9842 belongs to Master B, so it sends the command there.</li>
+<li>If the slot moved, B replies <code>MOVED 9842 hostC:6379</code>. The client updates its map and retries on C. During a migration a node may answer <code>ASK</code> for keys already moved.</li>
+</ol>
+<p><b>Hash tags in practice.</b> Hashing only the part inside braces lets related keys share a slot.</p>
+<pre><code>MGET {order:77}:header {order:77}:items     # same slot, works
+MGET order:77:header order:78:header         # may fail with CROSSSLOT
+EVAL "..." 2 {u:7}:cart {u:7}:stock ...      # script keys must share a slot</code></pre>
+<p>Tag with care: putting all of a tenant's keys on one tag makes that tenant one big hot node and prevents spreading.</p>
+<p><b>Failure handling.</b> Nodes gossip over a second port (the cluster bus). If a majority of masters decide a master is unreachable, one of its replicas is promoted. If a slot range has no master and <code>cluster-require-full-coverage</code> is yes (default), the whole cluster stops accepting writes; many teams set it to no for caches. Minimum recommended is three masters, each with at least one replica.</p>
+<p><b>What changes for the developer.</b> Only database 0; multi-key operations, transactions and scripts need same-slot keys; use a cluster-aware client (Lettuce or Jedis cluster mode) with topology refresh enabled; pub/sub messages are broadcast across nodes (shard channels exist in 7); and the memory of one node limits any single key.</p>
 <p class="rem"><b>Remember:</b> 16384 slots, CRC16 mod 16384, one master per slot. Multi-key commands need the same slot: use {hash tags}.</p>
 </div>
 </details>
@@ -579,6 +888,23 @@ HGET user:7 plan</code></pre>
 <pre><code>CONFIG SET maxmemory 2gb
 CONFIG SET maxmemory-policy allkeys-lfu
 INFO stats      # evicted_keys, expired_keys, keyspace_hits, keyspace_misses</code></pre>
+<p><b>Expiry versus eviction, a distinction worth stating.</b> Expiry removes keys whose TTL has passed, regardless of memory. Eviction removes keys that are still valid because memory is full. A cache needs both: TTL for freshness, eviction so a full cache keeps working instead of rejecting writes.</p>
+<p><b>What happens at the limit, in order.</b></p>
+<ol>
+<li>A write command arrives and used memory is above <code>maxmemory</code>.</li>
+<li>Redis applies the policy: it evicts some keys until enough memory is freed.</li>
+<li>If the policy is <code>noeviction</code>, or no eligible keys exist (for example a volatile policy with no TTL keys), the command fails with an OOM error. Reads keep working.</li>
+</ol>
+<table>
+<tr><th>Policy</th><th>Candidates</th><th>Choose when</th></tr>
+<tr><td>noeviction</td><td>None</td><td>Redis is a primary store; failing is better than losing data</td></tr>
+<tr><td>allkeys-lru</td><td>All keys, least recently used</td><td>General cache with a recency pattern</td></tr>
+<tr><td>allkeys-lfu</td><td>All keys, least frequently used</td><td>A stable popular set; scans must not flush it</td></tr>
+<tr><td>volatile-lru / lfu / ttl</td><td>Only keys with a TTL</td><td>Mixed instance where TTL marks "evictable"</td></tr>
+<tr><td>allkeys-random / volatile-random</td><td>Random</td><td>Rarely; uniform access</td></tr>
+</table>
+<p><b>LRU versus LFU, with an example.</b> A nightly report job reads 5 million keys once. Under LRU those keys are all "recently used" and push out your really popular keys. LFU counts access frequency (with decay, so it also forgets old fame), so keys read once stay low and are evicted first. Choose LFU when you have a clear hot set plus occasional scans.</p>
+<p><b>Practical points.</b> Memory used for replication and client output buffers counts toward the limit but is not evicted, so leave headroom (set <code>maxmemory</code> to maybe 70 to 80 percent of the host RAM, less if you snapshot with fork). Watch <code>evicted_keys</code>: a steady non-zero rate means the working set does not fit and the hit rate is suffering, so add memory or shrink values. Redis eviction is approximate (sampling), and a larger <code>maxmemory-samples</code> (10) improves accuracy at a small CPU cost.</p>
 <p class="rem"><b>Remember:</b> default noeviction = writes fail. Cache: allkeys-lru or allkeys-lfu. Redis LRU samples, it is not exact.</p>
 </div>
 </details>
@@ -588,6 +914,22 @@ INFO stats      # evicted_keys, expired_keys, keyspace_hits, keyspace_misses</co
 <div class="ans">
 <p class="ia">First <code>INFO keyspace</code>: the line <code>keys=5000000,expires=1200000</code> shows how many keys have no TTL. Most often some code path writes keys without a TTL, or the key space has unbounded cardinality, or a collection only grows. Then I find the offending prefix with <code>SCAN</code> and <code>TTL</code>, and fix the code, not just the symptom.</p>
 <p>Typical causes: a plain <code>SET</code> after <code>SETEX</code> removes the TTL; <code>INCR</code> on a new key creates it without a TTL; one key per request id or per user per minute; a list, set or stream with no trimming (<code>LTRIM</code>, <code>XTRIM</code>); big keys (<code>--bigkeys</code>); and fragmentation (<code>mem_fragmentation_ratio</code> well above 1.5). Expired keys nobody reads can also linger until the sampler finds them. As a guard, set <code>maxmemory</code> with an eviction policy so growth cannot take the host down.</p>
+<p><b>A systematic way to debug, in order.</b></p>
+<ol>
+<li><b>Is it really keys?</b> Compare <code>used_memory</code> with <code>used_memory_rss</code> in <code>INFO memory</code>. If RSS is much higher (<code>mem_fragmentation_ratio</code> above about 1.5), the allocator holds freed memory; consider active defragmentation or a restart during a quiet period. If used memory itself grows, continue.</li>
+<li><b>Key count and TTL coverage:</b> <code>INFO keyspace</code> shows <code>keys=N,expires=M</code>. A big gap means many keys never expire.</li>
+<li><b>Which prefix?</b> Sample with <code>SCAN</code> and check <code>TTL</code> and <code>MEMORY USAGE</code> per key, or run <code>redis-cli --memkeys</code> and <code>--bigkeys</code>. Group the results by prefix.</li>
+<li><b>Match the prefix to the code</b> that writes it.</li>
+</ol>
+<p><b>The usual culprits, each with the cause.</b></p>
+<ul>
+<li><b>No TTL set:</b> <code>SET key v</code> (clears an earlier TTL), or <code>INCR</code>/<code>HSET</code> creating a new key, since only <code>SET ... EX</code>, <code>EXPIRE</code> and <code>SETEX</code> add a TTL.</li>
+<li><b>Unbounded cardinality:</b> a key per request id, per session without cleanup, or per user per second.</li>
+<li><b>Unbounded collections:</b> a list or stream that is only appended to. Trim with <code>LTRIM</code>, <code>XADD ... MAXLEN ~ 100000</code> or <code>XTRIM</code>.</li>
+<li><b>Fat values:</b> verbose JSON, no compression, or large serialized Java objects.</li>
+<li><b>Replication and client buffers:</b> a slow replica or pub/sub subscriber can make the output buffer grow (<code>INFO clients</code>, <code>client-output-buffer-limit</code>).</li>
+</ul>
+<p>Fixing it for good: add a code review rule "every cache write has a TTL", wrap Redis writes in one helper that enforces it, set <code>maxmemory</code> plus a sensible policy, and alert on <code>used_memory</code> and on the ratio of keys without TTL.</p>
 <p class="rem"><b>Remember:</b> compare keys with expires, find the prefix with no TTL, cap collections, set maxmemory.</p>
 </div>
 </details>
@@ -604,6 +946,23 @@ v = GET balance:7           # app reads
 MULTI
 SET balance:7 (v - 50)
 EXEC                        # nil if someone else changed balance:7</code></pre>
+<p><b>What you actually get.</b> Redis transactions provide two guarantees: the queued commands run one after another without interruption (isolation), and either all are queued and run or, if a queuing error occurs, none run. They do <b>not</b> provide rollback of runtime errors, so the "A" in ACID is not there in the SQL sense.</p>
+<p><b>Compare with SQL.</b></p>
+<table>
+<tr><th>Property</th><th>SQL database</th><th>Redis MULTI/EXEC</th></tr>
+<tr><td>Rollback on failure</td><td>Yes</td><td>No: other commands still execute</td></tr>
+<tr><td>Read a value mid-transaction and branch</td><td>Yes</td><td>No: commands are only queued</td></tr>
+<tr><td>Isolation</td><td>Configurable levels</td><td>Full: nothing runs in between</td></tr>
+<tr><td>Durability</td><td>Commit is durable</td><td>Depends on AOF and replication settings</td></tr>
+</table>
+<p><b>Why no rollback?</b> The Redis authors argued that runtime command errors in a transaction are programming errors (wrong type), found in development, and that skipping rollback keeps Redis simple and fast.</p>
+<p><b>How WATCH gives optimistic locking, walked through.</b> You want to subtract 50 from a balance only if it is at least 50.</p>
+<ol>
+<li><code>WATCH balance:7</code> then <code>GET balance:7</code> returns 120.</li>
+<li>Your code decides it is allowed and starts <code>MULTI</code>, queues <code>DECRBY balance:7 50</code>.</li>
+<li><code>EXEC</code>: if no one modified <code>balance:7</code> since the WATCH, it runs. If someone did, <code>EXEC</code> returns nil (aborted) and you retry from step 1.</li>
+</ol>
+<p>Under heavy contention the retries pile up, so for hot keys a Lua script is simpler and faster, since it does the check and write server-side in one step. In Cluster all keys in a transaction must be in one slot. Spring's <code>SessionCallback</code> is the way to run MULTI/EXEC correctly on one connection, because plain template calls may use different pooled connections.</p>
 <p class="rem"><b>Remember:</b> MULTI/EXEC = isolated batch, no rollback. WATCH adds optimistic locking.</p>
 </div>
 </details>
@@ -619,6 +978,24 @@ if redis.call("GET", KEYS[1]) == ARGV[1] then
 else
   return 0
 end</code></pre>
+<p><b>Why scripts exist.</b> Redis commands are atomic one by one, but real logic is often "look at the value, decide, then change several keys". With separate commands another client can change the data between your read and your write. A Lua script is sent to Redis and executed on the main thread as a single indivisible step, so the whole read-decide-write sequence happens with nobody in between. It also replaces many round trips with one.</p>
+<p><b>A second example: safe stock decrement.</b></p>
+<pre><code>-- KEYS[1] = stock key, ARGV[1] = quantity wanted
+local s = tonumber(redis.call("GET", KEYS[1]) or "0")
+if s &gt;= tonumber(ARGV[1]) then
+  redis.call("DECRBY", KEYS[1], ARGV[1])
+  return 1       -- reserved
+end
+return 0         -- not enough stock</code></pre>
+<p>Called from Java as one <code>execute(script, keys, args)</code>. Two buyers can never both take the last unit, which a GET-then-DECR sequence cannot guarantee.</p>
+<p><b>Rules that keep it safe.</b></p>
+<ul>
+<li><b>Declare keys in KEYS:</b> required so Cluster can route to the right node, and the keys must be in the same slot.</li>
+<li><b>Keep it short and deterministic:</b> no loops over huge data; the script blocks the server. Past <code>busy-reply-threshold</code> (formerly <code>lua-time-limit</code>, default 5 s) Redis starts to reply BUSY to others, and you can only <code>SCRIPT KILL</code> a script that has not written yet.</li>
+<li><b>Cache by hash:</b> <code>SCRIPT LOAD</code> returns a SHA1, then call <code>EVALSHA</code>. Clients handle the NOSCRIPT fallback; Spring's <code>DefaultRedisScript</code> does this.</li>
+<li><b>Redis 7 Functions:</b> named libraries loaded into the server and persisted, easier to manage than loose scripts.</li>
+</ul>
+<p>Scripts also make good rate limiters, lock releases, and compare-and-set updates (the version check from the stale-cache race). Mention that scripts are not rolled back on error either.</p>
 <p class="rem"><b>Remember:</b> Lua = atomic read-decide-write in one round trip. Keep it short and pass keys in KEYS.</p>
 </div>
 </details>
@@ -628,6 +1005,23 @@ end</code></pre>
 <div class="ans">
 <p class="ia">Subscribers run <code>SUBSCRIBE channel</code>, a publisher runs <code>PUBLISH channel message</code>, and Redis pushes the message to whoever is subscribed at that moment. Nothing is stored: a subscriber that is offline, slow or not yet subscribed never sees it, and there is no acknowledgement or replay. So it suits ephemeral notifications and cache-invalidation broadcasts, not jobs that must be processed.</p>
 <p>A slow subscriber's output buffer grows, and Redis disconnects it when it passes <code>client-output-buffer-limit pubsub</code>. In a Cluster, a published message is broadcast to every node; Redis 7 added sharded pub/sub (<code>SPUBLISH</code>) to confine it to a shard.</p>
+<p><b>How it works, in a picture of time.</b> Imagine a radio station. Anyone tuned in at the moment of the broadcast hears it; nobody can listen to it later. <code>PUBLISH news "hello"</code> returns how many subscribers received it right now. If the count is 0 the message is simply gone, and Redis does not store it anywhere.</p>
+<table>
+<tr><th>Feature</th><th>Pub/Sub</th><th>List queue</th><th>Stream with groups</th></tr>
+<tr><td>Message stored</td><td>No</td><td>Until popped</td><td>Until trimmed</td></tr>
+<tr><td>Offline consumer catches up</td><td>No</td><td>Yes (items wait)</td><td>Yes (from its last id)</td></tr>
+<tr><td>Many consumers each get every message</td><td>Yes (fan-out)</td><td>No (one consumer per item)</td><td>Yes with separate groups</td></tr>
+<tr><td>Acknowledgement and retry</td><td>No</td><td>No</td><td>Yes</td></tr>
+</table>
+<p><b>Good uses.</b> Telling all app instances to drop a local cache entry (cache invalidation broadcast), live notifications where a missed one is harmless (typing indicators, presence), chat-style fan-out to connected websocket servers. The subscriber being connected is the whole delivery guarantee, so reconnect logic must also resync state (for example reload from a source of truth after a reconnect).</p>
+<p><b>Limits and pitfalls.</b></p>
+<ul>
+<li>A subscriber connection is dedicated: once subscribed it cannot run normal commands, so libraries use a separate connection.</li>
+<li>Slow subscribers: messages queue in the server's output buffer; past the limit Redis closes the connection (and the messages are lost).</li>
+<li>Pattern subscriptions (<code>PSUBSCRIBE</code>) cost CPU for every publish since each pattern is checked.</li>
+<li>In Cluster, classic publishes are propagated to all nodes, which is heavy with many channels; use sharded pub/sub (7.0+) where possible.</li>
+<li>Keyspace notifications (events for expired keys) also use pub/sub and are lossy; do not use them for must-not-miss logic such as "process when this key expires".</li>
+</ul>
 <p class="rem"><b>Remember:</b> pub/sub = fire and forget. Miss it and it is gone.</p>
 </div>
 </details>
@@ -641,6 +1035,23 @@ end</code></pre>
 XGROUP CREATE orders billing $ MKSTREAM
 XREADGROUP GROUP billing w1 COUNT 10 BLOCK 5000 STREAMS orders &gt;
 XACK orders billing 1731800000000-0</code></pre>
+<p><b>The mental model.</b> A stream is a log: entries are appended with increasing ids and are not removed when read. Each reader keeps its own position. This is the idea behind Kafka, in a smaller form inside Redis.</p>
+<p><b>Consumer groups, step by step.</b> Suppose an <code>orders</code> stream, and three billing workers in group <code>billing</code>.</p>
+<ol>
+<li>A producer calls <code>XADD orders * orderId 991</code>, which appends an entry with id like <code>1731800000000-0</code>.</li>
+<li>Worker 1 calls <code>XREADGROUP GROUP billing w1 ... STREAMS orders &gt;</code>. The <code>&gt;</code> means "entries never delivered to this group". Redis gives the entry to w1 only and records it in the group's <b>pending entries list</b> (PEL) with the delivery time.</li>
+<li>w1 processes it and calls <code>XACK</code>. The entry leaves the PEL.</li>
+<li>If w1 crashes, the entry stays pending. Another worker runs <code>XAUTOCLAIM</code> (or <code>XPENDING</code> then <code>XCLAIM</code>) for entries idle longer than, say, 60 seconds, and takes it over.</li>
+</ol>
+<p>This gives at-least-once delivery: after a crash the same entry may be processed twice, so the handler must be idempotent (for example, a unique order id in the database). For poison messages, track the delivery count in <code>XPENDING</code> and move entries over some count to a dead-letter stream.</p>
+<table>
+<tr><th>Choice</th><th>Use when</th></tr>
+<tr><td>Pub/Sub</td><td>Losing a message is fine; broadcast</td></tr>
+<tr><td>List with <code>BRPOPLPUSH</code> / <code>LMOVE</code></td><td>Simple single-consumer job queue, you add retry yourself</td></tr>
+<tr><td>Stream</td><td>Acks, several workers, replay, moderate volume, already on Redis</td></tr>
+<tr><td>Kafka / SQS / RabbitMQ</td><td>High volume, long retention, strong durability, many teams</td></tr>
+</table>
+<p><b>Operational caveats.</b> Streams live in memory, so cap them with <code>MAXLEN</code> or <code>MINID</code> trimming (the <code>~</code> form is cheaper). A stream is one key, so one shard in Cluster. And persistence and failover caveats of Redis apply: an acknowledged <code>XADD</code> can be lost on failover. That is the reason for choosing a durable broker when messages are business-critical.</p>
 <p class="rem"><b>Remember:</b> pub/sub forgets, list loses jobs on crash, stream keeps and acknowledges. Make handlers idempotent.</p>
 </div>
 </details>
@@ -666,6 +1077,24 @@ if redis.call("GET", KEYS[1]) == ARGV[1] then
 <rect class="hit" x="600" y="140" width="230" height="34" rx="6"/><text class="t-c t-sm" x="715" y="162">B writes at the same time</text>
 <text class="t-sm" x="140" y="215">Fix: a fencing token. The storage rejects any write with a token lower than the newest one it has seen.</text>
 </svg><figcaption>A lease can expire while the holder is still running. The lock alone cannot stop the late writer; a fencing token at the resource can.</figcaption></figure>
+<p><b>What a lock is for.</b> You want only one worker at a time to do a task, for example one instance running a nightly job, or one request processing order 42. A lock key in Redis is a shared "token on the table" that any instance can try to take.</p>
+<p><b>Why each part of the command matters.</b></p>
+<ul>
+<li><b>NX:</b> set only if the key does not exist. Two clients racing get one success; Redis serializes them.</li>
+<li><b>PX 30000:</b> a lease. If the holder crashes the lock vanishes after 30 s instead of staying forever.</li>
+<li><b>Random token as value:</b> identifies the owner so only the owner can release.</li>
+<li><b>One command:</b> acquiring and setting the expiry in two steps (SETNX then EXPIRE) can leave a lock with no expiry if the client dies in between.</li>
+</ul>
+<p><b>What goes wrong without the token, as a timeline.</b></p>
+<ol>
+<li>A takes the lock (30 s), starts a task that unexpectedly takes 40 s.</li>
+<li>At 30 s the lock expires; B takes it.</li>
+<li>At 40 s A finishes and runs <code>DEL lock</code>, deleting B's lock. Now C can also enter while B is still working.</li>
+</ol>
+<p>With the token, A's delete finds a different value and does nothing.</p>
+<p><b>Lease length and renewal.</b> Pick a lease longer than the worst realistic run, or have a watchdog extend it while the work is alive (Redisson does this by default: 30 s lease renewed every 10 s while the client is alive). A watchdog protects against slow work but not against a frozen process, because a frozen process cannot renew, though it also cannot know it lost the lock when it wakes up.</p>
+<p><b>Spring option.</b> Spring Integration's <code>RedisLockRegistry</code> or Redisson's <code>RLock</code> save you from writing this. For one-job-at-a-time scheduling, ShedLock is a library built for exactly that, usually on top of a database or Redis.</p>
+<p><b>The honest limit.</b> A single-Redis lock is best-effort. A failover can lose the lock key; a long pause can outlive the lease. Use it for efficiency, and protect correctness with idempotency or a database constraint, as discussed next.</p>
 <p class="rem"><b>Remember:</b> SET NX PX with a random token, release with a Lua compare-and-delete. A lease can expire, so make the work idempotent.</p>
 </div>
 </details>
@@ -675,6 +1104,16 @@ if redis.call("GET", KEYS[1]) == ARGV[1] then
 <div class="ans">
 <p class="ia">A single Redis lock can be lost on failover, because the replica may not yet have the lock key. Redlock takes the lock on five independent Redis masters and counts it as held if a majority (3 of 5) grants it within the lease time. Kleppmann argued it is still unsafe for correctness, because it relies on timing assumptions (no long pauses, no clock jumps) and gives no fencing token. My answer: Redis locks are fine for efficiency (avoiding duplicate work); for correctness add a fencing token or a database constraint.</p>
 <p>Kleppmann's scenario: a client gets the lock, pauses (GC, page fault), the lease expires, another client takes the lock, and the first resumes believing it still holds it. Clock jumps on a node can also expire locks early. He advised: if the lock is for efficiency, a single Redis lock is enough; if it is for correctness, you need a fencing token (an ever-increasing number checked by the resource itself), from a system such as ZooKeeper or etcd, or simply use the database's own guard: unique constraints, <code>UPDATE ... WHERE version = ?</code>, or transactions. Antirez replied that the timing assumptions are acceptable in practice; but Redlock's random token is not monotonic, so it cannot serve as a fencing token. Redisson's plain <code>RLock</code> is a single-node lock with a watchdog (default lease 30 s), not Redlock.</p>
+<p><b>The problem Redlock tries to fix.</b> With one Redis, if the primary dies right after granting a lock and before the replica copies it, the replica becomes primary without the lock key and a second client acquires the same lock. Two holders exist. Redlock tries to survive that by using several independent masters.</p>
+<p><b>The algorithm in steps.</b></p>
+<ol>
+<li>Record the start time. Try to acquire the same lock (same random token, short per-node timeout) on each of 5 independent masters, one after another.</li>
+<li>The lock counts as acquired if a majority (3 or more) said yes and the elapsed time is less than the lease validity (lease minus elapsed minus a clock drift allowance).</li>
+<li>If not acquired, release on all nodes and retry after a random delay.</li>
+</ol>
+<p><b>Kleppmann's critique, in plain terms.</b> The safety depends on time. If a client pauses (garbage collection, a stalled VM, slow disk) for longer than the lease, it will resume and write while someone else legitimately holds the lock. No checking of the clock on the client can fix this, because the pause may happen right after the check. A correct lock needs a <b>fencing token</b>: each acquisition returns a number that always increases, and the protected resource (database or storage) rejects writes with a number lower than one it has already seen. Redlock hands out random values, not increasing numbers, so it cannot be used for fencing. He also noted that nodes' clocks can jump, which can shorten leases.</p>
+<p><b>Antirez's reply.</b> Real systems already rely on bounded clock drift and process pauses are rare and can be detected by comparing times after acquisition; so for many uses Redlock is good enough.</p>
+<p><b>How to answer the interview question.</b> Classify the lock. If it only prevents duplicate work (efficiency, for example refreshing a cache), a single Redis lock is fine. If correctness depends on mutual exclusion (money, inventory), use something with fencing (ZooKeeper, etcd, or a database row lock or optimistic version), or design the operation to be idempotent so a double run is harmless. Redisson also offers a RedLock implementation, but many practitioners avoid it for the reasons above.</p>
 <p class="rem"><b>Remember:</b> lock for efficiency: Redis is fine. Lock for correctness: fencing token or a database constraint.</p>
 </div>
 </details>
@@ -711,6 +1150,25 @@ local c = redis.call("INCR", KEYS[1])
 if c == 1 then redis.call("EXPIRE", KEYS[1], ARGV[2]) end
 if c &gt; tonumber(ARGV[1]) then return 0 end
 return 1</code></pre>
+<p><b>Start from the requirement.</b> "Allow at most N requests per user per window." The design questions are: how exact must the limit be, may short bursts be allowed, how much memory per user, and what happens if Redis fails. A limiter shared across many API servers needs a central counter, which is why Redis is a natural fit.</p>
+<table>
+<tr><th>Algorithm</th><th>Memory per user</th><th>Accuracy</th><th>Bursts</th></tr>
+<tr><td>Fixed window counter</td><td>1 counter</td><td>Up to 2x at the boundary</td><td>Allowed (edge effect)</td></tr>
+<tr><td>Sliding window log</td><td>One entry per request</td><td>Exact</td><td>None beyond the limit</td></tr>
+<tr><td>Sliding window counter</td><td>2 counters</td><td>Close approximation</td><td>Smoothed</td></tr>
+<tr><td>Token bucket</td><td>2 values (tokens, last refill)</td><td>Average rate exact</td><td>Up to bucket size</td></tr>
+<tr><td>Leaky bucket</td><td>Queue or counter</td><td>Smooths output rate</td><td>Absorbed by the queue</td></tr>
+</table>
+<p><b>Token bucket as Lua, in words.</b> Keep a hash with <code>tokens</code> and <code>ts</code>. On each request: compute elapsed time since <code>ts</code>, add <code>elapsed * rate</code> tokens up to the capacity, set <code>ts</code> to now, and if tokens are at least 1 subtract one and allow; else deny and return how long until the next token. Use the Redis server time (<code>TIME</code> inside the script) so that app server clock skew does not matter. All of this inside one script means no race between instances.</p>
+<p><b>Sliding window log, example.</b> A zset per user, score = timestamp in ms. For each request: remove entries older than now minus 60,000, count the rest, and if the count is below 100, add this request and allow. The cost is one zset entry per request, so it suits low limits (100 per minute) but not millions per second.</p>
+<p><b>Production details.</b></p>
+<ul>
+<li>Put the limiter in a gateway or filter so every route is covered; return <code>429</code> with <code>Retry-After</code> and rate-limit headers.</li>
+<li>Choose the key: user id for logged-in users, API key, otherwise IP (careful with shared NAT addresses).</li>
+<li>Set a TTL on every limiter key so idle users cost nothing.</li>
+<li>Decide fail-open (allow if Redis is down, usual for public APIs) versus fail-closed (login or payment endpoints), and add a small local fallback limiter.</li>
+<li>In Cluster, the keys used in one script must share a slot; one user key per call is fine.</li>
+</ul>
 <p class="rem"><b>Remember:</b> fixed window is simple but leaks at the edge. Token bucket allows bursts. Make it atomic with Lua.</p>
 </div>
 </details>
@@ -723,6 +1181,21 @@ return 1</code></pre>
 <pre><code>ZINCRBY lb:global 20 player:7
 ZRANGE lb:global 0 9 REV WITHSCORES      # top 10 (6.2+; older: ZREVRANGE)
 ZREVRANK lb:global player:7              # my rank, 0 is first</code></pre>
+<p><b>Why a sorted set fits so well.</b> A leaderboard needs three operations to be fast at any scale: change a player's score, list the top N, and find a player's rank. A relational table needs an index and an <code>ORDER BY ... LIMIT</code> or a <code>COUNT(*)</code> of players with higher scores, which gets slow with millions of rows and constant updates. A sorted set does each of these in O(log N) in memory.</p>
+<p><b>The three core operations, with values.</b></p>
+<pre><code>ZINCRBY lb:global 50 player:7        # player 7 earned 50 points; returns new score
+ZRANGE lb:global 0 9 REV WITHSCORES   # top 10 with scores
+ZREVRANK lb:global player:7           # 0-based rank from the top (add 1 for display)
+ZRANGE lb:global (rank-2) (rank+2)    # players around me (compute indexes in app)</code></pre>
+<p><b>Time-bound boards.</b> For a weekly board use a key per period (<code>lb:2026-W47</code>), update both global and weekly sets, and give the weekly set a TTL of a few weeks. To combine days into a week use <code>ZUNIONSTORE lb:week 7 lb:d1 ... lb:d7</code> (with <code>WEIGHTS</code> if some days count more).</p>
+<p><b>Ties.</b> Equal scores are ordered by member name, which is rarely what you want. A common trick is to pack a time part into the fractional digits of the score (for example points plus a small number that is larger for earlier achievers), keeping the total within the 53-bit precision of a double, so the earlier achiever ranks higher.</p>
+<p><b>Scaling and safety.</b></p>
+<ul>
+<li>Keep the database as the system of record (or an events log); if Redis loses data, rebuild the set from it.</li>
+<li>For huge boards (hundreds of millions), shard by something sensible (country, game) and merge top N, because a single sorted set is one key on one node.</li>
+<li>Do not call <code>ZRANGE 0 -1</code> on a big board; always page.</li>
+<li>Show "approximate rank" for far-down players if exact rank is not needed, and use a cache for the top-10 page that is read by everybody.</li>
+</ul>
 <p class="rem"><b>Remember:</b> sorted set: ZINCRBY to score, ZRANGE REV for top N, ZREVRANK for my rank.</p>
 </div>
 </details>
@@ -732,6 +1205,23 @@ ZREVRANK lb:global player:7              # my rank, 0 is first</code></pre>
 <div class="ans">
 <p class="ia">Web servers should be stateless so any instance can serve any request, so the session data lives in Redis and the browser holds only a random session id in a cookie (<code>HttpOnly</code>, <code>Secure</code>). Redis stores <code>session:&lt;id&gt;</code> with a TTL equal to the idle timeout, refreshed on each request. In Spring, Spring Session with Redis does this with configuration.</p>
 <p>Watch for: Redis availability becomes login availability, so use replication with failover and decide what happens on loss (users log in again). Keep sessions small. Add an absolute maximum lifetime besides the idle one. Use TLS and auth. Be careful with serialization: changing a session class between deploys can make old sessions unreadable. Alternative: signed stateless tokens (JWT) avoid the lookup but make early revocation harder.</p>
+<p><b>The problem.</b> If sessions live in a web server's memory, the user must always return to the same server (sticky sessions), a restart logs people out, and scaling out is awkward. Moving the session data to a shared store makes the web tier stateless: any instance can serve any request.</p>
+<p><b>Request flow, step by step.</b></p>
+<ol>
+<li>User logs in. The server creates a random, unguessable session id (at least 128 bits from a secure random source) and stores <code>session:&lt;id&gt;</code> in Redis (a hash with user id, roles, a few attributes) with a TTL of, say, 30 minutes.</li>
+<li>The response sets a cookie containing only that id: <code>HttpOnly</code> (JavaScript cannot read it), <code>Secure</code> (HTTPS only), <code>SameSite</code> (CSRF protection).</li>
+<li>Each later request carries the cookie; the server reads Redis, and refreshes the TTL (<code>EXPIRE</code>), giving a sliding idle timeout.</li>
+<li>Logout deletes the key, so the session is invalid immediately.</li>
+</ol>
+<p><b>Design decisions to mention.</b></p>
+<ul>
+<li><b>Idle and absolute timeouts:</b> store the creation time and force re-login after, say, 8 hours even if active.</li>
+<li><b>Revocation:</b> deleting the key kills a session at once, which is the main advantage over JWTs that stay valid until they expire (unless you keep a deny list, which is a state store again). Also allows "log out everywhere" by keeping a set of session ids per user.</li>
+<li><b>Persistence and HA:</b> if Redis loses data, users must log in again. For most sites that is acceptable; if not, use AOF and replicas. Decide the failure mode up front.</li>
+<li><b>Size and serialization:</b> keep sessions small (ids and flags, not whole objects); use JSON or a stable format, since a changed Java class can make old sessions unreadable after a deploy.</li>
+<li><b>Security:</b> TLS to Redis, authentication and ACLs, rotate the session id on login (prevents fixation).</li>
+</ul>
+<p><b>Spring.</b> Adding <code>spring-session-data-redis</code> and <code>@EnableRedisHttpSession</code> (or the equivalent property) replaces the servlet container's session with the Redis-backed one; the application code that uses <code>HttpSession</code> does not change.</p>
 <p class="rem"><b>Remember:</b> cookie holds only the id; Redis holds the data with a sliding TTL. Plan for Redis loss.</p>
 </div>
 </details>
@@ -756,6 +1246,29 @@ public void update(User u) { repo.save(u); }
           new GenericJackson2JsonRedisSerializer()));
   return RedisCacheManager.builder(f).cacheDefaults(cfg).build();
 }</code></pre>
+<p><b>What the abstraction is.</b> Spring's cache support is a thin layer: you put annotations on methods, and Spring generates a proxy around the bean. When someone calls the method, the proxy builds a key, asks a <code>CacheManager</code> for the named cache, and either returns the cached value or calls the real method and stores its result. Redis is only one possible backing store (Caffeine, Ehcache and others use the same annotations), so swapping the store does not change business code.</p>
+<p><b>Flow of one <code>@Cacheable</code> call.</b></p>
+<ol>
+<li>Caller invokes <code>userService.find(42)</code> (a call through the Spring proxy).</li>
+<li>Proxy computes key <code>users::42</code> and does <code>GET</code> in Redis.</li>
+<li>Hit: deserialize and return; the method body never runs.</li>
+<li>Miss: run the method (database query), serialize the result, <code>SET users::42 ... EX ttl</code>, return it.</li>
+</ol>
+<table>
+<tr><th>Annotation</th><th>Runs the method?</th><th>Cache effect</th><th>Typical use</th></tr>
+<tr><td><code>@Cacheable</code></td><td>Only on a miss</td><td>Stores result</td><td>Read methods</td></tr>
+<tr><td><code>@CachePut</code></td><td>Always</td><td>Overwrites entry</td><td>Update returning the new object</td></tr>
+<tr><td><code>@CacheEvict</code></td><td>Always</td><td>Removes entry (or all with <code>allEntries = true</code>)</td><td>Delete and update methods</td></tr>
+<tr><td><code>@Caching</code></td><td>Depends</td><td>Combine several</td><td>Evict from multiple caches</td></tr>
+</table>
+<p><b>Configuration choices that matter.</b></p>
+<ul>
+<li><b>Per-cache TTL:</b> pass a map of <code>RedisCacheConfiguration</code> by cache name, so <code>users</code> lives 10 minutes and <code>flags</code> 30 seconds.</li>
+<li><b>Serializer:</b> JSON (Jackson) rather than JDK. Mind default typing, because the JSON must carry or know the class to deserialize back; and avoid classes without default constructors.</li>
+<li><b>Key prefix:</b> set a prefix per app or version (<code>computePrefixWith</code>) so deployments with incompatible classes do not read each other's entries.</li>
+<li><b>Null handling:</b> by default nulls are cached; <code>disableCachingNullValues()</code> changes this.</li>
+</ul>
+<p><b>When the annotations are not enough.</b> They give simple cache-aside only. For stampede control beyond <code>sync = true</code>, multi-level caching, or Redis-specific features (hashes, TTL jitter), use <code>RedisTemplate</code> directly or a library such as Redisson or a Caffeine plus Redis composite.</p>
 <p class="rem"><b>Remember:</b> Cacheable / CachePut / CacheEvict through a proxy. Set a TTL and a JSON serializer yourself.</p>
 </div>
 </details>
@@ -774,6 +1287,21 @@ public void update(User u) { repo.save(u); }
 <li><b>Transactions:</b> an eviction can run before the database commit, so a concurrent reader refills the old value; evict after commit (<code>TransactionAwareCacheManagerProxy</code>).</li>
 <li><b>Redis errors failing requests:</b> add a <code>CacheErrorHandler</code> so an outage becomes a miss, not a 500.</li>
 </ul>
+<p><b>The proxy explained, because it causes the top pitfall.</b> Spring caching works by wrapping your bean in a generated subclass or JDK proxy. Calls coming from other beans go through the proxy and see the caching logic. A call from inside the same object, <code>this.find(id)</code>, goes straight to the real method and skips the proxy, so no caching, no eviction, no transaction either. The same applies to private or final methods, and to methods on objects you created with <code>new</code> rather than getting from Spring.</p>
+<pre><code>@Service class UserService {
+  public User profile(long id) { return find(id); }   // self-call: NOT cached
+  @Cacheable("users") public User find(long id) { ... }
+}
+// fix: move find() to another bean (UserRepositoryCache), or inject self, or use AspectJ mode</code></pre>
+<p><b>The transaction ordering pitfall, explained.</b> Suppose <code>@Transactional @CacheEvict</code> on <code>update</code>. The eviction happens when the method returns, but the database commit may happen a moment later, when the transaction proxy completes. In that gap a concurrent reader misses, reads the old committed row, and caches it. After the commit the cache holds stale data until the TTL. The fix: evict after commit (wrap the cache manager with <code>TransactionAwareCacheManagerProxy</code>, or use <code>@TransactionalEventListener(AFTER_COMMIT)</code> to evict).</p>
+<p><b>Other pitfalls, quickly.</b></p>
+<ul>
+<li><b>Key defaults:</b> with several arguments the key is a combination; with none it is a constant; two different methods with the same cache name and arguments can collide. Use explicit keys such as <code>"'user:' + #id"</code>.</li>
+<li><b>Caching mutable or lazy objects:</b> caching a JPA entity with lazy collections fails on deserialization or serves a detached object; cache DTOs.</li>
+<li><b>Large collections:</b> a cached list is replaced as a whole; one change evicts the whole list.</li>
+<li><b>Errors:</b> by default a Redis exception propagates and fails the call. Implement <code>CacheErrorHandler</code> to log and treat the error as a miss.</li>
+<li><b>Testing:</b> unit tests that call the class directly or use a mock cache miss all of this; add an integration test through the real proxy (embedded or Testcontainers Redis).</li>
+</ul>
 <p class="rem"><b>Remember:</b> proxy means no self-calls. No TTL by default. Treat cache errors as misses.</p>
 </div>
 </details>
@@ -783,6 +1311,30 @@ public void update(User u) { repo.save(u); }
 <div class="ans">
 <p class="ia">If Redis is a cache, the service must keep working, slower, but protected. I use short client timeouts (tens to a few hundred milliseconds), a circuit breaker that stops calling Redis for a few seconds after repeated failures, and a limit on the fallback path to the database, because a Redis outage means a 100 percent miss rate that can crush the database.</p>
 <p>Catch cache exceptions so they never fail the request, and return degraded responses if needed (stale data from a local L1, hide non-essential features). For other uses choose fail-open or fail-closed on purpose: a rate limiter usually fails open, a payment lock usually fails closed. Sessions: decide between logging users out and a read-only mode. Also set client pool size and timeouts: a missing timeout is how one slow Redis hangs every application thread. Test it: block Redis in staging and watch the database.</p>
+<p><b>Think in terms of dependencies and failure modes.</b> If Redis is only a cache, then "Redis is slow" or "Redis is down" must degrade to "pages load slower", never to "site is down". The danger is not the missing cache itself, but how your app reacts: threads waiting, retries piling up, and a database suddenly receiving all reads.</p>
+<p><b>What happens without protection, as a chain.</b></p>
+<ol>
+<li>Redis stops answering. The client has a 2 s (or infinite) timeout.</li>
+<li>Each request thread blocks 2 s waiting for the cache, so the thread pool fills up (200 threads at 100 requests per second are exhausted in 2 s).</li>
+<li>Requests queue, latency goes to timeouts, health checks fail, instances restart, and the site is effectively down even though only the cache failed.</li>
+</ol>
+<p><b>The layered defence.</b></p>
+<ul>
+<li><b>Short timeouts:</b> connect and command timeouts of about 50 to 200 ms, so a slow Redis costs a bounded delay.</li>
+<li><b>Circuit breaker</b> (Resilience4j): after, say, 50 percent failures, open for 10 seconds and skip Redis entirely (go straight to the fallback), then probe again (half-open).</li>
+<li><b>Bulkhead:</b> a separate small thread pool or semaphore for cache calls so they cannot take every thread.</li>
+<li><b>Protect the database:</b> a concurrency limit, rate limit, or request coalescing on the fallback path, because every read is now a miss.</li>
+<li><b>Degrade gracefully:</b> serve stale data from a local L1, hide non-critical features (recommendations), return cached HTTP responses from a CDN.</li>
+</ul>
+<p><b>Fail open or fail closed per use case.</b></p>
+<table>
+<tr><th>Use</th><th>Usual choice</th><th>Why</th></tr>
+<tr><td>Read cache</td><td>Go to the database</td><td>Slower but correct</td></tr>
+<tr><td>Rate limiter</td><td>Fail open (allow)</td><td>Do not block all users because of a helper</td></tr>
+<tr><td>Lock for money movement</td><td>Fail closed</td><td>Safer to refuse than to run twice</td></tr>
+<tr><td>Session store</td><td>Depends: force login or read-only mode</td><td>Business decision</td></tr>
+</table>
+<p>Finally, rehearse it: block the Redis port in staging, watch thread pool usage and database load, and fix what breaks before production does it for you.</p>
 <p class="rem"><b>Remember:</b> short timeout, circuit breaker, protected fallback, deliberate fail-open or fail-closed.</p>
 </div>
 </details>
@@ -802,6 +1354,25 @@ public void update(User u) { repo.save(u); }
 <tr><td>Replication and failover</td><td>Built in</td><td>Not in core</td></tr>
 <tr><td>Sharding</td><td>Cluster (hash slots)</td><td>Client-side hashing</td></tr>
 </table>
+<p><b>Where Memcached is genuinely good.</b> It is very simple: a distributed hash table for byte blobs with LRU eviction. It is multi-threaded, so a single large machine can serve high throughput across many cores, its memory management (slab allocator) is predictable, and there is little to configure or get wrong. For a plain "cache of rendered pages or query results", it works well and many large sites ran on it for years.</p>
+<p><b>Where Redis wins, with concrete examples.</b></p>
+<ul>
+<li><b>Atomic operations on structures:</b> counters (<code>INCR</code>), leaderboards, sets, without reading and writing blobs. Memcached has increments but no structures.</li>
+<li><b>Partial updates:</b> change one hash field instead of rewriting a big blob.</li>
+<li><b>Availability:</b> replication plus automatic failover (Sentinel or Cluster). With Memcached, a lost node means a cold slice of the cache (and clients rehash).</li>
+<li><b>Persistence and warm restarts</b> (optional RDB or AOF).</li>
+<li><b>More roles:</b> locks, queues and streams, pub/sub, sessions, rate limiting. One system to operate instead of two.</li>
+<li><b>Eviction choices:</b> LRU and LFU, volatile or all keys; plus per-key TTL.</li>
+</ul>
+<p><b>When Memcached still makes sense.</b> A very large, read-mostly, blob-only cache where the throughput of a single multi-core node matters and you do not want to run more processes; or a team that already operates it well. With modern Redis (I/O threads, Cluster), the performance gap is small for most workloads, so the decision is usually about features and operations.</p>
+<table>
+<tr><th>Question</th><th>If yes</th></tr>
+<tr><td>Need anything other than blob get and set?</td><td>Redis</td></tr>
+<tr><td>Need to survive a node loss without a cold cache?</td><td>Redis</td></tr>
+<tr><td>Only simple blobs, extreme multi-core throughput on one box?</td><td>Memcached is fine</td></tr>
+<tr><td>Already running one of them well?</td><td>Prefer what you can operate</td></tr>
+</table>
+<p>Also mention managed options (ElastiCache supports both, MemoryDB is a durable Redis-compatible service), since many teams do not run these themselves.</p>
 <p class="rem"><b>Remember:</b> Memcached = simple multi-threaded blob cache. Redis = data structures plus HA plus persistence.</p>
 </div>
 </details>
@@ -811,6 +1382,18 @@ public void update(User u) { repo.save(u); }
 <div class="ans">
 <p class="ia">For rebuildable or short-lived data, yes: sessions, rate-limit counters, leaderboards, presence, feature flags. For money, orders and accounts, no: I keep a real database as the truth and Redis in front of it. The line: if I can rebuild it, Redis may be the primary; if losing a second of it costs money, it should not be.</p>
 <p>Why not for everything: the data set must fit in RAM, which is costly; durability is weaker (AOF everysec plus async replication can lose the last second of writes); there are no joins or rich queries, and secondary indexes need modules or manual upkeep; transactions have no rollback; and Cluster restricts multi-key operations.</p>
+<p><b>Two questions decide it.</b> Can I lose this data, and can I query it the way I need? If losing a few seconds of writes is acceptable (or the data can be rebuilt from elsewhere) and access is by key or simple structure, Redis may be the primary. If I need durable commits, relational queries, constraints or an audit trail, a database is.</p>
+<table>
+<tr><th>Concern</th><th>Redis</th><th>Relational or document DB</th></tr>
+<tr><td>Durability</td><td>Configurable but async replication and everysec fsync can lose recent writes</td><td>Commit is durable, synchronous replication possible</td></tr>
+<tr><td>Capacity</td><td>Limited by RAM</td><td>Limited by disk, much cheaper per GB</td></tr>
+<tr><td>Querying</td><td>By key, or structure commands; secondary indexes need modules</td><td>SQL, joins, indexes, aggregates</td></tr>
+<tr><td>Transactions</td><td>Isolation, no rollback</td><td>Full ACID</td></tr>
+<tr><td>Latency</td><td>Sub-millisecond</td><td>Milliseconds</td></tr>
+</table>
+<p><b>Examples of the right call.</b> Primary in Redis: user sessions, rate limiter counters, leaderboards that can be rebuilt, feature flags, presence, job state with a short life, and an inventory "hold" with a few minutes of life. Not primary: the order and payment records, account balances, and anything you must be able to audit or recover exactly.</p>
+<p><b>The middle path.</b> Use Redis in front of the database (cache), or as a derived copy that a pipeline keeps in sync (a leaderboard recomputed from game events). If you do use Redis as primary: enable AOF everysec plus replicas with <code>min-replicas-to-write</code>, run Sentinel or Cluster, take off-host backups, set <code>maxmemory-policy noeviction</code>, and monitor memory closely. Managed services like AWS MemoryDB (a durable Redis-compatible database using a multi-AZ transaction log) change the durability picture, which is worth knowing as an example of the trade being solvable at a cost.</p>
+<p>Closing line for the interview: "Redis is the fastest tier of my architecture, not the one I trust for the final record."</p>
 <p class="rem"><b>Remember:</b> Redis as primary only for data you can rebuild or can afford to lose a little of.</p>
 </div>
 </details>
@@ -822,6 +1405,18 @@ public void update(User u) { repo.save(u); }
 <div class="ans">
 <p class="ia">The load did not change, so the release changed the cache keys or TTLs. I compare hits and misses over time, diff the release for anything touching keys, then sample live keys to see their shape. Then I fix or roll back the key change.</p>
 <p><b>Situation:</b> the release is the suspect. <b>Check first:</b> <code>keyspace_hits</code> and <code>keyspace_misses</code> in <code>INFO stats</code> to see when the fall began; <code>evicted_keys</code> (memory pressure) and <code>expired_keys</code> (TTL change). <b>Look for:</b> a changed key format or version prefix (a new prefix is all-miss at first, then recovers), a request-specific part like a timestamp or request id in the key (every key unique, cache full of one-use entries), a shorter TTL, a changed serializer, or a code path that bypasses the cache. Use <code>SCAN</code> to look at real keys. <b>Fix:</b> correct the key, or roll back; if memory is full and evicting, find the new big key family. <b>Prevent:</b> a hit-rate alert per cache name, key unit tests, a canary that watches hit rate, and a warm-up when the key format must change.</p>
+<p><b>Why "same traffic, lower hit rate" points at keys.</b> The hit rate is hits divided by lookups. If lookups are the same and hits fell, then lookups are asking for keys that are not there, or the keys that are there were removed too early. Three possibilities: the keys changed (so old entries are useless), entries are expiring or being evicted faster, or the cache was emptied.</p>
+<p><b>A decision table to work from.</b></p>
+<table>
+<tr><th>Signal</th><th>Likely cause</th></tr>
+<tr><td><code>expired_keys</code> rate jumped</td><td>A TTL got shorter, or a TTL was added where none existed</td></tr>
+<tr><td><code>evicted_keys</code> rate jumped, memory at limit</td><td>New large or one-use keys pushing out useful ones</td></tr>
+<tr><td>Key count rose sharply, hit rate low</td><td>Cardinality explosion: a request-specific part (timestamp, trace id, full URL with random params) in the key</td></tr>
+<tr><td>Key count dropped to near zero</td><td>Flush, failover without data, or a key prefix or version bump</td></tr>
+<tr><td>Hit rate recovers slowly after the release</td><td>A deliberate key version bump (cold start); warm up next time</td></tr>
+</table>
+<p><b>Investigation steps.</b> 1) Plot hit rate against deployment time to confirm correlation. 2) Diff the release for changes to key builders, serializers, annotations (a new <code>#root.args</code> in a SpEL key can include an object with changing fields), TTLs or conditions. 3) Run <code>SCAN</code> with a sample and read a few keys and TTLs. 4) Check whether <code>unless</code> or <code>condition</code> now skips caching. 5) If a canary instance exists, compare its hit rate with others.</p>
+<p><b>Resolve and prevent.</b> Fix and redeploy, or roll back. A unit test that asserts the exact key string for each cached method catches this class of bug. Alert on hit rate per cache name (not just overall), because a drop in one small cache is invisible in the total.</p>
 <p class="rem"><b>Remember:</b> a hit-rate drop right after a deploy usually means the key changed. Look at live keys.</p>
 </div>
 </details>
@@ -831,6 +1426,15 @@ public void update(User u) { repo.save(u); }
 <div class="ans">
 <p class="ia">The policy is <code>noeviction</code> (the default), or a volatile policy with no keys that have a TTL. For a cache I switch to <code>allkeys-lru</code> or <code>allkeys-lfu</code> right away, then find which key family grew and fix the root cause.</p>
 <p><b>Situation:</b> <code>OOM command not allowed when used memory &gt; 'maxmemory'</code>. <b>Check first:</b> <code>INFO memory</code>, <code>INFO keyspace</code> (keys versus keys with expires), <code>CONFIG GET maxmemory-policy</code>, <code>--bigkeys</code>. <b>Relief:</b> change the policy if it is a cache; raise <code>maxmemory</code> if the host has room; or delete a known junk prefix with <code>SCAN</code> and <code>UNLINK</code> (never <code>KEYS</code>). <b>Cause:</b> keys without a TTL, a growing list or stream, or unbounded key cardinality. <b>Prevent:</b> a TTL on every cache key (review rule), cap collections, alert at 80 percent memory, and keep must-keep data in a separate instance from cache data.</p>
+<p><b>Reading the error.</b> The message <code>OOM command not allowed when used memory &gt; 'maxmemory'</code> means Redis is refusing writes by design. It is the effect of <code>noeviction</code>, or of a volatile policy with no evictable keys. Reads still succeed, so the symptom is "reads fine, writes fail", which can look like a partial outage.</p>
+<p><b>Triage in three steps.</b></p>
+<ol>
+<li><b>Stop the bleeding.</b> If it is a cache, <code>CONFIG SET maxmemory-policy allkeys-lru</code> takes effect immediately and memory starts being reclaimed. If the host has spare RAM, raise <code>maxmemory</code> briefly (leave room for replication buffers and fork copy-on-write). Do not run <code>KEYS</code> or <code>FLUSHALL</code> on a production instance without thinking, because they either block or destroy data.</li>
+<li><b>Find the growth.</b> Compare <code>INFO keyspace</code> now with a dashboard from last week. Check the key families with <code>--bigkeys</code>, <code>--memkeys</code> and <code>SCAN</code> sampling. Typically one prefix is responsible.</li>
+<li><b>Fix the cause.</b> A missing TTL, an uncapped list or stream, or a new feature caching large payloads.</li>
+</ol>
+<p><b>A trap to mention.</b> Changing the policy to an eviction policy on an instance that also stores "must keep" data (locks, sessions, queues) can silently delete that data. If the instance is mixed, either split it into separate instances or use volatile-lru and make sure only disposable keys have TTLs.</p>
+<p><b>Prevent.</b> Alerts at 70 and 85 percent of maxmemory, an alert on a rising <code>evicted_keys</code>, a review checklist that every new key family states its TTL and expected cardinality, and capacity planning that leaves 20 to 30 percent headroom for the fork and replication buffers.</p>
 <p class="rem"><b>Remember:</b> OOM on write = noeviction. Cache: allkeys-lru. Then hunt the key family with no TTL.</p>
 </div>
 </details>
@@ -840,6 +1444,18 @@ public void update(User u) { repo.save(u); }
 <div class="ans">
 <p class="ia">A regular pattern means something scheduled is blocking the single Redis thread: a cron job running an O(N) command, a big delete, a snapshot fork, or a mass expiry. I start with the slow log and line it up with the spike times.</p>
 <p><b>Check first:</b> <code>SLOWLOG GET 20</code> (default threshold 10 ms, execution time only), then <code>INFO commandstats</code>. Who runs at that time? A job doing <code>KEYS</code>, <code>SMEMBERS</code> or <code>HGETALL</code> on a big key, or a big <code>DEL</code>. Then persistence: <code>latest_fork_usec</code> and save times, AOF with <code>always</code> or a slow disk. Then expiry waves (many keys with the same TTL), swapping, and a too-small client pool. <b>Fix by cause:</b> replace the heavy command with <code>SCAN</code> or chunks, use <code>UNLINK</code>, add TTL jitter, snapshot on a replica, keep memory headroom. <b>Prevent:</b> a slow-log alert and a review rule that batch jobs use SCAN.</p>
+<p><b>The key reasoning.</b> Redis serves everything on one thread, so latency for all clients rises together when that thread is busy or blocked. A spike repeating every few minutes tells you something periodic is occupying it: a scheduled job, a persistence event or a mass expiry. The slow log records commands slower than a threshold, but not time spent forking or in the expiry loop, so you check several sources.</p>
+<table>
+<tr><th>Suspect</th><th>How to confirm</th><th>Fix</th></tr>
+<tr><td>Heavy command from a cron job</td><td><code>SLOWLOG GET</code> timestamps match; <code>INFO commandstats</code> shows high usec per call</td><td>SCAN instead of KEYS, page big reads, UNLINK</td></tr>
+<tr><td>RDB fork</td><td><code>latest_fork_usec</code> high, spikes match <code>save</code> intervals</td><td>Snapshot on a replica, smaller heap per instance, avoid transparent huge pages</td></tr>
+<tr><td>AOF fsync stall</td><td><code>aof_delayed_fsync</code>, disk latency</td><td>Faster disk, <code>everysec</code>, avoid <code>always</code> on slow disks</td></tr>
+<tr><td>Mass expiry</td><td>Spike when many keys share a TTL; <code>expired_keys</code> jumps</td><td>TTL jitter, lazy free settings</td></tr>
+<tr><td>Swapping</td><td>OS swap usage, RSS above RAM</td><td>More memory, set <code>maxmemory</code> lower</td></tr>
+<tr><td>Client side, not Redis</td><td>Redis shows low latency but app sees spikes (<code>redis-cli --latency</code> is flat)</td><td>Pool sizing, GC pauses, network</td></tr>
+</table>
+<p><b>Useful commands.</b> <code>redis-cli --latency</code> and <code>--intrinsic-latency</code> measure from the host; <code>LATENCY DOCTOR</code> and <code>LATENCY LATEST</code> (after enabling <code>latency-monitor-threshold</code>) show internal events like fork and expiry with timestamps; <code>INFO persistence</code> shows fork time and last save status.</p>
+<p><b>Order of attack.</b> Align timestamps first: write down the spike times, then match them against cron schedules, deploys, saves and expiries. That correlation usually names the cause in minutes. Fix, then keep a latency dashboard and a slow-log alert so the next one is caught before users report it.</p>
 <p class="rem"><b>Remember:</b> periodic spike = something scheduled blocks the one thread. Slow log first.</p>
 </div>
 </details>
@@ -849,6 +1465,24 @@ public void update(User u) { repo.save(u); }
 <div class="ans">
 <p class="ia">No, it is the design. Replication is asynchronous: the primary acknowledged the writes and died before sending them to the replica, so the promoted replica never had them. I either accept it for cache and session data, or shrink the window, or keep the truth in a durable database.</p>
 <p><b>Check:</b> replication offsets before the failure (<code>INFO replication</code>) and lag metrics; whether a partition let an old primary accept writes that were later discarded. <b>Options:</b> (1) accept it for a cache or session. (2) <code>min-replicas-to-write 1</code> with <code>min-replicas-max-lag 10</code> makes a primary refuse writes when it has no healthy replica, which limits what a cut-off primary can accept. (3) <code>WAIT 1 100</code> after critical writes narrows the gap, but is not a guarantee. (4) Use Redis as a derived copy of a durable database. (5) For queues that must not lose jobs, use Kafka or the database. <b>Prevent:</b> write down the data loss you accept per use case, and test failover in staging.</p>
+<p><b>Explain the timeline to the stakeholder.</b></p>
+<ol>
+<li>10:00:00.000 The client writes <code>order:5 = paid</code>; the primary applies it and replies OK.</li>
+<li>10:00:00.002 The primary is about to send it to the replicas, but the host dies.</li>
+<li>10:00:03 Sentinel or Cluster promotes a replica that does not have that write.</li>
+<li>The client was told "OK", yet the new primary has never heard of it.</li>
+</ol>
+<p>That window is the replication lag (usually milliseconds), plus anything in the replication backlog that had not been sent. If the old primary was cut off by a network partition and kept accepting writes for some seconds before being demoted, the loss can be larger, since all those writes are discarded when it rejoins as a replica.</p>
+<p><b>Options, from cheapest to strongest.</b></p>
+<table>
+<tr><th>Option</th><th>Effect</th><th>Cost</th></tr>
+<tr><td>Accept it</td><td>Fine for caches, sessions, counters</td><td>None</td></tr>
+<tr><td><code>min-replicas-to-write 1</code> and <code>min-replicas-max-lag 10</code></td><td>Isolated primary stops accepting writes after the lag window</td><td>Writes fail if replicas are unhealthy</td></tr>
+<tr><td><code>WAIT 1 100</code> after important writes</td><td>Blocks until a replica acks (or 100 ms)</td><td>Latency; still no hard guarantee</td></tr>
+<tr><td>Write to a durable database first</td><td>Redis becomes a copy; loss is harmless</td><td>Dual-write design</td></tr>
+<tr><td>Durable store (database, Kafka, MemoryDB-like service)</td><td>Real durability</td><td>Cost, latency, complexity</td></tr>
+</table>
+<p><b>What to say about the design.</b> "Asynchronous replication optimizes latency over durability, so I decide per use case how much loss is tolerable, document it, and put anything above that threshold in a durable store." Also mention Redis Cluster has the same property, and AOF everysec adds a second loss window only on a full crash, not on a replica promotion.</p>
 <p class="rem"><b>Remember:</b> async replication can lose the last writes by design. Decide the acceptable loss per use case.</p>
 </div>
 </details>
@@ -858,6 +1492,16 @@ public void update(User u) { repo.save(u); }
 <div class="ans">
 <p class="ia">That is a hot key: one key, one slot, one node. I find the key, then take the traffic off it with a short local cache in the app, key copies or replica reads. More shards will not help.</p>
 <p><b>Check first:</b> per-node ops per second and network out, then find the key with <code>redis-cli --hotkeys</code> (needs an LFU policy), a short <code>MONITOR</code> sample in a low-risk window (heavy), or client counters. Check value size too: a big value on a hot key saturates the network. <b>Fix:</b> a 1 to 5 second local cache for that key removes most traffic; or copy it into N variants (<code>sale:42:0</code> to <code>sale:42:7</code>), read a random one and write all on change; or read from replicas. For a hot counter such as stock or likes, split it into sub-counters. <b>Prevent:</b> load-test the sale path, pre-warm and replicate known hot keys, put a CDN or page cache in front of read-only pages, and alert on hot keys.</p>
+<p><b>Recognise the signature.</b> One node pinned at 100 percent CPU (or network) while others idle, with total traffic well within the cluster's capacity, is the textbook hot key or hot slot. During a flash sale, one product, its stock counter, or a promotion config receives most of the traffic. Adding nodes cannot help, because a single key can never be split by the cluster.</p>
+<p><b>Immediate mitigation (minutes).</b></p>
+<ul>
+<li>Put a 1 to 2 second in-process cache in front of the hot read key (a config or product page). Even at 50,000 reads per second across 100 instances, Redis then sees about 50 to 100 reads per second for it.</li>
+<li>Serve the page itself from a CDN or response cache if it is the same for everyone.</li>
+<li>Shed load that is not essential for a while.</li>
+</ul>
+<p><b>The stock counter is special.</b> A counter that every purchase decrements cannot be cached locally. Options: split the stock into N sub-counters (<code>stock:42:0</code> to <code>stock:42:7</code>) with a share of the units each, and decrement a random one, retrying another if it is empty; or reserve batches per instance (each app instance takes 50 units from the central counter and sells from its local batch); or put the purchase requests in a queue and serialize decrements. The trade is more complexity and possible small imbalance between shards, but the load spreads.</p>
+<p><b>Confirming it is not something else.</b> Check that it is not a big value (network), a Lua script that is slow, or a slot imbalance due to a hash tag that put too many keys together (<code>CLUSTER COUNTKEYSINSLOT</code>). Use per-node <code>INFO commandstats</code> and client-side metrics by key prefix.</p>
+<p><b>Prevention.</b> Load test with realistic skew (Zipf-like) not uniform keys, pre-split known hot keys before an event, use a CDN for public pages, and have a runbook with the toggles ready.</p>
 <p class="rem"><b>Remember:</b> one node pinned = hot key. Add L1 cache or key copies, not shards.</p>
 </div>
 </details>
@@ -867,6 +1511,23 @@ public void update(User u) { repo.save(u); }
 <div class="ans">
 <p class="ia">The database has the new data, so some cache layer still serves the old copy. I check the layers one by one: browser or CDN, per-instance local cache, Redis, and the database read replica. The most common root cause is a write path that deletes a different key than the read path uses.</p>
 <p><b>Check:</b> response headers (<code>Cache-Control</code>, <code>Age</code>); if refreshing shows old and new data alternately, it is a per-instance L1 cache; <code>GET</code> and <code>TTL</code> the Redis key; replica lag. Then the write path: is the key built differently on write and read (tenant or language missing)? Does the delete run before the transaction commits, so a concurrent read refilled the old value? Did the delete fail and the exception get swallowed? Or the slow-reader race? <b>Fix:</b> correct the key, evict after commit, retry failed invalidations, bypass the cache for that user for a few seconds after a write. <b>Prevent:</b> one helper that builds keys for both read and write, an integration test through the real cache, and the TTL as safety net.</p>
+<p><b>Why this is hard to see.</b> Several layers can hold a copy, so "the data is wrong" does not tell you which layer is wrong. A disciplined approach is to ask the same question at each layer, from the database outward, until you find the first layer that disagrees with the one before it.</p>
+<table>
+<tr><th>Layer</th><th>How to check</th><th>Typical cause</th></tr>
+<tr><td>Database primary</td><td>Query it directly</td><td>Write did not commit (rolled back)</td></tr>
+<tr><td>Read replica</td><td>Query replica, compare replication lag</td><td>Read right after a write on a lagging replica</td></tr>
+<tr><td>Redis</td><td><code>GET</code> and <code>TTL</code> on the exact key</td><td>Different key on write and read, failed or early delete, slow-reader race</td></tr>
+<tr><td>App local cache (L1)</td><td>Hit each instance separately, or refresh repeatedly</td><td>Not invalidated across instances, long TTL</td></tr>
+<tr><td>CDN or browser</td><td>Response headers <code>Cache-Control</code>, <code>ETag</code>, <code>Age</code></td><td>Public caching of a personal response, long max-age</td></tr>
+</table>
+<p><b>The most frequent root causes, with examples.</b></p>
+<ul>
+<li><b>Key mismatch:</b> the read key is <code>profile:{tenant}:{id}:{lang}</code> but the eviction only knows <code>profile:{id}</code>, so it deletes nothing.</li>
+<li><b>Order of operations:</b> delete before commit, so a concurrent read refilled the old value.</li>
+<li><b>Swallowed failure:</b> the delete threw a timeout, the code logged it and moved on, and the entry stays until the TTL (several minutes).</li>
+<li><b>Race:</b> the slow reader refilled the old value after the invalidation.</li>
+</ul>
+<p><b>Fix and prove it.</b> Correct the code, then reproduce with an integration test that writes through the service and reads via the real cache. For the user's immediate need, after a write you can set a short "recently written" flag so reads for that user bypass the cache for N seconds. Prevent with a single key-builder shared by readers and writers, retries for failed invalidations, and an agreed staleness bound documented per cache.</p>
 <p class="rem"><b>Remember:</b> walk the layers one by one. Check that read and write build the same key.</p>
 </div>
 </details>
@@ -876,6 +1537,23 @@ public void update(User u) { repo.save(u); }
 <div class="ans">
 <p class="ia">Two instances both believed they held the lock: the lease expired during a long run, or the release deleted someone else's lock, or a failover lost the lock key. The real fix is to make the charge idempotent with a unique constraint, because a Redis lock only gives efficiency, not correctness.</p>
 <p><b>Check:</b> job logs with lock acquire and release times against the lease length, Redis failover events at that time, and the release code (token check?). <b>Fix:</b> token plus Lua release; a lease longer than the worst-case run, with a renewal watchdog; and above all an idempotency key per customer per billing period with a unique constraint in the database, so a second run does nothing. <b>Prevent:</b> a fencing token or version check at the resource, an alert on overlapping runs, and a test that forces a pause (the Kleppmann argument).</p>
+<p><b>Be careful about the story you tell.</b> "Redis lock failed" is too vague. List the ways two instances can both hold a lock, and check logs for each.</p>
+<table>
+<tr><th>Cause</th><th>Evidence in logs or metrics</th></tr>
+<tr><td>Work longer than the lease</td><td>Run time greater than lease; second instance acquired during the first run</td></tr>
+<tr><td>Process pause (GC, VM freeze)</td><td>Gap in the first instance's logs; GC logs show a long pause</td></tr>
+<tr><td>Release deleted another's lock (no token)</td><td>Release call without ownership check in the code</td></tr>
+<tr><td>Failover lost the lock key</td><td>Sentinel or cluster failover time equals the double run</td></tr>
+<tr><td>Clock or TTL misuse</td><td>Wrong unit (seconds versus milliseconds) in the lease value</td></tr>
+</table>
+<p><b>Why the real fix is not "a better lock".</b> Any lock based on leases has a window where two holders can exist, because the holder cannot know instantly that its lease ended. So make the protected operation safe to run twice. For billing: a table <code>charge(customer_id, period, ...)</code> with a unique key on <code>(customer_id, period)</code>, and the job inserts first; the second run fails the insert and skips. Or pass an idempotency key to the payment provider so a repeat request returns the original result instead of charging again.</p>
+<p><b>Layered remediation.</b></p>
+<ol>
+<li>Today: identify the affected customers and refund; the idempotency key work is the permanent fix.</li>
+<li>Lock hygiene: random token, Lua compare-and-delete, a lease longer than p99 (or a watchdog), and log acquire and release with durations.</li>
+<li>If the job truly needs exclusive access, use a fencing token or a database row lock (<code>SELECT ... FOR UPDATE SKIP LOCKED</code>) as the guard, rather than Redis.</li>
+<li>Monitor: alert when two runs overlap, and record job run ids.</li>
+</ol>
 <p class="rem"><b>Remember:</b> the lock is for efficiency. Make the action idempotent, with a database constraint as the final guard.</p>
 </div>
 </details>
@@ -885,6 +1563,17 @@ public void update(User u) { repo.save(u); }
 <div class="ans">
 <p class="ia">The site depended on Redis more than intended: no or long timeouts filled the thread pool, or cache exceptions failed the requests, or the fallback overloaded the database. I restore Redis, then add short timeouts, a circuit breaker, error handling that treats failures as misses, and a protected fallback.</p>
 <p><b>What usually happened:</b> threads stuck waiting for Redis until the pool was full, so even requests that did not need Redis queued. <b>Fix:</b> connect and command timeouts of 50 to 200 ms, a circuit breaker, a <code>CacheErrorHandler</code> (cache errors become misses), a bulkhead so cache calls use a limited pool, a rate-limited fallback to the database, and a degraded mode (serve stale from L1, hide non-essential features). <b>Prevent:</b> a game day where Redis is blocked in staging, and a clear list of which features fail open and which fail closed.</p>
+<p><b>The usual root causes, in the order they appear in post-mortems.</b></p>
+<ol>
+<li><b>No or long timeouts:</b> the default of some clients is infinite or several seconds. Every request waits, threads run out, health checks fail.</li>
+<li><b>Exceptions bubbling up:</b> a cache call that throws turns a harmless miss into a 500.</li>
+<li><b>Retry storms:</b> retries multiply load and delay recovery when Redis returns (everyone reconnects and reloads at the same moment).</li>
+<li><b>Fallback overload:</b> all reads go to the database at the same time and it collapses, making the outage worse and longer.</li>
+<li><b>Hidden hard dependencies:</b> sessions, rate limiting or locks quietly required Redis for every request.</li>
+</ol>
+<p><b>What the corrected design does during the same outage.</b> Commands time out in 100 ms, the circuit breaker opens after a few failures and subsequent calls skip Redis instantly, the cache error handler turns failures into misses, a limiter allows only a safe number of concurrent database fallbacks, and non-critical features switch off. Users see slower pages for some requests and a few missing widgets, not errors.</p>
+<p><b>Recovery behaviour matters as well.</b> When Redis returns empty (cold), the hit rate starts at zero. Use a half-open breaker that ramps up, jittered TTLs, and pre-warming of the hottest keys so the database is not hit with the full load again.</p>
+<p><b>Architecture and process.</b> Run Redis with replicas and automatic failover; keep a small local L1 for the most important reads; classify every Redis use as fail-open or fail-closed in the design doc; and hold a game day: blackhole Redis in staging (drop its port with a firewall rule or proxy), watch which dashboards turn red, and fix them. Add alerting on cache error rate, not only on Redis host metrics.</p>
 <p class="rem"><b>Remember:</b> a cache outage must become slower, not down. Timeout, breaker, protected fallback.</p>
 </div>
 </details>
@@ -894,6 +1583,26 @@ public void update(User u) { repo.save(u); }
 <div class="ans">
 <p class="ia">The code does <code>INCR</code> and then a separate <code>EXPIRE</code>. If the process crashes or the second call fails in between, the counter has no TTL, grows to the limit and never resets. I fix it by making the two steps atomic with a Lua script, and clean up the stuck keys.</p>
 <p><b>Check:</b> <code>TTL key</code> returns -1 for blocked users; <code>SCAN</code> with a TTL check finds the rest. <b>Immediate:</b> delete or set a TTL on those keys. <b>Fix:</b> a Lua script doing <code>INCR</code> plus <code>EXPIRE</code> together, or <code>SET key 0 EX 60 NX</code> first and then <code>INCR</code> (which keeps the TTL). A second guard: if <code>TTL</code> is -1 after the increment, set it. <b>Prevent:</b> a rule that any check-then-act logic in Redis goes into a script, and an audit that counts keys with no TTL in rate-limit prefixes.</p>
+<p><b>Replay the failure, step by step.</b></p>
+<ol>
+<li>First request of the window: <code>INCR rl:user7</code> returns 1 (the key is created without a TTL).</li>
+<li>The app is about to call <code>EXPIRE rl:user7 60</code> but the pod is killed, the connection drops, or the call times out.</li>
+<li>The key now lives forever. Each later request increments it; once it passes the limit, every request is rejected and nothing ever resets it.</li>
+</ol>
+<p>The bug is classic "two non-atomic calls that must be a unit". It is rare on any one request, so it only shows up at scale or during deployments (pods being restarted), which is why it looks mysterious.</p>
+<p><b>Three ways to fix it.</b></p>
+<pre><code>-- 1) Lua: atomic (also fixes the case where the key lost its TTL)
+local c = redis.call("INCR", KEYS[1])
+if c == 1 or redis.call("TTL", KEYS[1]) == -1 then
+  redis.call("EXPIRE", KEYS[1], ARGV[1])
+end
+return c
+
+-- 2) Create with the TTL first, then INCR (INCR keeps the existing TTL)
+SET rl:user7 0 EX 60 NX
+INCR rl:user7</code></pre>
+<p>Option 3 is a pipeline or <code>MULTI/EXEC</code> with INCR and EXPIRE together, which sends both commands as a unit (the server either gets both or none arrives if the connection breaks mid-transaction), but the script is more robust because it can also repair a key whose TTL is missing.</p>
+<p><b>Cleaning up.</b> Find affected keys: <code>SCAN MATCH rl:*</code> then <code>TTL</code> equal to -1, and set a TTL or delete them (batch with a pipeline, never <code>KEYS</code>). Then add a monitor that counts keys with no TTL for the rate-limit prefix, so a recurrence is noticed immediately. Also review other places where code does read-then-write or two dependent commands (locks with SETNX then EXPIRE, counters with unique-set-plus-increment), since the same bug pattern likely exists there.</p>
 <p class="rem"><b>Remember:</b> two calls are not atomic. INCR plus EXPIRE belong in one Lua script.</p>
 </div>
 </details>

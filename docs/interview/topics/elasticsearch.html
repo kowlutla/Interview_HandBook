@@ -144,6 +144,17 @@
 <div class="ans">
 <p class="ia">Elasticsearch is a distributed search and analytics engine built on Apache Lucene. You store JSON documents, and it builds indexes that make full-text search, filtering and aggregations fast, usually in milliseconds even over hundreds of millions of documents. I use it for product or document search, log search, autocomplete and dashboard-style counts.</p>
 <p>Lucene is the Java library that does the real indexing and searching inside one shard. Elasticsearch adds the parts around it: a REST API with JSON, distribution across nodes, replication and a query language (the Query DSL). The things it is bad at are what a relational database is good at: transactions, joins, strict consistency, and being the single source of truth. So the usual design is a database as the source of truth and Elasticsearch as a derived, searchable copy.</p>
+<p><b>Why it exists.</b> A relational database answers "give me the row with id 42" very well, but it struggles with "find products about <i>waterproof hiking boots</i>, best match first, and tell me how many there are per brand". Doing that with <code>LIKE '%boots%'</code> scans every row, cannot rank, and cannot cope with plurals or typos. Search engines solve this by doing the hard work when data is written (cutting text into words and building an index), so that reading is cheap.</p>
+<p><b>The vocabulary you need.</b></p>
+<ul>
+<li><b>Document:</b> one JSON object, the unit you store and find (like a row).</li>
+<li><b>Index:</b> a named collection of documents with a similar shape (like a table, roughly). Do not confuse it with a database index.</li>
+<li><b>Mapping:</b> the schema of an index (which field is text, which is a number).</li>
+<li><b>Shard:</b> a slice of an index; each shard is a complete Lucene index.</li>
+<li><b>Node and cluster:</b> a node is one running Elasticsearch process; a cluster is the group of nodes that share the work.</li>
+</ul>
+<p><b>A tiny example.</b> You store <code>{"name": "Red running shoes", "price": 79}</code> with <code>PUT products/_doc/1</code>. Then <code>GET products/_search</code> with <code>{"query": {"match": {"name": "shoe"}}}</code> returns it ranked by relevance, and an <code>aggs</code> block can add "count per brand" to the same response. One system does the search and the counts.</p>
+<p><b>Where it is used:</b> site and product search, document search, log and event analytics (the "ELK" stack: Elasticsearch, Logstash, Kibana), autocomplete, and metrics dashboards. <b>Where it is weak:</b> being the only copy of important data (it does not give you transactions), many-to-many joins, and workloads that update the same document many times per second. An interviewer who hears "ES is our database" will usually push back, so always say "derived, rebuildable copy".</p>
 <p class="rem"><b>Remember:</b> ES = Lucene + REST + distribution. Great at search and aggregations, not a system of record.</p>
 </div>
 </details>
@@ -160,6 +171,14 @@
 <tr><td>Data model</td><td>normalised</td><td>denormalised documents</td></tr>
 <tr><td>Role</td><td>source of truth</td><td>derived search copy</td></tr>
 </table>
+<p><b>The core idea: two different index structures.</b> A database index (a B-tree) is sorted by the column value. That is perfect for "id = 42" or "price between 10 and 20", because it can walk straight to the place. It is useless for "the word boots appears somewhere inside the description", because the sort order is by the whole string, not by the words inside it. An inverted index is sorted by word, so it answers that question directly and can also rank the matches.</p>
+<p><b>A concrete comparison.</b> Query: "waterproof boots under 100, newest first, plus a count per brand."</p>
+<ul>
+<li><b>SQL way:</b> <code>WHERE description LIKE '%waterproof%' AND description LIKE '%boots%' AND price &lt; 100 ORDER BY created DESC</code> plus a second <code>GROUP BY brand</code> query. The LIKE conditions cannot use a normal index, so it scans the table. There is no concept of "best match first", no stemming ("boot" will not match "boots") and no typo tolerance.</li>
+<li><b>Elasticsearch way:</b> one request with a <code>match</code> on the text, a <code>range</code> filter on price and a <code>terms</code> aggregation on brand. The words are looked up in the inverted index and the counts come from column-style data (doc values). Results are ranked by relevance.</li>
+</ul>
+<p><b>Decision rule I use.</b> Does the user type free text or need ranking, facets and counts over a large data set? Add Elasticsearch. Is it "find by key, join a few tables, change several rows atomically"? Stay on the database. A table with 50,000 rows and a simple <code>LIKE 'abc%'</code> does not need a search cluster, and a database with built-in full-text search (for example PostgreSQL) can be enough for small needs. Adding ES also adds a new system to run, a sync pipeline to build and eventual consistency to explain to users.</p>
+<p><b>What an interviewer probes next:</b> "how do you keep the two in sync" (answer: the outbox/CDC question later on this page) and "what do you do when ES and the database disagree" (the database wins; rebuild the index).</p>
 <p class="rem"><b>Remember:</b> DB for truth and transactions, ES for search and analytics. Never make ES your only copy.</p>
 </div>
 </details>
@@ -182,6 +201,20 @@
 <rect class="db" x="370" y="180" width="420" height="30" rx="4"/><text class="t-sm" x="380" y="200">shoes</text><text class="t-sm" x="520" y="200">[1]</text>
 <text class="t-sm" x="10" y="190">Query "red jacket": red = [1,3], jacket = [2,3].</text><text class="t-sm" x="10" y="210">Both words: doc 3. Either word: docs 1, 2, 3.</text>
 </svg><figcaption>Search is a dictionary lookup plus a merge of short lists. The documents themselves are not scanned.</figcaption></figure>
+<p><b>How it is built, step by step.</b> Take the three documents in the picture.</p>
+<ol>
+<li>Each text is analysed (cut into words and lowercased): doc 1 gives <code>red, running, shoes</code>.</li>
+<li>For every word, the engine records which documents contain it. The words are kept in a sorted dictionary, so a lookup is a quick binary-search-like jump, not a scan.</li>
+<li>Next to each document id it also stores how often the word occurs (term frequency, used for scoring) and the positions (used for phrase queries such as "running shoes").</li>
+</ol>
+<p><b>How a query uses it.</b> For <code>match: "red jacket"</code>, ES analyses the query into <code>red</code> and <code>jacket</code>, looks both up (red = [1,3], jacket = [2,3]) and combines the lists. With AND it intersects them (only doc 3). With OR it unions them (docs 1, 2, 3) and scores doc 3 highest because it matched both words. Intersecting two sorted lists of ids is a fast linear merge, which is why even millions of documents answer in milliseconds.</p>
+<p><b>The trade-off.</b> The index is built at write time, so writing is heavier than a plain row insert, and updating a document means re-analysing it. Also, the structure answers "which documents contain this word" brilliantly but is not designed for "give me the whole value of field X for document 7". For that, ES keeps a second structure next to it:</p>
+<ul>
+<li><b>Inverted index:</b> term to documents. Used for searching and filtering.</li>
+<li><b>Doc values:</b> document to value, stored column by column on disk. Used for sorting and aggregations.</li>
+<li><b>Stored <code>_source</code>:</b> the original JSON, returned in the response.</li>
+</ul>
+<p><b>Pitfall:</b> the inverted index stores analysed terms, not your original text. If the analyzer lowercases and stems, the index contains <code>run</code>, not <code>Running</code>. That is exactly why an exact-value <code>term</code> query on an analysed field fails, a classic question in this chapter.</p>
 <p class="rem"><b>Remember:</b> word to documents, built at write time. Search cost follows matches, not total documents.</p>
 </div>
 </details>
@@ -204,6 +237,22 @@
 <text class="t-sm" x="360" y="30">1. query phase: ids + scores</text>
 <text class="t-sm" x="690" y="120">2. fetch phase:</text><text class="t-sm" x="690" y="138">only the final</text><text class="t-sm" x="690" y="156">top N documents</text>
 </svg><figcaption>Phase 1 asks every shard for ids and scores. Phase 2 fetches the winning documents only.</figcaption></figure>
+<p><b>Walk through one request.</b> You run <code>GET products/_search</code> with <code>from: 0, size: 10</code> on an index with 3 primary shards.</p>
+<ol>
+<li>Your request reaches any node. That node becomes the coordinating node for this request (every node can do this).</li>
+<li><b>Query phase.</b> For each of the 3 shards, the coordinator picks one copy (primary or a replica, rotating so load is spread) and forwards the query. Each shard runs it against its local Lucene index and builds a priority queue of its own best 10 hits (<code>from + size</code> entries). It sends back only document ids and scores or sort values, which is tiny.</li>
+<li>The coordinator merges the 3 lists of 10 (30 candidates) and keeps the global top 10.</li>
+<li><b>Fetch phase.</b> The coordinator asks only the shards that own those 10 winners to return the actual <code>_source</code> (and highlights). This is a multi-get by id, so it is cheap.</li>
+<li>The coordinator assembles the response with <code>took</code>, <code>hits</code>, and the merged <code>aggs</code>.</li>
+</ol>
+<p><b>Why two phases?</b> Shipping full documents from every shard would waste network: 30 documents travel to be thrown away. Sending ids and scores first means only the 10 winners are fetched in full.</p>
+<p><b>Replicas help reads.</b> Because any copy can answer, adding replicas raises search throughput, not just safety. Adding primaries raises the data and write capacity, but each search then has more shards to visit.</p>
+<p><b>Pitfalls and probes.</b></p>
+<ul>
+<li>If one shard is slow or down, the whole request waits for it or returns partial results. The response includes <code>_shards.failed</code>, and <code>timed_out</code> when a <code>timeout</code> was set. Always look at those fields in production code.</li>
+<li>Scores come from per-shard statistics, so tiny indices with many shards can rank oddly. The better cure is fewer shards; <code>dfs_query_then_fetch</code> is the workaround.</li>
+<li>Aggregations follow the same scatter and gather pattern, which is why some of them (terms, cardinality) are approximate when merged.</li>
+</ul>
 <p class="rem"><b>Remember:</b> coordinator fans out, shards return top ids, coordinator merges, then fetches. Cost grows with from + size.</p>
 </div>
 </details>
@@ -219,6 +268,21 @@
 PUT products/_settings
 { "index": { "refresh_interval": "30s" } }</code></pre>
 <p>Note that an idle shard (no search for 30 seconds by default) skips scheduled refreshes, and the next search triggers one, so this is invisible in practice.</p>
+<p><b>What happens in the first second.</b> A new document is first placed in an in-memory indexing buffer and appended to the translog (the safety log). At that point it is durable, but no search can see it, because searchers read only committed-to-searchable Lucene <b>segments</b> (small immutable index files). At the next <b>refresh</b>, the buffer is written as a new segment and the searcher is reopened to include it. From now on, search sees the document.</p>
+<p><b>Timeline example.</b></p>
+<ul>
+<li>t = 0.00 s: <code>PUT products/_doc/1</code> returns 201. The document exists.</li>
+<li>t = 0.20 s: <code>GET products/_doc/1</code> works (real-time get, it can read from the translog). <code>_search</code> does not find it yet.</li>
+<li>t = 1.00 s: refresh runs. <code>_search</code> finds it.</li>
+</ul>
+<p><b>Why not refresh on every write?</b> Each refresh creates a new tiny segment. Hundreds of tiny segments make every search slower (it has to look in each one) and force the background merger to work hard. A 1-second batch is the compromise between freshness and cost.</p>
+<table>
+<tr><th>Option on the write</th><th>Effect</th><th>Use for</th></tr>
+<tr><td>(default)</td><td>visible within about 1 s</td><td>almost everything</td></tr>
+<tr><td><code>refresh=wait_for</code></td><td>request returns after the next refresh made it visible</td><td>occasional writes where the user must see their own change</td></tr>
+<tr><td><code>refresh=true</code></td><td>forces a refresh right now</td><td>tests, rare admin actions; never in a hot loop</td></tr>
+</table>
+<p><b>Pitfalls.</b> Tests that index and then search without a refresh are flaky; call the refresh API in tests. A pipeline through a queue adds its own lag on top of the 1 s. And "near real time" is about searchability, not durability: the data is already safe in the translog before it is searchable.</p>
 <p class="rem"><b>Remember:</b> searchable after refresh (about 1 s), get-by-id is instant. Use wait_for for read-your-write, slower refresh for bulk loads.</p>
 </div>
 </details>
@@ -229,7 +293,61 @@ PUT products/_settings
 <p class="ia">An index is split into primary shards so data and work spread over nodes. Each document is routed to one primary by hashing its id. A replica is a copy of a primary on a different node: it keeps data safe if a node dies and also serves search requests. The number of primaries is fixed when the index is created, so I size it for the data and keep shards moderate, not tiny and not huge.</p>
 <p>Routing is <code>shard = hash(_routing) % number_of_primary_shards</code>, where <code>_routing</code> defaults to the document id. That formula is why you cannot change the primary count in place: the modulus would change and documents would be looked up in the wrong shard. To change it you reindex, or use the split or shrink APIs. Replicas can be changed any time, and default to 1.</p>
 <p>The common mistake is over-sharding. Every shard costs memory, file handles and a thread when searched, and a search touches all shards of the index. Hundreds of tiny shards are slower than a few well-sized ones. A rule of thumb many teams use is shards of roughly 10 to 50 GB, and since 7.0 the default is just one primary. If data grows over time (logs), use time-based indices instead of one giant index. Cluster-level planning is specialist territory beyond this page.</p>
+<p><b>Worked example.</b> Index <code>orders</code> with 3 primaries and 1 replica each means 6 shards in total, placed on at least 2 nodes (a replica never shares a node with its own primary). Write document <code>order-77</code>: <code>hash("order-77") % 3 = 1</code>, so it goes to primary P1 and is copied to P1's replica. A search touches one copy of each of the 3 shards.</p>
+<p><b>Why not "as many shards as possible"?</b></p>
+<ul>
+<li>Each shard is a full Lucene index with its own memory structures, file handles and cluster-state entry. Thousands of small shards waste heap and slow down the master node.</li>
+<li>A search must visit every shard of the index (unless you route), so 100 shards of 100 MB each cost more than 2 shards of 5 GB.</li>
+<li>Too few, very large shards make recovery and rebalancing slow (moving a 300 GB shard takes a long time).</li>
+</ul>
+<p><b>How I would size it.</b> Estimate the final index size, divide by a target shard size of roughly 10 to 50 GB (a common starting point, not a law; measure for your workload), and round to a small number. A 20 GB product index: 1 primary is fine today. For logs, use time-based indices (one per day or month, or rollover) so old indices can be dropped or shrunk without touching new ones.</p>
+<p><b>Replica count.</b> One replica gives you survival of a single node failure and doubles read capacity. Zero replicas is acceptable only during a bulk load or when data is easily rebuilt. More replicas help read-heavy workloads but multiply storage and write work.</p>
+<p><b>What to watch.</b> Hot shards: if one customer owns most of the data and you route by customer id, that shard grows far larger than the rest. Resizing later is possible with the <code>_split</code> (increase, in multiples) and <code>_shrink</code> (decrease) APIs, but both need a read-only index and planning.</p>
 <p class="rem"><b>Remember:</b> primaries are fixed at creation and chosen by hash(id); replicas are copies for safety and reads. Too many small shards hurt.</p>
+</div>
+</details>
+
+<details class="iq" id="q-cluster-health">
+<summary>What do green, yellow and red cluster health mean, and why is my index yellow? <span class="lvl i">Intermediate</span></summary>
+<div class="ans">
+<p class="ia">Green means all primary and replica shards are allocated. Yellow means all primaries are allocated, but at least one replica is not: searches and writes work, but there is no spare copy, so one more node failure could lose data. Red means at least one primary shard is not allocated, so part of the index is unavailable and searches on it return partial results or errors.</p>
+<p><b>The most common yellow.</b> A single-node cluster (a laptop or a dev container) with the default 1 replica. A replica is never placed on the same node as its primary, so with one node the replicas stay unassigned and the index stays yellow forever. That is normal. The fix is either to add a node or to set <code>number_of_replicas: 0</code> in development.</p>
+<p><b>How to investigate.</b></p>
+<pre><code>GET _cluster/health?level=indices
+GET _cat/shards?v&amp;h=index,shard,prirep,state,unassigned.reason
+GET _cluster/allocation/explain</code></pre>
+<p><code>_cat/shards</code> shows which shards are <code>UNASSIGNED</code> and the reason; <code>_cluster/allocation/explain</code> tells you in words why a particular shard cannot be placed. Typical reasons: not enough nodes for the replica count, a node left and the cluster is waiting before reallocating (a delay of about one minute by default), disk watermarks reached so no new shards are placed on a full node, or allocation filters that exclude every node.</p>
+<table>
+<tr><th>Status</th><th>Primaries</th><th>Replicas</th><th>Meaning for the app</th></tr>
+<tr><td>green</td><td>all assigned</td><td>all assigned</td><td>healthy</td></tr>
+<tr><td>yellow</td><td>all assigned</td><td>some missing</td><td>works, but no redundancy</td></tr>
+<tr><td>red</td><td>some missing</td><td>any</td><td>data partly unavailable</td></tr>
+</table>
+<p><b>Why the application developer cares.</b> A red index returns incomplete results while your code still gets HTTP 200 unless you check <code>_shards.failed</code>. Treat <code>_shards.failed &gt; 0</code> as a warning in your own monitoring. Cluster operations in depth are outside this page, but the status colours are a standard interview question.</p>
+<p class="rem"><b>Remember:</b> green = all copies, yellow = a replica missing (data still complete), red = a primary missing (data unavailable). One node plus 1 replica is always yellow.</p>
+</div>
+</details>
+
+<details class="iq" id="q-node-failure">
+<summary>What happens to my data and my writes when a node dies? <span class="lvl s">Senior</span></summary>
+<div class="ans">
+<p class="ia">If the dead node held a primary shard, the cluster promotes one of that shard's replicas to be the new primary, so no acknowledged write is lost as long as the write had reached the replica copies in sync. Then it rebuilds the missing replicas on the remaining nodes. Searches keep working from the surviving copies. This is why I run at least one replica and at least three master-eligible nodes in production.</p>
+<p><b>Step by step, node 2 dies and it held primary P1.</b></p>
+<ol>
+<li>The master node notices (a missing heartbeat) and removes node 2 from the cluster state.</li>
+<li>For P1, an in-sync replica on another node is promoted to primary and the primary term is increased. Writes continue against the new primary. The index is yellow for a while.</li>
+<li>After a short delay (to avoid reshuffling if the node comes back right away), the master allocates new replica copies on other nodes and copies the data across. When done, the index is green again.</li>
+<li>If node 2 returns early, it can reuse its on-disk data and catch up from the translog instead of copying everything.</li>
+</ol>
+<p><b>Why writes do not get lost.</b> A write is acknowledged only after the primary and all in-sync replicas applied it. The index setting <code>wait_for_active_shards</code> (default 1, meaning just the primary) lets you require more active copies before a write is even attempted. Note that this protects availability and not durability by itself: durability comes from replicas holding the data plus the translog fsync.</p>
+<p><b>When data can be lost.</b></p>
+<ul>
+<li>Zero replicas: a dead node with a primary means a red index, and if its disk is gone, the data is gone. Restore from a snapshot.</li>
+<li>All copies of a shard on failed nodes at once (for example both nodes in one availability zone, with no zone awareness).</li>
+<li>Split brain was historically a problem with an even number of master-eligible nodes. Since 7.0 the cluster manages its voting configuration itself, but you still want 3 master-eligible nodes so a majority survives one failure.</li>
+</ul>
+<p><b>What the app should do.</b> Use the client's retry on connection failures and keep several node addresses in the client config. Make writes idempotent (stable ids) so a retry after an ambiguous failure is safe. Snapshots (backups) are still needed because replicas protect against a node failure, not against a bad delete or a bad deployment.</p>
+<p class="rem"><b>Remember:</b> a replica is promoted to primary, then new replicas are rebuilt. Replicas are for availability, snapshots are for backup, and writes need stable ids so retries are safe.</p>
 </div>
 </details>
 
@@ -252,6 +370,31 @@ PUT products/_settings
 <pre><code>POST _analyze
 { "analyzer": "standard", "text": "Running Shoes!" }
 -- terms: running, shoes</code></pre>
+<p><b>Why analysis exists.</b> Computers compare strings exactly, but people do not search that way. A user types "running shoe", the product title says "Red Running Shoes!". Without analysis there is no match: different case, a plural, punctuation. Analysis rewrites both sides into a normal form so the comparison works.</p>
+<p><b>The three stages with an example.</b> Input: <code>&lt;p&gt;The Quick Foxes&lt;/p&gt;</code>.</p>
+<ol>
+<li><b>Character filters</b> (zero or more) rewrite the raw string before splitting. <code>html_strip</code> removes the tags: <code>The Quick Foxes</code>. A <code>mapping</code> char filter can replace characters.</li>
+<li>The <b>tokenizer</b> (exactly one) cuts the string into tokens: <code>The</code>, <code>Quick</code>, <code>Foxes</code>. The standard tokenizer follows Unicode word boundaries; <code>whitespace</code> splits only on spaces; <code>keyword</code> keeps the whole string as one token.</li>
+<li><b>Token filters</b> (zero or more, in order) change the tokens: <code>lowercase</code> gives <code>the, quick, foxes</code>; a <code>stop</code> filter would drop <code>the</code>; a stemmer would turn <code>foxes</code> into <code>fox</code>; a <code>synonym</code> filter could add <code>car</code> beside <code>automobile</code>.</li>
+</ol>
+<p>The resulting terms are what go into the inverted index, and the same pipeline (usually) is applied to the query text.</p>
+<p><b>Built-in analyzers to know.</b></p>
+<table>
+<tr><th>Analyzer</th><th>What it does</th><th>Typical use</th></tr>
+<tr><td><code>standard</code> (default)</td><td>word split, lowercase, no stemming, no stop words by default</td><td>general text</td></tr>
+<tr><td><code>english</code> (language analyzers)</td><td>standard plus English stop words and stemming</td><td>English prose</td></tr>
+<tr><td><code>keyword</code></td><td>whole input as one term</td><td>exact values (this is what the keyword field type behaves like, with an option to add a lowercase normalizer)</td></tr>
+<tr><td><code>whitespace</code></td><td>split on spaces only</td><td>codes where punctuation matters</td></tr>
+</table>
+<p><b>Custom analyzer example.</b> Combine the parts yourself in the index settings:</p>
+<pre><code>PUT products
+{ "settings": { "analysis": { "analyzer": { "my_text": {
+    "type": "custom",
+    "char_filter": ["html_strip"],
+    "tokenizer": "standard",
+    "filter": ["lowercase", "asciifolding"] } } } },
+  "mappings": { "properties": { "name": { "type": "text", "analyzer": "my_text" } } } }</code></pre>
+<p><code>asciifolding</code> makes "caf&eacute;" match "cafe". <b>Pitfalls:</b> the analyzer is fixed per field once data is indexed (changing it needs a reindex); language-specific stemming is lossy (it may conflate unrelated words); and stop word removal breaks searches such as "to be or not to be". Test with <code>_analyze</code> before you ship an analyzer.</p>
 <p class="rem"><b>Remember:</b> char filter, tokenizer, token filters. When a match surprises you, run _analyze.</p>
 </div>
 </details>
@@ -261,6 +404,19 @@ PUT products/_settings
 <div class="ans">
 <p class="ia">By default yes: a <code>text</code> field uses its analyzer at index time and the same one at query time, so both sides produce the same terms. If they differ by accident, the query terms do not exist in the index and the search returns nothing, with no error. I only use a different <code>search_analyzer</code> on purpose, mainly for autocomplete.</p>
 <p>A typical accident: the field was indexed with a stemming analyzer (stores <code>run</code>) but the query goes against a <code>keyword</code> field or a <code>term</code> query, which does not analyse, so searching <code>Running</code> finds nothing. The intended use is edge n-grams: index "laptop" as <code>l, la, lap, ...</code> but analyse the query "lap" only as <code>lap</code>, otherwise the query would also be cut into n-grams and match unrelated words.</p>
+<p><b>Why the two sides must agree.</b> The index stores the output of the index-time analyzer. The query text goes through the search-time analyzer and the resulting terms are looked up in the index. A match happens only if the two produce the same terms. Think of it as a key and a lock: the key must be cut the same way as the lock.</p>
+<p><b>A failing example.</b></p>
+<ul>
+<li>Field <code>title</code> uses an <code>english</code> analyzer. The document "Running Shoes" is stored as terms <code>run</code>, <code>shoe</code>.</li>
+<li>A <code>match</code> query on <code>title</code> analyses "Running" with the same analyzer into <code>run</code>, and finds it. Good.</li>
+<li>A <code>term</code> query on <code>title</code> for <code>Running</code> sends the raw string <code>Running</code>, which is not in the index (the index has <code>run</code>). Zero results, no error. Same effect if you query a different field that was analysed differently.</li>
+</ul>
+<p><b>The one legitimate reason to split them: autocomplete.</b> At index time, "laptop" is expanded by an edge n-gram filter into <code>l, la, lap, lapt, lapto, laptop</code>. A user who has typed "lap" should match, so the index must contain <code>lap</code>. But at search time you want "lap" to stay as the single term <code>lap</code>. If the same n-gram analyzer ran on the query, "lap" would become <code>l, la, lap</code> and match anything starting with "l", which is far too broad. So you set <code>analyzer</code> (index time) to the n-gram analyzer and <code>search_analyzer</code> to a plain one.</p>
+<pre><code>"name": { "type": "text",
+          "analyzer": "autocomplete_ngram",
+          "search_analyzer": "standard" }</code></pre>
+<p><b>Another legitimate case:</b> synonyms applied only at search time, so you can change the synonym list without reindexing (search-time synonyms can be reloaded with the reload API in newer versions; check your version).</p>
+<p><b>Debug routine.</b> Run <code>POST index/_analyze</code> with <code>"field": "title"</code> and the query text, and compare with what the stored document produces. If the two term lists differ, you have found the problem.</p>
 <p class="rem"><b>Remember:</b> same analysis on both sides, unless you chose a search_analyzer deliberately (autocomplete). A mismatch gives empty results, not errors.</p>
 </div>
 </details>
@@ -282,6 +438,23 @@ GET products/_search
 { "query": { "multi_match": {
     "query": "lap", "type": "bool_prefix",
     "fields": ["name", "name._2gram", "name._3gram"] } } }</code></pre>
+<p><b>First decide what "autocomplete" means.</b> There are three different products hiding behind the word.</p>
+<ol>
+<li><b>Suggest query strings or names</b> as the user types ("laptop stand", "laptop bag"): the completion suggester or <code>search_as_you_type</code> on a name field.</li>
+<li><b>Search results while typing</b> (instant search): matches on words in titles, mid-phrase included. This is <code>search_as_you_type</code> or edge n-grams, with the normal search path.</li>
+<li><b>Typo-tolerant "did you mean"</b>: the phrase suggester or fuzziness.</li>
+</ol>
+<p><b>How edge n-grams work, with numbers.</b> The word "laptop" with edge n-grams of min 1 and max 10 is stored as <code>l, la, lap, lapt, lapto, laptop</code>. A query "lapt" is looked up as one term and found directly. No scan, no wildcard, so it stays fast, at the price of a bigger index (several terms per word) and slower indexing. Choose a sensible <code>min_gram</code> (often 2) and <code>max_gram</code>, otherwise the index grows for no gain.</p>
+<p><b>What <code>search_as_you_type</code> builds for you.</b> It creates sub-fields <code>name._2gram</code>, <code>name._3gram</code> (shingles of 2 and 3 words) and <code>name._index_prefix</code> (edge n-grams of the last word). A <code>bool_prefix</code> multi_match treats the last typed word as a prefix and the previous words as complete terms, so "red run" matches "Red running shoes" and "wireless head" matches "wireless headphones". The word order is free, and phrase-like ranking comes from the 2-gram and 3-gram fields.</p>
+<p><b>Completion suggester.</b> It uses a compact in-memory structure (an FST), so lookups take microseconds. Feed it explicit inputs and weights (for example popular searches) with the <code>completion</code> field type. It matches only from the start of the input (with <code>fuzzy</code> optional) and returns suggestions, not full documents with filters, though it supports contexts (such as category) for narrowing.</p>
+<table>
+<tr><th>Technique</th><th>Matches in the middle of the text?</th><th>Index cost</th><th>Best for</th></tr>
+<tr><td>completion suggester</td><td>no, prefix of the input only</td><td>small, in memory</td><td>fast suggestion list</td></tr>
+<tr><td>search_as_you_type</td><td>yes, any word, last word as prefix</td><td>medium</td><td>search box showing results</td></tr>
+<tr><td>edge n-gram analyzer</td><td>yes, per word</td><td>larger</td><td>custom control, languages</td></tr>
+<tr><td>prefix / wildcard</td><td>depends</td><td>none</td><td>small data only</td></tr>
+</table>
+<p><b>Production notes.</b> Debounce the keystrokes in the client (send after a short pause, not on every key), set a small <code>size</code>, and cache popular prefixes. Filter by tenant or category in the same query so suggestions do not leak other tenants' data.</p>
 <p class="rem"><b>Remember:</b> n-grams at index time, plain terms at search time. search_as_you_type for most cases, completion suggester for pure prefix speed.</p>
 </div>
 </details>
@@ -304,7 +477,37 @@ GET products/_search
 { "sort": [ { "name.raw": "asc" } ],
   "aggs": { "by_status": { "terms": { "field": "status" } } } }</code></pre>
 <p>For money I use <code>scaled_float</code> or integer cents, not a plain float.</p>
+<p><b>What actually gets stored.</b> Take the value <code>"Red Running Shoes"</code>.</p>
+<table>
+<tr><th></th><th>text</th><th>keyword</th></tr>
+<tr><td>Stored terms</td><td><code>red</code>, <code>running</code>, <code>shoes</code></td><td><code>Red Running Shoes</code> (one term, unchanged)</td></tr>
+<tr><td><code>match: "running"</code></td><td>finds it</td><td>does not find it</td></tr>
+<tr><td><code>term: "Red Running Shoes"</code></td><td>no match (no such term)</td><td>finds it (exact, case-sensitive)</td></tr>
+<tr><td>Sort / aggregate</td><td>not allowed by default</td><td>works (uses doc values)</td></tr>
+<tr><td>Relevance scoring</td><td>yes</td><td>constant, no meaningful ranking</td></tr>
+</table>
+<p><b>Choose by how you use the field.</b> If humans search it in words (title, description, comments), use <code>text</code>. If a program compares it for equality, groups by it, or sorts by it (status, country, SKU, email, tenant id, enum values), use <code>keyword</code>. If both, use a multi-field: <code>text</code> on the main field and a <code>keyword</code> sub-field for the exact side. Numbers that you never do range queries on (zip codes, phone numbers, ids) are often better as <code>keyword</code>: term lookups on keywords are fast, and they keep leading zeros.</p>
+<p><b>Useful keyword options.</b> <code>ignore_above</code> skips very long values (the dynamic default is 256 for the sub-field). A <b>normalizer</b> (for example lowercase) lets you do case-insensitive exact matching while keeping a keyword. Newer versions also offer a <code>case_insensitive</code> option on the term query.</p>
+<p><b>Why not just make everything text?</b> Text fields cost more CPU and index space (analysis, positions, norms) and cannot be sorted or aggregated without loading fielddata into heap. Why not make everything keyword? Then no word-level search. The common bug is the reverse of what people expect: querying a <code>text</code> field with <code>term</code> and a capital letter. Look at the mapping first (<code>GET index/_mapping</code>) whenever a query surprises you.</p>
 <p class="rem"><b>Remember:</b> text = searched by words, keyword = exact value for filter, sort, aggregate. Use both via a sub-field.</p>
+</div>
+</details>
+
+<details class="iq" id="q-doc-values-fielddata">
+<summary>What are doc values and fielddata, and why can't I sort or aggregate on a text field? <span class="lvl s">Senior</span></summary>
+<div class="ans">
+<p class="ia">The inverted index maps term to documents, which is the wrong direction for sorting and aggregating, where I need document to value. For that Elasticsearch writes <b>doc values</b>, a column-style structure stored on disk at index time for keyword, numeric, date and most other non-text fields. Text fields have no doc values, so sorting or aggregating on them fails unless I enable <b>fielddata</b>, which builds the structure in JVM heap at query time and is risky. The normal fix is a keyword sub-field.</p>
+<p><b>Why the direction matters.</b> To sort by price you need, for each matching document, its price. The inverted index would force you to read every term and check whether the document is in its list. Doc values store, in document order, the value for each document, so a sort or a <code>terms</code> aggregation reads a compact column. It is kept on disk and relies on the operating system file cache rather than the JVM heap, so it scales to big data.</p>
+<table>
+<tr><th></th><th>Doc values</th><th>Fielddata (on text)</th></tr>
+<tr><td>Built</td><td>at index time, on disk</td><td>at first query, in heap</td></tr>
+<tr><td>Default</td><td>on for keyword, number, date, boolean, ip</td><td>off for text</td></tr>
+<tr><td>Memory risk</td><td>low (file cache)</td><td>high, can cause circuit breaker errors or out-of-memory</td></tr>
+<tr><td>Content</td><td>the original (keyword) value or number</td><td>individual analysed terms, not the whole text</td></tr>
+</table>
+<p><b>Why enabling fielddata on text is rarely what you want even if it works.</b> A <code>terms</code> aggregation on an analysed field returns single words (<code>red</code>, <code>running</code>), not whole values, and it loads every unique term into heap. Use the <code>.keyword</code> sub-field and you get whole values with no heap cost.</p>
+<p><b>Other uses and trade-offs.</b> Doc values also power scripts and <code>function_score</code> field access. If a field is never sorted, aggregated or used in scripts (for example a big keyword field you only filter on), you can set <code>"doc_values": false</code> to save disk. Conversely, if a field is only ever sorted or aggregated and never searched, you can set <code>"index": false</code> and keep only the column.</p>
+<p class="rem"><b>Remember:</b> search uses the inverted index, sort and aggregations use doc values (on disk). Text has none, so use a keyword sub-field, not fielddata.</p>
 </div>
 </details>
 
@@ -321,6 +524,17 @@ GET products/_search
 { "mappings": { "dynamic": "strict",
     "properties": { "name": { "type": "text" } } } }</code></pre>
 <p><code>strict</code> rejects documents with unknown fields, <code>false</code> accepts them but does not index them, <code>true</code> (default) maps them.</p>
+<p><b>What dynamic mapping does, with the detection rules.</b> When a new field appears, ES chooses a type from the JSON value: a string becomes <code>text</code> with a <code>.keyword</code> sub-field (unless it looks like a date, and date detection is on by default for common formats), integers become <code>long</code>, decimals become <code>float</code>, booleans become <code>boolean</code>, and objects become <code>object</code>. Numbers inside strings (<code>"7"</code>) are not detected as numbers by default.</p>
+<p><b>A pitfall in numbers.</b> The first document has <code>"price": 10</code>, so the field becomes <code>long</code>. The second document has <code>"price": 9.99</code>. It is accepted, but the value is stored in the document's _source as 9.99 and indexed truncated into a long (the search index sees 9), so range queries are wrong. That silent loss is worse than an error. Defining <code>price</code> explicitly as <code>scaled_float</code> avoids it. And a first value of <code>"N/A"</code> in a field that later receives dates makes later documents fail.</p>
+<table>
+<tr><th><code>dynamic</code> value</th><th>New unknown field</th><th>Use when</th></tr>
+<tr><td><code>true</code> (default)</td><td>added to mapping automatically</td><td>prototypes, logs where shape is unknown</td></tr>
+<tr><td><code>runtime</code></td><td>added as a runtime field, not indexed</td><td>exploring unknown data cheaply (7.11+)</td></tr>
+<tr><td><code>false</code></td><td>kept in <code>_source</code>, not searchable</td><td>store extra data without growing the mapping</td></tr>
+<tr><td><code>strict</code></td><td>request is rejected</td><td>production schemas you control</td></tr>
+</table>
+<p><b>Useful tools.</b> <code>dynamic_templates</code> let you set rules ("every string whose name ends in <code>_id</code> is a keyword, all other strings are text only"), which fixes the doubled-index cost without losing flexibility. Index templates apply a mapping to every new index matching a pattern (daily log indices).</p>
+<p><b>Why interviewers ask.</b> It reveals whether you have run ES in production. The stories are always the same: a field mapped as the wrong type by the first document, an uncontrolled client sending random keys until the 1,000-field limit is reached, and an index that doubled in size because every string had both text and keyword. The answer: explicit mappings, strict or false for unknown fields, templates for the rest.</p>
 <p class="rem"><b>Remember:</b> first value fixes the type. Define mappings yourself, use dynamic strict or false, and never use data as field names.</p>
 </div>
 </details>
@@ -334,6 +548,24 @@ GET products/_search
 { "actions": [
   { "remove": { "index": "products_v1", "alias": "products" } },
   { "add":    { "index": "products_v2", "alias": "products" } } ] }</code></pre>
+<p><b>Why it is impossible, not just forbidden.</b> The inverted index for a field was written with one analyzer, as terms. If you switched a field from <code>text</code> to <code>keyword</code>, the old documents would still contain analysed terms and the new queries would look for whole values, so the same query would behave differently on old and new data. Segments are immutable and cannot be rewritten in place, so ES refuses and forces you to build a fresh index.</p>
+<p><b>What you can change on a live index.</b></p>
+<ul>
+<li>Add a new field (<code>PUT index/_mapping</code>).</li>
+<li>Add a sub-field to an existing field (a new multi-field), but only documents indexed afterwards will have it; run <code>_update_by_query</code> to fill it for old documents.</li>
+<li>A few parameters such as <code>ignore_above</code> on a keyword, or <code>search_analyzer</code>, can be updated.</li>
+<li>Replica count and <code>refresh_interval</code> (these are settings, not mapping).</li>
+</ul>
+<p><b>What needs a new index:</b> changing a field's type, its analyzer, or <code>index</code>/<code>doc_values</code> options, and the number of primary shards (or use the split/shrink APIs for shards).</p>
+<p><b>The full recipe with numbers.</b> Suppose 200 million documents, 40 minutes per copy.</p>
+<ol>
+<li>Create <code>products_v2</code> with the corrected mapping.</li>
+<li>Start <code>_reindex</code> from v1 to v2. It reads documents from the old index and writes them to the new one using the new analysis.</li>
+<li>Writes that happened during the copy are replayed or dual-written.</li>
+<li>One atomic <code>_aliases</code> call moves the alias. Clients using <code>products</code> never notice.</li>
+<li>Keep v1 until you are confident, then delete it.</li>
+</ol>
+<p><b>Tips.</b> Reindex reads <code>_source</code>, so fields that are not in <code>_source</code> are lost (do not disable <code>_source</code> casually). If the new mapping coerces data differently, test with a sample first. Where possible, rebuild from the database instead of from the old index, because it also repairs any drift.</p>
 <p class="rem"><b>Remember:</b> mappings are append-only. New index, reindex, flip the alias.</p>
 </div>
 </details>
@@ -357,6 +589,17 @@ GET products/_search
     "comments": { "type": "nested", "properties": {
         "user":  { "type": "keyword" },
         "stars": { "type": "integer" } } } } } }</code></pre>
+<p><b>Why flattening happens.</b> Lucene has no concept of objects: a document is a flat set of fields. ES maps <code>comments.user</code> and <code>comments.stars</code> to two flat multi-value fields. A document with 2 comments gets <code>comments.user = [john, amy]</code> and <code>comments.stars = [5, 1]</code>. Positions of values inside the arrays are not kept as a pair, so the pairing john-5 is gone.</p>
+<p><b>The wrong result in a query.</b> With a plain object, <code>bool must: [comments.user = john, comments.stars = 1]</code> matches this document, because john is somewhere in the user array and 1 is somewhere in the stars array, even though john gave 5 stars. This is a correctness bug, not a performance issue, and users will report it as "the filter shows wrong results".</p>
+<p><b>How nested stores it.</b> Each element becomes its own hidden Lucene document, stored right next to the parent in the same segment (so they are on the same shard and are "block joined"). The nested query runs its inner query against the hidden documents and then maps matches back to the parent. A document with 100 comments is stored as 101 Lucene documents.</p>
+<p><b>The costs, concretely.</b></p>
+<ul>
+<li>Memory and disk: more Lucene documents (the doc count in <code>_cat/indices</code> includes nested docs).</li>
+<li>Updates: changing one comment reindexes the parent and all the comments, because the block must be written together.</li>
+<li>Limits: <code>index.mapping.nested_fields.limit</code> (50) and <code>index.mapping.nested_objects.limit</code> (10,000 per document) protect against explosions.</li>
+<li>Queries and aggregations need <code>nested</code> syntax.</li>
+</ul>
+<p><b>Decision rule.</b> Do you ever need two or more conditions to hold on the <i>same</i> array element? If not (for example just "any comment by john" or "any tag red"), keep a plain object or array, which is cheaper and simpler. If yes, use nested. If elements are numerous and change often, consider denormalising into a separate index instead. A third, lighter option, when fields are few, is to concatenate them into a single keyword like <code>"john|5"</code> and use a term query.</p>
 <p class="rem"><b>Remember:</b> arrays of objects flatten and mix up fields. Use nested when fields must match together, and pay for it.</p>
 </div>
 </details>
@@ -372,6 +615,16 @@ GET products/_search
 <tr><td>nested</td><td>good</td><td>whole parent reindexed</td><td>match several fields of one list item</td></tr>
 <tr><td>join (parent/child)</td><td>slower</td><td>child updated alone</td><td>many children changing often</td></tr>
 </table>
+<p><b>The mindset change.</b> In SQL you normalise data and join at query time. In Elasticsearch you precompute the answer shape: store the data the way it will be queried, even if it repeats. Writes get a little more work, reads become one fast lookup.</p>
+<p><b>Example with an order system.</b> You must search orders by customer name and city.</p>
+<ul>
+<li><b>Denormalise:</b> each order document includes <code>customer: {id, name, city}</code>. Search is one query. If a customer changes city, you update the orders you care about (for example with <code>_update_by_query</code> on <code>customer.id</code>), or accept that old orders keep the old city, which is often actually correct historically.</li>
+<li><b>Nested:</b> an order with line items <code>[{sku, qty}, ...]</code> where you need "sku = A and qty &gt; 5 in the same line". Items are part of the order, so they change together.</li>
+<li><b>Join field:</b> a question with many answers where votes on answers change constantly, and you do not want to reindex the question on every vote. Parent and children are separate documents on the same shard, linked by a <code>join</code> mapping, and queried with <code>has_child</code> or <code>has_parent</code>.</li>
+</ul>
+<p><b>Why join is the last resort.</b> <code>has_child</code> queries must build a global lookup of parent ids in memory (global ordinals), they are noticeably slower than a flat query, and all related documents must share a routing value so they land on the same shard. They also complicate reindexing.</p>
+<p><b>A fourth option: application-side join.</b> Query ES for matching ids, then fetch details from the database or from another ES query (<code>terms</code> on ids). Fine for small result pages (20 ids), and it avoids copying volatile fields into ES. Another approach, for lookups in the other direction, is an <b>enrich processor</b> at ingest time, which copies values from a small lookup index into the incoming document.</p>
+<p><b>How to answer in an interview.</b> Ask "what are the queries and how often do the related fields change?" Then pick: rarely changing, queried together: denormalise. List items queried together: nested. Frequently changing children with a large parent: join. Never say "I would just use join like a foreign key".</p>
 <p class="rem"><b>Remember:</b> flatten for search; nested if fields must match together; join as a last resort.</p>
 </div>
 </details>
@@ -395,6 +648,26 @@ GET products/_search
 { "query": { "term": { "status": "ACTIVE" } } }
 -- exact, case-sensitive value on a keyword field</code></pre>
 <p>The classic bug: <code>term</code> on a <code>text</code> field. The index holds lowercase terms (<code>active</code>), but <code>term</code> sends <code>ACTIVE</code> unchanged, so nothing matches. Fix it by using <code>match</code> on text, or <code>term</code> on a keyword field. <code>terms</code> is the "IN" version: <code>{"terms": {"status": ["ACTIVE", "PENDING"]}}</code>. <code>match_phrase</code> accepts a <code>slop</code> setting to allow some words in between.</p>
+<p><b>The mental model.</b> There are two worlds. In the <i>full-text world</i> (<code>match</code>, <code>match_phrase</code>, <code>multi_match</code>) your query string is run through the field's analyzer, so it becomes the same kind of terms the index holds. In the <i>exact world</i> (<code>term</code>, <code>terms</code>, <code>range</code>, <code>exists</code>, <code>prefix</code>) the value you send is used as-is. Most mistakes come from using an exact-world query on a field that stores analysed terms.</p>
+<p><b>One field, three queries.</b> The document has <code>name: "Red Running Shoes"</code>, mapped as text (stored terms: <code>red</code>, <code>running</code>, <code>shoes</code>).</p>
+<table>
+<tr><th>Query</th><th>What ES looks for</th><th>Result</th></tr>
+<tr><td><code>match: "running boots"</code></td><td><code>running</code> OR <code>boots</code></td><td>matches (running is there), score based on one term</td></tr>
+<tr><td><code>match</code> with <code>operator: and</code></td><td><code>running</code> AND <code>boots</code></td><td>no match</td></tr>
+<tr><td><code>match_phrase: "running shoes"</code></td><td><code>running</code> then <code>shoes</code> at the next position</td><td>matches</td></tr>
+<tr><td><code>match_phrase: "shoes running"</code></td><td>wrong order</td><td>no match (unless <code>slop</code> is 2 or more)</td></tr>
+<tr><td><code>term: "Red"</code></td><td>the literal term <code>Red</code></td><td>no match (the index has <code>red</code>)</td></tr>
+<tr><td><code>term: "red"</code></td><td>the literal term <code>red</code></td><td>matches, by luck, because it equals an analysed term</td></tr>
+</table>
+<p>That last row shows why <code>term</code> on text is dangerous: it sometimes works in a test (lowercase single word) and then fails in production (capital letters, multiple words, punctuation).</p>
+<p><b>Useful variants.</b></p>
+<ul>
+<li><code>minimum_should_match</code> in a <code>match</code> query is the middle ground between OR and AND: <code>"minimum_should_match": "75%"</code> requires three of four words.</li>
+<li><code>match_phrase</code> with <code>slop: 1</code> allows one word in between or a swap.</li>
+<li><code>match_phrase_prefix</code> and <code>match_bool_prefix</code> treat the last word as a prefix (a cheap way to build autocomplete on small data).</li>
+<li><code>match_all</code> returns everything (score 1.0), <code>exists</code> finds documents that have a value for a field, and <code>ids</code> fetches by id.</li>
+</ul>
+<p><b>Rule of thumb.</b> Ask "is a human typing this?" Yes: <code>match</code> family on a text field. No, a program supplies a fixed value (status, id, enum, boolean): <code>term</code> or <code>terms</code> on a keyword, number or boolean, ideally inside <code>filter</code>.</p>
 <p class="rem"><b>Remember:</b> match analyses and ORs the words, match_phrase wants order and adjacency, term is exact and only for keyword, number, date. terms = IN.</p>
 </div>
 </details>
@@ -410,6 +683,19 @@ GET products/_search
     "type": "best_fields",
     "tie_breaker": 0.3 } } }</code></pre>
 <p>With <code>best_fields</code>, a document where both words are in the <code>name</code> beats one where one word is in the name and the other in the description. With <code>tie_breaker</code>, the other fields add a small share of their score. Use <code>cross_fields</code> when one logical value is split across fields, for example <code>first_name</code> and <code>last_name</code> with <code>"operator": "and"</code>. If the same text is indexed several ways (stemmed, exact), <code>most_fields</code> makes sense. Setting <code>fuzziness</code> here also works (see the fuzzy question).</p>
+<p><b>Why not three separate match queries in a bool?</b> You can, and sometimes should, but <code>multi_match</code> is the short form and has smarter combinations. The question to answer is: how do scores of different fields combine into one document score?</p>
+<p><b>Example with numbers.</b> Query "running shoes", fields <code>name^3</code>, <code>description</code>. Document A: both words in the name. Document B: "running" in the name and "shoes" in the description.</p>
+<table>
+<tr><th>type</th><th>Idea</th><th>A vs B</th></tr>
+<tr><td><code>best_fields</code></td><td>score = best single field (plus <code>tie_breaker</code> x others)</td><td>A wins, because one field matched all the words</td></tr>
+<tr><td><code>most_fields</code></td><td>score = sum over fields</td><td>can favour B or C when the same words appear in many fields</td></tr>
+<tr><td><code>cross_fields</code></td><td>treat all fields as one big field, term by term</td><td>A and B can be equal, which is right for "first name" and "last name"</td></tr>
+<tr><td><code>phrase</code> / <code>phrase_prefix</code></td><td>phrase match per field</td><td>words must be adjacent</td></tr>
+<tr><td><code>bool_prefix</code></td><td>last term as prefix</td><td>autocomplete</td></tr>
+</table>
+<p><b>When to pick which.</b> Searching a title and a description: <code>best_fields</code> with a small <code>tie_breaker</code> (0.1 to 0.3), because the strongest field should lead. Searching the same text analysed in two ways, such as <code>name</code> (stemmed) and <code>name.exact</code> (not stemmed): <code>most_fields</code>, so an exact hit adds a bonus. Searching a person by "john smith" over <code>first_name</code> and <code>last_name</code>: <code>cross_fields</code> with <code>operator: and</code>, so each word may match in a different field but every word must match somewhere.</p>
+<p><b>Boost syntax.</b> <code>name^3</code> multiplies that field's score by 3. Boosts are relative, so changing all of them by the same factor changes nothing. Do not guess the numbers: use <code>_explain</code> on a few queries and adjust, then keep your example query set as a regression test.</p>
+<p><b>Pitfall.</b> Do not mix a <code>keyword</code> field with analysed text fields in the same <code>multi_match</code> (a non-analysed field only matches the exact full value, which silently reduces recall); also remember that <code>operator</code> and <code>minimum_should_match</code> apply per field in <code>best_fields</code> but across all fields in <code>cross_fields</code>.</p>
 <p class="rem"><b>Remember:</b> multi_match + field^boost. best_fields = best one wins, most_fields = sum, cross_fields = one virtual field.</p>
 </div>
 </details>
@@ -435,6 +721,26 @@ GET products/_search
 <rect class="box" x="610" y="30" width="180" height="90" rx="8"/><text class="t-c t-b" x="700" y="58">should</text><text class="t-c t-sm" x="700" y="80">optional bonus</text><text class="t-c t-sm" x="700" y="98">(required if alone)</text>
 <text class="t-sm" x="10" y="160">AND = several in must / filter.   OR = should + minimum_should_match.   NOT = must_not.</text>
 </svg><figcaption>Only must and should affect the score. filter and must_not just include or exclude.</figcaption></figure>
+<p><b>Mapping to everyday logic.</b></p>
+<table>
+<tr><th>You want</th><th>Write</th></tr>
+<tr><td>A AND B</td><td>both in <code>filter</code> (no score) or both in <code>must</code> (with score)</td></tr>
+<tr><td>A OR B</td><td>both in <code>should</code> with <code>minimum_should_match: 1</code> (inside its own <code>bool</code>)</td></tr>
+<tr><td>NOT A</td><td><code>must_not</code></td></tr>
+<tr><td>(A OR B) AND C</td><td><code>bool</code> with <code>filter: [C, {bool: {should: [A, B], minimum_should_match: 1}}]</code></td></tr>
+</table>
+<p><b>How <code>should</code> behaves, precisely.</b> If the bool contains at least one <code>must</code> or <code>filter</code>, then <code>minimum_should_match</code> defaults to 0: the <code>should</code> clauses become optional bonuses. If the bool has only <code>should</code> clauses (and <code>must_not</code>), the default is 1, so at least one must match. Inside a filter context the default is 0 too. When in doubt, write <code>minimum_should_match</code> explicitly.</p>
+<p><b>Score arithmetic.</b> The bool score is the sum of the scores of the matching <code>must</code> and <code>should</code> clauses. A document that matches both a must and two shoulds gets a higher score than one that matches just the must. That is how "boost on-sale items" works without excluding others.</p>
+<p><b>Nesting example: "(red or blue) shoes, in stock, not acme".</b></p>
+<pre><code>{ "bool": {
+    "must":     [ { "match": { "name": "shoes" } } ],
+    "filter":   [ { "term": { "in_stock": true } },
+                  { "bool": { "should": [ { "term": { "color": "red" } },
+                                          { "term": { "color": "blue" } } ],
+                              "minimum_should_match": 1 } } ],
+    "must_not": [ { "term": { "brand": "acme" } } ] } }</code></pre>
+<p>(For simple cases like this, <code>"terms": {"color": ["red", "blue"]}</code> is shorter than the inner bool.)</p>
+<p><b>Pitfalls.</b> Putting everything in <code>must</code> works but wastes scoring work and caching. A <code>must_not</code> alone with nothing else would return all documents except the matches (it is fine, but it is a very broad query). And an empty <code>bool</code> matches all documents, which has bitten people who build queries from optional user input: guard against empty condition lists.</p>
 <p class="rem"><b>Remember:</b> must scores, filter does not, must_not excludes, should is a bonus unless it is alone.</p>
 </div>
 </details>
@@ -455,6 +761,17 @@ GET products/_search
 <rect class="db" x="680" y="40" width="110" height="60" rx="8"/><text class="t-c t-b" x="735" y="76">Ranked hits</text>
 <line class="arrow" x1="170" y1="70" x2="228" y2="70" marker-end="url(#ah)"/><line class="arrow" x1="420" y1="70" x2="478" y2="70" marker-end="url(#ah)"/><line class="arrow" x1="630" y1="70" x2="678" y2="70" marker-end="url(#ah)"/>
 </svg><figcaption>Cheap yes/no conditions shrink the set first. Only the text query pays for scoring. (Conceptual: Lucene actually interleaves clauses, but the cost model is the same.)</figcaption></figure>
+<p><b>Two questions, two costs.</b> "How relevant is this document?" needs statistics from the index: how often the term appears in the document, how rare it is across all documents, the length of the field. "Is the status ACTIVE?" needs none. Filter context skips the first kind of work entirely, and gives a simple set of document ids.</p>
+<p><b>What caching means here.</b> For each segment, Lucene can keep a bitset (one bit per document: 1 = matches) for a filter such as <code>tenant_id = t-42</code>. The next request with the same filter reuses the bitset instead of recomputing it, and combining filters is a bit-wise AND, which is extremely cheap. Elasticsearch's query cache decides itself which filters are worth caching (it tracks usage and typically skips very small segments and rarely reused filters). You do not enable it manually; you just put your yes/no conditions in <code>filter</code>.</p>
+<p><b>Example of the difference.</b> Say <code>must: [{term: {status: "ACTIVE"}}]</code> and <code>filter: [{term: {status: "ACTIVE"}}]</code> return the same documents, but the first gives each a score of about 0.2 (a meaningless number, since every result has the same status) and recomputes each time, while the second gives score 0 and may be cached. If the same condition is in <code>must</code> and the order of results should come only from the text match, the extra constant scores add noise.</p>
+<p><b>Where filter context applies.</b> <code>filter</code> and <code>must_not</code> clauses of <code>bool</code>, the <code>filter</code> inside <code>constant_score</code>, and aggregation filters. Anything in <code>must</code> or <code>should</code> is query context.</p>
+<p><b>Common patterns.</b></p>
+<ul>
+<li>Multi-tenant isolation: <code>filter: term tenant_id</code> always, built by server code, never from user input.</li>
+<li>Catalogue facets: category, brand, price range, in-stock as filters.</li>
+<li>Pure filtering with a fixed score: wrap in <code>constant_score</code> with a boost.</li>
+</ul>
+<p><b>Pitfall.</b> A filter that contains <code>now</code> without rounding changes every millisecond and cannot be cached, so round date math (<code>now/h</code>, <code>now/d</code>). And remember filter context does not rank, so if "contains the word X" should affect ordering, keep it in <code>must</code> or <code>should</code>.</p>
 <p class="rem"><b>Remember:</b> if it is not about relevance, put it in filter. No scoring, and it can be cached.</p>
 </div>
 </details>
@@ -468,6 +785,18 @@ GET products/_search
     { "range": { "created": { "gte": "now-7d/d", "lt": "now/d" } } },
     { "range": { "total":   { "gte": 100, "lte": 500 } } } ] } } }</code></pre>
 <p>Reading it: orders created from the start of the day 7 days ago up to (not including) the start of today, with a total between 100 and 500. Things to watch: a range on a <code>text</code> field compares terms as strings, so <code>"9" > "10"</code>, which is almost never what you want, so use numeric or date fields. Dates are stored as UTC milliseconds, so pass <code>time_zone</code> if "today" means the user's day. A filter containing <code>now</code> cannot be cached well since the value changes constantly, which is why rounding with <code>/d</code> helps caching.</p>
+<p><b>Operators and what they mean.</b> <code>gt</code> (greater than), <code>gte</code> (greater or equal), <code>lt</code>, <code>lte</code>. You can use any combination, even just one bound. For dates, a string such as <code>"2024-05-01"</code> works, as does a format given explicitly with <code>"format": "dd/MM/yyyy"</code>, and so does date math.</p>
+<p><b>Date math explained by example.</b> Suppose "now" is 2024-05-15 14:32 UTC.</p>
+<ul>
+<li><code>now-7d</code> = 2024-05-08 14:32 (exact moment, 7 days back).</li>
+<li><code>now-7d/d</code> = 2024-05-08 00:00 (rounded <i>down</i> to the start of the day).</li>
+<li><code>now/d</code> = 2024-05-15 00:00, start of today.</li>
+<li>With <code>lte</code> and a rounded value, ES rounds <i>up</i> to the end of the unit: <code>"lte": "2024-05-15||/d"</code> means up to 2024-05-15 23:59:59.999. With <code>lt</code> it rounds down. This is a famous source of off-by-one-day bugs; test the boundary.</li>
+</ul>
+<p><b>Example "yesterday's orders".</b> <code>{"gte": "now-1d/d", "lt": "now/d"}</code> gives midnight yesterday up to (not including) midnight today. This half-open interval ([from, to)) is the safest way to make daily buckets that never overlap.</p>
+<p><b>Time zones.</b> Stored dates are UTC instants. <code>now/d</code> rounds on UTC day boundaries unless you pass <code>"time_zone": "+05:30"</code> (or a name like <code>Asia/Kolkata</code>), in which case "today" means the user's day. The <code>now</code> value itself is always the current UTC instant, but <code>time_zone</code> does change how date math rounding such as <code>now/d</code> is calculated, and how date strings without an offset are read.</p>
+<p><b>Other range types.</b> A <code>range</code> on <code>ip</code> fields supports CIDR; a <code>range</code> on <code>keyword</code> compares lexicographically (so "b" is between "a" and "c", and "10" &lt; "9"); and there are range <i>field types</i> (<code>date_range</code>, <code>integer_range</code>) for storing an interval in a document, like a hotel room's availability.</p>
+<p><b>Performance.</b> Numeric and date ranges are fast: they use a structure called BKD trees (points), not term lists. A range on a very selective field combined with other filters is cheap. Keep ranges in <code>filter</code>.</p>
 <p class="rem"><b>Remember:</b> range goes in filter, use date math with rounding, never range over text fields, and mind time zones.</p>
 </div>
 </details>
@@ -480,6 +809,24 @@ GET products/_search
 { "query": { "prefix":   { "sku": "AB-" } } }                    // cheaper, still expands
 { "query": { "match":    { "name": "laptop" } } }                // best: normal term lookup</code></pre>
 <p>The better pattern is to change the data, not the query: index what you search for. For codes where you search parts, use an n-gram analyzer or split the code into separate fields. For genuine "contains" over log lines or ids, the <code>wildcard</code> field type (7.9+) is built for it. Also, never run <code>wildcard</code> on a big <code>text</code> field and never expose it directly to users, who will type <code>*a*</code>. The setting <code>search.allow_expensive_queries: false</code> blocks these query types cluster-wide.</p>
+<p><b>Why a leading star is expensive, in plain terms.</b> The dictionary of terms is sorted alphabetically, like a phone book. To find names starting with "Smi" you flip straight to S-m-i. To find names ending with "son" there is no shortcut: you must read the whole book. ES does the same: for <code>*top</code> it goes through every unique term in the field, tests each against the pattern, and then collects the documents for the matches. On a field with millions of unique terms (ids, URLs, free text) that is slow and uses CPU and memory.</p>
+<table>
+<tr><th>Query</th><th>Cost</th><th>Why</th></tr>
+<tr><td><code>term</code> / <code>match</code></td><td>low</td><td>direct lookup</td></tr>
+<tr><td><code>prefix: "lap"</code></td><td>low to medium</td><td>jumps to "lap", walks a range</td></tr>
+<tr><td><code>wildcard: "lap*"</code></td><td>like prefix</td><td>fixed start</td></tr>
+<tr><td><code>wildcard: "*top"</code>, <code>"*lap*"</code></td><td>high</td><td>tests every term</td></tr>
+<tr><td><code>regexp</code></td><td>high</td><td>automaton run over the dictionary; a leading <code>.*</code> is the worst</td></tr>
+<tr><td><code>fuzzy</code> (big edit distance)</td><td>medium to high</td><td>generates many candidates</td></tr>
+</table>
+<p><b>Rewriting the problem, with examples.</b></p>
+<ul>
+<li>"Contains" search on a product name: it is words, not substrings. Use a text field and <code>match</code>. Users searching "top" probably want "laptop"? Then index n-grams.</li>
+<li>Searching SKU parts like <code>AB-2024-77</code>: split into fields (<code>prefix: AB</code>, <code>year: 2024</code>, <code>number: 77</code>), or add a <code>pattern</code> tokenizer that splits on dashes.</li>
+<li>Suffix search (<code>*son</code>): index a reversed copy of the field (using a <code>reverse</code> token filter) and run a prefix query on it.</li>
+<li>Log lines, ids and free substring search: the <code>wildcard</code> field type, which uses n-gram-like structures internally and is built for this purpose.</li>
+</ul>
+<p><b>Safety.</b> Setting <code>search.allow_expensive_queries: false</code> makes the cluster reject wildcard, regexp, prefix (without index_prefixes), fuzzy, script and some other queries. If users type raw text into a search box, never pass their input into <code>wildcard</code> or <code>query_string</code> unescaped: someone can send <code>*a*b*c*</code> on a large index and burn CPU.</p>
 <p class="rem"><b>Remember:</b> leading wildcard and regexp scan the whole term dictionary. Index it the way you search (n-grams), do not wildcard it.</p>
 </div>
 </details>
@@ -494,6 +841,22 @@ GET products/_search
     "fuzziness": "AUTO",
     "prefix_length": 1 } } } }</code></pre>
 <p><code>AUTO</code> allows 0 edits for terms of 1 to 2 characters, 1 edit for 3 to 5, and 2 edits for longer terms (2 is the maximum). <code>prefix_length: 1</code> means the first letter must be exact, which both speeds the query up and cuts silly matches, because most typos are not in the first letter. Fuzzy matches score lower than exact ones, so exact matches still rank first. For a "did you mean" hint instead of silently widening the query, use the <code>term</code> or <code>phrase</code> suggester. Fuzziness on very short terms or with an edit distance of 2 on large fields is expensive; do not turn it on blindly for every field.</p>
+<p><b>What "edit distance" means.</b> The Levenshtein distance between two words is the number of single-letter changes needed to turn one into the other. "runing" to "running": insert one n, distance 1. "shoos" to "shoes": replace one letter, distance 1. ES also counts swapping two adjacent letters as one edit (<code>transpositions: true</code> by default), so "shose" to "shoes" is 1.</p>
+<p><b>How it is done efficiently.</b> ES does not compare your word with every document. It builds a small automaton for the query word (all strings within distance N) and intersects it with the term dictionary, collecting the matching terms. Then it looks them up like a multi-term query. The cost depends on the length of the word, the edit distance and how many unique terms the field has.</p>
+<table>
+<tr><th>Term length</th><th><code>AUTO</code> allows</th><th>Example</th></tr>
+<tr><td>1 to 2</td><td>0 edits</td><td>"ox" must be exact</td></tr>
+<tr><td>3 to 5</td><td>1 edit</td><td>"shoos" finds "shoes"</td></tr>
+<tr><td>6 or more</td><td>2 edits</td><td>"runnng" finds "running"</td></tr>
+</table>
+<p><b>Knobs that matter.</b></p>
+<ul>
+<li><code>prefix_length</code>: letters at the start that must match exactly. Setting 1 to 2 shrinks the candidate set drastically.</li>
+<li><code>max_expansions</code> (default 50): the maximum number of terms the fuzzy part may expand to, to limit cost.</li>
+<li><code>fuzzy_transpositions</code> and <code>operator</code>: for multi-word queries, a typo in one word of an AND query still lets that word match its corrected form.</li>
+</ul>
+<p><b>Fuzzy versus the alternatives.</b> Fuzzy fixes typos in the index terms. Synonyms handle different words with the same meaning. Phonetic analyzers (for example Metaphone through a plugin) handle "sounds like" names. A "did you mean" suggestion shows the corrected phrase and lets the user confirm, which gives the user control and avoids surprising results.</p>
+<p><b>Pitfalls.</b> A fuzzy match scores lower than an exact one, but it can still outrank a weak exact match from another field; check ranking with <code>_explain</code>. Fuzziness on short product codes or numbers produces nonsense matches, so enable it only on the natural language fields (name, description), not on ids. Use <code>keyword</code> fields without fuzziness for codes.</p>
 <p class="rem"><b>Remember:</b> match + fuzziness AUTO + prefix_length 1. Max 2 edits; exact matches still rank higher.</p>
 </div>
 </details>
@@ -510,6 +873,22 @@ GET products/_search
         { "range": { "comments.stars": { "lte": 2 } } } ] } },
     "inner_hits": {} } } }</code></pre>
 <p>This returns posts that have a comment by john with at most 2 stars, both conditions on the same comment, and <code>inner_hits</code> shows which comments matched. Aggregations on nested data need a <code>nested</code> aggregation first, then the inner aggregation, and <code>reverse_nested</code> to go back up to the parent level. Another thing to remember: score mode (<code>score_mode</code>: avg by default) decides how the scores of several matching nested items combine into the parent's score.</p>
+<p><b>Why the plain query fails.</b> The comments are hidden documents. A query <code>match comments.user = john</code> is run on the parent documents, and the parent has no such field in its own index, so it returns nothing and no error. The <code>nested</code> query temporarily switches into the hidden documents of the given <code>path</code>, runs the inner query there, and joins the result back to the parents.</p>
+<p><b>A worked example.</b> Index with two posts.</p>
+<pre><code>post 1: comments = [ {user: john, stars: 5}, {user: amy,  stars: 1} ]
+post 2: comments = [ {user: john, stars: 1} ]</code></pre>
+<p>The query above (user john AND stars at most 2) matches only post 2, because only post 2 has one comment that satisfies both conditions at once. Post 1 has john and has a 1-star comment, but not in the same element. With an object field it would have matched.</p>
+<p><b>Useful options.</b></p>
+<ul>
+<li><code>inner_hits</code> returns the matching comments inside each parent hit (with their own <code>_nested.offset</code>), so the UI can show "john: 1 star".</li>
+<li><code>score_mode</code> (<code>avg</code>, <code>sum</code>, <code>max</code>, <code>min</code>, <code>none</code>) decides how scores of several matching children produce the parent's score. Use <code>none</code> in filters when you do not need a score.</li>
+<li><code>ignore_unmapped: true</code> avoids an error when querying several indices where some lack the nested path.</li>
+</ul>
+<p><b>Aggregations on nested data.</b> To get the average stars per user over comments, wrap in a <code>nested</code> aggregation first, then run <code>terms</code> and <code>avg</code> inside it. To go back to a parent-level field (for example count distinct posts), use <code>reverse_nested</code>.</p>
+<pre><code>"aggs": { "c": { "nested": { "path": "comments" },
+    "aggs": { "by_user": { "terms": { "field": "comments.user" },
+        "aggs": { "avg_stars": { "avg": { "field": "comments.stars" } } } } } } }</code></pre>
+<p><b>Pitfall.</b> Nested queries are noticeably slower than plain ones and cannot be combined across two different nested paths in a single clause: use two <code>nested</code> clauses inside a bool. Keep the number of nested elements per document small.</p>
 <p class="rem"><b>Remember:</b> nested field = nested query with path. Same for aggregations. inner_hits shows which children matched.</p>
 </div>
 </details>
@@ -527,6 +906,17 @@ GET products/_search
     "text": "runing shoes",
     "phrase": { "field": "description" } } } }</code></pre>
 <p>The response carries <code>hits[].highlight.description</code> (a list of snippets) and a <code>suggest</code> block with corrected phrases. Highlighting works from the stored text and the query terms, so highlight the same field you query. If the page shows user text as HTML, escape it: set <code>"encoder": "html"</code> so stored markup is not injected into the page. The default highlighter is fine for most cases.</p>
+<p><b>How highlighting works.</b> After the query decides which documents match, the highlighter takes the text of the requested field from <code>_source</code>, finds the places where the query terms occur (re-analysing the text, or using stored positions or offsets), cuts out short fragments around the best places, and wraps the matched words in tags. It is a display feature: it does not affect which documents match or their rank.</p>
+<p><b>Example output.</b> Query "runing shoes" with a fuzzy match, document "Red running shoes for trail": the response has <code>"highlight": {"description": ["Red &lt;mark&gt;running&lt;/mark&gt; &lt;mark&gt;shoes&lt;/mark&gt; for trail"]}</code>. The default tag is <code>&lt;em&gt;</code>.</p>
+<p><b>Options worth knowing.</b></p>
+<ul>
+<li><code>fragment_size</code> and <code>number_of_fragments</code>: snippet length and count. Use <code>number_of_fragments: 0</code> to return the whole field, highlighted (good for short titles).</li>
+<li><code>require_field_match</code> (default true): highlight only in the field that matched. Set false to highlight the same terms in other fields.</li>
+<li><code>highlight_query</code>: highlight with a different query than the one used to search (useful when the main query includes filters or rescoring).</li>
+<li>Highlighters: <code>unified</code> (default, good all-round), <code>plain</code> (simple, slower on big text), and <code>fvh</code> (needs term vectors, fast on large fields, more disk).</li>
+</ul>
+<p><b>"Did you mean".</b> The <b>term suggester</b> corrects word by word using edit distance against terms in the index, and the <b>phrase suggester</b> scores whole corrected phrases using n-gram language models (it understands that "noble prize" should be "nobel prize" in context). Use <code>suggest_mode: missing</code> to suggest only for terms that are not found, which avoids suggestions for correct words. A common UI: if the search returns few or no results, show "Did you mean ...?".</p>
+<p><b>Security.</b> Highlighted fragments contain the original text, which may include user HTML. Use <code>"encoder": "html"</code> so markup in stored text is escaped and only your own highlight tags are real HTML, then render the snippet as HTML in the page. Skipping this is a cross-site scripting hole.</p>
 <p class="rem"><b>Remember:</b> highlight = marked snippets per hit; suggest = corrected spelling. Use the html encoder for safety.</p>
 </div>
 </details>
@@ -558,6 +948,25 @@ GET products/_search
 <li><b>sort:</b> score first, then a unique field as a tie-breaker so pages are stable.</li>
 <li><b>_source filtering:</b> return only the fields the page needs.</li>
 </ul>
+<p><b>Why each part is where it is.</b> This question tests whether you know the request has distinct slots, each with a purpose.</p>
+<ol>
+<li><b>User text goes in <code>must</code> as <code>multi_match</code></b>: this is the only part that needs scoring. <code>name^3</code> makes title hits matter more.</li>
+<li><b>Hard conditions go in <code>filter</code></b>: in-stock, selected brands, price range. They narrow results, are cacheable, and do not disturb ranking. Selected brands use <code>terms</code> (OR within one facet), while different facets are ANDed.</li>
+<li><b>The currently clicked facet goes in <code>post_filter</code></b> so that its own counts stay visible (see the facets question). Only the facet being selected is handled this way; other facets' selections stay in <code>filter</code> or are applied inside aggregation filters.</li>
+<li><b><code>aggs</code></b> produce the facet counts the left sidebar shows: top brands, colours, and price buckets. <code>size</code> caps buckets.</li>
+<li><b><code>sort</code></b> lets the user choose: relevance (<code>_score</code>), price, newest. Always end with a unique tie-breaker so pagination does not repeat or skip items.</li>
+<li><b><code>from</code>/<code>size</code></b> for pages 1 to a few; if infinite scroll or exports are needed, switch to <code>search_after</code>.</li>
+<li><b><code>_source</code> filtering</b> returns only what the cards display, reducing transfer size.</li>
+<li><b><code>highlight</code></b> for snippets, <code>suggest</code> when the result count is low.</li>
+</ol>
+<p><b>Details that show experience.</b></p>
+<ul>
+<li>Total count: the default stops counting at 10,000; use <code>track_total_hits</code> only if the UI shows exact totals, or show "10,000+" and avoid the cost.</li>
+<li>Build the JSON on the server from a validated model of the request. Never forward raw user JSON, because it can run expensive queries or read other tenants' data. Always add the tenant filter on the server.</li>
+<li>Empty search text: use <code>match_all</code> in <code>must</code> (or omit must) so browsing by filters works, and sort by something sensible, not by a meaningless constant score.</li>
+<li>Facet value count and cost: aggregations over millions of documents add latency; cache facet results for the common unfiltered page and use shorter <code>size</code>s.</li>
+</ul>
+<p><b>What I would say if asked to improve it.</b> Add synonyms and stemming for relevance, <code>function_score</code> or <code>rank_feature</code> for popularity, a "did you mean" suggester on empty results, and a query log to learn which searches fail (zero results) so I can fix them with synonyms or better data.</p>
 <p class="rem"><b>Remember:</b> text in must, exact in filter, facets in aggs, selected facet in post_filter, sort with a tie-breaker, trim _source.</p>
 </div>
 </details>
@@ -566,7 +975,7 @@ GET products/_search
 <summary>How do you find out why a document matched, why it ranked high, or why a query is slow? <span class="lvl s">Senior</span></summary>
 <div class="ans">
 <p class="ia">I use three tools. The <code>_analyze</code> API shows what terms my text produces, which explains most "why no match". <code>explain</code> shows how one document's score was computed. <code>profile</code> shows how long each part of a query took on each shard, which finds the slow clause.</p>
-<pre><code>POST _analyze  { "field": "name", "text": "Running Shoes" }
+<pre><code>POST products/_analyze  { "field": "name", "text": "Running Shoes" }
 
 GET products/_explain/42
 { "query": { "match": { "name": "running shoes" } } }
@@ -574,6 +983,17 @@ GET products/_explain/42
 GET products/_search
 { "profile": true, "query": { "bool": { "must": [ { "match": { "name": "shoes" } } ] } } }</code></pre>
 <p><code>_explain</code> returns a tree: term frequency, inverse document frequency, field length factor, boost, and the final number, or tells me the document did not match and which clause failed. In the <code>profile</code> output I look for the clause with the largest <code>time_in_nanos</code> (often a wildcard, regexp or a script) and for breakdown phases such as <code>advance</code> or <code>score</code>. Beyond the query, the slow log (<code>index.search.slowlog.threshold.query.warn</code>) shows which queries are slow in production. Use <code>profile</code> in test, since it adds overhead itself.</p>
+<p><b>Three different questions need three different tools.</b></p>
+<table>
+<tr><th>Symptom</th><th>Tool</th><th>What it tells you</th></tr>
+<tr><td>"It should match but doesn't"</td><td><code>_analyze</code>, <code>_validate/query?explain</code>, <code>_explain</code></td><td>which terms are stored, how the query was rewritten, which clause failed</td></tr>
+<tr><td>"Why is this ranked above that?"</td><td><code>_explain</code> (also <code>"explain": true</code> in a search)</td><td>score breakdown per document</td></tr>
+<tr><td>"The search is slow"</td><td><code>profile</code>, slow log, <code>took</code></td><td>time per query component per shard</td></tr>
+</table>
+<p><b>Reading <code>_explain</code> output.</b> You get a nested tree. For BM25 on one term it shows <code>weight(name:running)</code> = idf x tf-part. The <code>idf</code> node shows how many documents contain the term and out of how many; the <code>tf</code> node shows term frequency, field length and average field length. If a document lost to another, compare these numbers: usually a longer field or a more common term explains it. Sum nodes show how a bool adds clause scores, and boosts show up as a separate multiplier.</p>
+<p><b>Reading <code>profile</code>.</b> The response lists, per shard, the query tree (for example a <code>BooleanQuery</code> containing <code>TermQuery</code> children) with <code>time_in_nanos</code> and a <code>breakdown</code> (<code>create_weight</code>, <code>build_scorer</code>, <code>next_doc</code>, <code>advance</code>, <code>score</code>, <code>match</code>). A big <code>score</code> value says scoring is the expense (consider filter context); a big <code>next_doc</code> or <code>advance</code> means iterating many matching documents (too broad a query). It also profiles aggregations and the collectors, so it can show a slow aggregation. It slows the request, and the numbers are meant for relative comparison, not absolute timing.</p>
+<p><b>Slow log.</b> Set thresholds per index, for example <code>index.search.slowlog.threshold.query.warn: 2s</code>, <code>...fetch.warn: 1s</code>. Entries show the query body, so you can reproduce the exact slow search. Enable it before you need it.</p>
+<p><b>A systematic routine for "slow query".</b> (1) Compare <code>took</code> with the client-observed time to rule out the network or app. (2) Run the query with <code>profile</code>. (3) Look at the response size and <code>_source</code> size, since fetch and transfer can dominate. (4) Check shard count and whether the index has many tiny segments. (5) Check whether the node is under heap or CPU pressure (the cluster's own monitoring). (6) Only then consider hardware.</p>
 <p class="rem"><b>Remember:</b> _analyze for terms, _explain for score, profile for time, slow log for production.</p>
 </div>
 </details>
@@ -590,6 +1010,26 @@ GET products/_search
 <li><b>Field length:</b> one match in a 3-word title beats one match in a 3,000-word body (controlled by <code>b</code>, default 0.75).</li>
 </ul>
 <p>The score is only meaningful for ranking within one query; do not compare scores across queries or treat them as percentages. Two practical points. Statistics are per shard, so on small data with many shards the idf can differ and ordering looks odd; <code>dfs_query_then_fetch</code> fixes this at extra cost, but the real cure is fewer shards. And when you sort by a field instead of <code>_score</code>, scores are not computed at all (unless <code>track_scores: true</code>), which saves work. BM25 replaced the older TF-IDF default in Elasticsearch 5.0.</p>
+<p><b>Why a scoring formula at all.</b> Matching is yes or no. But a search for "shoes" can match 50,000 documents, and users only read the first few. Scoring orders them so the most likely helpful ones come first. BM25 is a well-tested formula from information retrieval that turns three simple intuitions into one number.</p>
+<p><b>The three intuitions with a small example.</b> Query: <code>ergonomic chair</code>. Two documents:</p>
+<ul>
+<li>Doc A, title: "Ergonomic chair" (2 words).</li>
+<li>Doc B, description: a 300-word text that mentions "chair" five times and "ergonomic" once.</li>
+</ul>
+<ol>
+<li><b>Rare words count more (idf).</b> Suppose "chair" appears in 40% of documents and "ergonomic" in 1%. A match on "ergonomic" is a far stronger clue and adds more to the score.</li>
+<li><b>More occurrences help, but less and less (tf saturation).</b> The 5th mention of "chair" adds much less than the 1st. This prevents keyword stuffing from winning. The parameter <code>k1</code> (default 1.2) sets how fast it saturates.</li>
+<li><b>Short fields beat long fields (length normalisation).</b> One "chair" in a 2-word title says "this is about chairs". One "chair" in a 300-word text says little. The parameter <code>b</code> (default 0.75) controls how strongly length matters; <code>b: 0</code> disables it.</li>
+</ol>
+<p>Doc A wins here, as it should. The final score of a document is the sum over the query terms (and clauses), each being roughly <code>idf x (tf x (k1+1)) / (tf + k1 x (1 - b + b x fieldLength/avgFieldLength))</code>. You do not need to memorise it, but you should be able to say what each part does.</p>
+<p><b>Practical consequences.</b></p>
+<ul>
+<li>Scores are not probabilities and are not comparable between different queries or even between indices. Never show "87% match" from <code>_score</code>, or set a global score threshold (<code>min_score</code>) without testing it.</li>
+<li>Statistics are per shard. Very small indices spread over many shards can produce odd rankings; use one shard, or <code>dfs_query_then_fetch</code>.</li>
+<li>Deleted documents still count in idf statistics until segments are merged, so scores can change slightly after merges.</li>
+<li>Some fields should not use length normalisation (for example a tags field, where more tags is not worse). You can disable norms (<code>"norms": false</code>) on fields you only filter on, which also saves disk.</li>
+</ul>
+<p><b>Is BM25 enough?</b> It only knows about words. It does not know that a product is popular, new, or in stock. That is why a layer of business signals (next question) usually sits on top, and why relevance tuning is a testing job, not a one-time setting.</p>
 <p class="rem"><b>Remember:</b> BM25 = frequent in doc (saturating) x rare overall x short field. Scores only rank, they are not percentages.</p>
 </div>
 </details>
@@ -606,6 +1046,23 @@ GET products/_search
       { "gauss": { "created": { "origin": "now", "scale": "30d", "decay": 0.5 } } } ],
     "score_mode": "multiply", "boost_mode": "multiply" } } }</code></pre>
 <p>Here <code>log1p</code> on sales means a product with 10,000 sales is better but not 10,000 times better, and the <code>gauss</code> decay halves the freshness boost every 30 days. Always use a damping function (<code>log1p</code>, <code>sqrt</code>) on counts, otherwise one hugely popular item wins every query. Keep it testable: collect example queries with the expected top results, and compare the ranking before and after a change. For a simple numeric signal, the <code>rank_feature</code> field type is a cheaper alternative. A pinned product list is done with the <code>pinned</code> query.</p>
+<p><b>The tools, from simplest to most powerful.</b></p>
+<ol>
+<li><b>Field boost</b> (<code>name^3</code>): "matches in the name count more". No code, easy to reason about.</li>
+<li><b>A <code>should</code> clause with a boost</b>: add a bonus for exact phrase, in-stock, or a promoted brand without excluding other results.</li>
+<li><b><code>function_score</code></b>: multiply or add a computed number (from a field, a decay, a script or a random seed) to the text score.</li>
+<li><b><code>rank_feature</code> field</b> (and <code>rank_feature</code> query): store a positive numeric signal such as popularity or a page-rank-like value; it is cheaper than <code>function_score</code> because it is designed for score contributions.</li>
+<li><b><code>rescore</code></b>: run an expensive query only on the top N hits of a cheap first pass.</li>
+<li><b>Learning to rank</b> (a machine-learned model that reorders the top results): the advanced option when you have click data. Available as a plugin or in some Elastic subscriptions; mention it, but do not go deep unless asked.</li>
+</ol>
+<p><b>Why damping matters, with numbers.</b> Suppose text score for a good match is about 8, and the best-seller has 100,000 sales while a normal product has 100.</p>
+<ul>
+<li>Raw sales as a multiplier: 8 x 100,000 vs 8 x 100. The bestseller wins every query, even irrelevant ones.</li>
+<li>With <code>log1p</code>: log10(100,001) is about 5 and log10(101) is about 2, so the bestseller gets about 2.5 times the boost, not 1,000 times. Popular items rise, but a much better text match can still win.</li>
+</ul>
+<p><b>Decay functions.</b> <code>gauss</code>, <code>exp</code> and <code>linear</code> reduce a score as a value moves away from an <code>origin</code>. For freshness, <code>origin: now, scale: 30d, decay: 0.5</code> means a 30-day-old item gets half the boost. For geo, <code>origin</code> is the user's location and <code>scale</code> a distance. Add an <code>offset</code> to give everything within, say, 3 days the full boost.</p>
+<p><b>How to combine.</b> <code>score_mode</code> says how several functions combine with each other (multiply, sum, max, ...) and <code>boost_mode</code> says how the result combines with the text score (multiply is the usual, <code>sum</code> or <code>replace</code> when you want more control). Use <code>max_boost</code> to cap runaway values.</p>
+<p><b>Process matters more than syntax.</b> Collect 30 to 100 real queries with the products you expect at the top. After each change, replay them and compare. Check zero-result queries and "head" queries (the 20 most frequent), because those drive business value. Resist tuning for one complaint at the cost of the rest. Use <code>pinned</code> (or <code>pinned</code> ids) for editorial promotions rather than extreme boosts.</p>
 <p class="rem"><b>Remember:</b> boost fields, then function_score with damped signals (log1p, decay). Always test with a fixed query set.</p>
 </div>
 </details>
@@ -624,6 +1081,24 @@ GET products/_search
     "avg_total": { "avg": { "field": "total" } },
     "customers": { "cardinality": { "field": "customer_id" } } } }</code></pre>
 <p><code>"size": 0</code> skips returning hits, since I only want the numbers. Roughly the SQL equivalent: <code>SELECT status, COUNT(*) ... GROUP BY status</code>. Things to know: <code>terms</code> returns the top 10 buckets by default; <code>cardinality</code> and <code>percentiles</code> are approximate (they trade a little accuracy for low memory); aggregations run on doc values (a column-style structure), so the field must be <code>keyword</code>, number or date, not <code>text</code>.</p>
+<p><b>Why not just run several queries?</b> Aggregations run in the same pass over the matching documents as the search, using doc values, so they are cheaper than one extra query per number. They also run in parallel on all shards and are merged by the coordinator, so they scale with the cluster.</p>
+<p><b>The three families, with real uses.</b></p>
+<table>
+<tr><th>Family</th><th>Question it answers</th><th>Examples</th></tr>
+<tr><td>Bucket</td><td>"Which group does each document belong to?"</td><td><code>terms</code> (by category), <code>date_histogram</code> (by day), <code>range</code> (price bands), <code>filters</code>, <code>histogram</code>, <code>geo_distance</code>, <code>composite</code></td></tr>
+<tr><td>Metric</td><td>"What single number describes these documents?"</td><td><code>avg</code>, <code>sum</code>, <code>min</code>, <code>max</code>, <code>stats</code>, <code>value_count</code>, <code>cardinality</code> (distinct count), <code>percentiles</code>, <code>top_hits</code></td></tr>
+<tr><td>Pipeline</td><td>"What can I compute from other aggregations' outputs?"</td><td><code>derivative</code> (change per day), <code>cumulative_sum</code>, <code>moving_avg</code> (<code>moving_fn</code>), <code>bucket_sort</code>, <code>avg_bucket</code></td></tr>
+</table>
+<p><b>Reading the example response.</b> For the query above, the response looks like:</p>
+<pre><code>"aggregations": {
+  "by_status": { "buckets": [ { "key": "PAID", "doc_count": 912 },
+                              { "key": "SHIPPED", "doc_count": 450 } ] },
+  "avg_total": { "value": 63.4 },
+  "customers": { "value": 701 } }</code></pre>
+<p>Buckets carry a <code>key</code> and a <code>doc_count</code>. Metrics carry a <code>value</code>.</p>
+<p><b>Aggregations see the query's matches.</b> The <code>query</code> decides which documents are aggregated: here, the last 30 days. To also see global numbers regardless of the query, use a <code>global</code> aggregation, and to filter just one aggregation use a <code>filter</code> aggregation.</p>
+<p><b>Precision notes.</b> <code>cardinality</code> uses HyperLogLog++ (approximate; very accurate below the precision threshold, which defaults to 3,000 and can be raised up to 40,000). <code>percentiles</code> uses TDigest (accurate at the extremes, approximate in between). <code>terms</code> merges per-shard top lists (see the accuracy question). Sums and averages are exact.</p>
+<p><b>Memory and limits.</b> Aggregations buffer results in heap on the coordinating node. A <code>terms</code> aggregation on a field with millions of values and a large <code>size</code> can trip the circuit breaker (<code>search.max_buckets</code>, default 65,536 in recent versions, limits total buckets in one response). Use <code>composite</code> to walk through large numbers of buckets in pages.</p>
 <p class="rem"><b>Remember:</b> bucket groups, metric calculates, pipeline works on results. size 0 when you only want numbers.</p>
 </div>
 </details>
@@ -651,6 +1126,24 @@ GET products/_search
 <text class="t-sm" x="640" y="50">number per bucket</text><text class="t-sm" x="640" y="150">best doc per bucket</text>
 </svg><figcaption>Each level runs once per bucket of the level above. Keep the nesting shallow and the sizes small.</figcaption></figure>
 <p>Use <code>calendar_interval</code> for month, quarter and year (they vary in length) and <code>fixed_interval</code> for fixed lengths like <code>30d</code> or <code>1h</code>; the older plain <code>interval</code> is deprecated. Cost multiplies with nesting: 12 months x 5 categories x top hits is fine, but a nested <code>terms</code> on a high-cardinality field explodes. Add <code>"min_doc_count": 0</code> to a histogram to get empty months too.</p>
+<p><b>How to think about nesting.</b> Read the request from the outside in as a sentence: "for each month, for each of the top categories in that month, sum the revenue and show the single best order." The response is a tree of the same shape: months contain categories contain numbers. Each level is computed once per parent bucket, so the number of work items multiplies: 12 months x 5 categories = 60 buckets, each with a sum and a top hit.</p>
+<p><b>What the response looks like (shortened).</b></p>
+<pre><code>"per_month": { "buckets": [
+  { "key_as_string": "2024-01", "doc_count": 1200,
+    "per_category": { "buckets": [
+      { "key": "shoes", "doc_count": 400,
+        "revenue": { "value": 31250.0 },
+        "best": { "hits": { "hits": [ { "_source": { "product": "Trail Pro" } } ] } } },
+      { "key": "jackets", "doc_count": 310, "revenue": { "value": 28100.0 }, "best": { "...": "..." } } ] } },
+  { "key_as_string": "2024-02", "...": "..." } ] }</code></pre>
+<p><b>Common variations.</b></p>
+<ul>
+<li><b>Top N categories over the whole period, then monthly detail:</b> reverse the nesting: <code>terms</code> on category outside, <code>date_histogram</code> inside. Choose the order by which dimension you want to be limited by <code>size</code>.</li>
+<li><b>Order buckets by a sub-aggregation:</b> <code>"terms": {"field": "category", "order": {"revenue": "desc"}}</code> sorts categories by revenue, not by document count. (Ordering by a sub-aggregation is also what makes top-N less accurate across shards.)</li>
+<li><b>Month-over-month growth:</b> add a <code>derivative</code> pipeline aggregation on the <code>revenue</code> inside the histogram.</li>
+<li><b>Time zone:</b> <code>"time_zone": "Asia/Kolkata"</code> on the histogram makes month boundaries follow the user's calendar.</li>
+</ul>
+<p><b>Limits and costs.</b> The total bucket count is capped by <code>search.max_buckets</code>. <code>top_hits</code> is expensive when used in many buckets, because it fetches documents per bucket, so keep <code>size</code> small. A <code>terms</code> inside a <code>terms</code> on two high-cardinality fields (customer and product) creates millions of buckets; compute those with <code>composite</code> or in a batch job. Empty months are returned by default only between the first and last bucket with data in the results; set <code>min_doc_count: 0</code> with <code>extended_bounds</code> to force a continuous axis for charts.</p>
 <p class="rem"><b>Remember:</b> aggregations nest as a tree. calendar_interval for months, and mind the multiplication of bucket counts.</p>
 </div>
 </details>
@@ -667,6 +1160,19 @@ GET products/_search
     "brands": { "filter": { "term": { "color": "red" } },
                 "aggs": { "b": { "terms": { "field": "brand" } } } } } }</code></pre>
 <p>Reading it: the hit list shows only red shoes (<code>post_filter</code>). The <code>colors</code> facet still counts all colours of "shoes", so the user can switch colour. The <code>brands</code> facet counts brands among red shoes only, because it applies the colour filter itself. The cost is that <code>post_filter</code> runs after the aggregations, so it does not make them cheaper and can slow the search. Use it only for facet-style filters, and put all other conditions in the normal <code>bool filter</code>.</p>
+<p><b>The problem from the user's side.</b> The sidebar shows colour: red (40), blue (25), black (60). The user clicks "red". What should the colour facet show next? Most shops keep showing red (40), blue (25), black (60) so the user can switch or add another colour. But the product grid must show only red items.</p>
+<p><b>Why a normal filter gets it wrong.</b> If the red filter is in the <code>bool filter</code> of the query, then the aggregations run only on red products, so blue and black counts drop to 0 and disappear. The user can no longer see alternatives.</p>
+<p><b>The mechanism.</b> A search runs in this order: (1) <code>query</code> selects documents, (2) aggregations compute on those documents, (3) <code>post_filter</code> narrows the hit list, which is what gets sorted and paged. So <code>post_filter</code> changes only what appears in <code>hits</code>, never the aggregation input.</p>
+<p><b>Multiple facets: the standard solution.</b> Assume the user chose colour = red and brand = nike. The full rule is: each facet counts the documents matched by all <i>other</i> selected filters, but not its own.</p>
+<table>
+<tr><th>Facet</th><th>Counts documents that match</th></tr>
+<tr><td>colour</td><td>text query + brand = nike (not colour)</td></tr>
+<tr><td>brand</td><td>text query + colour = red (not brand)</td></tr>
+<tr><td>price range</td><td>text query + colour = red + brand = nike</td></tr>
+<tr><td>hits (grid)</td><td>text query + colour = red + brand = nike (done with <code>post_filter</code> holding both)</td></tr>
+</table>
+<p>Implementation: put the text query in <code>query</code>, both selections in <code>post_filter</code>, and give each aggregation a wrapper <code>filter</code> aggregation containing the other facets' selections. A common shortcut: put the filters that apply to every facet (like in-stock) in the query's <code>bool filter</code>, and use <code>post_filter</code> plus per-facet filter aggregations only for the interactive facets.</p>
+<p><b>Cost.</b> Because aggregations run over the larger, unfiltered-by-facet set, it is more work than a simple filter. Keep facet sizes small (10 to 20 buckets), only compute facets that are visible, and use <code>"size": 0</code> style requests for refreshing facets only. For big catalogues, some teams precompute facet counts for the empty-query page and cache them.</p>
 <p class="rem"><b>Remember:</b> filter in the query narrows everything. post_filter narrows hits only, so sibling facet counts stay full.</p>
 </div>
 </details>
@@ -677,6 +1183,26 @@ GET products/_search
 <p class="ia">Not always. Each shard returns only its own top terms (<code>shard_size</code>), and the coordinator adds them up. A term that is popular overall but just misses each shard's cut-off can be undercounted or missing. On a single shard it is exact. The response tells me the worst-case error in <code>doc_count_error_upper_bound</code>.</p>
 <p>Example: with 3 shards, a term ranked 11th on every shard is cut from all three lists, yet its total could rank in the top 10. By default <code>shard_size</code> is about <code>size * 1.5 + 10</code>, which usually makes the error negligible. If I need better accuracy, I raise <code>shard_size</code> (more memory and network), or I route documents so each term lives on one shard. For fully exact grouping over very many values, the <code>composite</code> aggregation pages through all buckets, using <code>after_key</code> to continue, much like <code>search_after</code>. Remember the other approximations too: <code>cardinality</code> and <code>percentiles</code> are estimates by design.</p>
 <pre><code>{ "aggs": { "top": { "terms": { "field": "brand", "size": 10, "shard_size": 100 } } } }</code></pre>
+<p><b>Why it happens, with a small example.</b> Three shards, and you ask for the top 2 brands (<code>size: 2</code>, imagine <code>shard_size: 2</code> for simplicity).</p>
+<table>
+<tr><th>Brand</th><th>Shard 1</th><th>Shard 2</th><th>Shard 3</th><th>True total</th></tr>
+<tr><td>nike</td><td>50</td><td>50</td><td>5</td><td>105</td></tr>
+<tr><td>adidas</td><td>45</td><td>5</td><td>50</td><td>100</td></tr>
+<tr><td>puma</td><td>5</td><td>45</td><td>45</td><td>95</td></tr>
+<tr><td>reebok</td><td>40</td><td>40</td><td>40</td><td>120</td></tr>
+</table>
+<p>Each shard returns only its top 2. Shard 1 sends nike and adidas, shard 2 sends nike and puma, shard 3 sends adidas and puma. Reebok never makes anyone's top 2, yet it has the highest true total (120). The merged answer misses it and undercounts others. With a larger <code>shard_size</code>, each shard would send more candidates and the error shrinks.</p>
+<p><b>What the response tells you.</b> <code>doc_count_error_upper_bound</code> is the largest possible error for the whole result, and each bucket may show its own bound when <code>show_term_doc_count_error</code> is true. A value of 0 means exact. <code>sum_other_doc_count</code> says how many documents fell into buckets that were not returned.</p>
+<p><b>When it is a real problem.</b> Reports, billing and anything that must reconcile with a database total. Analytics dashboards usually tolerate small errors. The error is most visible when: many shards, high cardinality, a long tail of near-equal counts, ordering by something other than <code>doc_count</code> (for example by a sub-aggregation or ascending count; ascending order is not reliable at all, and is discouraged).</p>
+<p><b>Options for exact results.</b></p>
+<ol>
+<li>Raise <code>shard_size</code> (for example to 10x of <code>size</code>): more memory, more network, still not perfect.</li>
+<li>Use fewer shards. One shard is exact; many deployments of moderate size can use a single shard per index.</li>
+<li>Route by the term so each value lives on one shard (custom routing on the grouping key): then each shard's count for a term is complete.</li>
+<li>Use <code>composite</code> aggregation to enumerate all buckets exactly, page by page. Slower and sequential, but exact for the counts of each bucket.</li>
+<li>Pre-aggregate in a batch job or a transform (a rollup index) and query the result.</li>
+</ol>
+<p>In an interview, the key sentence is: "terms is a distributed top-N, so it is approximate, and I either raise shard_size or switch to composite when exactness matters."</p>
 <p class="rem"><b>Remember:</b> terms aggs are per-shard top-N merged, so approximate with many shards. Raise shard_size, or use composite for exact paging.</p>
 </div>
 </details>
@@ -693,6 +1219,18 @@ GET products/_search
             { "name.raw": "asc" },
             { "id": "asc" } ] }</code></pre>
 <p>Use <code>"_score": "desc"</code> as the first sort when relevance should lead, then break ties by a unique field. Without a tie-breaker, documents with equal values may switch order between requests, so a user paging through can see duplicates or miss items. Sorting by an analysed string fails with a fielddata error; use the keyword sub-field. Missing values can be controlled with <code>"missing": "_last"</code>. Sorting on a field with doc values is cheap, since doc values are a column-style structure read straight from disk and the file cache.</p>
+<p><b>How a sort runs.</b> For each matching document the shard reads the sort field from doc values (a column on disk, via the file cache), keeps a priority queue of the best <code>from + size</code> entries, and returns their sort values with the ids. The coordinator merges these. Because it uses doc values, sorting is only available for fields that have them: keyword, numbers, dates, booleans, ip. Analysed <code>text</code> has none, so Elasticsearch raises an error about fielddata.</p>
+<p><b>Examples of sort options.</b></p>
+<ul>
+<li>Multiple keys: the second key breaks ties of the first. <code>[{"price": "asc"}, {"_score": "desc"}, {"id": "asc"}]</code>.</li>
+<li>Missing values: <code>{"price": {"order": "asc", "missing": "_last"}}</code> puts documents without a price at the end.</li>
+<li>Multi-valued fields (an array of prices): choose <code>"mode": "min"</code> or <code>"max"</code>, <code>avg</code>, <code>sum</code> for which value to sort by.</li>
+<li>Sorting by a nested field needs a <code>nested</code> section naming the path and optional filter.</li>
+<li>Sort by distance: <code>_geo_distance</code>. Sort by a script: possible but slow; precompute the value instead.</li>
+</ul>
+<p><b>Why a unique tie-breaker is essential.</b> Imagine 30 products with the same price 49 and pages of 10. Without a further key, the order among equal values can differ from one request to the next (it depends on which shard copy answered and on segment internals). Page 1 could show products 1 to 10 and page 2 could repeat some of them and skip others. Adding a unique field (<code>id</code>, or a numeric sequence) makes the order total and stable. The tie-breaker must be a field with doc values and a unique value per document.</p>
+<p><b>Do not sort by <code>_id</code>.</b> The <code>_id</code> field has no doc values by default (sorting on it would load fielddata, which is discouraged and disabled by default in recent versions). Copy it into a keyword field instead. If you use PIT, ES provides an implicit tie-breaker called <code>_shard_doc</code>.</p>
+<p><b>Relevance versus field sort.</b> When sorted by a field, <code>_score</code> is null in the hits unless you set <code>track_scores: true</code>. If your product needs "sort by price but only among relevant documents", filter by relevance first (a <code>min_score</code> or a stricter query) rather than hoping the order will reflect it. Sort cost grows with the number of matching documents, so narrow the match set with filters first.</p>
 <p class="rem"><b>Remember:</b> sort on keyword, number or date only. Add a unique tie-breaker. Sorting by field skips scoring.</p>
 </div>
 </details>
@@ -705,6 +1243,16 @@ GET products/_search
 <pre><code>GET products/_search
 { "from": 19980, "size": 20, "query": { "match_all": {} } }
 -- error: Result window is too large, from + size must be less than or equal to 10000</code></pre>
+<p><b>The numbers behind the limit.</b> Each shard must produce a sorted list of its top <code>from + size</code> hits, because any of them might end up on the requested page after merging. With <code>from: 9990, size: 10</code> and 5 shards, every shard keeps and sorts 10,000 entries and the coordinator merges 50,000 of them just to return 10. Memory and CPU grow linearly with depth, multiplied by the number of shards, and concurrent users multiply it again. The 10,000 default is a safety fuse. Raising <code>index.max_result_window</code> to 1,000,000 removes the fuse, not the danger: one crawler can then take down a node.</p>
+<p><b>What the real fixes look like.</b></p>
+<ul>
+<li><b>UI list:</b> keep <code>from/size</code> for the first pages (people rarely pass page 10), and give more filters and a better sort.</li>
+<li><b>Infinite scroll or "next page" API:</b> <code>search_after</code> with a unique sort.</li>
+<li><b>Export or batch job:</b> PIT plus <code>search_after</code> in a loop (or scroll in older code).</li>
+<li><b>"Jump to page 50":</b> reconsider the requirement; if unavoidable, approximate it by sorting on a stable field and using a range filter as a cursor.</li>
+</ul>
+<p><b>About the total hit count.</b> <code>hits.total</code> looks like <code>{"value": 10000, "relation": "gte"}</code>: "at least 10,000". ES stops counting once it knows the result is above the threshold, which lets it skip documents (it can even avoid scoring them when the sort allows). Options: <code>"track_total_hits": true</code> counts exactly (can be slow on large result sets), or a number like <code>20000</code> counts up to that. A UI showing "about 10,000+ results" avoids the cost and is usually fine. For exact counts, use the <code>_count</code> API with the same query.</p>
+<p><b>Pitfalls.</b> With <code>from/size</code> and concurrent indexing, an item added between page 1 and page 2 shifts everything by one, so the user sees a duplicate or skips one. That is acceptable for browsing but not for exports. Also, ordering by <code>_score</code> alone with <code>from/size</code> has the tie problem described in the sorting question.</p>
 <p class="rem"><b>Remember:</b> from + size cost grows with depth, so the 10,000 cap. Deep paging means search_after. The total count is capped at 10,000 unless track_total_hits is true.</p>
 </div>
 </details>
@@ -734,6 +1282,25 @@ GET _search
 <li><b>Scroll</b> does a similar snapshot job with a server-side context, and still works, but Elastic recommends PIT with <code>search_after</code> for deep paging and exports.</li>
 <li>UI "jump to page N" is not possible; infinite scroll and "next" buttons are.</li>
 </ul>
+<p><b>The idea in one picture.</b> Imagine the result list sorted by <code>(created, id)</code>. Page 1 ends with the item <code>(1731800000000, "p-981")</code>. Instead of saying "skip 20 items" (from/size), you say "give me the next items that sort after (1731800000000, p-981)". Each shard can use its sorted index structures to start right after that point and take only <code>size</code> items. The cost per page is constant (page 1 equals page 5,000).</p>
+<p><b>The loop in an export job.</b></p>
+<ol>
+<li>Open a PIT: <code>POST products/_pit?keep_alive=1m</code>. Save the returned id.</li>
+<li>Search with <code>pit.id</code>, a stable sort, <code>size</code> 1,000 and no <code>search_after</code>.</li>
+<li>Process the hits. Take the <code>sort</code> array of the <i>last</i> hit.</li>
+<li>Search again with <code>search_after</code> = that array (use the <code>pit.id</code> returned by the previous response, as it can change).</li>
+<li>Stop when a page returns fewer than <code>size</code> hits. Close the PIT.</li>
+</ol>
+<p><b>Why PIT is there.</b> Without it, each request sees the index as it is at that instant. Between two requests a refresh may add, update or remove documents, so pages can have duplicates or gaps. A PIT keeps the segments as they were, so every page is consistent with the first. It is lightweight compared with scroll because it does not copy state per search, but it still holds old segments, so keep <code>keep_alive</code> short and renew it with each request. When using PIT, Elasticsearch adds a hidden tie-breaker (<code>_shard_doc</code>) to the sort, so exports without a natural unique field still work; for user-facing paging I still prefer an explicit unique field.</p>
+<table>
+<tr><th></th><th>from / size</th><th>search_after (+PIT)</th><th>scroll</th></tr>
+<tr><td>Random page jump</td><td>yes (up to the window)</td><td>no, next only</td><td>no</td></tr>
+<tr><td>Cost per page</td><td>grows with depth</td><td>constant</td><td>constant</td></tr>
+<tr><td>Consistent snapshot</td><td>no</td><td>yes, with PIT</td><td>yes</td></tr>
+<tr><td>Server state</td><td>none</td><td>PIT (light)</td><td>search context (heavier)</td></tr>
+<tr><td>Best for</td><td>first few UI pages</td><td>infinite scroll, exports</td><td>legacy exports, reindex</td></tr>
+</table>
+<p><b>Pitfalls.</b> The sort values must be passed back exactly (including types: dates as milliseconds, strings as they are). If the sort field is mutable (for example a "last modified" time) and you do not use a PIT, an item can move between pages and be missed or repeated; a PIT freezes the view and prevents that. Previous-page navigation requires you to keep your own history of cursors or to reverse the sort.</p>
 <p class="rem"><b>Remember:</b> from/size = skip and discard, search_after = continue from the last sort value. Add PIT for a stable view and a unique tie-breaker in the sort.</p>
 </div>
 </details>
@@ -750,6 +1317,16 @@ POST _search/scroll
 
 DELETE _search/scroll   { "scroll_id": "DXF1ZXJ5..." }</code></pre>
 <p>The scroll keeps old segments alive while open (so merges cannot reclaim disk space) and counts against a limit of open contexts (500 by default). Always set a short keep-alive (renewed on each call) and clear the scroll when done. For parallel exports, <code>sliced scroll</code> splits the work into independent slices. Scroll results are a snapshot, so they do not show later writes, which is fine for exports.</p>
+<p><b>How scroll works.</b> The first request with <code>?scroll=1m</code> creates a search context that pins a snapshot of the index and returns the first batch and a <code>_scroll_id</code>. Each following request sends the id and gets the next batch. With every call you give a new <code>scroll</code> time (the keep-alive), which is the time to keep the context alive until the <i>next</i> call, not for the whole export. When done, delete the context with <code>DELETE _search/scroll</code> instead of waiting for expiry.</p>
+<p><b>What it costs the server.</b> While the context is open, the segments it needs cannot be deleted after merges, so heavy updating and merging while many scrolls are open increases disk usage. Each open context uses memory and file handles. There is a limit on open scroll contexts (<code>search.max_open_scroll_context</code>, 500 by default), and exceeding it gives an error. Each shard keeps its own context.</p>
+<p><b>Typical correct usage.</b></p>
+<pre><code>1. POST products/_search?scroll=2m   { "size": 1000, "sort": ["_doc"] }
+2. loop: POST _search/scroll { "scroll": "2m", "scroll_id": "..." }
+3. until hits is empty
+4. DELETE _search/scroll { "scroll_id": "..." }</code></pre>
+<p>Sorting by <code>_doc</code> (index order) is the cheapest order for a scroll and is what <code>_reindex</code> uses internally. Use <code>slice</code> to split one scroll into N parallel independent ones: <code>"slice": {"id": 0, "max": 4}</code> for the first of four workers.</p>
+<p><b>Scroll versus PIT in one sentence.</b> Scroll is a stateful cursor that must be advanced in order and cannot be resumed after you lose the id. PIT with <code>search_after</code> lets you retry a failed page, change the page size between calls and is the lighter, recommended approach.</p>
+<p><b>When I still use scroll.</b> Existing code or tools that depend on it (older client libraries, <code>_reindex</code>, <code>_update_by_query</code> and <code>_delete_by_query</code> use scroll or PIT internally), one-off scripts on an old cluster version before 7.10, and exports where order does not matter. Never use it for user-facing pagination, because every user session would hold a server context.</p>
 <p class="rem"><b>Remember:</b> scroll = snapshot cursor for bulk export; heavy on the server. Prefer PIT + search_after for new code.</p>
 </div>
 </details>
@@ -774,6 +1351,26 @@ DELETE _search/scroll   { "scroll_id": "DXF1ZXJ5..." }</code></pre>
 <line class="arrow-g" x1="318" y1="140" x2="588" y2="156" marker-end="url(#ahg)"/>
 </svg><figcaption>The write is durable once it is in the translog. It is searchable only after the refresh.</figcaption></figure>
 <p>Why this design: segments are immutable files, so Elasticsearch never edits an index in place. A write must still survive a crash before it is flushed, so the translog records it first; after a crash, ES replays the translog. The immutability has a cost for updates and deletes: a delete only marks the old copy as deleted, and an update is a delete plus a full re-index of the document. Background merges combine small segments and finally drop the deleted copies. So an update-heavy workload creates garbage and merge work.</p>
+<p><b>Step by step, for <code>PUT products/_doc/7</code>.</b></p>
+<ol>
+<li>The coordinating node computes <code>hash(7) % number_of_primaries</code> and forwards the request to the node holding that primary.</li>
+<li>The primary validates the document against the mapping, analyses the text fields, and adds the document to the in-memory indexing buffer.</li>
+<li>It also appends the operation to the <b>translog</b> (a sequential file on disk). By default the translog is fsynced before the request is acknowledged (<code>index.translog.durability: request</code>), so an acknowledged write survives a crash of the process or machine.</li>
+<li>The primary sends the same operation, with a sequence number, to each in-sync replica in parallel. Each replica does steps 2 and 3 itself.</li>
+<li>When all in-sync replicas confirm, the primary acknowledges success to the client.</li>
+<li><b>Refresh</b> (every second by default): the buffer is written out as a new immutable segment and searchers are reopened. Now the document is searchable. This segment may still live in the file system cache and is not yet fsynced.</li>
+<li><b>Flush</b> (when the translog gets large, or at intervals): Lucene commits, meaning all segments are fsynced to disk, a commit point is written and old translog files are removed. After a crash, ES loads the last commit and replays the translog operations after it.</li>
+</ol>
+<p><b>Why the translog is needed.</b> Refresh does not fsync (fsyncing every second is costly), and a full Lucene commit is heavy. The translog gives cheap durability: appending to a sequential log is fast, and on restart it fills the gap between the last commit and the crash. It is the same idea as a database write-ahead log.</p>
+<p><b>Segments and merges.</b> Segments are write-once files. Deletes are recorded in a small "deleted" bitmap, and updates are "mark old as deleted, add new". A background merge process combines small segments into larger ones, physically dropping deleted documents. Merging uses I/O and CPU, which is why heavy bulk indexing or heavy updating makes the cluster work harder in the background. Searching many small segments is slower than searching a few large ones, so merges also help query speed.</p>
+<table>
+<tr><th>Operation</th><th>What it does</th><th>Gives you</th><th>Default frequency</th></tr>
+<tr><td>translog append</td><td>log operation to disk</td><td>durability of acknowledged writes</td><td>every request</td></tr>
+<tr><td>refresh</td><td>buffer to new searchable segment</td><td>visibility to search</td><td>1 s</td></tr>
+<tr><td>flush</td><td>fsync segments, trim translog</td><td>short recovery time</td><td>by translog size</td></tr>
+<tr><td>merge</td><td>combine segments, drop deletes</td><td>faster search, reclaimed space</td><td>continuous, in background</td></tr>
+</table>
+<p><b>Interview probes.</b> "Is the write safe if I get a 200?" Yes, it is in the translog on the primary and replicas. "Is it visible?" Not until refresh. "Does a delete free disk immediately?" No, only after a merge. "Why is updating a counter field a bad idea?" Because each update rewrites the whole document into a new segment and leaves a deleted copy behind.</p>
 <p class="rem"><b>Remember:</b> buffer + translog for durability, refresh for visibility, flush for committing. Update = delete + re-add, merges clean up later.</p>
 </div>
 </details>
@@ -794,6 +1391,17 @@ DELETE _search/scroll   { "scroll_id": "DXF1ZXJ5..." }</code></pre>
 <li><b>Bulk load tip:</b> set <code>refresh_interval</code> to <code>30s</code> or <code>-1</code> and replicas to 0 during a huge initial load, then restore. In Java use the client's bulk helper (<code>BulkIngester</code> or <code>BulkProcessor</code>) which batches, retries and limits concurrency.</li>
 <li>Use stable ids so retries are idempotent (a retried index with the same id overwrites, not duplicates).</li>
 </ul>
+<p><b>Why bulk is faster, with an example.</b> Indexing 1 million documents one by one means 1 million HTTP round trips, each paying network latency (say 1 ms) and request parsing, which is at least 1,000 seconds of pure overhead. With bulk requests of 5,000 documents, there are 200 round trips. The shard also processes the batch together, which makes better use of its internal buffers.</p>
+<p><b>The format.</b> The body is newline-delimited JSON with a final newline: an action line (<code>index</code>, <code>create</code>, <code>update</code>, <code>delete</code>) and, except for delete, a source line. It is not a JSON array, because that format lets the server read it line by line without parsing a whole giant document. The content type is <code>application/x-ndjson</code>.</p>
+<p><b>The response, and why 200 is misleading.</b> The overall request is "accepted", and each item succeeds or fails on its own:</p>
+<pre><code>{ "took": 38, "errors": true, "items": [
+  { "index":  { "_id": "1", "status": 201, "result": "created" } },
+  { "update": { "_id": "2", "status": 404, "error": { "type": "document_missing_exception" } } },
+  { "index":  { "_id": "9", "status": 429, "error": { "type": "es_rejected_execution_exception" } } } ] }</code></pre>
+<p>Item statuses mean different things. <b>429</b> and some <b>503</b>: temporary, retry that item. <b>400</b> (mapping conflict, bad data): permanent, retrying will not help; send it to a dead-letter store and log it. <b>409</b>: version conflict, usually fine if you used external versions, because it means a newer copy is already there. <b>404</b> on update: the document does not exist (use an upsert).</p>
+<p><b>Retry loop.</b> Collect only the retryable failed items, wait (exponential backoff with jitter, for example 200 ms, 400 ms, 800 ms), and resend; give up after a limit and dead-letter. Because ids are stable, resending is idempotent.</p>
+<p><b>Sizing.</b> The right batch size depends on document size, mapping and hardware. Start around 1,000 to 5,000 small documents or 5 to 15 MB and increase until throughput stops improving, then back off. Use a few concurrent workers (for example 2 to 4 per data node) instead of one giant request. A request that is too big wastes heap on the coordinating node, and ES has an HTTP size limit (100 MB by default).</p>
+<p><b>Other levers for a big load.</b> Disable or slow refresh, set replicas to 0 and restore it at the end, let ES generate ids if you do not need your own (it skips the check for existing ids and is faster), and use a client helper (<code>BulkProcessor</code> or <code>BulkIngester</code> in Java) that handles batching, concurrency and retries together.</p>
 <p class="rem"><b>Remember:</b> bulk = fewer round trips. 200 does not mean success: check per-item status, retry 429 with backoff, use stable ids.</p>
 </div>
 </details>
@@ -816,6 +1424,23 @@ POST products/_update_by_query
 { "query": { "term": { "brand": "acme" } },
   "script": { "source": "ctx._source.brand = 'ACME'" } }</code></pre>
 <p>Use <code>if_seq_no</code> when a read-modify-write in my app must not clobber another change. Use <code>retry_on_conflict</code> for simple partial updates that commute. For data coming from a database, the best approach is external versioning: <code>version_type=external</code> with the row's version, so an old event arriving late is rejected and never overwrites newer data. <code>_update_by_query</code> is a batch operation (it snapshots, then updates each match), not a transaction.</p>
+<p><b>What happens inside an update.</b> The Update API reads the current <code>_source</code> from the shard, applies your partial document or script, and indexes the result as a new document version, marking the old one as deleted. So a one-field change rewrites everything. For a document with large text, the cost is the size of the document, not the size of your change. That is why you avoid frequently updating counters or timestamps on big documents; keep volatile data in another index or in the database.</p>
+<p><b>The lost-update problem with a timeline.</b></p>
+<ol>
+<li>Worker A reads product 1: stock 5.</li>
+<li>Worker B reads product 1: stock 5.</li>
+<li>A writes stock 4. B writes stock 4 (it also thought 5 minus 1). One sale is lost; the true stock should be 3.</li>
+</ol>
+<p><b>The fix with optimistic concurrency.</b> Every document operation gets a sequence number (<code>_seq_no</code>) and the shard has a <code>_primary_term</code> (which increases when a new primary is elected). You read the pair and write with <code>if_seq_no</code> and <code>if_primary_term</code>. If anything changed in between, ES answers <b>409 Conflict</b> and writes nothing, and your code re-reads and retries. The pair together matters because after a failover the sequence numbers can restart on a new primary term.</p>
+<table>
+<tr><th>Mechanism</th><th>Use for</th></tr>
+<tr><td><code>if_seq_no</code> + <code>if_primary_term</code></td><td>app-level read-modify-write (the cart example)</td></tr>
+<tr><td><code>retry_on_conflict=N</code> on <code>_update</code></td><td>partial updates and scripts that do not depend on what you read (increment, set a flag)</td></tr>
+<tr><td><code>version_type=external</code> (+ <code>version</code>)</td><td>data owned by another system (database row version, event timestamp); old events are rejected with 409</td></tr>
+<tr><td>script in <code>_update</code></td><td>atomic change on the server: <code>ctx._source.stock -= params.n</code> (runs on the latest copy, so no read needed)</td></tr>
+</table>
+<p>The scripted update is the best fix for the stock example: the decrement happens on the server against the current value, and <code>retry_on_conflict</code> handles collisions. Still, if you need strict stock control, the database should own the number, because Elasticsearch gives no multi-document transactions and the 1 s refresh delay means search shows slightly old values.</p>
+<p><b>Upsert and bulk updates.</b> <code>doc_as_upsert: true</code> (or an <code>upsert</code> block) creates the document if missing. <code>_update_by_query</code> and <code>_delete_by_query</code> work on a snapshot of the matching documents and update them in batches with version checks; if documents change during the run you get conflicts, which you can ignore with <code>conflicts=proceed</code> or retry. They are throttled and run as tasks (<code>wait_for_completion=false</code>), because a run over millions of documents takes a long time.</p>
 <p class="rem"><b>Remember:</b> update = re-index whole doc. Use if_seq_no/if_primary_term to detect conflicts, retry_on_conflict for easy cases, external versions for DB-fed data.</p>
 </div>
 </details>
@@ -832,6 +1457,17 @@ POST products/_update_by_query
 <line class="arrow" x1="130" y1="65" x2="298" y2="38" marker-end="url(#ah)"/><line class="arrow-r" x1="130" y1="85" x2="298" y2="115" marker-end="url(#ahr)"/>
 <text class="t-sm" x="480" y="70">No shared transaction:</text><text class="t-sm" x="480" y="90">the two copies drift apart.</text>
 </svg><figcaption>Two independent writes cannot be made atomic. One succeeds, one fails, and nobody notices.</figcaption></figure>
+<p><b>The failure cases, concretely.</b> Code: <code>repo.save(order); esClient.index(order);</code> inside one service call.</p>
+<ul>
+<li><b>ES call fails after the DB commit</b> (timeout, 429, node restart): the order exists but is invisible in search. If you roll back the DB instead, the user sees an error for something that mostly worked and a retry may duplicate side effects.</li>
+<li><b>App crashes between the two calls:</b> same result and no error is logged anywhere.</li>
+<li><b>DB commit fails after the ES call:</b> search shows an order that does not exist (a phantom).</li>
+<li><b>Ordering race:</b> request 1 updates the price to 10, request 2 updates it to 12. In the DB, 2 is the last. In ES, request 1's index call is delayed and arrives last, so the index says 10. The two stores disagree, and nothing ever corrects it.</li>
+<li><b>Latency and availability:</b> your write path is now only as available as the slower of two systems, and every save pays for both.</li>
+</ul>
+<p><b>Why "try/catch and retry" does not fix it.</b> You can retry the ES call, but the process can die during the retry, and a retry with older data can overwrite a newer update that reached ES first. Two-phase commit across a database and Elasticsearch is not supported. So the correct design removes the second write from the request path.</p>
+<p><b>What to do instead.</b> One system is the writer of record (the database). Everything else follows from its committed changes: either by reading its log (CDC) or an outbox table written in the same transaction. The indexer processes events in order per entity, uses the entity's version for idempotent writes, and retries safely. The cost is a few seconds of lag, which is acceptable for search, and you tell the UI to read the user's own just-saved data from the database.</p>
+<p><b>When a simple dual write is "okay".</b> A small internal tool where drift is tolerable and a full reindex runs nightly. Say that out loud: it shows judgement, not dogma. For anything customer-facing, say outbox or CDC.</p>
 <p class="rem"><b>Remember:</b> no transaction across DB and ES. Write to the DB, feed ES from the DB.</p>
 </div>
 </details>
@@ -855,6 +1491,19 @@ POST products/_update_by_query
 <line class="arrow" x1="150" y1="68" x2="198" y2="68" marker-end="url(#ah)"/><line class="arrow" x1="350" y1="68" x2="398" y2="68" marker-end="url(#ah)"/><line class="arrow" x1="530" y1="68" x2="578" y2="68" marker-end="url(#ah)"/><line class="arrow" x1="700" y1="68" x2="738" y2="68" marker-end="url(#ah)"/>
 <text class="t-sm" x="200" y="124">The relay (or Debezium) reads the outbox and publishes. Search lags the DB by seconds, not never.</text>
 </svg><figcaption>The database commit is the single decision point. Everything after it can be retried.</figcaption></figure>
+<p><b>Outbox in detail.</b> In one database transaction, the service writes the business row and inserts an event row into an <code>outbox</code> table (<code>id, aggregate_id, type, payload, version, created_at</code>). Either both commit or neither does. A relay process then reads unsent rows (by polling, or through the database log) and publishes them to a broker such as Kafka, then marks them sent (or deletes them). If the relay crashes after publishing but before marking, it republishes: that is the at-least-once behaviour.</p>
+<p><b>CDC in detail.</b> A tool such as Debezium reads the database's transaction log (the binlog in MySQL, the WAL in PostgreSQL), turns each committed row change into an event and publishes it. No application change is needed and no triggers are used, but the consumer gets table-shaped events, not business events, and schema changes must be handled. A common hybrid: Debezium reads the outbox table, which gives a clean event contract and reliable delivery.</p>
+<table>
+<tr><th></th><th>Outbox</th><th>CDC on tables</th><th>Polling with updated_at</th></tr>
+<tr><td>App change</td><td>yes (write outbox row)</td><td>none</td><td>none</td></tr>
+<tr><td>Deletes</td><td>explicit event</td><td>captured from the log</td><td>missed unless soft-deleted</td></tr>
+<tr><td>Ordering</td><td>per aggregate, if keyed</td><td>commit order per table</td><td>by timestamp, risky</td></tr>
+<tr><td>Extra infrastructure</td><td>relay and broker</td><td>CDC connector and broker</td><td>a scheduled job</td></tr>
+<tr><td>Best for</td><td>clear business events</td><td>legacy apps, many tables</td><td>small systems</td></tr>
+</table>
+<p><b>The idempotent indexer.</b> Events can arrive twice or out of order. The indexer turns each event into a full-document index (or delete) for entity id <code>E</code>, with <code>version_type=external</code> and the entity's version (or the event's source timestamp or log position). If an older event arrives after a newer one, ES rejects it with 409, and the indexer treats 409 as "already up to date" and moves on. Partition the Kafka topic by entity id so events for the same entity are processed in order by one consumer.</p>
+<p><b>Index the data the search needs.</b> If the search document is built from several tables (order plus customer plus items), the indexer should load the current state from the database when it handles the event (an event says "order 5 changed", then it reads the order aggregate and indexes it), rather than trusting stale event payloads. When the related customer changes, you also need an event that re-indexes the affected orders.</p>
+<p><b>Operations.</b> Monitor consumer lag and the dead-letter queue, run a periodic reconciliation (count and checksum per id range, or compare max version), and keep a full-rebuild path: create a new index, bulk-load from the database, replay events from a saved position, flip the alias.</p>
 <p class="rem"><b>Remember:</b> outbox or CDC, then an idempotent indexer with external versions. Handle deletes and keep a rebuild path.</p>
 </div>
 </details>
@@ -874,6 +1523,27 @@ POST products/_update_by_query
 </ul>
 <p><b>Fix:</b> move exact conditions into <code>filter</code>; replace wildcard with n-grams or <code>search_as_you_type</code>; use <code>search_after</code> instead of deep <code>from</code>; return only needed fields (<code>_source</code> filtering); cap aggregation sizes; precompute script values at index time.</p>
 <p><b>Prevent:</b> keep the slow log on, load-test new queries on production-size data, and review any new query shape before release.</p>
+<p><b>Triage order.</b> Work from cheapest evidence to most expensive, and change one thing at a time.</p>
+<ol>
+<li><b>Is it really Elasticsearch?</b> Compare the response field <code>took</code> (time inside ES) with the time your app measured. A big gap means the network, serialisation of a huge response, or the client library.</li>
+<li><b>What changed?</b> A release with a new query shape, a data volume jump (the index doubled), a new aggregation, a traffic spike, or a cluster event (a node restarted, many shards relocating, a merge storm, heap pressure and long garbage collection).</li>
+<li><b>Which part?</b> Run the slow query with <code>"profile": true</code>. If the time is in one <code>WildcardQuery</code> or a script, you have the cause. If time is spread across fetch, check the size of <code>_source</code> and number of hits. If aggregations dominate, look at the cardinality of the grouped field.</li>
+<li><b>Cluster side:</b> if all queries are slower, check the hot threads (<code>GET _nodes/hot_threads</code>), search thread-pool queue and rejections (<code>GET _cat/thread_pool/search?v</code>), JVM heap and GC, disk I/O, and the shard count per node.</li>
+</ol>
+<p><b>Example diagnosis.</b> The product list endpoint got slow after "search by SKU contains" was added as <code>wildcard: "*abc*"</code> on a keyword field with 80 million unique values. Profile shows 3.8 s inside the wildcard query. The fix: index SKU n-grams (or the <code>wildcard</code> field type) and query a term; response drops to 40 ms.</p>
+<p><b>Frequent causes and fixes, in a table.</b></p>
+<table>
+<tr><th>Finding</th><th>Fix</th></tr>
+<tr><td>leading wildcard, regexp</td><td>n-grams, <code>wildcard</code> field type, reshape the data</td></tr>
+<tr><td>deep <code>from</code></td><td><code>search_after</code></td></tr>
+<tr><td>huge <code>size</code> or large <code>_source</code></td><td>smaller pages, <code>_source</code> filtering, fetch details separately</td></tr>
+<tr><td>filters in <code>must</code></td><td>move to <code>filter</code> for cache and no scoring</td></tr>
+<tr><td><code>terms</code> agg on ids, huge <code>size</code></td><td>lower size, composite, or precompute</td></tr>
+<tr><td>script queries or sorts</td><td>precompute at index time</td></tr>
+<tr><td>too many small shards / segments</td><td>fewer shards, force merge on read-only indices (carefully)</td></tr>
+<tr><td>cold cache after restart</td><td>warm common queries, give more RAM for the file cache</td></tr>
+</table>
+<p>Do not "fix" it by adding nodes first: that hides a bad query shape and costs money. And do not forget the first-hit effect of caches: a query that is slow once and fast after is a cache story, which should be tested on a representative data set before declaring victory.</p>
 <p class="rem"><b>Remember:</b> slow log to find it, profile to localise it, then fix the query shape before touching the cluster.</p>
 </div>
 </details>
@@ -889,6 +1559,24 @@ POST products/_update_by_query
 -- or: show the just-created item from the DB response, not from search</code></pre>
 <p>Avoid <code>refresh=true</code> on each write: it creates a tiny segment every time, floods merges and hurts throughput. For a write path that goes through a queue, tell the UI that the list updates shortly, or merge the new item into the displayed list locally.</p>
 <p><b>Prevent:</b> decide per screen whether it needs read-your-writes. Most search pages do not, and only edit screens do.</p>
+<p><b>Why this scenario is a classic.</b> The write path (database, queue, indexer, Elasticsearch) is asynchronous, and the page after the redirect reads from the search index. The user's save and the user's read use different systems at different times. Every extra hop adds lag: queue wait, indexer processing, bulk batching delay, and the 1-second refresh.</p>
+<p><b>Timeline for a typical pipeline.</b></p>
+<table>
+<tr><th>Time</th><th>Event</th></tr>
+<tr><td>0 ms</td><td>DB commit, UI redirects to the list</td></tr>
+<tr><td>50 ms</td><td>list page queries ES: item missing</td></tr>
+<tr><td>300 ms</td><td>event consumed by indexer</td></tr>
+<tr><td>500 ms to 2 s</td><td>bulk flushed, then refresh makes it searchable</td></tr>
+</table>
+<p><b>Options, with trade-offs.</b></p>
+<ul>
+<li><b>Show the user's own change from the primary data.</b> After the save, render the new item from the save response and merge it into the list (optimistic UI). Cheapest and always right.</li>
+<li><b>Direct synchronous index for that one write with <code>refresh=wait_for</code>:</b> the save returns after the document is searchable. Costs latency (up to the refresh interval) and re-introduces a dual write for this path, so use only if the rest of the pipeline can still repair failures.</li>
+<li><b>Short polling or a "processing" state:</b> the UI shows the item as pending and refreshes in a moment.</li>
+<li><b>Sticky read:</b> for a few seconds after a write by this user, route their list request to the database instead of search.</li>
+</ul>
+<p><b>How to prove the cause.</b> Take the id and call <code>GET products/_doc/ID</code>: found means indexing worked and the delay is refresh or pipeline lag. Not found for many seconds means the pipeline is behind or the event failed (look at consumer lag and the dead-letter queue). Compare <code>_cat/indices</code> doc counts with the source if you suspect lost events. Also check the index's <code>refresh_interval</code>; if someone set it to <code>-1</code> or 30 s for a bulk load and forgot to restore it, you have found the real bug.</p>
+<p><b>Not a fix:</b> setting <code>refresh_interval</code> to 100 ms or <code>refresh=true</code> on every write. It creates a flood of tiny segments, slows searches, and does not fix pipeline lag at all.</p>
 <p class="rem"><b>Remember:</b> write is instant for get-by-id, visible to search after refresh. Use wait_for sparingly, never refresh=true in a loop.</p>
 </div>
 </details>
@@ -910,6 +1598,18 @@ POST products/_update_by_query
 "attrs": { "type": "flattened" }</code></pre>
 <p>Use a nested type for the key/value list if you must query key and value together. Raise <code>index.mapping.total_fields.limit</code> only as a temporary relief. The index must be rebuilt (reindex) with the fixed mapping.</p>
 <p><b>Prevent:</b> <code>"dynamic": "strict"</code> in production mappings, and a review of every new field.</p>
+<p><b>Why a field count limit exists.</b> Every field is stored in the mapping, which is part of the cluster state sent to all nodes and held in memory. Thousands of fields make cluster state updates slow, bloat heap, and make searches (especially <code>*</code> field patterns and <code>query_string</code> over all fields) expensive. The default limit of 1,000 (<code>index.mapping.total_fields.limit</code>) is a guard rail, and it is almost always a symptom of a modelling mistake.</p>
+<p><b>How it happens, with a typical example.</b> A service stores user attributes as a JSON map <code>{"attrs": {"color_pref": "red", "plan_2024_q1": "gold", "u12345_flag": true}}</code>. Each new key becomes a new field. After enough tenants and months, there are tens of thousands of distinct keys.</p>
+<p><b>The three data shapes to choose from.</b></p>
+<table>
+<tr><th>Shape</th><th>Fields created</th><th>Query</th><th>Use when</th></tr>
+<tr><td>keys as field names</td><td>one per key (unbounded)</td><td><code>attrs.color: red</code></td><td>small fixed set of keys only</td></tr>
+<tr><td><code>[{k, v}]</code> list, <code>nested</code></td><td>2 fixed fields</td><td><code>nested</code> query on <code>k</code> and <code>v</code> together</td><td>need exact pairing of key and value</td></tr>
+<tr><td><code>flattened</code> type</td><td>1 field</td><td><code>attrs.color: red</code> as exact keyword match</td><td>unknown keys, only exact-match or prefix needs, no per-key analysis or numeric ranges</td></tr>
+</table>
+<p>With <code>flattened</code>, all leaf values are indexed as keywords in one field, so you lose per-key types, analysis and numeric range queries, but you keep simple filtering on any key. If you need per-key full-text or range, the nested list or a separate index per attribute family is better. Another approach is to keep unknown data in <code>_source</code> only with <code>"dynamic": false</code> or <code>"enabled": false</code> on that object, so it is stored and returned but not indexed.</p>
+<p><b>Repair steps.</b> (1) Find the culprit: <code>GET index/_mapping</code> and count children per object (a short script helps). (2) Stop the bleeding with a mapping that has <code>dynamic: strict</code> or <code>false</code> on that object. (3) Fix the producer to send the new shape. (4) Reindex into a new index (existing fields cannot be removed from a mapping), optionally with a Painless script or an ingest pipeline that transforms old documents into the new shape. (5) Flip the alias.</p>
+<p><b>Do not</b> just raise the limit to 100,000. It postpones the incident and leaves a heavy cluster state. If asked what else grows with mappings: <code>index.mapping.depth.limit</code> (20 levels), and the number of nested fields (50).</p>
 <p class="rem"><b>Remember:</b> keys must not be data. Key/value lists or flattened, strict mappings, reindex to repair.</p>
 </div>
 </details>
@@ -934,6 +1634,18 @@ POST _aliases
 { "actions": [ { "remove": { "index": "products_v1", "alias": "products_read" } },
                { "add":    { "index": "products_v2", "alias": "products_read" } } ] }</code></pre>
 <p><b>Prevent:</b> always code against aliases and keep a rebuild path from the source of truth.</p>
+<p><b>The hard part is not the copy, it is the writes during the copy.</b> A 200-million-document reindex can take hours. While it runs, the product team still edits products, and new products come in. If you copy a snapshot and flip the alias, everything written in those hours is missing from the new index. So the plan needs a way to capture changes.</p>
+<p><b>Three ways to handle writes during the copy.</b></p>
+<table>
+<tr><th>Approach</th><th>How</th><th>Trade-off</th></tr>
+<tr><td>Dual write to both indices</td><td>write alias points to v1 and v2 (or the indexer writes both) while the copy runs</td><td>simple; copy must not overwrite newer data (use external versions)</td></tr>
+<tr><td>Replay from the source</td><td>record the position (Kafka offset, <code>updated_at</code>) at the copy start; after the copy, replay changes since then into v2</td><td>cleanest if you have a log or timestamp</td></tr>
+<tr><td>Rebuild from the database</td><td>skip <code>_reindex</code>; bulk-load v2 from the DB, then replay</td><td>fixes drift too; needs a DB export path</td></tr>
+</table>
+<p><b>Why <code>version_type: external</code> in the reindex.</b> A document copied from v1 may be older than a document that the live indexer already wrote to v2 for the same id. With external versions (the document's version or <code>updated_at</code> as a number), the copy gets a 409 conflict for the stale one and does not overwrite the newer one. Set <code>conflicts: proceed</code> on the reindex so those conflicts are counted, not fatal.</p>
+<p><b>Speed and safety settings on v2 during the copy.</b> <code>refresh_interval: -1</code>, <code>number_of_replicas: 0</code>, then restore both and wait for green before the flip. Use <code>slices: auto</code> for parallel reads and <code>requests_per_second</code> to throttle so live searches on v1 are not hurt. Run with <code>wait_for_completion=false</code> and track the task (<code>GET _tasks/ID</code>), since an HTTP call cannot stay open for hours.</p>
+<p><b>Validation before the flip.</b> Compare <code>_count</code> on both, compare counts per important filter (status, tenant), and run a sample of real queries against both and diff the top results. Only then run the atomic alias action. The flip is instant and reversible: to roll back, run the inverse action.</p>
+<p><b>After the flip.</b> Keep v1 read-only for a day or so. Delete when happy. If you changed analysis (a text field to keyword), also update the application queries (for example <code>match</code> to <code>term</code>) in the same release, ideally behind a feature flag that follows the alias flip.</p>
 <p class="rem"><b>Remember:</b> new index, reindex in background, catch up on writes, atomic alias flip, keep the old index for rollback.</p>
 </div>
 </details>
@@ -955,6 +1667,16 @@ GET products/_search
     "should": [ { "match_phrase": { "name": { "query": "iphone case", "boost": 2 } } } ] } } }</code></pre>
 <p>Stemming makes <code>cases</code> and <code>case</code> the same term. <code>operator: and</code> requires both words, <code>match_phrase</code> in <code>should</code> rewards the exact phrase, and boosting <code>category</code> lifts documents that are really in the "Cases" category. A synonym list (case, cover) can be added carefully. Measure with a fixed set of example queries before and after.</p>
 <p><b>Prevent:</b> keep a test list of important queries with the expected top results, and review it whenever analysis or boosts change.</p>
+<p><b>Split the complaint into two different bugs.</b> People often treat "search is bad" as one problem. Here there are two distinct causes and two kinds of fix.</p>
+<p><b>Bug 1: "cases" returns nothing (recall problem).</b> Use <code>POST products/_analyze</code> with the field and text "cases". With the standard analyzer the output is <code>cases</code>, but the document contains <code>case</code>. The terms differ, so there is no match. Fix with a stemmer or lemmatiser in the analyzer, so both become <code>case</code> (this also helps "cover", if you add a synonym <code>case, cover</code> carefully). Remember to reindex, since changing an analyzer needs new index data.</p>
+<p><b>Bug 2: "iphone case" shows phones first (precision and ranking problem).</b> Default <code>match</code> uses OR: a document matching only "iphone" (a phone) is a valid hit, and "iphone" is a rarer word than "case" so it carries a high idf weight. Phones, whose titles are short and contain "iphone", outscore cases whose titles are longer. Three changes help:</p>
+<ol>
+<li><b>Require both words</b> (<code>operator: and</code> or <code>minimum_should_match: 75%</code>), so a plain phone no longer qualifies.</li>
+<li><b>Reward the phrase</b> in a <code>should</code> (<code>match_phrase</code>), which lifts "iPhone 15 case" items above scattered matches.</li>
+<li><b>Use category signal:</b> boost <code>category</code> matches, or classify the query ("case" is an accessory word) and add a filter or boost on category = Accessories. The best mature solutions detect product type from the query and use it as a strong signal.</li>
+</ol>
+<p><b>How to verify without guessing.</b> Run <code>_explain</code> for the top phone and the top case for the query and compare their score trees: you will see the idf and field length numbers. After changes, replay a fixed list of 50 to 100 queries and compare top-5 before and after. Track a metric such as the share of queries with a click in the top 3, and zero-result rate.</p>
+<p><b>Cautions.</b> Aggressive stemming can create false matches ("organization" and "organ"); test with real vocabulary. Stop words and synonyms should be curated (a synonym file under version control, with reload or reindex procedure). Do not tune boosts to fix one query: add it to the test list and look at the whole set.</p>
 <p class="rem"><b>Remember:</b> no match = analysis, wrong order = scoring. Stemmer + AND + phrase bonus + field boosts, then test with real queries.</p>
 </div>
 </details>
@@ -973,6 +1695,17 @@ GET _search
   "search_after": [ 1731800000000, "p-981" ] }</code></pre>
 <p>Loop until a page returns fewer than <code>size</code> hits, remember the last hit's sort values for the next call, and delete the PIT at the end. For a huge CSV export, run it as a background job and let the user download the file later, instead of holding an HTTP request open.</p>
 <p><b>Prevent:</b> cap the page number in the API, and give users filters and sorting instead of deep paging.</p>
+<p><b>Understand who is calling.</b> A request for page 2,000 is almost never a human. Typical sources: a nightly export or sync job written with a page loop, a web crawler or API client scraping all results, or a front end that lets the user type a page number. Ask who it is before choosing the fix, because the right answer differs.</p>
+<table>
+<tr><th>Caller</th><th>Right fix</th></tr>
+<tr><td>Export or sync job</td><td>PIT + <code>search_after</code> loop in a background job, results to a file or queue</td></tr>
+<tr><td>Scraper or API consumer</td><td>offer a cursor-based API (<code>next_cursor</code> token carrying the last sort values), and rate-limit; cap page depth</td></tr>
+<tr><td>Human UI</td><td>limit the page count (for example 100 pages), offer filters and sorting, and show "refine your search"</td></tr>
+</table>
+<p><b>Why raising <code>max_result_window</code> is wrong.</b> You would allow a request that makes each shard collect and sort 100,000 or a million entries. One client doing this a few times concurrently can exhaust heap and trigger circuit breaker errors for everyone. The limit is protection, so an API should return a clear 400 for too-deep pages instead of passing the problem to ES.</p>
+<p><b>Design of the cursor.</b> The cursor given to the client is an opaque, signed or encoded string that contains the last hit's sort values (and, if you use PIT, the PIT id and its expiry). Clients cannot jump, but "next" is cheap. If the PIT expires, restart from the stored sort values with a fresh PIT, accepting that you may see small inconsistencies.</p>
+<p><b>Export design.</b> A background job writes pages of 1,000 to 5,000 to a file (CSV or Parquet) or a queue, reports progress, and stores a file link for download. HTTP requests are not held open for minutes. If the export is huge and has no query (everything), consider reading from the database or the data lake instead, since the search engine is not the best source for full dumps.</p>
+<p><b>Verification.</b> Test with a data set larger than 10,000 documents, and with concurrent writes while the export runs, checking count equality and no duplicate ids in the output.</p>
 <p class="rem"><b>Remember:</b> never raise max_result_window as a fix. UI = search_after, export = PIT + search_after in a background job.</p>
 </div>
 </details>
@@ -990,6 +1723,17 @@ GET _search
 <li>Use stable ids so a retry overwrites instead of duplicating.</li>
 </ul>
 <p><b>Prevent:</b> use the client's bulk helper with backpressure, alert on a non-zero failed-items count, and finish the run with a count check against the source.</p>
+<p><b>What a 429 means inside ES.</b> Each node has thread pools with bounded queues (the <code>write</code> pool handles indexing, bulk and update requests). When the queue is full, new requests are rejected with <code>es_rejected_execution_exception</code>, HTTP 429. It is a back-pressure signal: "slow down". Recent versions also reject at the coordinating level when the in-flight indexing bytes exceed a memory limit (<code>indexing_pressure</code>), again with 429.</p>
+<p><b>Why documents went missing.</b> Many clients, when a bulk request returns HTTP 200, assume success. The 429 appears only inside the per-item results, so those documents were silently dropped. This is the single most common bulk bug. The fix is code, not cluster: inspect <code>errors</code> and item statuses every time.</p>
+<p><b>Fix in order of impact.</b></p>
+<ol>
+<li><b>Handle the response:</b> retry only the 429 and 5xx items, with backoff and a maximum attempt count; log or dead-letter permanent errors (400).</li>
+<li><b>Apply back-pressure:</b> use a bounded number of concurrent bulk requests, and when you see 429s, reduce the rate (an adaptive producer). The client helpers (<code>BulkIngester</code>, <code>BulkProcessor</code>, Python's <code>parallel_bulk</code>, Logstash) already provide this; use them.</li>
+<li><b>Tune the target for loading:</b> <code>refresh_interval: -1</code> (or 30 s), replicas 0 during an initial load, a modest number of shards that spread across nodes, and let ES assign ids when you can.</li>
+<li><b>Check the cluster is healthy:</b> a node with a slow disk, long GC pauses or too many shards will reject more. Look at <code>_cat/thread_pool/write?v</code> for queue and rejected counts, and node stats for heap and disk.</li>
+</ol>
+<p><b>Do not</b> just increase the write queue size. A longer queue only hides overload, uses heap, and increases latency until it fails more badly.</p>
+<p><b>Verification at the end.</b> After the job, compare the number of documents sent with <code>_count</code> (for a fresh index) and with the number of successful items your code tallied. Have the job fail loudly if there is any unresolved item.</p>
 <p class="rem"><b>Remember:</b> bulk returns 200 with per-item failures. Retry 429 items with backoff, slow down, relax refresh and replicas during the load.</p>
 </div>
 </details>
@@ -1003,6 +1747,19 @@ GET _search
 <pre><code>POST products/_delete_by_query
 { "query": { "terms": { "id": ["p-17", "p-18", "p-19"] } } }</code></pre>
 <p><b>Prevent:</b> a nightly reconciliation job that compares ids or counts between DB and ES and alerts on a difference, plus a tested full-rebuild path. Treat ES as a rebuildable cache of the database.</p>
+<p><b>Why both symptoms point to the pipeline.</b> Zombie documents (deleted in the DB, still in search) mean delete events are never applied: perhaps polling by <code>updated_at</code> only sees live rows, or the consumer ignores delete messages, or the delete event failed and was dropped. Missing new documents mean index events were lost, rejected (mapping error, 429), or stuck behind a poison message in the queue.</p>
+<p><b>Investigation steps.</b></p>
+<ol>
+<li><b>Quantify.</b> Take a stable slice (for example created last week) and compare DB ids to ES ids, using <code>_search</code> with only <code>_id</code> and <code>"_source": false</code> via <code>search_after</code> loops, or count per day on both sides. Note whether the gaps are random or clustered in time (an outage, a deployment, a schema change).</li>
+<li><b>Find the cause in the pipeline.</b> Look for consumer lag, a dead-letter queue, bulk failures (400 mapping errors, 429), logs from the indexer in the gap period, and whether soft deletes are handled.</li>
+<li><b>Check the nature of the deletes.</b> Hard deletes in the DB are the usual blind spot of polling jobs. Soft deletes (status = deleted) need the search query or the indexer to remove them.</li>
+</ol>
+<p><b>Repair strategies.</b></p>
+<ul>
+<li><b>Targeted:</b> re-publish events for the affected id range, or <code>_delete_by_query</code> for ids found in ES but not in the DB.</li>
+<li><b>Full rebuild:</b> build a new index from the database, replay recent events, then flip the alias. Safest when the extent is unknown.</li>
+</ul>
+<p><b>Permanent fixes.</b> Delete events in the outbox or CDC stream, idempotent writes with external versions, retries with a dead-letter queue and alerts on it, and a nightly reconciliation job that compares counts per day or ids by range and posts a metric (drift count). Add a visible "last indexed" lag metric. A good closing line: "I treat the index as a rebuildable cache, so the first thing I make sure of is that a rebuild is a routine, tested button and not a heroic project."</p>
 <p class="rem"><b>Remember:</b> ES is a derived copy. Detect drift with reconciliation, repair by reindexing from the DB, and fix delete handling.</p>
 </div>
 </details>
