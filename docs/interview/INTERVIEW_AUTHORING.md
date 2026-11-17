@@ -4,6 +4,17 @@ One page per topic: `C:/Users/kmangali/HLD/interview/topics/<slug>.html`. The re
 
 Do NOT copy the old Q&A in `C:/Users/kmangali/Personal Repos/Interview-Preparation/<Topic>`. That repo is only a topic checklist: read it to see what is covered, then write fresh, better, deeper content from your own knowledge. Where the repo is wrong or shallow, correct it.
 
+## Audience and depth (the user asked for this explicitly)
+The reader is a SENIOR SOFTWARE ENGINEER with 5 to 10 years of experience, interviewing for developer roles. Write at the depth such a developer is expected to have: what they use daily, how it works well enough to debug and design with it, and the trade-offs they must be able to explain. Do NOT go to DevOps/SRE/platform-specialist depth (for example for CI/CD: pipelines, deployment strategies, rollbacks, secrets, common failures yes; Jenkins plugin internals, cluster operations, capacity planning, kernel-level tuning no). If a topic is a specialist area, cover what an application developer must know and mention in one line where the specialist depth begins. Remove any question that only a dedicated ops or infrastructure engineer would be asked.
+
+## Quality bar (the user asked for this explicitly)
+- Answers must be DETAILED yet SIMPLE: written the way a friendly senior colleague explains it out loud. Natural, conversational English. Short sentences, everyday words, one idea at a time. Explain the "why" before the "how". Use a small concrete example or analogy in most answers.
+- Never leave a term unexplained. If you must use jargon, define it in a few plain words right there.
+- A model answer is 6 to 12 sentences for normal questions (more with code or a diagram). Not a bullet dump of keywords: bullets only for lists of options or steps.
+- Questions are the ones really asked in interviews for senior engineers (8+ years): mix "what and why", "how does it work inside", "compare X and Y", "what happens when...", debugging, design, and production incidents.
+- Accuracy over volume. For anything version-specific say which version. If unsure, say "typically" or leave it out. Review your own facts at the end.
+- Use `interview/topics/git.html` as the exemplar for depth, tone, structure, markup and diagram quality. Read at least its first 400 lines before writing.
+
 ## Reference pages (read first)
 - `quicknotes/notes/q04-caching.html` for tone, `tl`/`say`/`trap`/`nums` boxes, tables, diagram style.
 - `quicknotes/assets/quick.css`, `interview/assets/interview.css` for classes.

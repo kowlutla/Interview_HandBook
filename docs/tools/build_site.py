@@ -244,6 +244,19 @@ write(os.path.join(QN, 'index.html'), qindex)
 IV = os.path.join(ROOT, 'interview')
 INT_TOPICS = [  # slug, short title. Order = reading order. Only topics whose page exists are built.
     ('git', 'Git'),
+    ('maven-gradle', 'Maven and Gradle'),
+    ('ci-cd', 'CI/CD'),
+    ('docker-kubernetes', 'Docker, Kubernetes and Helm'),
+    ('redis-caching', 'Redis and Caching'),
+    ('elasticsearch', 'Elasticsearch'),
+    ('hibernate-jpa', 'Hibernate and JPA'),
+    ('kafka', 'Kafka'),
+    ('microservices-rest', 'Microservices and REST APIs'),
+    ('distributed-systems', 'Distributed Systems'),
+    ('sql-databases', 'SQL and Databases'),
+    ('design-patterns-lld', 'Design Patterns and LLD'),
+    ('data-engineering', 'Data Engineering (Avro, Iceberg)'),
+    ('spark', 'Apache Spark'),
 ]
 INT_TOPICS = [t for t in INT_TOPICS if os.path.exists(os.path.join(IV, 'topics', t[0] + '.html'))]
 
