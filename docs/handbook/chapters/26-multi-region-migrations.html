@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 26: Multi-Region Data and Migrations | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="26-multi-region-migrations">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+  </defs>
+</svg>
+
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+
+<main>
+<div class="kicker">Chapter 26 · Module 3 · Data and storage</div>
+<h1>Multi-Region Data and Migrations</h1>
+<p class="lead">Running your data in more than one region buys lower latency, survival of a regional outage, and compliance with data-residency law, but it forces you to pay the speed of light on every write. The second half of the chapter covers the other hard data problem of a long-lived system: changing schemas, databases and shard keys while the system keeps serving traffic.</p>
+
+<!-- ======================= 1 ======================= -->
+<h2 id="why">1. Why go multi-region at all</h2>
+
+<p>A <b>region</b> is a geographic area (for example Northern Virginia, Frankfurt, or Singapore) that contains several <b>availability zones</b>, which are separate data centers with independent power and networking, connected by fast links a few milliseconds apart. Most systems start in one region, using several zones inside it for resilience. That already survives the loss of a machine, a rack, or one data center. Going to two or more regions is a much bigger step, and you should be able to name the reason for it. There are four common reasons.</p>
+
+<ul>
+  <li><b>Latency.</b> A user in Sydney talking to a database in Virginia pays roughly 200 ms per round trip (section 5 gives numbers). If a page needs three sequential database calls, that is over half a second the user feels. Placing data and compute near users removes that cost for reads, and sometimes for writes.</li>
+  <li><b>Availability.</b> Whole regions do fail: a bad network configuration push, a power or cooling event, a cloud control-plane bug. If your business cannot tolerate hours of downtime, a second region that can take over is the only protection against a regional failure. See <a href="41-ha-dr.html">Chapter 41</a> for the broader high-availability and disaster-recovery picture; this chapter focuses on the data.</li>
+  <li><b>Data residency.</b> Some laws and contracts require that certain data about certain people stays inside a country or bloc (for example personal data of EU residents, or health data in some countries). This forces data to be stored in a particular region regardless of performance. <a href="56-privacy-cost-mobile.html">Chapter 56</a> covers the privacy side.</li>
+  <li><b>Disaster recovery (DR).</b> Even if you never serve users from a second region, keeping a copy of the data elsewhere protects against losing the primary region permanently. Here the goals are two numbers: <b>RPO</b> (recovery point objective: how much recent data you can afford to lose) and <b>RTO</b> (recovery time objective: how long you can be down).</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b>
+Multi-region is not one decision but a spectrum. At one end you keep a cold backup in another region and accept hours of downtime. At the other end every region accepts writes and users never notice a region failing. Each step to the right buys availability and latency and costs money, complexity, and consistency. The interview skill is to pick the cheapest point on the spectrum that meets the stated requirement.
+</div>
+
+<div class="callout tip"><b>Interview tip</b>
+Do not say "we will go multi-region for scale." A single region scales to enormous sizes. Name the actual driver: a latency target for distant users, an availability target such as 99.99% that a single region cannot reliably give, or a residency rule. The driver decides the topology.
+</div>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="topologies">2. Topologies: from one region with DR to active-active</h2>
+
+<p>Here are the main shapes, from simplest to most demanding. Throughout, the word <b>primary</b> means the copy of the data that accepts writes, and a <b>replica</b> is a copy kept up to date by <a href="24-replication.html">replication</a> (Chapter 24).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Three multi-region topologies side by side">
+  <text class="t-c t-b" x="150" y="20">Active-passive</text>
+  <text class="t-c t-b" x="450" y="20">Active-active (every region writes)</text>
+  <text class="t-c t-b" x="750" y="20">Home-region ownership</text>
+
+  <rect class="ext" x="40" y="40" width="220" height="34" rx="8"/><text class="t-c t-sm" x="150" y="62">All users</text>
+  <rect class="box" x="30" y="110" width="110" height="60" rx="8"/><text class="t-c t-b" x="85" y="136">Region A</text><text class="t-c t-sm" x="85" y="154">serves traffic</text>
+  <rect class="miss" x="160" y="110" width="110" height="60" rx="8"/><text class="t-c t-b" x="215" y="136">Region B</text><text class="t-c t-sm" x="215" y="154">standby</text>
+  <rect class="db" x="30" y="210" width="110" height="50" rx="8"/><text class="t-c t-b" x="85" y="232">Primary DB</text><text class="t-c t-sm" x="85" y="248">accepts writes</text>
+  <rect class="db" x="160" y="210" width="110" height="50" rx="8"/><text class="t-c t-b" x="215" y="232">Replica</text><text class="t-c t-sm" x="215" y="248">read-only</text>
+  <path class="arrow" d="M150 74 L85 108"/><path class="arrow dash" d="M150 74 L215 108"/>
+  <path class="arrow" d="M85 170 L85 208"/><path class="arrow" d="M215 170 L215 208"/>
+  <path class="arrow dash" d="M142 235 L158 235"/>
+  <text class="t-c t-sm" x="150" y="290">Async replication A to B.</text>
+  <text class="t-c t-sm" x="150" y="308">Failover = promote B.</text>
+  <text class="t-c t-sm" x="150" y="326">Simple. RPO &gt; 0 possible.</text>
+
+  <rect class="ext" x="345" y="40" width="110" height="34" rx="8"/><text class="t-c t-sm" x="400" y="62">Users near A</text>
+  <rect class="ext" x="465" y="40" width="110" height="34" rx="8"/><text class="t-c t-sm" x="520" y="62">Users near B</text>
+  <rect class="box" x="345" y="110" width="110" height="60" rx="8"/><text class="t-c t-b" x="400" y="136">Region A</text><text class="t-c t-sm" x="400" y="154">reads + writes</text>
+  <rect class="box" x="465" y="110" width="110" height="60" rx="8"/><text class="t-c t-b" x="520" y="136">Region B</text><text class="t-c t-sm" x="520" y="154">reads + writes</text>
+  <rect class="db" x="345" y="210" width="110" height="50" rx="8"/><text class="t-c t-b" x="400" y="240">DB copy A</text>
+  <rect class="db" x="465" y="210" width="110" height="50" rx="8"/><text class="t-c t-b" x="520" y="240">DB copy B</text>
+  <path class="arrow" d="M400 74 L400 108"/><path class="arrow" d="M520 74 L520 108"/>
+  <path class="arrow" d="M400 170 L400 208"/><path class="arrow" d="M520 170 L520 208"/>
+  <path class="arrow dash" d="M457 228 L463 228"/><path class="arrow dash" d="M463 242 L457 242"/>
+  <text class="t-c t-sm" x="450" y="290">Two-way replication or</text>
+  <text class="t-c t-sm" x="450" y="308">consensus across regions.</text>
+  <text class="t-c t-sm" x="450" y="326">Conflicts must be handled.</text>
+
+  <rect class="ext" x="650" y="40" width="200" height="34" rx="8"/><text class="t-c t-sm" x="750" y="62">Router: user's home region</text>
+  <rect class="box" x="640" y="110" width="100" height="60" rx="8"/><text class="t-c t-b" x="690" y="136">EU region</text><text class="t-c t-sm" x="690" y="154">owns EU users</text>
+  <rect class="box" x="760" y="110" width="100" height="60" rx="8"/><text class="t-c t-b" x="810" y="136">US region</text><text class="t-c t-sm" x="810" y="154">owns US users</text>
+  <rect class="db" x="640" y="210" width="100" height="50" rx="8"/><text class="t-c t-b" x="690" y="240">EU data</text>
+  <rect class="db" x="760" y="210" width="100" height="50" rx="8"/><text class="t-c t-b" x="810" y="240">US data</text>
+  <path class="arrow" d="M720 74 L690 108"/><path class="arrow" d="M780 74 L810 108"/>
+  <path class="arrow" d="M690 170 L690 208"/><path class="arrow" d="M810 170 L810 208"/>
+  <text class="t-c t-sm" x="750" y="290">Each key has exactly one writer.</text>
+  <text class="t-c t-sm" x="750" y="308">No write conflicts. Cross-region</text>
+  <text class="t-c t-sm" x="750" y="326">access is slow for traveling users.</text>
+  <rect class="cache" x="40" y="350" width="820" height="36" rx="8"/>
+  <text class="t-c t-sm" x="450" y="373">Moving right on the page = more availability and lower latency, but more cost and more consistency work.</text>
+</svg>
+<figcaption>Left: one region does the work and the other waits. Middle: both regions write the same data, so conflicts are possible. Right: each piece of data has a single owning region, so there are no conflicts, and users are routed to their data.</figcaption>
+</figure>
+
+<h3>2.1 Single region with DR backups</h3>
+<p>All traffic and all writes go to one region, spread across zones. You regularly copy backups and, often, a stream of the write-ahead log to a second region. If the primary region is lost, you build or wake up the environment in the second region and restore. This is the cheapest option. RPO is the age of the newest copy that made it across (seconds to minutes with log shipping, hours with nightly backups) and RTO is typically hours, because someone must restore data, deploy services, and shift traffic. Appropriate for internal tools and many business systems.</p>
+
+<h3>2.2 Active-passive (warm or cold standby)</h3>
+<p>Two regions both hold the data, but only one (the <b>active</b> region) serves traffic and accepts writes. The other (<b>passive</b>) receives replication.</p>
+<ul>
+  <li><b>Cold standby:</b> the passive region has the data but little or no running compute. On failover you launch servers, which takes minutes to tens of minutes. Cheap, slower RTO.</li>
+  <li><b>Warm standby:</b> the passive region runs a scaled-down but real copy of the stack, with databases replicating and services already running at low capacity. On failover you scale up and flip traffic. RTO is minutes. Cost is perhaps 20-50 percent of the active region.</li>
+  <li><b>Hot standby:</b> the passive region runs at full capacity and could take all traffic immediately, but still does not take writes under normal operation. Cost approaches double.</li>
+</ul>
+<p>Because replication between regions is normally asynchronous (section 5 explains why), a failover can lose the last few hundred milliseconds to seconds of writes, the unreplicated tail. That is the nonzero RPO. The big advantage of active-passive is that there is only ever one writer, so there are no write conflicts and the consistency story is the same as a single region.</p>
+
+<h3>2.3 Active-active</h3>
+<p>Every region serves users and accepts writes. This is the strongest for latency and availability: a region can vanish and the rest simply keep working, with no promotion step. The cost is the central difficulty of this chapter: if two regions can both modify the same piece of data at nearly the same time, the system must either make them agree before acknowledging (slow, section 5) or reconcile the conflicting versions afterwards (section 4). There is no free option.</p>
+
+<h3>2.4 Follower reads</h3>
+<p>A middle path: writes go to a single leader region, but each region has local read replicas, and reads are served from the nearest one. Most traffic in most applications is reads, so this captures a large share of the latency benefit. The price is that a local replica may be slightly behind, so a user might not see their own just-made change. Standard fixes are <b>read-your-writes</b> routing (after a user writes, send their reads to the leader, or to a replica that has caught up to their write's log position, for a short window) and session tokens that carry the position they last saw. Some systems (Spanner, CockroachDB) offer <b>stale reads</b> explicitly, letting you say "any data at most 10 seconds old is fine" so a local replica can answer with no coordination.</p>
+
+<h3>2.5 Regional ownership (home region)</h3>
+<p>Each record is assigned a <b>home region</b>, typically based on the user: a European user's data lives in and is written from the EU region. All writes to that record go to its home. Different users have different homes, so every region is active for its own data and there are no write conflicts, because for any key exactly one region accepts writes. Reads can still be served from copies elsewhere if allowed. This is the model used when residency is a requirement, and also the easiest active-active variant to reason about. The weakness is anything that touches data owned by two regions (a transfer between a US user and an EU user), and a user who travels far from home, who pays cross-region latency or must be re-homed. Section 7 covers the routing.</p>
+
+<table>
+<tr><th>Topology</th><th>Writes</th><th>Typical RPO / RTO</th><th>Main difficulty</th><th>Relative cost</th></tr>
+<tr><td>Single region + DR backups</td><td>One region</td><td>Minutes-hours / hours</td><td>Restore drills actually working</td><td>1.1x</td></tr>
+<tr><td>Active-passive warm</td><td>One region</td><td>Seconds / minutes</td><td>Failover tooling, failback, split-brain</td><td>1.3-1.6x</td></tr>
+<tr><td>Follower reads</td><td>One region</td><td>Seconds / minutes</td><td>Stale reads, read-your-writes</td><td>1.5-2x</td></tr>
+<tr><td>Home-region ownership</td><td>One region per key</td><td>Depends on in-region HA</td><td>Cross-owner operations, re-homing</td><td>1.5-2x</td></tr>
+<tr><td>Active-active, conflicts resolved</td><td>All regions</td><td>Near zero / near zero</td><td>Conflict semantics, correctness</td><td>2x or more</td></tr>
+<tr><td>Active-active, consensus-based</td><td>All regions, coordinated</td><td>Zero / seconds</td><td>Write latency across regions</td><td>2x or more</td></tr>
+</table>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="global-dbs">3. Global databases at a conceptual level</h2>
+
+<p>Several products package multi-region behaviour so you do not build it yourself. You should know each at the level of "what model does it use and what does that cost you," not their configuration screens. This section sticks to well-known properties.</p>
+
+<h3>3.1 Google Spanner and the TrueTime idea</h3>
+<p>Spanner is a globally distributed relational database offering strongly consistent, externally consistent transactions across regions. Data is split into ranges; each range is replicated across zones or regions using a consensus protocol (Paxos, see <a href="29-consensus.html">Chapter 29</a>), with a leader that orders writes. A write is acknowledged once a <b>majority</b> of replicas have it. If the replicas are in different regions, every commit pays at least one cross-region round trip to the nearest majority, which is why Spanner configurations put a write quorum in nearby regions where possible.</p>
+<p>The famous idea is <b>TrueTime</b>. Distributed transactions need a global order of events, but clocks on different machines disagree. Spanner uses GPS receivers and atomic clocks in each data center and exposes the clock as an <i>interval</i> rather than a point: "the true time is somewhere between earliest and latest," with a small uncertainty (a few milliseconds). When a transaction commits, Spanner picks a commit timestamp and then <b>waits out the uncertainty</b> ("commit wait") before making the result visible, so that any transaction that starts afterward is guaranteed a later timestamp. The result is that timestamps agree with real-time order, which lets Spanner serve consistent snapshot reads at a chosen timestamp from any replica that is caught up, without locking. The lesson for interviews: synchronized, bounded-error clocks can replace some coordination, at the price of small waits on every commit.</p>
+
+<h3>3.2 CockroachDB and YugabyteDB</h3>
+<p>These are open-source-style distributed SQL databases inspired by Spanner. Data is split into ranges, each replicated with Raft (a consensus protocol, again <a href="29-consensus.html">Chapter 29</a>), with a leaseholder serving reads for each range. Without atomic clocks, they rely on ordinary hybrid logical clocks plus a configured maximum clock offset, and restart or wait transactions that fall in the uncertainty window. They give you knobs to control where replicas live: you can pin a table (or rows of a table, by a region column) to a region, which is exactly home-region ownership with SQL on top. A table can also be configured so reads are fast everywhere but writes pay the cross-region cost ("global tables"), which suits small, rarely changed reference data.</p>
+
+<h3>3.3 DynamoDB global tables</h3>
+<p>A DynamoDB global table is a set of replica tables in multiple regions that all accept writes. A write is committed locally and then asynchronously replicated to the other regions, typically within about a second. If the same item is written in two regions concurrently, the system resolves it by <b>last writer wins</b> using a timestamp (section 4.1). There are no multi-region transactions across replicas in the classic mode. This is the archetypal "eventually consistent active-active": very low write latency everywhere, simple operation, and you must design your data so that concurrent conflicting writes are rare or harmless. Newer modes add stronger multi-region consistency options, but the classic LWW behaviour is what interviewers expect you to know.</p>
+
+<h3>3.4 Azure Cosmos DB</h3>
+<p>Cosmos DB offers multi-region replication with a menu of five consistency levels: strong, bounded staleness, session, consistent prefix, and eventual. You can enable multi-region writes, in which case conflicts are resolved by a policy you choose, last-writer-wins on a timestamp or another numeric property, or a custom merge procedure. The notable teaching point is the explicit menu: strong consistency across regions limits how far apart regions can be and raises write latency; weaker levels are cheaper and faster. It is a clear example of "consistency per use" as a product feature.</p>
+
+<h3>3.5 Amazon Aurora Global Database</h3>
+<p>Aurora Global Database has one primary region that takes writes and up to several secondary regions with read-only replicas. Replication happens at the storage layer, typically with lag under a second. Reads in secondary regions are local and fast. If the primary region fails, you promote a secondary (managed failover), accepting an RPO of the replication lag. It is therefore active-passive with follower reads, plus an option to forward writes from secondary regions to the primary at the cost of cross-region latency. Simple, familiar relational semantics, but not true multi-writer.</p>
+
+<table>
+<tr><th>System</th><th>Write model</th><th>Cross-region write cost</th><th>Conflict handling</th></tr>
+<tr><td>Spanner</td><td>Consensus per range, multi-region optional</td><td>Round trip to a nearby majority plus commit wait</td><td>None needed; transactions serialize</td></tr>
+<tr><td>CockroachDB / Yugabyte</td><td>Raft per range, locality-pinned</td><td>Round trip to majority; zero if pinned to home region</td><td>None needed; transactions serialize</td></tr>
+<tr><td>DynamoDB global tables (classic)</td><td>Local write, async replicate</td><td>None on the write path</td><td>Last writer wins</td></tr>
+<tr><td>Cosmos DB multi-region writes</td><td>Local write, async replicate</td><td>None on the write path (depends on level)</td><td>LWW or custom policy</td></tr>
+<tr><td>Aurora Global</td><td>Single primary region</td><td>Forwarded writes pay a round trip</td><td>None; single writer</td></tr>
+</table>
+
+<div class="callout key"><b>Key idea</b>
+Global databases split into two families. <b>Coordinated</b> systems (Spanner, CockroachDB) keep the strong guarantees and make you pay latency on writes that span regions. <b>Replicated and reconciled</b> systems (DynamoDB global tables, Cosmos multi-write) keep writes fast and make you accept that two regions can briefly disagree, and that some update may be overwritten. Which family fits depends on the feature, not the company.
+</div>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="conflicts">4. Conflict handling in active-active</h2>
+
+<p>A <b>write conflict</b> arises when two regions modify the same record before either has heard about the other's change. Neither region did anything wrong locally, but when the changes meet, the system must decide what the record now says. Suppose a user's display name is "Ann" and the user changes it to "Anna" in the EU region while a support tool in the US region sets it to "Ann B" within the same 100 ms. Replication takes longer than 100 ms, so each region accepts its own write, then receives the other's.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Concurrent writes in two regions create a conflict that is resolved by last writer wins">
+  <rect class="box" x="120" y="14" width="160" height="34" rx="8"/><text class="t-c t-b" x="200" y="36">Region EU</text>
+  <rect class="box" x="620" y="14" width="160" height="34" rx="8"/><text class="t-c t-b" x="700" y="36">Region US</text>
+  <line class="life" x1="200" y1="48" x2="200" y2="320"/><line class="life" x1="700" y1="48" x2="700" y2="320"/>
+
+  <text class="t-sm" x="215" y="80">t=100 ms: write name="Anna" (clock 100)</text>
+  <text class="t-sm" x="715" y="110">t=130 ms: write name="Ann B" (clock 130)</text>
+  <rect class="hit" x="60" y="86" width="130" height="26" rx="6"/><text class="t-c t-sm" x="125" y="104">EU shows: Anna</text>
+  <rect class="hit" x="710" y="118" width="150" height="26" rx="6"/><text class="t-c t-sm" x="785" y="136">US shows: Ann B</text>
+
+  <path class="arrow dash" d="M204 160 L696 190"/><text class="t-sm" x="300" y="164">async replicate "Anna"@100 (takes ~150 ms)</text>
+  <path class="arrow dash" d="M696 220 L204 250"/><text class="t-sm" x="300" y="226">async replicate "Ann B"@130</text>
+
+  <rect class="miss" x="40" y="262" width="260" height="50" rx="8"/><text class="t-sm" x="52" y="282">EU compares: 130 &gt; 100, keeps "Ann B".</text><text class="t-sm" x="52" y="300">The user's own edit "Anna" is lost.</text>
+  <rect class="miss" x="600" y="262" width="260" height="50" rx="8"/><text class="t-sm" x="612" y="282">US compares: 100 &lt; 130, ignores "Anna".</text><text class="t-sm" x="612" y="300">Both regions converge on "Ann B".</text>
+</svg>
+<figcaption>Both regions accept a write locally, so each user sees success. When replication delivers the other write, a rule (here, higher timestamp wins) makes both regions converge on one value. The losing write silently disappears.</figcaption>
+</figure>
+
+<h3>4.1 Last writer wins (LWW)</h3>
+<p>Attach a timestamp to every write and keep the version with the highest timestamp. It is simple, needs no coordination, and guarantees all replicas converge to the same value. The downsides are serious. First, it <b>silently discards</b> one of the writes, which is data loss from the user's point of view. Second, it depends on clocks: if the EU server's clock runs 200 ms fast, its writes win even when they were earlier in real time. Third, for updates that should combine, such as two people adding different items to a shared cart, it loses one. LWW is acceptable when the data is naturally overwritten (a user's last-seen location, a presence flag, a cached profile) and dangerous for counters, balances, or collections.</p>
+
+<h3>4.2 Per-key ownership</h3>
+<p>Avoid the problem: assign each key a single owning region and route all writes for it there (section 2.5). Conflicts cannot occur on writes because there is only one writer. This is often the best answer in interviews because it replaces a hard research problem with a routing table. It works well for user-centric data. It works poorly for data genuinely shared across owners, such as a global inventory count or a shared document, where you either pick an owner and accept remote latency for others, or use one of the techniques below.</p>
+
+<h3>4.3 CRDTs</h3>
+<p>A <b>CRDT</b> (conflict-free replicated data type, covered in <a href="59-sorted-sets-crdt.html">Chapter 59</a>) is a data structure designed so that concurrent updates always merge into a sensible result, in any order, with no coordination. Examples: a <b>grow-only counter</b> (each region keeps its own count and the total is the sum of all regions' counts), a <b>set</b> where additions and removals are tracked with unique tags so a concurrent add and remove resolve predictably, and text structures used in collaborative editors. CRDTs fit counters (likes, view counts), sets (tags, memberships), and presence. They do not fit constraints that need global agreement, such as "stock must not go below zero," because each region merges independently and cannot know the total in time.</p>
+
+<h3>4.4 Application-level merge</h3>
+<p>Sometimes the application knows best. Keep <b>both</b> conflicting versions (called siblings, as in some Dynamo-style stores that track causality with version vectors) and let application code, or the user, merge. A shopping cart merges by taking the union of items. A document might show a "your edit conflicts with another" prompt. This is the most correct and the most work. Version vectors let the system tell the difference between "B is a newer version of A" (just replace) and "A and B are concurrent" (a real conflict needing a merge), see <a href="27-failure-time-ordering.html">Chapter 27</a>.</p>
+
+<h3>4.5 Avoiding conflicts by design</h3>
+<p>Beyond choosing a mechanism, shape the data to make conflicts rare. Use append-only records (an event log of changes) rather than overwriting a single row, so two regions' additions never touch the same row. Split a hot field into per-region fields (a counter per region). Make operations commutative, such as "add 5" rather than "set to 105". Generate IDs that cannot collide across regions (<a href="32-idempotency-ids.html">Chapter 32</a>). Many production systems end up with a hybrid: most data region-owned, a few counters as CRDTs, and a small set of critical data (money, uniqueness) kept in a single-writer or consensus system.</p>
+
+<table>
+<tr><th>Technique</th><th>Correct for</th><th>Avoid for</th><th>Cost</th></tr>
+<tr><td>Last writer wins</td><td>Overwritable state: presence, last location, preferences</td><td>Counters, balances, shared collections</td><td>Lowest; silent lost updates</td></tr>
+<tr><td>Per-key ownership</td><td>Per-user and per-tenant data</td><td>Truly shared global data</td><td>Remote latency for non-owners</td></tr>
+<tr><td>CRDT</td><td>Counters, sets, collaborative state</td><td>Invariants like "never negative"</td><td>Data-type design and metadata growth</td></tr>
+<tr><td>Application merge</td><td>Carts, documents, anything with domain rules</td><td>Anything high-volume with no one to merge</td><td>Developer effort, extra storage for siblings</td></tr>
+<tr><td>Consensus (Spanner style)</td><td>Money, uniqueness, inventory</td><td>Latency-critical writes from far regions</td><td>Cross-region round trip per commit</td></tr>
+</table>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="latency">5. Cross-region latency and what it does to writes</h2>
+
+<p>The reason all of this is hard is physics. Light in fiber covers about 200 km per millisecond, and real routes are longer than straight lines. Typical round-trip times between regions, approximate and varying by provider, are:</p>
+
+<table>
+<tr><th>Path</th><th>Approximate round trip</th></tr>
+<tr><td>Between zones in one region</td><td>0.5-2 ms</td></tr>
+<tr><td>US East to US West</td><td>60-70 ms</td></tr>
+<tr><td>US East to Western Europe</td><td>70-90 ms</td></tr>
+<tr><td>US East to Singapore / Mumbai</td><td>200-250 ms</td></tr>
+<tr><td>Western Europe to Singapore</td><td>160-180 ms</td></tr>
+<tr><td>US West to Sydney</td><td>140-160 ms</td></tr>
+</table>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Bar chart of round-trip latency in different network distances against typical transaction budgets">
+  <text class="t-b" x="20" y="22">Round-trip time by distance (milliseconds, bars drawn to linear scale)</text>
+  <text class="t-sm" x="20" y="64">Same zone</text><rect class="hit" x="170" y="50" width="4" height="22" rx="2"/><text class="t-sm" x="185" y="66">~0.5</text>
+  <text class="t-sm" x="20" y="100">Zone to zone</text><rect class="hit" x="170" y="86" width="12" height="22" rx="2"/><text class="t-sm" x="192" y="102">~2</text>
+  <text class="t-sm" x="20" y="136">US East - US West</text><rect class="cache" x="170" y="122" width="130" height="22" rx="2"/><text class="t-sm" x="310" y="138">~65</text>
+  <text class="t-sm" x="20" y="172">US East - Europe</text><rect class="cache" x="170" y="158" width="160" height="22" rx="2"/><text class="t-sm" x="340" y="174">~80</text>
+  <text class="t-sm" x="20" y="208">Europe - Singapore</text><rect class="miss" x="170" y="194" width="340" height="22" rx="2"/><text class="t-sm" x="520" y="210">~170</text>
+  <text class="t-sm" x="20" y="244">US East - Singapore</text><rect class="miss" x="170" y="230" width="440" height="22" rx="2"/><text class="t-sm" x="620" y="246">~220</text>
+  <path class="arrow dash" d="M700 40 L700 270"/>
+  <text class="t-sm" x="712" y="120">A 5-statement transaction</text>
+  <text class="t-sm" x="712" y="138">with 1 round trip per</text>
+  <text class="t-sm" x="712" y="156">statement across the</text>
+  <text class="t-sm" x="712" y="174">Atlantic costs ~400 ms,</text>
+  <text class="t-sm" x="712" y="192">versus ~5 ms in-region.</text>
+</svg>
+<figcaption>Bars are scaled at 2 pixels per millisecond. Anything that needs several sequential cross-ocean round trips quickly reaches human-noticeable delay.</figcaption>
+</figure>
+
+<h3>5.1 Quorum and consensus writes</h3>
+<p>A write that must be acknowledged by a majority (a quorum) of replicas cannot finish faster than the round trip to the nearest majority. With three replicas, a majority is two: the leader plus the closest follower. If all three are in one region the cost is a millisecond or two. If replicas are in Virginia, Ohio and Oregon, the nearest follower from Virginia is Ohio, so writes take roughly the Virginia-Ohio round trip, perhaps 10-15 ms. If they are spread across three continents, the nearest one may still be 80 ms away, and every commit pays it. A transaction that commits several times, or that holds locks while waiting, is slowed proportionally, and lock hold time grows, which can reduce throughput badly on hot rows.</p>
+<p>That is why geo-distributed consensus databases encourage you to keep the replicas of any one piece of data <b>close together</b> (a survivable but nearby set of regions), not spread to the farthest corners. It also explains why surviving a <i>region</i> failure with zero data loss means paying at least one inter-region round trip per write, a trade you may or may not accept.</p>
+
+<h3>5.2 Replication lag across oceans</h3>
+<p>With asynchronous replication, lag is at minimum the one-way network time (about half the round trip), plus the time to read, ship, and apply the change. Under normal load that is usually well under a second across a typical pair of regions. Under heavy write load, a large batch job, or a degraded link, lag can grow to many seconds or minutes. You should watch it as a first-class metric: <b>replication lag in seconds</b> is the operational measure of your effective RPO. Alert when it exceeds the RPO you promised, and design the application to tolerate it: do not make a read in region B depend on a write in region A having arrived, unless you route that read to A or wait for a position.</p>
+
+<h3>5.3 Consequences for transactions</h3>
+<ul>
+  <li>Keep multi-statement transactions inside one region. Cross-region two-phase commit (<a href="31-distributed-transactions.html">Chapter 31</a>) is slow and fragile because its blocking time includes round trips across oceans.</li>
+  <li>Reduce chattiness. A service that makes ten database calls per request should be co-located with its database, or the calls batched.</li>
+  <li>Use sagas (<a href="48-sagas.html">Chapter 48</a>) instead of cross-region atomic transactions when an operation spans owners.</li>
+  <li>Put the <b>compute</b> where the <b>data</b> lives. Having a stateless service in Singapore call a primary in Virginia ten times per request is worse than forwarding the whole request once.</li>
+</ul>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="consistency-choices">6. Consistency choices per feature</h2>
+
+<p>An important design move is to stop asking "what consistency does our system have?" and ask "what consistency does <i>this feature</i> need?" Different features in the same product can sit at different points. Chapter 28 (<a href="28-cap-consistency.html">CAP and consistency models</a>) gives the vocabulary. Here is how it plays out across regions.</p>
+
+<table>
+<tr><th>Feature</th><th>What goes wrong if stale or conflicting</th><th>Reasonable multi-region choice</th></tr>
+<tr><td>Account balance, payments, inventory decrement</td><td>Double spend, overselling</td><td>Single-writer or consensus; accept cross-region write latency or route to home region</td></tr>
+<tr><td>Username uniqueness, email uniqueness</td><td>Two accounts with one name</td><td>Global uniqueness check in one place (consensus or a single home); reserve the name first</td></tr>
+<tr><td>User profile edits</td><td>Brief wrong name shown</td><td>Home region writes, async replication, read-your-writes for the author</td></tr>
+<tr><td>Feed, timeline, recommendations</td><td>Seeing a post a few seconds late</td><td>Eventual consistency, local reads from replicas</td></tr>
+<tr><td>Like counts, view counts</td><td>Count off by a few for a moment</td><td>Per-region counters merged as a CRDT or aggregated asynchronously</td></tr>
+<tr><td>Session / login state</td><td>User logged out after failover</td><td>Replicate tokens or use signed stateless tokens (<a href="55-security.html">Chapter 55</a>)</td></tr>
+<tr><td>Feature flags, config</td><td>Regions disagree briefly</td><td>Replicated config store, eventual, with versions</td></tr>
+</table>
+
+<div class="callout tip"><b>Interview tip</b>
+Say it explicitly: "I would not put everything on the strongest, slowest setting. Money and uniqueness get strong guarantees and a single deciding region; feeds and counters get eventual consistency and local reads." This is the sentence that shows you understand multi-region trade-offs.
+</div>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="routing">7. Routing requests across regions</h2>
+
+<p>The data layer is only half the picture. Something must send each user to a region, and that something must react when a region becomes unhealthy. There are three layers, which you can combine.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Global request routing: DNS or anycast to a regional load balancer to services and database with home-region forwarding">
+  <rect class="ext" x="20" y="130" width="120" height="50" rx="10"/><text class="t-c t-b" x="80" y="152">Users</text><text class="t-c t-sm" x="80" y="169">worldwide</text>
+  <rect class="cache" x="190" y="120" width="170" height="70" rx="10"/><text class="t-c t-b" x="275" y="146">Global entry</text><text class="t-c t-sm" x="275" y="164">GeoDNS or anycast IP</text><text class="t-c t-sm" x="275" y="180">health checks</text>
+  <rect class="box" x="430" y="30" width="170" height="70" rx="10"/><text class="t-c t-b" x="515" y="56">Region EU</text><text class="t-c t-sm" x="515" y="74">regional LB + services</text><text class="t-c t-sm" x="515" y="90">EU data (home)</text>
+  <rect class="box" x="430" y="130" width="170" height="70" rx="10"/><text class="t-c t-b" x="515" y="156">Region US</text><text class="t-c t-sm" x="515" y="174">regional LB + services</text><text class="t-c t-sm" x="515" y="190">US data (home)</text>
+  <rect class="box" x="430" y="230" width="170" height="70" rx="10"/><text class="t-c t-b" x="515" y="256">Region APAC</text><text class="t-c t-sm" x="515" y="274">regional LB + services</text><text class="t-c t-sm" x="515" y="290">APAC data (home)</text>
+  <path class="arrow" d="M140 155 L186 155"/>
+  <path class="arrow" d="M360 140 L426 70"/><path class="arrow" d="M360 155 L426 165"/><path class="arrow" d="M360 170 L426 260"/>
+  <path class="arrow dash" d="M600 90 L650 150 L600 150"/>
+  <rect class="miss" x="670" y="110" width="200" height="90" rx="8"/>
+  <text class="t-b" x="684" y="134">Home-region forward</text>
+  <text class="t-sm" x="684" y="154">If the user's data lives in</text>
+  <text class="t-sm" x="684" y="170">another region, the service</text>
+  <text class="t-sm" x="684" y="186">proxies the call there.</text>
+  <text class="t-sm" x="190" y="215">Picks the nearest healthy region.</text>
+  <text class="t-sm" x="190" y="232">Pulls a sick region out within</text>
+  <text class="t-sm" x="190" y="249">seconds (anycast) or one DNS</text>
+  <text class="t-sm" x="190" y="266">TTL (GeoDNS).</text>
+</svg>
+<figcaption>Step one picks a region near the user. Step two, inside the region, is an ordinary load balancer. If the data is homed elsewhere, the service forwards the call to the owning region.</figcaption>
+</figure>
+
+<ul>
+  <li><b>GeoDNS / latency-based DNS.</b> The authoritative DNS server answers with the address of the region closest to the resolver (or lowest measured latency), skipping unhealthy regions. Simple and widely available. Its limit is caching: resolvers and clients cache answers for the TTL, so even a 30-second TTL means some users keep hitting a dead region for a while, and some clients ignore TTLs. See <a href="04-dns.html">Chapter 4</a>.</li>
+  <li><b>Anycast.</b> The same IP is announced from every region and the internet's routing sends each packet to a nearby one. When a region withdraws its announcement, traffic moves quickly with no DNS caching issue. The cost is less fine-grained control: you cannot easily say "send 10 percent of traffic to region B." Often implemented by a cloud provider's global load balancer or a CDN edge, see <a href="12-cdn.html">Chapter 12</a>.</li>
+  <li><b>Global load balancer / edge proxy.</b> A global front end terminates the user connection near them and proxies over the provider's private backbone to the chosen region. It can use health checks, weights and request content (such as a user ID or tenant header) to choose the destination, which is how you implement home-region routing. See <a href="09-load-balancing.html">Chapter 9</a>.</li>
+</ul>
+
+<h3>7.1 How requests find the user's home region</h3>
+<p>For home-region designs the routing layer needs to know which region owns a user. Options: encode it in an identifier (user IDs carry a region prefix, so the router can read it without a lookup), keep a small, heavily cached, globally replicated <b>directory</b> mapping user or tenant to region, or let any region receive the request and have the application forward it. The directory is a tiny, read-mostly dataset, so it can live in a replicated config store. The cheapest, most robust choice is the ID prefix, with the directory only for exceptions. When a user moves, you re-home the data (a data migration, see sections 14 and 15).</p>
+
+<h3>7.2 Sticky routing and state</h3>
+<p>If services are stateless and the database is shared, any region can serve any user and routing is only about proximity. If a session holds data only in one region, routing must stick to it. Prefer making the request carry what it needs (signed tokens) so failover to another region does not log everyone out.</p>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="residency">8. Data locality and residency</h2>
+
+<p>Residency changes the architecture from "where is it fastest" to "where is it allowed." Typical requirements: personal data of citizens of region X must be stored in X; certain data may leave only in anonymized form; backups and logs must obey the same rule; and administrators from other regions may not be able to read it. The design implications are these.</p>
+<ul>
+  <li><b>Partition by jurisdiction.</b> Assign each user or tenant a residency region at signup and make it part of the key. This is home-region ownership with a legal reason, and it works with every database that supports locality placement.</li>
+  <li><b>Replicas must obey too.</b> Adding a read replica or a DR copy in another country can violate the rule. DR for EU-resident data should go to another EU region, not the US.</li>
+  <li><b>Everything derived counts.</b> Search indexes, caches, analytics warehouses, message queues, logs and backups often contain copies of personal data. List them all. Chapter 56 (<a href="56-privacy-cost-mobile.html">Privacy, cost and mobile</a>) covers deletion and privacy obligations.</li>
+  <li><b>Split global from regional.</b> Keep a small global layer that holds non-personal or pseudonymized data (like the user to region directory) and regional layers for the sensitive data. Cross-region queries then need to fetch from the owner, not join across.</li>
+  <li><b>Tenant-level control.</b> In B2B systems, residency is usually per tenant (the customer chooses a region). This fits cells and tenant placement (<a href="42-multitenancy-cells.html">Chapter 42</a>) naturally: a tenant is pinned to a cell located in the chosen region.</li>
+</ul>
+
+<div class="callout watch"><b>Watch out</b>
+A global secondary index or a global unique constraint (for example "email must be unique worldwide") needs data about every user in one place, which conflicts with residency. Typical answers are to store only a hash of the email in a global uniqueness service, or to scope uniqueness per region and accept a manual process for collisions. Raise this trade-off yourself if the interviewer mentions residency.
+</div>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="failover">9. Failover, failback, and split-brain</h2>
+
+<h3>9.1 The failover sequence</h3>
+<p>In an active-passive design, losing the active region requires a series of steps. The key is to make them as automatic as possible and rehearsed, because outages are stressful and people make mistakes under pressure.</p>
+<ol>
+  <li><b>Detect.</b> Health checks from several independent vantage points (not only from the failing region itself) conclude that the region is unhealthy. Requiring several consecutive failures avoids flapping on a blip.</li>
+  <li><b>Decide.</b> A human or an automated controller declares failover. Many teams keep a human approval step for data-layer promotion because a false positive is expensive.</li>
+  <li><b>Fence the old primary.</b> Make sure the old primary can no longer accept writes (section 9.3). This is the most important step.</li>
+  <li><b>Promote.</b> Make the replica in the passive region the new primary. Check how far behind it was; that gap is the lost data (the RPO realized).</li>
+  <li><b>Shift traffic.</b> Update DNS, global load balancer weights or anycast announcements so users reach the new region. Scale up compute if it was warm.</li>
+  <li><b>Reconcile.</b> After the old region returns, work out which writes it accepted that never replicated, and decide what to do with them.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Timeline of a regional failover from failure through detection promotion and traffic shift">
+  <line x1="40" y1="130" x2="860" y2="130" stroke="var(--fg)" stroke-width="2"/>
+  <circle cx="80" cy="130" r="7" fill="var(--bad)"/><text class="t-c t-b" x="80" y="108">T0</text><text class="t-c t-sm" x="80" y="160">Region A fails</text>
+  <circle cx="230" cy="130" r="7" fill="var(--fg)"/><text class="t-c t-b" x="230" y="108">T0+30 s</text><text class="t-c t-sm" x="230" y="160">Health checks agree</text><text class="t-c t-sm" x="230" y="176">(several probes fail)</text>
+  <circle cx="380" cy="130" r="7" fill="var(--fg)"/><text class="t-c t-b" x="380" y="108">T0+2 min</text><text class="t-c t-sm" x="380" y="160">Fence A, promote B</text><text class="t-c t-sm" x="380" y="176">(check replication gap)</text>
+  <circle cx="540" cy="130" r="7" fill="var(--fg)"/><text class="t-c t-b" x="540" y="108">T0+4 min</text><text class="t-c t-sm" x="540" y="160">Shift traffic to B</text><text class="t-c t-sm" x="540" y="176">scale compute up</text>
+  <circle cx="700" cy="130" r="7" fill="var(--good)"/><text class="t-c t-b" x="700" y="108">T0+10 min</text><text class="t-c t-sm" x="700" y="160">Most DNS caches</text><text class="t-c t-sm" x="700" y="176">expired; stable on B</text>
+  <circle cx="830" cy="130" r="7" fill="var(--good)"/><text class="t-c t-b" x="830" y="108">Later</text><text class="t-c t-sm" x="830" y="160">Reconcile, then</text><text class="t-c t-sm" x="830" y="176">failback</text>
+  <rect class="miss" x="60" y="210" width="320" height="34" rx="8"/><text class="t-c t-sm" x="220" y="232">Users see errors: detection + decision time</text>
+  <rect class="cache" x="390" y="210" width="310" height="34" rx="8"/><text class="t-c t-sm" x="545" y="232">Partial impact: DNS caches and warm-up</text>
+  <rect class="hit" x="710" y="210" width="150" height="34" rx="8"/><text class="t-c t-sm" x="785" y="232">Recovered</text>
+  <text class="t-sm" x="40" y="280">RTO is the whole stretch from T0 to recovered. RPO is the replication gap measured at promotion time.</text>
+</svg>
+<figcaption>A realistic failover is a chain of small delays. Detection and DNS caching often cost more than the promotion itself, which is why anycast and short TTLs matter.</figcaption>
+</figure>
+
+<h3>9.2 Failback</h3>
+<p><b>Failback</b> means moving back to the original region once it is healthy. It is often harder than failover, because the original region now has stale data and possibly some writes the other region never saw. Safe procedure: rebuild the original region as a <i>replica</i> of the new primary (discard or quarantine its unreplicated tail), let it catch up, test it, then perform a planned, controlled switchover at a quiet time, reversing roles with the same fence-promote-shift steps. Many teams decide not to fail back at all: the former passive region simply becomes the new active one, and the old one becomes the new standby. That is simpler and entirely valid.</p>
+
+<h3>9.3 Split-brain</h3>
+<p><b>Split-brain</b> means two regions both believe they are the primary and both accept writes while unable to see each other (a network partition, or a falsely detected failure). Their data diverges, and merging afterwards can be impossible without losing writes. Prevention techniques:</p>
+<ul>
+  <li><b>Fencing.</b> Before promoting B, make sure A cannot write: revoke its credentials or storage access, power it off (the "STONITH" idea), or use a <b>fencing token</b>, a number that increases with each new primary, which the storage layer checks and rejects if it is old (<a href="30-coordination-locks.html">Chapter 30</a>).</li>
+  <li><b>Quorum with a third location.</b> Use a lock or lease in a small consensus cluster hosted in a third region or at least a third failure domain. Only the region holding the lease may write. A partitioned region that cannot reach the quorum loses the lease and stops writing, no matter what it believes. With two regions only, you cannot distinguish "the other region is dead" from "the link is cut," which is why a third tie-breaker is standard.</li>
+  <li><b>Leases with timeouts.</b> The primary must keep renewing its lease, and stops accepting writes if it cannot. The new primary waits out the lease duration before starting, so the two never overlap (given bounded clock drift).</li>
+  <li><b>Prefer human decisions for data promotion</b> when the cost of a wrong failover (permanent divergence) is larger than a few more minutes of downtime.</li>
+</ul>
+
+<div class="callout watch"><b>Watch out</b>
+A failover mechanism that has never been exercised does not work. Teams that only test failover during real incidents discover that credentials were not replicated, capacity limits in the standby region were too low, or the DNS TTL was far longer than assumed. Run game days where you actually shift traffic, and keep standby capacity <i>reserved</i>, because during a regional outage everyone else fails over too and spare capacity vanishes.
+</div>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="cost">10. Cost</h2>
+<p>Multi-region is expensive in four ways, and an interviewer will appreciate hearing all four.</p>
+<ul>
+  <li><b>Duplicate infrastructure.</b> Compute and storage in each region. Warm standby adds a fraction; active-active adds close to 100 percent per additional region, because each region should be able to absorb a failed neighbor's load (so with two regions, each runs at 50 percent utilization at most; with three, each can run near 66 percent).</li>
+  <li><b>Data transfer.</b> Cloud providers charge for traffic that leaves a region, often a few cents per GB. Replicating 10 TB of changes a month across regions costs on the order of hundreds of dollars; chatty cross-region service calls and full-copy replication of big blobs can cost far more. Compress, replicate only what must be replicated, and keep large objects regional unless needed.</li>
+  <li><b>Operations.</b> More on-call complexity, more deploy pipelines, more tests, more cases for incidents.</li>
+  <li><b>Engineering.</b> Conflict handling, routing, failover drills, and consistency reasoning are ongoing costs paid by every feature team.</li>
+</ul>
+<p>Note that "each region must absorb a neighbor's load" is a requirement from the availability goal and can often be relaxed for degraded modes (shedding low-priority traffic during failover), see <a href="40-resilience.html">Chapter 40</a>. Express cost as a ratio to the baseline, as the topology table in section 2 does.</p>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="migrations-intro">11. Online migrations: the second half of the chapter</h2>
+
+<p>Systems live for years, and their data has to change shape: a column is added, a table is split, a database vendor is replaced, a shard key turns out to be wrong. A <b>migration</b> is any such change to how data is stored. An <b>online</b> (or zero-downtime) migration is one performed while the system keeps serving reads and writes. The reason it is hard has nothing to do with copying bytes; it is that <b>during the change, old and new code, old and new schema, and old and new storage all exist at the same time</b>.</p>
+
+<p>Three facts make that overlap unavoidable. First, a deployment is not instant: while you roll out a new version across hundreds of servers, some run the old code and some the new. Second, the data keeps changing while you copy it, so any copy is out of date the moment it is made. Third, you can rarely be certain the new thing is right until real traffic has run through it, so you need a way to go back. Every technique below is a way to deal with one of those three facts.</p>
+
+<div class="callout key"><b>Key idea</b>
+Break every risky change into a sequence of small steps, each of which is <b>backward compatible</b> (the previous version still works after it) and <b>reversible</b> (you can undo it without data loss). The migration then becomes a series of boring, individually safe deployments instead of one terrifying big switch.
+</div>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="schema">12. Schema changes without downtime: expand and contract</h2>
+
+<p>Suppose a <code>users</code> table has a column <code>name</code> and you want to split it into <code>first_name</code> and <code>last_name</code>. The naive plan is to run a script that adds the two columns, fills them, drops <code>name</code>, and deploys the new code, all at once. This fails in several ways: the new code is not yet running when the column vanishes, rows written between the script and the deploy are wrong, and if you find a bug you cannot get the old column back. The safe method is <b>expand and contract</b> (also called parallel change).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Expand and contract phases for a schema change shown as a table of steps with code and schema state">
+  <rect class="box" x="20" y="20" width="160" height="56" rx="8"/><text class="t-c t-b" x="100" y="44">1. Expand</text><text class="t-c t-sm" x="100" y="62">add new columns</text>
+  <rect class="box" x="200" y="20" width="160" height="56" rx="8"/><text class="t-c t-b" x="280" y="44">2. Dual write</text><text class="t-c t-sm" x="280" y="62">code writes both</text>
+  <rect class="box" x="380" y="20" width="160" height="56" rx="8"/><text class="t-c t-b" x="460" y="44">3. Backfill</text><text class="t-c t-sm" x="460" y="62">copy old rows</text>
+  <rect class="box" x="560" y="20" width="160" height="56" rx="8"/><text class="t-c t-b" x="640" y="44">4. Switch reads</text><text class="t-c t-sm" x="640" y="62">read the new column</text>
+  <rect class="box" x="740" y="20" width="140" height="56" rx="8"/><text class="t-c t-b" x="810" y="44">5. Contract</text><text class="t-c t-sm" x="810" y="62">drop the old one</text>
+  <path class="arrow" d="M180 48 L198 48"/><path class="arrow" d="M360 48 L378 48"/><path class="arrow" d="M540 48 L558 48"/><path class="arrow" d="M720 48 L738 48"/>
+
+  <text class="t-b" x="20" y="116">Old column "name"</text>
+  <rect class="hit" x="150" y="100" width="590" height="22" rx="4"/><text class="t-sm" x="160" y="116">written and read</text>
+  <rect class="cache" x="740" y="100" width="40" height="22" rx="4"/><rect class="miss" x="780" y="100" width="100" height="22" rx="4"/><text class="t-sm" x="790" y="116">dropped</text>
+
+  <text class="t-b" x="20" y="166">New columns</text>
+  <rect class="miss" x="20" y="150" width="130" height="22" rx="4"/><text class="t-sm" x="30" y="166">do not exist</text>
+  <rect class="cache" x="150" y="150" width="30" height="22" rx="4"/>
+  <rect class="hit" x="200" y="150" width="680" height="22" rx="4"/><text class="t-sm" x="215" y="166">written from step 2, filled by backfill at step 3, read from step 4</text>
+
+  <text class="t-b" x="20" y="216">Rollback possible?</text>
+  <rect class="hit" x="150" y="200" width="590" height="22" rx="4"/><text class="t-sm" x="160" y="216">yes at every step: old column is complete and still correct</text>
+  <rect class="miss" x="740" y="200" width="140" height="22" rx="4"/><text class="t-sm" x="750" y="216">no (data gone)</text>
+
+  <rect class="cache" x="20" y="256" width="860" height="84" rx="8"/>
+  <text class="t-sm" x="34" y="278">Each box is a separate deployment, days apart if needed. Between boxes, the system works with either version of the code.</text>
+  <text class="t-sm" x="34" y="298">Step 5 is the only irreversible one, so wait until you are sure (often a week or more, plus a final backup).</text>
+  <text class="t-sm" x="34" y="318">Never combine steps: "add column and drop old column in one deploy" is how outages happen.</text>
+</svg>
+<figcaption>The old column stays complete and authoritative until the very end, so any step can be rolled back by redeploying the previous code.</figcaption>
+</figure>
+
+<h3>12.1 The steps in detail</h3>
+<ol>
+  <li><b>Expand.</b> Add the new columns (nullable, no default that rewrites the table, no new constraints that old code would violate). Nothing reads them yet, so this is safe. The old code is completely unaffected.</li>
+  <li><b>Dual write.</b> Deploy code that writes the old column <i>and</i> populates the new columns on every insert and update. Reads still use the old column. Since old and new code versions run side by side during rollout, both must be correct with the schema as it is.</li>
+  <li><b>Backfill.</b> Rows that existed before step 2 and have not been touched since lack the new values. Run a background job that processes the table in small batches (see section 12.3) and fills them in.</li>
+  <li><b>Switch reads.</b> Deploy code that reads from the new columns. Ideally first run it in a <i>shadow</i> mode that reads both and compares (section 14.2), to prove the backfill was complete. Keep dual writing, so rolling back the read switch is safe.</li>
+  <li><b>Contract.</b> Stop writing the old column (deploy), wait for confidence, then drop it. Only now is there no way back, so make a backup first.</li>
+</ol>
+
+<h3>12.2 Backward-compatible rules of thumb</h3>
+<ul>
+  <li><b>Adding</b> a nullable column, a new table, or a new index is generally safe. Making a column <b>NOT NULL</b> is not safe until all writers set it and the backfill is done.</li>
+  <li><b>Renaming</b> a column is really "add new, dual write, backfill, switch reads, drop old." A single rename statement breaks any running code that uses the old name.</li>
+  <li><b>Changing a type</b> (say, int to bigint) follows the same copy-then-switch approach on a new column.</li>
+  <li><b>Dropping</b> a column is the last step and only after no code reads or writes it. First deploy code that stops referencing it; confirm through logs or metrics; then drop.</li>
+  <li><b>Constraints and foreign keys</b> should be added last, in a way that validates existing rows without long locks (some databases let you add a constraint as "not valid" first and validate later).</li>
+  <li>The same rule governs messages and APIs: add fields before using them, ignore unknown fields on read, and remove fields only after consumers have stopped using them (<a href="07-serialization.html">Chapter 7</a>, <a href="05-api-design.html">Chapter 5</a>).</li>
+</ul>
+
+<h3>12.3 Backfilling safely</h3>
+<p>A backfill is a large write workload running next to production. Done carelessly it fills the replication log, saturates disks, and slows real users. Practical rules: process by primary key range in batches of a few hundred to a few thousand rows; sleep between batches or adapt the pace to replica lag and CPU; make each batch <b>idempotent</b> so it can be re-run (<a href="32-idempotency-ids.html">Chapter 32</a>); record a checkpoint (the last key processed) so a crash resumes where it stopped; and skip rows where the new value is already present, so the backfill does not overwrite a newer value written by the live code path. Run it with a kill switch.</p>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="online-ddl">13. Online DDL tools: gh-ost and pt-online-schema-change</h2>
+
+<p><b>DDL</b> (data definition language) statements such as <code>ALTER TABLE</code> change the structure of a table. On a large table some DDL operations lock the table or rebuild it, blocking writes for minutes or hours, and replicas replay the same slow statement afterwards, causing lag. Newer database versions can do many alters "in place" or instantly (adding a nullable column is often cheap), but changes such as altering a column type or adding certain indexes on huge tables may still be disruptive. Tools exist to do the change online by building a new table beside the old one.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 310" role="img" aria-label="Online schema change tool creates a shadow table copies rows applies live changes and swaps names">
+  <rect class="db" x="30" y="40" width="190" height="64" rx="8"/><text class="t-c t-b" x="125" y="66">users (original)</text><text class="t-c t-sm" x="125" y="86">live traffic continues</text>
+  <rect class="db" x="360" y="40" width="190" height="64" rx="8"/><text class="t-c t-b" x="455" y="66">_users_new</text><text class="t-c t-sm" x="455" y="86">new schema, empty at first</text>
+  <rect class="cache" x="360" y="170" width="190" height="64" rx="8"/><text class="t-c t-b" x="455" y="196">Change stream</text><text class="t-c t-sm" x="455" y="216">triggers or binlog reader</text>
+  <rect class="box" x="690" y="40" width="190" height="64" rx="8"/><text class="t-c t-b" x="785" y="66">Atomic swap</text><text class="t-c t-sm" x="785" y="86">rename old/new in one step</text>
+  <path class="arrow" d="M220 62 L356 62"/><text class="t-c t-sm" x="288" y="54">1. copy in chunks</text>
+  <path class="arrow dash" d="M125 104 L125 202 L356 202"/><text class="t-sm" x="132" y="150">2. capture writes that</text><text class="t-sm" x="132" y="166">happen during the copy</text>
+  <path class="arrow dash" d="M455 170 L455 108"/><text class="t-sm" x="465" y="140">3. apply to new table</text>
+  <path class="arrow" d="M550 72 L686 72"/><text class="t-c t-sm" x="618" y="64">4. when caught up</text>
+  <rect class="hit" x="30" y="264" width="850" height="36" rx="8"/><text class="t-c t-sm" x="455" y="287">Throttle on replica lag. Keep the old table for a while as the rollback path. Drop it later.</text>
+</svg>
+<figcaption>The tool builds the new table in the background, mirrors ongoing writes into it, and swaps the names when the two match. Application downtime is a brief metadata lock, not a table rebuild.</figcaption>
+</figure>
+
+<p><b>pt-online-schema-change</b> (from the Percona Toolkit) and <b>gh-ost</b> (GitHub's online schema tool) both follow this shape for MySQL. They differ in how they capture changes during the copy:</p>
+<ul>
+  <li><b>pt-osc</b> installs database <b>triggers</b> on the original table, so every insert, update and delete also applies to the new table inside the same transaction. Simple, but triggers add overhead to every write, add contention on busy tables, and cannot be paused cleanly.</li>
+  <li><b>gh-ost</b> is <b>triggerless</b>: it reads the database's binary log (the replication stream) to learn about changes and applies them to the new table itself. It can run against a replica to keep load off the primary, can be paused, throttled, and aborted at any time, and does the final cutover in a controlled way. The cost is more moving parts and a dependency on the binary log format.</li>
+</ul>
+<p>Other databases have their own options: PostgreSQL does many changes concurrently (for instance building an index with a concurrent option and adding constraints in two phases), and managed databases may provide online DDL natively. In an interview, naming "shadow table, copy in chunks, capture ongoing writes, atomic rename, throttle on replica lag" shows you understand the mechanism without needing a specific product.</p>
+
+<div class="callout watch"><b>Watch out</b>
+Online DDL tools solve the <i>lock</i> problem, not the <i>compatibility</i> problem. If you rename a column with gh-ost while old code still uses the old name, the code breaks. You still need expand and contract; the tool just makes each expand step cheap.
+</div>
+
+<!-- ======================= 14 ======================= -->
+<h2 id="data-migration">14. Migrating data between databases</h2>
+
+<p>Moving from one database to another (a single MySQL to a sharded store, an on-premise database to a cloud service, a relational store to a document store) is the same pattern at a larger scale. The standard recipe has the following phases. Each is a separate, checkable step, and the whole system works the entire time.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Architecture during migration with old store new store dual write backfill CDC and shadow read comparison">
+  <rect class="box" x="20" y="130" width="140" height="70" rx="8"/><text class="t-c t-b" x="90" y="158">Application</text><text class="t-c t-sm" x="90" y="176">data access layer</text>
+  <rect class="db" x="360" y="40" width="170" height="70" rx="8"/><text class="t-c t-b" x="445" y="68">Old store</text><text class="t-c t-sm" x="445" y="86">source of truth</text>
+  <rect class="db" x="360" y="230" width="170" height="70" rx="8"/><text class="t-c t-b" x="445" y="258">New store</text><text class="t-c t-sm" x="445" y="276">being filled</text>
+  <rect class="cache" x="680" y="40" width="190" height="64" rx="8"/><text class="t-c t-b" x="775" y="66">Backfill / CDC</text><text class="t-c t-sm" x="775" y="84">copy history + changes</text>
+  <rect class="ext" x="680" y="230" width="190" height="70" rx="8"/><text class="t-c t-b" x="775" y="256">Comparator</text><text class="t-c t-sm" x="775" y="274">diffs, metrics, alerts</text>
+  <path class="arrow" d="M160 150 L356 80"/><text class="t-sm" x="200" y="98">write + read (primary)</text>
+  <path class="arrow dash" d="M160 180 L356 260"/><text class="t-sm" x="190" y="236">dual write</text><text class="t-sm" x="190" y="252">+ shadow read</text>
+  <path class="arrow dash" d="M530 75 L676 72"/>
+  <path class="arrow dash" d="M775 104 L775 126 L560 126 L560 262 L534 262"/><text class="t-sm" x="570" y="150">fill new store</text>
+  <path class="arrow dash" d="M530 262 L676 262"/><text class="t-sm" x="545" y="248">sample/compare</text>
+  <path class="arrow dash" d="M530 90 L676 255"/>
+  <rect class="hit" x="20" y="320" width="860" height="30" rx="8"/><text class="t-c t-sm" x="450" y="340">Users only ever see answers from the old store until the comparator reports no differences.</text>
+</svg>
+<figcaption>The old store stays the source of truth. The new store is filled two ways (history via backfill, new changes via dual write or change capture) and is verified by comparing it against the old one under real traffic.</figcaption>
+</figure>
+
+<h3>14.1 Phase by phase</h3>
+<ol>
+  <li><b>Prepare the new store.</b> Design its schema and keys for the target access patterns (<a href="17-data-modeling.html">Chapter 17</a>), build the data access code behind an interface so the application can talk to either store, and add metrics and a kill switch controlled by a feature flag.</li>
+  <li><b>Dual write.</b> The application writes to the old store (authoritative) and to the new store. Treat the new-store write as best effort at first: if it fails, log it and continue, never fail the user's request because of the new system. Missed writes are later repaired by the backfill and the comparator.</li>
+  <li><b>Backfill history.</b> Copy all existing data from old to new in batches, as in section 12.3. Because dual write is already running, the backfill must be careful not to overwrite newer values: write only if the target is absent or older, comparing a version number or updated timestamp.</li>
+  <li><b>Shadow read and compare.</b> For a sample of read requests (then all), read from both stores, return the old store's answer to the user, and compare the two in the background. Record every mismatch with details. Triage the mismatches: some are bugs in the translation, some are timing races (the write has not yet reached the new store), some are legitimately old data. Iterate until the mismatch rate is zero or explained.</li>
+  <li><b>Cutover.</b> Gradually move reads to the new store: 1 percent of users, 10, 50, 100, watching error rates, latency and correctness metrics at each step. Then flip writes so that the new store becomes the source of truth. This is the sensitive moment (section 14.3).</li>
+  <li><b>Keep the old store in sync as a fallback</b> (reverse dual write) for a safety period, so you can return to it without losing data written since the cutover.</li>
+  <li><b>Decommission.</b> After the safety period (days to weeks), stop writing to the old store, take a final snapshot, and shut it down.</li>
+</ol>
+
+<h3>14.2 Dual write and its problems</h3>
+<p>Dual writing from application code sounds easy and is subtly dangerous. The two writes are not atomic: the first can succeed and the second fail, or two concurrent updates can reach the two stores in different orders, leaving them permanently different. Mitigations: write to the authoritative store first and the secondary second, use idempotent writes with version numbers so a retry or reordering converges, queue the secondary write on a reliable queue (<a href="34-queues-kafka.html">Chapter 34</a>) so failures are retried, and rely on the comparator plus a repair job to detect and fix the rest. Never make the user-facing success depend on the secondary store until it is trusted.</p>
+
+<h3>14.3 CDC-based migration</h3>
+<p><b>Change data capture (CDC)</b> reads the source database's own change log (for MySQL the binary log, for PostgreSQL logical replication or the write-ahead log) and emits every insert, update and delete as an event. Instead of modifying every application write path to dual write, you run a CDC pipeline (for example Debezium feeding Kafka, see <a href="36-event-driven.html">Chapter 36</a>) that applies those events to the new store. Advantages: no application changes on the write path, nothing missed (the log contains every committed change in order), and the old store sees no extra latency. A common CDC migration sequence is: take a consistent snapshot of the source and record the log position at that moment, bulk load the snapshot into the new store, then start applying the log from the recorded position, so that changes made during the bulk load are replayed in order. When the lag reaches seconds, you are caught up and can run the shadow-read comparison. Disadvantages: the pipeline is extra infrastructure, schema translation happens in the consumer, and the new store is always slightly behind, which complicates the final write cutover (below).</p>
+
+<h3>14.4 The write cutover</h3>
+<p>Moving reads is easy to reverse. Moving writes is the real decision. Choose among:</p>
+<ul>
+  <li><b>Brief write pause.</b> Pause writes (return a short retry or queue them) for seconds, wait until the new store has applied everything from the old store (lag zero), flip the source of truth, resume. Simplest and safe if a few seconds of write delay is acceptable. Combine with a lock or a flag checked by all writers so no write slips through in between.</li>
+  <li><b>Per-key or per-tenant cutover.</b> Migrate users in small groups. For each group, pause that group's writes, verify, flip. Blast radius is tiny, and a problem affects only a few percent of users.</li>
+  <li><b>Reverse replication.</b> Once the new store is the source of truth, replay its changes back into the old store so a rollback does not lose the writes made since the flip. Without it, rollback means losing or manually reconciling post-cutover data.</li>
+</ul>
+
+<!-- ======================= 15 ======================= -->
+<h2 id="resharding">15. Changing the shard key and resharding</h2>
+
+<p>Chapter 25 (<a href="25-sharding.html">Sharding</a>) explains how data is split across nodes by a shard key. Two related migrations happen over a system's life. <b>Resharding</b> keeps the key but changes the number of shards or the placement (adding capacity, splitting a hot shard). <b>Changing the shard key</b> picks a different key altogether (for example, from <code>user_id</code> to <code>tenant_id</code>) because the access pattern changed. The second is far harder, because every row moves to a different shard in a different pattern.</p>
+
+<h3>15.1 Resharding with the same key</h3>
+<p>If the original design used consistent hashing or many small virtual partitions (for example 1,024 logical shards mapped to 8 physical nodes), adding capacity means moving whole logical shards between nodes, with no rehash of rows. The procedure is the same shape as everything else: copy the logical shard to the new node while it still serves from the old, stream the ongoing changes, verify, switch the mapping entry for that shard in the routing metadata, and delete the old copy. Because the unit of movement is a whole shard with a stable identity, each move is a small, resumable, individually reversible operation. This is why experienced designers choose <b>many more logical shards than nodes</b> at the outset.</p>
+
+<h3>15.2 Changing to a new shard key</h3>
+<p>This is a full data migration into a new store (or new table layout) in which the destination is partitioned by the new key. It uses the recipe from section 14: build the new layout, dual write (the write path computes the new shard from the new key), backfill, shadow read, cut over reads, then writes. Two additional concerns arise.</p>
+<ul>
+  <li><b>Routing during the transition.</b> A router (a thin library or proxy) must know, for each record or key range, whether it currently lives in the old layout or the new one. Maintain a migration state per range (not started, copying, dual write, verified, switched) and route accordingly. Without an explicit state, requests can read from a shard that does not have the row yet.</li>
+  <li><b>Queries that depended on the old key.</b> The old key made certain queries cheap (single shard). With the new key those same queries may become scatter-gather, and vice versa. Check all important queries against the new design before starting, and add secondary indexes or denormalized copies if needed.</li>
+</ul>
+
+<table>
+<tr><th>Change</th><th>Rows that move</th><th>Difficulty</th><th>Typical approach</th></tr>
+<tr><td>Add nodes, many logical shards</td><td>Whole logical shards</td><td>Low</td><td>Move shard, update routing map</td></tr>
+<tr><td>Split a hot shard in two</td><td>Half of one shard</td><td>Medium</td><td>Copy half, catch up, switch range boundary</td></tr>
+<tr><td>Modulo hashing, add a node</td><td>Almost every row</td><td>High</td><td>Avoid; migrate to consistent hashing or logical shards</td></tr>
+<tr><td>Change the shard key</td><td>Most rows</td><td>Highest</td><td>Full dual write, backfill, shadow read, cutover</td></tr>
+<tr><td>Re-home a user to another region</td><td>One user's rows</td><td>Medium</td><td>Per-key migration with write pause, update directory</td></tr>
+</table>
+
+<!-- ======================= 16 ======================= -->
+<h2 id="playbook">16. The zero-downtime migration playbook</h2>
+
+<p>Putting the pieces together, here is a general template you can apply to nearly any migration, described as a timeline. The phase names matter less than the principle: each phase ends at a <b>gate</b>, a measurable condition that must hold before moving on, and each phase has a documented <b>way back</b>.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Timeline with phases of a zero-downtime migration and the gate and rollback at each phase">
+  <rect class="box" x="20"  y="20" width="130" height="50" rx="8"/><text class="t-c t-b" x="85" y="42">0. Prepare</text><text class="t-c t-sm" x="85" y="58">design, flags</text>
+  <rect class="box" x="160" y="20" width="130" height="50" rx="8"/><text class="t-c t-b" x="225" y="42">1. Dual write</text><text class="t-c t-sm" x="225" y="58">new store, async</text>
+  <rect class="box" x="300" y="20" width="130" height="50" rx="8"/><text class="t-c t-b" x="365" y="42">2. Backfill</text><text class="t-c t-sm" x="365" y="58">or snapshot + CDC</text>
+  <rect class="box" x="440" y="20" width="130" height="50" rx="8"/><text class="t-c t-b" x="505" y="42">3. Shadow read</text><text class="t-c t-sm" x="505" y="58">compare, fix</text>
+  <rect class="box" x="580" y="20" width="130" height="50" rx="8"/><text class="t-c t-b" x="645" y="42">4. Read ramp</text><text class="t-c t-sm" x="645" y="58">1, 10, 50, 100 %</text>
+  <rect class="box" x="720" y="20" width="160" height="50" rx="8"/><text class="t-c t-b" x="800" y="42">5. Write cutover</text><text class="t-c t-sm" x="800" y="58">new = source of truth</text>
+
+  <line x1="20" y1="100" x2="880" y2="100" stroke="var(--fg)" stroke-width="2"/>
+  <text class="t-sm" x="20" y="92">time ----------------------------------------------------------------------------------------------&gt;</text>
+  <rect class="cache" x="20" y="110" width="860" height="26" rx="4"/><text class="t-sm" x="30" y="128">Old store is the source of truth for every phase up to 5. Users see no change.</text>
+  <rect class="hit" x="720" y="110" width="160" height="26" rx="4"/><text class="t-sm" x="730" y="128">New store is truth</text>
+  <rect class="miss" x="20" y="142" width="700" height="26" rx="4"/><text class="t-sm" x="30" y="160">Rollback = flip a flag, no data loss (old store is complete).</text>
+  <rect class="cache" x="720" y="142" width="160" height="26" rx="4"/><text class="t-sm" x="730" y="160">needs reverse sync</text>
+
+  <text class="t-b" x="20" y="200">Gate to leave each phase</text>
+  <text class="t-sm" x="20" y="224">0: runbook reviewed, kill switch tested, metrics dashboards built.</text>
+  <text class="t-sm" x="20" y="244">1: new-store write error rate below 0.1 percent, user latency unchanged.</text>
+  <text class="t-sm" x="20" y="264">2: row counts and checksums match for all key ranges, backfill lag near zero.</text>
+  <text class="t-sm" x="20" y="284">3: mismatch rate zero (or every class of mismatch explained) over several days of peak traffic.</text>
+  <text class="t-sm" x="20" y="304">4: error rate and p99 latency on the new store within budget at each step, held for hours or days.</text>
+  <text class="t-sm" x="20" y="324">5: write pause under the agreed limit, reverse sync running, old store kept for a safety period.</text>
+  <text class="t-sm" x="20" y="352">6: Decommission: freeze old store, take a final snapshot, remove dual write code and flags.</text>
+  <text class="t-sm" x="20" y="378">Duration: weeks for a large system. The elapsed time is mostly waiting for evidence, not doing work.</text>
+</svg>
+<figcaption>Read left to right. Until phase 5 the old store is authoritative, so going back is just turning off a flag. The riskiest step, the write cutover, comes last, after everything else has been proven under real load.</figcaption>
+</figure>
+
+<div class="callout good"><b>Good practice</b>
+Make the strategy visible in the code: a single data-access interface with a migration-mode setting per entity (<code>OLD_ONLY</code>, <code>DUAL_WRITE_OLD_READ</code>, <code>DUAL_WRITE_SHADOW_READ</code>, <code>DUAL_WRITE_NEW_READ</code>, <code>NEW_ONLY</code>). The mode is read from a flag service, which can change per user, tenant, or percentage, and takes effect without a deploy. Rollback becomes a flag change measured in seconds.
+</div>
+
+<!-- ======================= 17 ======================= -->
+<h2 id="verification">17. Verifying correctness</h2>
+
+<p>A migration without verification is a hope. Several complementary checks are used, from cheap to thorough:</p>
+<ul>
+  <li><b>Counts.</b> Row counts per table or per key range. Cheap, catches gross loss or duplication, but misses wrong values.</li>
+  <li><b>Checksums and hashes.</b> Compute a hash over each key range in both stores and compare the hashes, drilling into ranges that differ. This is the same idea as Merkle trees used by anti-entropy repair (<a href="33-gossip-merkle.html">Chapter 33</a>), and it compares terabytes while moving only small digests.</li>
+  <li><b>Full row diff.</b> Stream both stores in key order and compare field by field. Expensive but definitive; run it on a snapshot or on a lagging replica to avoid timing noise.</li>
+  <li><b>Shadow reads.</b> The live comparison under real traffic, the most realistic test, because it exercises the actual queries users issue, including odd shapes of data nobody thought of.</li>
+  <li><b>Invariant checks.</b> Business-level assertions such as "the sum of balances is unchanged" or "every order has a customer," which catch semantic errors that bytewise comparison would not notice after a transformation.</li>
+  <li><b>Canary and dark launches.</b> Send a small share of real users to the new path and compare their error rates and latency with the control group (<a href="43-deployment-autoscaling.html">Chapter 43</a>).</li>
+</ul>
+<p>Plan for <b>noise</b>: when writes are flowing, the two stores differ for a few milliseconds after each write, so a naive comparator reports false mismatches. Reasonable approaches: re-check a mismatched key after a short delay before reporting it, compare using versions or timestamps, or exclude keys modified in the last few seconds. Tune this until the mismatch signal is clean, otherwise people learn to ignore it.</p>
+
+<!-- ======================= 18 ======================= -->
+<h2 id="failure-modes">18. Failure modes</h2>
+
+<table>
+<tr><th>What goes wrong</th><th>Why</th><th>Mitigation</th></tr>
+<tr><td>Dual write diverges</td><td>One of the two writes fails or the two stores receive concurrent updates in different order</td><td>Authoritative store first, idempotent versioned writes, queue the secondary, comparator plus repair job</td></tr>
+<tr><td>Backfill overwrites newer data</td><td>Copy reads an old value, a live write lands, the copy then writes the stale value</td><td>Conditional write: only if target absent or version lower; or process under per-row version check</td></tr>
+<tr><td>Backfill overloads production</td><td>Unthrottled batches saturate disks, network or replication</td><td>Small batches, adaptive pacing on replica lag, off-peak windows, kill switch</td></tr>
+<tr><td>Replica lag breaks the cutover</td><td>Switch writes while the new store is still behind, so recent data seems to vanish</td><td>Write pause until lag is zero, or read-your-writes with log position</td></tr>
+<tr><td>Rollback is impossible</td><td>Contract step done, or writes since cutover exist only in the new store</td><td>Delay irreversible steps, reverse replication, snapshots before the point of no return</td></tr>
+<tr><td>Old and new code disagree</td><td>A deploy ordering mistake, such as reading a column before it is populated</td><td>Strict phase order, each phase compatible with the previous code, feature flags per phase</td></tr>
+<tr><td>Hidden consumers break</td><td>Another team, report, or ETL job reads the old table or column</td><td>Search for usage, add access logging to the old structure, announce, keep a compatibility view</td></tr>
+<tr><td>Hot spots in the new layout</td><td>The new shard key distributes load worse than the test data suggested</td><td>Test with production-shaped traffic via shadow reads before cutover; keep ability to split shards</td></tr>
+<tr><td>Long lock on the final swap</td><td>Metadata lock waits for a long-running transaction</td><td>Kill or wait out long transactions, retry the swap with a short timeout</td></tr>
+<tr><td>Migration never finishes</td><td>Fear, scope creep, two systems forever</td><td>Explicit decommission date and an owner; the old store has a cost that gets tracked</td></tr>
+</table>
+
+<!-- ======================= 19 ======================= -->
+<h2 id="worked">19. Worked example: migrating a user table to a new sharded store</h2>
+
+<p>Scenario: a social product keeps 400 million users in one MySQL primary with replicas. The table <code>users</code> is 600 GB, receives around 3,000 writes per second at peak and 40,000 reads per second. The primary is at 70 percent disk and CPU on peak days and cannot be made bigger. The decision is to move to a sharded key-value store (for example a sharded document store or distributed SQL cluster) partitioned by <code>user_id</code>, with 1,024 logical shards mapped to 16 nodes at first. Requirement: no downtime, and no more than 5 seconds of write delay for any user.</p>
+
+<h3>19.1 Sizing and plan</h3>
+<ul>
+  <li><b>Data size per shard.</b> 600 GB over 1,024 logical shards is about 600 MB per shard, small enough to move one shard in a minute or two. Sixteen nodes hold 64 shards each, about 38 GB per node of raw data (before replication, typically 3 copies).</li>
+  <li><b>Backfill time.</b> If the backfill runs at 20 MB per second to stay gentle, 600 GB takes 600,000 MB / 20 = 30,000 seconds, a bit over 8 hours. Plan a full day to allow for throttling during busy periods.</li>
+  <li><b>Dual-write load.</b> 3,000 writes per second to the old store plus 3,000 per second to the new one is trivial for 16 nodes (under 200 writes per second per node), so capacity of the new store is not the constraint.</li>
+  <li><b>Region note.</b> User IDs are given a region prefix, so shards can later be pinned to the user's home region (sections 2.5 and 8), without a second migration.</li>
+</ul>
+
+<h3>19.2 Step by step</h3>
+<ol>
+  <li><b>Interface and flags.</b> Introduce a <code>UserStore</code> interface with old and new implementations. Add a per-user migration mode flag, defaulting to <code>OLD_ONLY</code>. Deploy. Nothing changes for users.</li>
+  <li><b>Expand the schema.</b> Add a <code>version</code> (incremented on each update, or use <code>updated_at</code> with microsecond precision) to the old table through gh-ost. This gives the idempotent writes something to compare. Backfill the version for existing rows. Meanwhile design the new store's record: <code>user_id</code> as partition key, JSON for the profile fields, and a separate small lookup record keyed by email hash for the "find by email" query that the old table served with a secondary index.</li>
+  <li><b>Start dual writes.</b> For all users, writes go to MySQL first; if that succeeds, a message with the row and version is placed on a durable queue and a worker upserts it into the new store using "write if version is greater than stored". Failures retry with backoff. The user-facing path does not wait for the new store. After a day, check that queue lag is a second or two, the new-store error rate is low, and write latency for users has not changed.</li>
+  <li><b>Backfill.</b> A job walks the old table in primary-key order in batches of 1,000 rows, upserting each row into the new store with the same conditional rule, so it never overwrites a newer value from the live path. It records the last key as a checkpoint after each batch, and pauses when replica lag exceeds 2 seconds. It finishes in about a day.</li>
+  <li><b>Verify.</b> Run a per-range checksum comparison across all 1,024 logical shards. Differences are re-compared once after a delay; persistent ones are inspected and repaired from the old store. Repeat daily. In parallel turn on shadow reads for 1 percent of read requests: read both, return the old answer, log mismatches. The first run shows a 0.3 percent mismatch rate; investigation finds two causes, a time-zone conversion bug in the translation of one timestamp field, and the lookup record for emails that differ only by case. Fix both, backfill the affected records again, and the mismatch rate drops to the unavoidable few per million caused by write races. Raise shadow reads to 100 percent for a week covering peak days.</li>
+  <li><b>Ramp reads.</b> Switch reads by user percentage: 1, 10, 50, 100, holding at least a day at each stage, with the comparator still running at a sample rate and dashboards comparing p99 latency and error rate between old and new paths. A rollback at any stage is a flag change and costs nothing, because the old store is still fully up to date.</li>
+  <li><b>Cut over writes in cohorts.</b> For each cohort of users (starting with employees, then 1 percent, then 10 percent and so on): set the mode to <code>PAUSE_WRITES</code>, which makes the writer return a retryable response; wait until the queue lag for that cohort is zero (typically under a second); do a last targeted comparison; set the mode to <code>NEW_PRIMARY</code>, which writes to the new store first and replicates back to MySQL via the same queue in the reverse direction. Pause per cohort stays within 1-2 seconds, inside the 5-second budget, and clients retry transparently.</li>
+  <li><b>Safety period.</b> Run for two weeks with reverse replication to MySQL. If a serious problem appeared, reverse the flags per cohort and no post-cutover write is lost. At the end, take a final snapshot of MySQL, stop the reverse replication, switch to <code>NEW_ONLY</code>, and remove the old-store code and the flags in a cleanup change.</li>
+  <li><b>Decommission.</b> Shut down the MySQL cluster after the retention window for the snapshot, and remove the dual-write queue and checksum job.</li>
+</ol>
+
+<h3>19.3 What could still go wrong, and the answer</h3>
+<ul>
+  <li><b>A new field is introduced during the migration.</b> Freeze schema changes for the entity during phases 3-6, or make each such change in both stores before the code that uses it.</li>
+  <li><b>A hot user</b> (a celebrity account) makes one shard hot. The key distributes users evenly but not traffic. Plan to cache the profile (<a href="13-caching-patterns.html">Chapter 13</a>) and to split that logical shard onto its own node if needed.</li>
+  <li><b>Multi-row operations</b> such as "transfer ownership" that formerly used a single MySQL transaction now may span shards. These need a saga or a design change, and must be found before cutover through code review and query-log analysis.</li>
+</ul>
+
+<!-- ======================= 20 ======================= -->
+<h2 id="qa">20. Interview Q&amp;A</h2>
+
+<details><summary>When would you choose active-active over active-passive, and what do you give up?</summary>
+<p>I choose active-active when the business needs very low write latency for users on several continents, or cannot accept even a few minutes of failover time, and when the data is shaped so that conflicts are manageable. What I give up is the simple consistency of a single writer: concurrent writes in different regions must be reconciled by last-writer-wins, CRDTs, application merging, or by coordinating through consensus at the cost of cross-region latency. I also pay roughly double the infrastructure, since each region must be able to take a failed neighbor's load. If the requirement is merely "survive a region loss within a few minutes," warm active-passive is much cheaper and simpler, and I would start there.</p></details>
+
+<details><summary>Two regions accept a write to the same record at the same time. What happens and how do you design around it?</summary>
+<p>Each region commits locally and acknowledges its user, and later each receives the other's change via asynchronous replication. Without a rule the regions would hold different values forever, so the system applies a deterministic resolution such as the highest timestamp winning, which converges but silently drops one update and is sensitive to clock skew. To design around it, I first try to make conflicts impossible: give each record a single home region that handles all its writes. For genuinely shared data I use structures that merge naturally, such as per-region counters or set CRDTs, or I keep both versions and merge in application code. For invariants like balances or unique names, I send the write to one deciding region or a consensus store rather than relying on merge.</p></details>
+
+<details><summary>Why can a globally replicated database not give you fast strongly consistent writes everywhere?</summary>
+<p>Strong consistency requires that a write be durable on a majority of replicas, or be ordered relative to other writes, before it is acknowledged. Replicas in different regions are separated by tens to hundreds of milliseconds of round-trip time, set by the speed of light in fiber, so each commit must wait at least for the nearest majority. Spanner reduces coordination with synchronized clocks but still pays a quorum round trip and a small commit-wait. You can make writes fast by committing locally and replicating asynchronously, but then reads elsewhere may be stale and concurrent writes may conflict. This is the practical form of the trade-off described by CAP and PACELC, so the design decision is which features need which side.</p></details>
+
+<details><summary>Walk me through a regional failover for a database and explain how you avoid split-brain.</summary>
+<p>Health checks from independent vantage points detect that the active region is unhealthy and a controller, or an operator for the data tier, declares failover. Before promoting the replica in the second region I fence the old primary, by revoking its access or by using an increasing fencing token that storage rejects if stale, so it cannot accept writes even if it comes back believing it is still primary. Then I promote the replica, record how far behind it was (the data lost), shift traffic through DNS, anycast or the global load balancer, and scale compute up. Split-brain is prevented by fencing plus a lease or quorum held in a third location, so a region that cannot reach the quorum must stop writing. Afterwards I rebuild the old region as a replica and decide whether to fail back or simply swap roles.</p></details>
+
+<details><summary>What is expand and contract, and why is it better than one big migration script?</summary>
+<p>Expand and contract splits a breaking change into steps that are each backward compatible. First expand by adding the new column or table, then deploy code that writes both old and new, backfill history, switch reads to the new one, and only at the end contract by dropping the old structure. A single script cannot work because deployments are gradual, so for a while old and new code run together against the same schema, and because you need a way to roll back if something is wrong. With expand and contract the old data stays complete and correct until the last step, so every earlier step is reversible by redeploying the previous code. The cost is more deployments and more elapsed time, which is a good trade for avoiding outages.</p></details>
+
+<details><summary>How do gh-ost and pt-online-schema-change work, and how do they differ?</summary>
+<p>Both create a shadow copy of the table with the new schema, copy rows into it in small chunks while throttling on replica lag, keep it in sync with changes made to the original during the copy, and finally swap the table names atomically. pt-online-schema-change keeps the shadow table in sync with database triggers on the original table, which is simple but adds overhead and lock contention to every write and cannot be paused cleanly. gh-ost avoids triggers by reading the binary log and applying changes itself, so it adds less load to the primary, can run against a replica, and can be paused, throttled or aborted at any moment. Neither fixes application compatibility, so you still pair them with expand and contract.</p></details>
+
+<details><summary>How do you migrate between two databases with no downtime and be able to roll back?</summary>
+<p>I keep the old database as the source of truth through almost all of the migration. I add a data access abstraction with a per-user mode flag, begin dual writing with the old store first and the new store through an idempotent, versioned, retryable path, and backfill history with a conditional write that never overwrites a newer value. Alternatively I take a snapshot with a log position and apply the CDC stream from there. Then I shadow-read from both stores and compare until mismatches are zero or explained, ramp reads gradually, and cut writes over per cohort with a short pause until lag is zero. I replicate writes back to the old store for a safety period so rollback loses nothing, and I only decommission after that period.</p></details>
+
+<details><summary>What are the advantages of CDC over application-level dual writes for a migration?</summary>
+<p>CDC reads the source database's committed change log, so it captures every change in the exact order they were committed, including those made by scripts, other services or manual fixes that bypass your application code. It does not add latency or failure modes to the user's write path, and there is no gap where the first write succeeded and the second failed. The drawbacks are additional infrastructure, a replication lag that must be driven to near zero before cutover, and the need to translate the data model in the consumer. Dual writes in the application give lower lag and full control of the transformation but are easier to get subtly wrong. Many teams use CDC for the bulk and ongoing copy, and the comparator to prove correctness.</p></details>
+
+<details><summary>How do you change a shard key on a live system?</summary>
+<p>It is a full migration into a new layout partitioned by the new key, because most rows end up in different shards. I would build the new layout, add a routing layer that records migration state per key range, dual write using a shard calculated from the new key, backfill the history with conditional writes, shadow read and compare, then cut over reads and writes gradually. Before starting I check the main queries against the new key, since queries that were single-shard may now scatter across shards, and I add secondary indexes or denormalized copies as needed. I would also use many logical shards so that future capacity changes are just moving whole shards rather than another key change.</p></details>
+
+<details><summary>How would you verify that a migration did not lose or corrupt data?</summary>
+<p>I use layers. Row counts per range catch gross problems. Per-range checksums, which work like a Merkle tree, compare large volumes cheaply and tell me which ranges to examine. A full diff on a snapshot gives definitive proof for the sample I choose. Shadow reads under real traffic test the queries that matter and the strange data shapes tests missed. Finally, business invariants, such as total balances unchanged, catch transformation errors that look like valid data. I tune the comparison to ignore short timing differences after fresh writes by rechecking after a delay, because a noisy comparator is quickly ignored. Cutover happens only when mismatches are zero or fully explained over a representative period including peak load.</p></details>
+
+<details><summary>How do data residency rules affect a multi-region design?</summary>
+<p>Residency turns placement from a performance choice into a hard constraint. I assign each user or tenant a residency region at signup, embed it in the identifier, and route all reads and writes for that data to its home region, which is the home-region ownership pattern. I must check every copy of the data, including replicas, DR targets, caches, search indexes, analytics stores, logs and backups, so none leaves the permitted jurisdiction. Global features such as email uniqueness or cross-region search need special design, for example storing only hashes in a global service. Disaster recovery for regulated data must use another region inside the same jurisdiction.</p></details>
+
+<!-- ======================= 21 ======================= -->
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">21. Recap</h2>
+<ul>
+  <li>Go multi-region for a named reason: latency, availability beyond one region, residency, or DR. The reason chooses the topology.</li>
+  <li>Topologies run from backups only, to warm active-passive, to follower reads, to home-region ownership, to full active-active. Each step raises cost and consistency work.</li>
+  <li>Global databases split into coordinated systems (Spanner, CockroachDB: strong, pay round trips) and replicated-and-reconciled systems (DynamoDB global tables, Cosmos multi-write: fast, accept conflicts). Aurora Global is single-writer with remote read replicas.</li>
+  <li>Conflict tools: avoid conflicts through ownership, then CRDTs and append-only designs, then application merge, then LWW only for overwritable state, and consensus for money and uniqueness.</li>
+  <li>Cross-region round trips of 60-250 ms dominate quorum writes and transactions. Keep transactions in one region, put compute near the data, and watch replication lag as the real RPO.</li>
+  <li>Choose consistency per feature, route with GeoDNS, anycast or a global load balancer, and use an ID-based home region lookup.</li>
+  <li>Failover is detect, decide, fence, promote, shift, reconcile. Prevent split-brain with fencing and a third-location quorum. Practice it, and reserve standby capacity.</li>
+  <li>Schema changes use expand and contract, with online DDL tools (gh-ost, pt-osc) making each step cheap. Data migrations use dual write or CDC, backfill, shadow read and compare, a gradual read ramp, a per-cohort write cutover, reverse replication, and delayed decommission.</li>
+  <li>Resharding is easy with many logical shards and hard when the shard key changes. Verify with counts, checksums, diffs and shadow reads, and always keep a rollback.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="24-replication.html">Chapter 24</a> (replication) and <a href="25-sharding.html">Chapter 25</a> (sharding), and uses the routing ideas of <a href="04-dns.html">Chapter 4</a>, <a href="09-load-balancing.html">Chapter 9</a> and <a href="12-cdn.html">Chapter 12</a>. The consistency trade-offs are developed in <a href="28-cap-consistency.html">Chapter 28</a> and <a href="29-consensus.html">Chapter 29</a>, conflict-free data types in <a href="59-sorted-sets-crdt.html">Chapter 59</a>, regional high availability in <a href="41-ha-dr.html">Chapter 41</a>, and the monolith-to-microservices data splits that rely on these same migration techniques in <a href="44-monolith-to-microservices.html">Chapter 44</a> and <a href="46-microservice-data.html">Chapter 46</a>.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

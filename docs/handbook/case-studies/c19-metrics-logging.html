@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 19: Design Metrics and Log Aggregation | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c19-metrics-logging">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 19 · Worked solutions</div>
+<h1>Design Metrics and Log Aggregation</h1>
+<p class="lead">We design the system that every other system depends on when it breaks: a platform that collects numeric metrics and text logs from tens of thousands of machines, stores them cheaply, answers dashboard queries in a second, and wakes someone up within a minute when something is wrong. The hard parts are the write volume, the cost of storage, the explosion of label combinations, and the fact that this system must stay up exactly when everything else is down.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is usually one line: "Design a metrics and logging system like Prometheus plus Grafana plus an ELK stack, or like Datadog." That sentence hides two different workloads. <b>Metrics</b> are small numbers sampled over time (CPU at 63 percent, 412 requests served), identified by a name and a set of labels. <b>Logs</b> are free text or structured records describing individual events ("user 7 failed login from 10.0.0.4"). They differ in volume, shape, query pattern and cost, so a good answer builds two pipelines that share an ingestion buffer, an alerting engine, a tenancy model and a UI. We start by asking questions, as described in <a href="../chapters/01-interview-framework.html">Chapter 1</a>.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>Who are the users?</td><td>Engineers and on-call responders of one large company (internal platform), roughly 500 teams, treated as tenants. We note how it changes for a SaaS vendor.</td></tr>
+<tr><td>How many sources?</td><td>50,000 hosts and containers, about 200 active metric series per process on average after labels, plus infrastructure and business metrics. Target: <b>10 million active time series</b> and <b>1 million log lines per second</b> on average.</td></tr>
+<tr><td>Metric resolution?</td><td>10 second default scrape or push interval, 1 second allowed for a few opt-in series.</td></tr>
+<tr><td>Freshness?</td><td>A metric sample should be queryable within 15 seconds of collection; a log line searchable within 30 seconds. Alerts fire within about 1 minute of a condition becoming true.</td></tr>
+<tr><td>Retention?</td><td>Metrics: raw 15 days, 1 minute rollups 90 days, 5 minute rollups 13 months. Logs: 7 days fully searchable, 30 days cheap and slower, 1 year archived for compliance on selected streams.</td></tr>
+<tr><td>Is it acceptable to lose data?</td><td>Metrics: small losses are tolerable (a gap of a few samples), never silent. Logs: audit logs must not be lost; application debug logs may be sampled or dropped under overload with a counter of what was dropped.</td></tr>
+<tr><td>Query types?</td><td>Metrics: range queries with aggregation ("p99 latency per service for the last 6 hours"). Logs: filter by time range plus labels plus text ("service=checkout, level=error, contains 'timeout'").</td></tr>
+<tr><td>Traces?</td><td>Out of scope; we mention where they plug in. See <a href="../chapters/54-observability-slos.html">Chapter 54</a> and <a href="../chapters/52-microservice-observability.html">Chapter 52</a>.</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional</h3>
+<ul>
+<li>Collect metrics from hosts, containers and applications through agents, with both pull (scrape) and push paths.</li>
+<li>Store time series with labels and answer range queries with aggregations (sum, rate, quantiles) and group-by on labels.</li>
+<li>Collect logs, parse them into structured fields, store and search them by time, labels and text.</li>
+<li>Dashboards: saved queries rendered as graphs, auto refreshing.</li>
+<li>Alerting: user-defined rules over metrics (and optionally log-derived counts), notification routing to pager, chat and email, with deduplication, grouping, silencing and escalation.</li>
+<li>Multi-tenancy: per-team isolation, quotas, and per-team cost visibility.</li>
+</ul>
+<h3>2.2 Non-functional</h3>
+<ul>
+<li><b>Write availability above all.</b> Ingest must accept data during a storm. A monitoring system that goes blind during an outage is useless.</li>
+<li>Dashboard queries return in under 2 seconds at p95 for the last 24 hours, under 5 seconds for 30 days.</li>
+<li>The alerting path is more critical than dashboards and must be independent of the heavy query path.</li>
+<li>Cost: the storage bill is the dominant cost. We will compress aggressively and tier data.</li>
+<li>The system must survive the loss of one availability zone with no alert loss, and must not depend on the infrastructure it monitors (no circular dependency).</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Distributed tracing storage, profiling, user-facing product analytics (see <a href="c20-ad-click-aggregation.html">Case study 20</a> for stream aggregation with exactness), security information and event management detection rules, and anomaly detection by machine learning (we mention it only as a later extension).</p>
+
+<h2 id="estimation">3. Estimation with real arithmetic</h2>
+<p>Estimation drives the architecture here more than in most designs, so we do it carefully. Techniques are in <a href="../chapters/02-estimation.html">Chapter 2</a>.</p>
+<h3>3.1 Metrics volume</h3>
+<ul>
+<li>Active series: 10,000,000. Scrape interval 10 s, so each series gets 0.1 sample per second.</li>
+<li>Sample rate: 10,000,000 × 0.1 = <b>1,000,000 samples per second</b> on average. Peak (restarts, scrape alignment, a deploy that creates new series) is about 2×, so 2M samples/s. Design for 3M to leave headroom.</li>
+<li>Raw sample: an 8 byte timestamp and an 8 byte double is 16 bytes. Per day: 1,000,000 × 86,400 = 86.4 billion samples. Uncompressed that is 86.4e9 × 16 B = about 1.38 TB per day.</li>
+<li>Compressed with the delta-of-delta timestamp and XOR value scheme (section 7), real data averages about 1.4 to 2 bytes per sample. Take 1.5 B: 86.4e9 × 1.5 = <b>about 130 GB per day</b>. With 15 days raw: about 1.95 TB. With replication factor 3 for durability on local disks: about 6 TB of block storage. Small.</li>
+<li>Series index: 10M series, each with about 10 labels at about 60 bytes of text (names and values dictionary encoded to far less). Say 150 bytes per series in the index: 1.5 GB, plus the postings (inverted) lists. Active-series state in memory: about 3 KB per head series in a Prometheus-like engine (labels, chunk, mapping) so 10M series is about 30 GB across the ingesters. Memory, not disk, is the real limit, and this is why cardinality dominates the design.</li>
+<li>Rollups: 1 minute rollup stores per series per minute a few aggregates (min, max, sum, count; call it 4 values, about 6 bytes compressed). 10M × 1,440 minutes × 6 B = 86 GB per day for 90 days = 7.8 TB. 5 minute rollups: 10M × 288 × 6 B = 17 GB/day; 13 months is 395 days, so 6.8 TB. Rollups cost more than raw in total because they live much longer, which is why we only roll up series that are queried over long ranges.</li>
+</ul>
+<h3>3.2 Ingest network for metrics</h3>
+<p>Agents send batches. A batch sample is about 20 bytes on the wire after protobuf and snappy compression with label references interned per request. 2M samples/s peak × 20 B = 40 MB/s. Easy for a few dozen distributors; the pressure is on memory and CPU of ingesters.</p>
+<h3>3.3 Log volume</h3>
+<ul>
+<li>1,000,000 lines per second average, 500 bytes per line (structured JSON including labels): <b>500 MB/s</b>. Peak 3× during an incident, when everyone logs errors: 1.5 GB/s.</li>
+<li>Per day: 500 MB/s × 86,400 = 43.2 TB raw. Per year: 15.8 PB raw.</li>
+<li>Compression: general purpose block compression (zstd) on repetitive structured text typically gives 6 to 10×. Take 8×: 5.4 TB per day. 30 days: 162 TB in object storage. At about $23 per TB-month for standard object storage that is about $3.7k per month. Compare with indexing every token in a search engine: an inverted index plus stored fields is often 1× to 1.5× of raw size on fast replicated SSD. 7 days × 43.2 TB × 1.2 × 2 copies is roughly 730 TB of SSD, an order of magnitude more expensive. This one comparison decides the logs architecture (section 8).</li>
+<li>Kafka buffer sizing: 500 MB/s × 3 replicas = 1.5 GB/s of replicated disk writes. Retention 6 hours of buffer: 500 MB/s × 21,600 s = 10.8 TB per copy, 32 TB with replication (compressed batches halve this to about 16 TB). Partitions at roughly 5 MB/s sustained each: 100 partitions at average, 300 to absorb peak with consumer parallelism.</li>
+</ul>
+<h3>3.4 Query load</h3>
+<p>Dashboards: 5,000 engineers, 2,000 open dashboards at any time, each with 12 panels refreshing every 30 seconds: 2,000 × 12 / 30 = <b>800 panel queries per second</b>, a heavily repetitive load (identical queries, so a results cache helps). Alert rules: 50,000 rules at a 30 s evaluation interval = 1,670 evaluations per second. Ad hoc log searches: about 20 per second.</p>
+<div class="callout key"><b>Key numbers to carry</b> 10M series, 1M samples/s, 1.5 B per compressed sample, 130 GB/day metrics. 1M lines/s, 500 MB/s, 43 TB/day raw, 5 TB/day compressed. Logs outweigh metrics in bytes by about 40×, but metrics outweigh logs in query value per byte. Treat them separately.</div>
+
+<h2 id="api">4. API design</h2>
+<p>We need a write API for agents and a read API for dashboards and alerting. Both are authenticated, carry a tenant id, and follow the conventions in <a href="../chapters/05-api-design.html">Chapter 5</a>. The wire format is binary and compressed, per <a href="../chapters/07-serialization.html">Chapter 7</a>.</p>
+<pre>POST /v1/metrics/write            (Content-Encoding: snappy, body: protobuf)
+Headers: X-Tenant-Id: team-checkout, Authorization: Bearer ...
+Body: [ { labels: {__name__:"http_requests_total", service:"cart", code:"200", pod:"cart-7f"},
+          samples: [ {ts_ms: 1700000000000, value: 4123.0}, ... ] }, ... ]
+Response: 204 | 400 (bad labels) | 413 (too large) | 429 (quota, Retry-After) | 503 (retry)
+
+POST /v1/logs/push                (body: protobuf or NDJSON, snappy)
+Body: { stream_labels: {service:"cart", env:"prod", level:"error"},
+        entries: [ {ts_ns, line, structured_metadata:{trace_id:"..."}} ] }
+
+GET /v1/query_range?query=sum(rate(http_requests_total{service="cart"}[5m])) by (code)
+        &amp;start=...&amp;end=...&amp;step=60s
+GET /v1/logs/query?query={service="cart",env="prod"} |= "timeout" | json | latency_ms &gt; 500
+        &amp;start=...&amp;end=...&amp;limit=1000&amp;direction=backward
+
+PUT /v1/rules/{tenant}            (alert and recording rule groups, YAML)
+POST /v1/alerts/silences          (matchers, start, end, creator, comment)</pre>
+<p>Two design points. First, the write path is <b>batched and idempotent enough</b>: re-sending the same (series, timestamp, value) is harmless because storage drops exact duplicates, so agents can retry freely. A different value at an identical timestamp is rejected as "out of order or conflicting". Second, a <b>429 with Retry-After</b> is how quotas and backpressure are communicated to agents (section 12).</p>
+
+<h2 id="datamodel">5. Data model and storage choices</h2>
+<p>A time series is identified by its full label set, including the special label <code>__name__</code>. The identity of a series is a hash of its sorted label pairs. A <b>sample</b> is (timestamp, float64). Everything else follows from these two facts.</p>
+<table>
+<tr><th>Data</th><th>Shape</th><th>Store and why</th></tr>
+<tr><td>Recent metric samples</td><td>Append-only, per series, time ordered</td><td>Purpose built TSDB blocks on local SSD (section 7). Writes are sequential appends in memory plus a write-ahead log. A general key-value or wide column store works for small deployments (<a href="../chapters/20-nosql.html">Chapter 20</a>, <a href="../chapters/23-other-stores.html">Chapter 23</a>) but pays too much per sample.</td></tr>
+<tr><td>Series index</td><td>Label to series ids (inverted index)</td><td>Inside each TSDB block, as posting lists, the same idea as a search engine inverted index (<a href="../chapters/22-search-engines.html">Chapter 22</a>) but specialized.</td></tr>
+<tr><td>Old metric blocks</td><td>Immutable files</td><td>Object storage (<a href="../chapters/21-object-storage.html">Chapter 21</a>): cheap, durable, 11 nines. Blocks are uploaded once, then queried through a store gateway with cached index headers.</td></tr>
+<tr><td>Log chunks</td><td>Compressed batches of lines per stream</td><td>Object storage. A small index maps (stream labels, time) to chunk files.</td></tr>
+<tr><td>Log full text index (hot, optional)</td><td>Inverted index over tokens</td><td>Search engine (Elasticsearch/OpenSearch) only for the subset of streams that need free text search at low latency, for a short window.</td></tr>
+<tr><td>Rules, dashboards, silences, tenants</td><td>Small, relational</td><td>A replicated relational store (<a href="../chapters/18-relational-internals.html">Chapter 18</a>), or Git for rules and dashboards as code.</td></tr>
+<tr><td>Alert state (firing, pending)</td><td>Small, hot, tolerant of short loss</td><td>In memory in the alert managers, gossiped between replicas, plus periodic snapshots. See section 11.</td></tr>
+</table>
+
+<h2 id="simple">6. A first simple design, then the scaled architecture</h2>
+<h3>6.1 The single-box version</h3>
+<p>One Prometheus-style server scrapes about 1,000 targets every 10 seconds, stores 10 to 100 thousand series on local disk, evaluates alert rules, and serves a graph UI. Logs go to files that an agent ships to one search node. This works to roughly a few hundred thousand series and a few thousand log lines per second, and it is how most companies start. It fails in four ways: (1) a single machine's memory caps active series, (2) the disk is the only copy so loss of the node loses history, (3) the node is both the alerter and the query engine, so a heavy dashboard query can delay alerts, and (4) there is no tenant isolation. Scaling means solving those four, in the order that hurts.</p>
+<h3>6.2 The scaled architecture</h3>
+<figure class="diagram">
+<svg viewBox="0 0 960 470" role="img" aria-label="High level architecture of the metrics and logs platform">
+  <rect class="ext" x="14" y="30" width="150" height="80" rx="8"/><text class="t-c t-b" x="89" y="58">Hosts and pods</text><text class="t-c t-sm" x="89" y="76">apps, exporters</text><text class="t-c t-sm" x="89" y="92">50,000 sources</text>
+  <rect class="box" x="14" y="150" width="150" height="70" rx="8"/><text class="t-c t-b" x="89" y="178">Node agent</text><text class="t-c t-sm" x="89" y="196">scrape, tail logs, buffer</text>
+  <path class="arrow" d="M89 110 L89 148"/>
+  <rect class="box" x="214" y="150" width="130" height="70" rx="8"/><text class="t-c t-b" x="279" y="178">Distributors</text><text class="t-c t-sm" x="279" y="196">auth, quota, shard</text>
+  <path class="arrow" d="M164 185 L212 185"/>
+  <rect class="cache" x="394" y="130" width="150" height="110" rx="8"/><text class="t-c t-b" x="469" y="160">Kafka buffer</text><text class="t-c t-sm" x="469" y="180">topics: metrics, logs</text><text class="t-c t-sm" x="469" y="198">6 h retention</text><text class="t-c t-sm" x="469" y="216">100 to 300 partitions</text>
+  <path class="arrow" d="M344 185 L392 185"/>
+  <rect class="box" x="600" y="40" width="150" height="70" rx="8"/><text class="t-c t-b" x="675" y="68">Metric ingesters</text><text class="t-c t-sm" x="675" y="86">head block + WAL</text>
+  <rect class="box" x="600" y="260" width="150" height="70" rx="8"/><text class="t-c t-b" x="675" y="288">Log ingesters</text><text class="t-c t-sm" x="675" y="306">chunks + small index</text>
+  <rect class="box" x="600" y="150" width="150" height="70" rx="8"/><text class="t-c t-b" x="675" y="178">Rule evaluator</text><text class="t-c t-sm" x="675" y="196">alert + recording</text>
+  <path class="arrow" d="M544 160 L598 80"/><path class="arrow" d="M544 200 L598 185"/><path class="arrow" d="M544 220 L598 290"/>
+  <rect class="db" x="810" y="40" width="136" height="70" rx="8"/><text class="t-c t-b" x="878" y="68">Object storage</text><text class="t-c t-sm" x="878" y="86">blocks, chunks</text>
+  <path class="arrow" d="M750 75 L808 75"/><path class="arrow" d="M750 295 L830 112"/>
+  <rect class="db" x="810" y="150" width="136" height="70" rx="8"/><text class="t-c t-b" x="878" y="178">Compactor</text><text class="t-c t-sm" x="878" y="196">merge, rollup, expire</text>
+  <path class="arrow" d="M878 112 L878 148"/>
+  <rect class="box" x="394" y="330" width="150" height="70" rx="8"/><text class="t-c t-b" x="469" y="358">Query frontend</text><text class="t-c t-sm" x="469" y="376">split, cache, queue</text>
+  <rect class="box" x="600" y="360" width="150" height="70" rx="8"/><text class="t-c t-b" x="675" y="388">Queriers + store gw</text><text class="t-c t-sm" x="675" y="406">ingesters + blocks</text>
+  <path class="arrow" d="M544 365 L598 390"/>
+  <path class="arrow dash" d="M675 360 L675 112"/>
+  <path class="arrow dash" d="M750 400 L878 222"/>
+  <rect class="box" x="214" y="360" width="130" height="70" rx="8"/><text class="t-c t-b" x="279" y="388">Dashboards</text><text class="t-c t-sm" x="279" y="406">UI, API users</text>
+  <path class="arrow" d="M344 395 L392 370"/>
+  <rect class="miss" x="814" y="270" width="132" height="70" rx="8"/><text class="t-c t-b" x="880" y="298">Alert manager</text><text class="t-c t-sm" x="880" y="316">dedup, route, notify</text>
+  <path class="arrow" d="M750 190 L790 190 L790 300 L812 300"/>
+  <rect class="ext" x="814" y="380" width="132" height="50" rx="8"/><text class="t-c t-b" x="880" y="410">Pager, chat</text>
+  <path class="arrow" d="M880 340 L880 378"/>
+</svg>
+<figcaption>Agents batch data to stateless distributors, which write to Kafka. Ingesters and the rule evaluator consume from it independently, so a slow query path never delays alerting. Long term data lives as immutable files in object storage; the compactor merges and rolls them up. Queries fan out to ingesters (recent) and the store gateway (history).</figcaption>
+</figure>
+<p>The key structural choice is the <b>decoupling at the Kafka buffer</b> (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>). Without it, every ingester restart or slow disk turns into dropped writes at the edge. With it, ingesters consume at their own pace, the same data stream can feed multiple consumers (ingesters, a streaming rule evaluator, an archiver), and a regional outage of a downstream store only grows a lag that drains later. The cost is extra latency (a second or two) and operating Kafka.</p>
+
+<h3>6.3 Agents and collectors: push versus pull</h3>
+<p>This is the first design fork an interviewer expects you to discuss. In <b>pull</b>, a collector knows the list of targets (from service discovery, see <a href="../chapters/49-discovery-config.html">Chapter 49</a>) and fetches an HTTP endpoint (<code>/metrics</code>) from each target every interval. In <b>push</b>, each application or agent sends its data to a central endpoint.</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 300" role="img" aria-label="Pull versus push collection compared">
+  <text class="t-b" x="20" y="24">Pull: collector scrapes targets</text>
+  <rect class="box" x="20" y="50" width="150" height="60" rx="8"/><text class="t-c t-b" x="95" y="76">Collector</text><text class="t-c t-sm" x="95" y="94">holds target list</text>
+  <rect class="ext" x="260" y="40" width="150" height="40" rx="8"/><text class="t-c" x="335" y="65">app A /metrics</text>
+  <rect class="ext" x="260" y="90" width="150" height="40" rx="8"/><text class="t-c" x="335" y="115">app B /metrics</text>
+  <path class="arrow" d="M170 70 L258 60"/><path class="arrow" d="M170 90 L258 110"/>
+  <rect class="db" x="20" y="160" width="150" height="50" rx="8"/><text class="t-c t-b" x="95" y="190">Service discovery</text>
+  <path class="arrow dash" d="M95 160 L95 112"/>
+  <text class="t-sm" x="20" y="240">+ up/down is free: failed scrape means target is down</text>
+  <text class="t-sm" x="20" y="258">+ collector controls rate; no inbound auth per app</text>
+  <text class="t-sm" x="20" y="276">- needs reachability and discovery; short lived jobs missed</text>
+  <text class="t-b" x="500" y="24">Push: agents send to ingest endpoint</text>
+  <rect class="ext" x="500" y="40" width="150" height="40" rx="8"/><text class="t-c" x="575" y="65">app A + agent</text>
+  <rect class="ext" x="500" y="90" width="150" height="40" rx="8"/><text class="t-c" x="575" y="115">batch job</text>
+  <rect class="box" x="760" y="50" width="160" height="60" rx="8"/><text class="t-c t-b" x="840" y="76">Gateway</text><text class="t-c t-sm" x="840" y="94">auth, quota</text>
+  <path class="arrow" d="M650 60 L758 70"/><path class="arrow" d="M650 110 L758 95"/>
+  <text class="t-sm" x="500" y="240">+ works across NAT and for short lived jobs</text>
+  <text class="t-sm" x="500" y="258">+ event style data (logs) is naturally push</text>
+  <text class="t-sm" x="500" y="276">- silence is ambiguous: dead app or dead network?</text>
+</svg>
+<figcaption>Pull gives free liveness detection and central control of the rate; push handles ephemeral jobs and firewalled networks. Real systems use both.</figcaption>
+</figure>
+<p>Our answer is a <b>hybrid built around a node agent</b>. On every host a lightweight agent (a DaemonSet in Kubernetes) scrapes local targets by pull, which gives the "up" signal for free (a failed scrape records <code>up=0</code>) and keeps scrape load local. The agent also tails log files, reads the container runtime log streams, and accepts pushes from short lived batch jobs on localhost. It then does a single outbound push (remote write) of batched, snappy compressed data to the distributors. This gives the benefits of pull for liveness and rate control inside the host, and the benefits of push across the network boundary: agents initiate outbound connections only, which passes firewalls and means the central system need not know every target. Agents add jittered scrape offsets so that 50,000 hosts do not all fire in the same second, and they buffer on local disk (a few minutes to an hour) when the network or the platform is down. Compare the same trade in the chapters on <a href="../chapters/52-microservice-observability.html">microservice observability</a> and <a href="../chapters/40-resilience.html">resilience</a>.</p>
+<div class="callout tip"><b>Interview tip</b> Never say "pull is better" or "push is better". Say which signals each is good at: pull for liveness of long running services, push for ephemeral jobs and logs, and that the agent hybrid gives you both.</div>
+
+<h2 id="flows">7. Request flows and time-series storage internals</h2>
+<h3>7.1 Write flow</h3>
+<figure class="diagram">
+<svg viewBox="0 0 960 360" role="img" aria-label="Write path sequence">
+  <rect class="ext" x="20" y="14" width="120" height="34" rx="8"/><text class="t-c t-b" x="80" y="36">Agent</text>
+  <rect class="box" x="210" y="14" width="120" height="34" rx="8"/><text class="t-c t-b" x="270" y="36">Distributor</text>
+  <rect class="cache" x="400" y="14" width="120" height="34" rx="8"/><text class="t-c t-b" x="460" y="36">Kafka</text>
+  <rect class="box" x="590" y="14" width="120" height="34" rx="8"/><text class="t-c t-b" x="650" y="36">Ingester</text>
+  <rect class="db" x="780" y="14" width="140" height="34" rx="8"/><text class="t-c t-b" x="850" y="36">Object storage</text>
+  <path class="life" d="M80 48 L80 340"/><path class="life" d="M270 48 L270 340"/><path class="life" d="M460 48 L460 340"/><path class="life" d="M650 48 L650 340"/><path class="life" d="M850 48 L850 340"/>
+  <path class="arrow" d="M80 80 L268 80"/><text class="t-sm" x="86" y="72">1 batch, snappy, tenant id</text>
+  <path class="arrow dash" d="M270 110 L270 130 L180 130 L180 110"/><text class="t-sm" x="30" y="150">2 auth, limits, hash(series) to partition</text>
+  <path class="arrow" d="M270 175 L458 175"/><text class="t-sm" x="280" y="167">3 produce, acks=all</text>
+  <path class="arrow-g" d="M458 205 L272 205"/><text class="t-sm" x="290" y="223">4 ack, then 204 to agent</text>
+  <path class="arrow" d="M652 250 L462 250"/><text class="t-sm" x="480" y="242">5 consume (own partitions)</text>
+  <path class="arrow dash" d="M650 270 L650 290 L720 290 L720 270"/><text class="t-sm" x="660" y="310">6 append WAL + head chunk</text>
+  <path class="arrow" d="M652 335 L848 335"/><text class="t-sm" x="670" y="327">7 every 2 h: block upload</text>
+</svg>
+<figcaption>The agent gets its acknowledgement after the Kafka write (step 4), which is durable and replicated. The ingester applies it later, so a slow ingester delays freshness but never loses data.</figcaption>
+</figure>
+<ol>
+<li>The agent posts a batch (up to a few thousand samples) to a distributor chosen by load balancer (<a href="../chapters/09-load-balancing.html">Chapter 9</a>).</li>
+<li>The distributor authenticates the tenant, checks per-tenant limits (series count, rate, label size), validates labels, then computes <code>hash(tenant, labels)</code> to choose a Kafka partition so that every sample of a series lands on one partition and therefore one ingester (preserving per series order).</li>
+<li>It produces with <code>acks=all</code>, waits for the replicas to acknowledge, and returns 204. If Kafka is unavailable it returns 503 and the agent retries from its local buffer.</li>
+<li>The ingester that owns the partition appends to a write-ahead log and to the <b>head block</b> in memory.</li>
+<li>Every 2 hours the head is cut into an immutable block, uploaded to object storage, and the WAL is truncated.</li>
+</ol>
+<h3>7.2 Why a dedicated time-series engine</h3>
+<p>Time series data has properties a general store ignores. Writes are overwhelmingly appends of the newest timestamp. Reads ask for a time range of many series. Neighboring samples in one series are nearly identical (a counter increments slowly, a gauge barely moves, timestamps are regular). A B-tree storing (series, ts, value) rows pays tree maintenance for ordering that arrives for free, and stores about 16 bytes plus overhead per sample. See <a href="../chapters/19-storage-engines.html">Chapter 19</a> for LSM versus B-tree. A TSDB instead stores per series a compressed stream of samples in a chunk, and keeps the series identity once.</p>
+<h3>7.3 Compression: delta-of-delta and XOR</h3>
+<p>The scheme from Facebook's Gorilla paper (and used in Prometheus and many others) compresses timestamps and values separately.</p>
+<ul>
+<li><b>Timestamps, delta-of-delta.</b> Scrapes are every 10,000 ms, so consecutive timestamps are t, t+10000, t+20000. The first difference (delta) is 10,000 every time. The difference of those deltas (delta of delta) is 0. A delta-of-delta of zero is encoded in <b>1 bit</b>. Small deviations (jitter of a few ms) take 9 to 12 bits with a short prefix code. A series with perfectly regular timestamps therefore spends about 1 bit per sample on time.</li>
+<li><b>Values, XOR.</b> Interpret each float64 as 64 bits and XOR it with the previous value. If the value is unchanged the XOR is zero, stored as 1 bit. If it changed slightly (same sign, exponent, high mantissa bits) the XOR has long runs of leading and trailing zeros; store only the meaningful middle bits plus a few bits describing where they sit. Counters that increase by small integers and gauges that stay near a value compress very well; random noise compresses poorly.</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 960 250" role="img" aria-label="Delta of delta and XOR encoding example">
+  <text class="t-b" x="20" y="24">Timestamps (ms)</text>
+  <text x="20" y="50">t:</text><text x="140" y="50">1000000</text><text x="300" y="50">1010000</text><text x="460" y="50">1020000</text><text x="620" y="50">1030002</text><text x="780" y="50">1040001</text>
+  <text x="20" y="80">delta:</text><text class="t-sm" x="140" y="80">(header)</text><text x="300" y="80">10000</text><text x="460" y="80">10000</text><text x="620" y="80">10002</text><text x="780" y="80">9999</text>
+  <text x="20" y="110">dod:</text><text class="t-sm" x="300" y="110">(first delta)</text><text x="460" y="110">0</text><text x="620" y="110">+2</text><text x="780" y="110">-3</text>
+  <text x="20" y="140">bits:</text><text class="t-sm" x="300" y="140">14</text><text x="460" y="140">1 bit</text><text x="620" y="140">9 bits</text><text x="780" y="140">9 bits</text>
+  <path class="arrow" d="M20 160 L940 160" style="opacity:.3"/>
+  <text class="t-b" x="20" y="190">Values (counter)</text>
+  <text x="20" y="215">v:</text><text x="140" y="215">4123.0</text><text x="300" y="215">4123.0</text><text x="460" y="215">4125.0</text><text x="620" y="215">4125.0</text><text x="780" y="215">4130.0</text>
+  <text class="t-sm" x="20" y="238">XOR with previous: first full 64 bits, then 1 bit (same), about 14 bits (small change), 1 bit (same), about 16 bits</text>
+</svg>
+<figcaption>Regular timestamps cost 1 bit; values that repeat cost 1 bit; small changes cost a dozen or so. Averaged over real fleets this is 1.3 to 2 bytes per sample, versus 16 bytes raw.</figcaption>
+</figure>
+<p>The arithmetic matters for the estimation: 130 GB per day instead of 1.4 TB is the difference between a cheap and a painful system. Note the limitation: compression works per chunk (typically 120 samples per series), so a series that is queried must decompress sequentially from the start of a chunk. That is fine because queries read ranges.</p>
+<h3>7.4 Block layout and the index</h3>
+<figure class="diagram">
+<svg viewBox="0 0 960 300" role="img" aria-label="TSDB head and block layout">
+  <rect class="cache" x="20" y="30" width="270" height="220" rx="8"/><text class="t-b" x="34" y="54">Head (memory + WAL)</text>
+  <text class="t-sm" x="34" y="80">last 2 h of samples, open chunks</text>
+  <text class="t-sm" x="34" y="100">series map: labels to series ref</text>
+  <text class="t-sm" x="34" y="120">in-memory postings</text>
+  <text class="t-sm" x="34" y="150">WAL on disk for crash recovery</text>
+  <text class="t-sm" x="34" y="180">cost: about 3 KB per active series</text>
+  <path class="arrow" d="M290 140 L360 140"/><text class="t-sm" x="296" y="130">cut</text>
+  <rect class="db" x="360" y="30" width="570" height="220" rx="8"/><text class="t-b" x="374" y="54">Immutable block (2 h, later 12 h, 24 h after compaction)</text>
+  <rect class="box" x="380" y="76" width="160" height="70" rx="8"/><text class="t-c t-b" x="460" y="104">chunks/</text><text class="t-c t-sm" x="460" y="122">compressed samples</text>
+  <rect class="box" x="560" y="76" width="160" height="70" rx="8"/><text class="t-c t-b" x="640" y="104">index</text><text class="t-c t-sm" x="640" y="122">series, postings</text>
+  <rect class="box" x="740" y="76" width="170" height="70" rx="8"/><text class="t-c t-b" x="825" y="104">meta.json</text><text class="t-c t-sm" x="825" y="122">minTime, maxTime, stats</text>
+  <text class="t-sm" x="380" y="176">postings: label=value to sorted list of series ids</text>
+  <text class="t-sm" x="380" y="196">service="cart" AND code=~"5.." is a list intersection</text>
+  <text class="t-sm" x="380" y="216">query: pick blocks by time, intersect postings, read chunks</text>
+</svg>
+<figcaption>Recent data sits in a memory head backed by a WAL; every two hours it is frozen into an immutable block with a chunk file and an inverted index. Compaction merges small blocks into larger ones and removes deleted series.</figcaption>
+</figure>
+<p>The <b>postings lists</b> are the same structure as a search engine's inverted index (<a href="../chapters/22-search-engines.html">Chapter 22</a>): for each label pair, a sorted list of series ids. A selector like <code>{service="cart", code=~"5.."}</code> is evaluated by looking up the lists for each matcher and intersecting them with a merge, which is fast because lists are sorted. This is also why high cardinality is expensive: the index grows with the number of distinct label pairs and series.</p>
+
+<h2 id="cardinality">8. Deep dive 1: cardinality explosion</h2>
+<p><b>Cardinality</b> is the number of distinct time series. A metric with labels multiplies: <code>http_requests_total</code> with 50 services × 20 endpoints × 5 status codes × 3 methods is 15,000 series. That is fine. Add a <code>user_id</code> label with a million users and it is 15 billion potential series. Each new label value creates a new series with its own head chunk, index entry and posting list entries, costing about 3 KB of memory in the head. A developer who adds one innocent label (request id, URL with path parameter, container id that churns on every deploy) can create millions of series in minutes, push ingesters out of memory, and bring down monitoring for everyone. This is the most common production incident for metrics systems, and the interviewer wants to hear it.</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 280" role="img" aria-label="How a high cardinality label multiplies series">
+  <rect class="box" x="20" y="40" width="190" height="60" rx="8"/><text class="t-c t-b" x="115" y="66">metric name</text><text class="t-c t-sm" x="115" y="84">http_requests_total</text>
+  <text class="t-b" x="226" y="76">×</text>
+  <rect class="box" x="250" y="40" width="130" height="60" rx="8"/><text class="t-c t-b" x="315" y="66">service</text><text class="t-c t-sm" x="315" y="84">50 values</text>
+  <text class="t-b" x="392" y="76">×</text>
+  <rect class="box" x="414" y="40" width="130" height="60" rx="8"/><text class="t-c t-b" x="479" y="66">endpoint</text><text class="t-c t-sm" x="479" y="84">20 values</text>
+  <text class="t-b" x="556" y="76">×</text>
+  <rect class="box" x="578" y="40" width="130" height="60" rx="8"/><text class="t-c t-b" x="643" y="66">status</text><text class="t-c t-sm" x="643" y="84">5 values</text>
+  <text class="t-b" x="720" y="76">=</text>
+  <rect class="hit" x="744" y="40" width="190" height="60" rx="8"/><text class="t-c t-b" x="839" y="66">5,000 series</text><text class="t-c t-sm" x="839" y="84">OK, bounded</text>
+  <text class="t-b" x="226" y="176">×</text>
+  <rect class="miss" x="250" y="140" width="294" height="60" rx="8"/><text class="t-c t-b" x="397" y="166">user_id label</text><text class="t-c t-sm" x="397" y="184">1,000,000 values, unbounded</text>
+  <text class="t-b" x="556" y="176">=</text>
+  <rect class="miss" x="578" y="140" width="356" height="60" rx="8"/><text class="t-c t-b" x="756" y="166">5 billion series (potential)</text><text class="t-c t-sm" x="756" y="184">15 TB of head memory: impossible</text>
+  <text class="t-sm" x="20" y="240">Rule: label values must come from a small, bounded set. Identifiers belong in logs or traces, not in metric labels.</text>
+</svg>
+<figcaption>Series count is the product of label value counts. One unbounded label destroys the budget.</figcaption>
+</figure>
+<h3>8.1 Defenses, in layers</h3>
+<ol>
+<li><b>Per-tenant active series limit</b> enforced at the distributor using a cheap estimate (a HyperLogLog sketch per tenant, see <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>) or an exact count by the ingester. Beyond the limit, new series are rejected with a clear error, while existing series continue to accept samples. This contains blast radius to the offending team (<a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>).</li>
+<li><b>Label hygiene validation</b>: maximum labels per series (for example 30), maximum name and value length, forbidden label names.</li>
+<li><b>Agent-side relabeling and drop rules</b> to strip known bad labels before they leave the host.</li>
+<li><b>Cardinality analysis UI</b>: top metrics by series count, top labels by distinct values, growth rate. Alert when a metric's series count grows more than 3× in an hour. This is the feedback loop that educates teams.</li>
+<li><b>Churn control.</b> Containers get a new pod name at each deploy, so a deploy creates a whole new generation of series and the old ones become inactive. Active series stay constant but total series ever created grows, bloating the index. Mitigation: drop the pod label (aggregate to deployment level in the agent) for most metrics, and let compaction drop series with no recent samples.</li>
+<li><b>Pre-aggregation (recording rules)</b> turn a high cardinality input into a small result stored for dashboards ("requests per service, per code, per minute").</li>
+</ol>
+<table>
+<tr><th>Option for handling excess cardinality</th><th>Pro</th><th>Con</th></tr>
+<tr><td>Reject new series over limit</td><td>Protects the system; predictable; tenant sees the error</td><td>Some of the tenant's metrics silently missing until they fix it, so surface errors prominently</td></tr>
+<tr><td>Aggregate away labels at ingest (drop the label, sum)</td><td>Keeps the data, bounded cost</td><td>Loses detail; changes semantics for gauges (sum of gauges may be meaningless)</td></tr>
+<tr><td>Allow, charge the tenant (usage based billing)</td><td>Fair for a vendor product; simple policy</td><td>Does not protect memory in real time; a hard cap is still needed</td></tr>
+</table>
+<p>We choose reject plus alert for an internal platform (a hard cap per tenant with a soft warning at 80 percent), and charge back for a vendor. The same dimension appears in logs: the set of <b>stream labels</b> must also be small, which is the lesson of section 10.</p>
+
+<h2 id="retention">9. Deep dive 2: downsampling, rollups and retention tiers</h2>
+<p>Nobody needs 10 second resolution from 11 months ago. A graph of one year at a typical 1,000 pixel width has a point every 8.7 hours, so loading 3 million raw samples per series to draw it is pure waste. Downsampling stores long-range data at lower resolution. The compactor produces rollup blocks in the background.</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 300" role="img" aria-label="Retention tiers with resolution and storage medium">
+  <rect class="cache" x="20" y="40" width="260" height="130" rx="8"/><text class="t-b" x="34" y="66">Tier 1: raw 10 s</text><text class="t-sm" x="34" y="92">0 to 15 days</text><text class="t-sm" x="34" y="112">local SSD + object store</text><text class="t-sm" x="34" y="132">about 2 TB compressed</text><text class="t-sm" x="34" y="152">alerts, live debugging</text>
+  <path class="arrow" d="M280 105 L340 105"/>
+  <rect class="box" x="340" y="40" width="260" height="130" rx="8"/><text class="t-b" x="354" y="66">Tier 2: 1 min rollup</text><text class="t-sm" x="354" y="92">15 to 90 days</text><text class="t-sm" x="354" y="112">object storage</text><text class="t-sm" x="354" y="132">about 7.8 TB</text><text class="t-sm" x="354" y="152">weekly review, capacity</text>
+  <path class="arrow" d="M600 105 L660 105"/>
+  <rect class="db" x="660" y="40" width="270" height="130" rx="8"/><text class="t-b" x="674" y="66">Tier 3: 5 min rollup</text><text class="t-sm" x="674" y="92">90 days to 13 months</text><text class="t-sm" x="674" y="112">object storage, cold class</text><text class="t-sm" x="674" y="132">about 6.8 TB</text><text class="t-sm" x="674" y="152">trends, year over year</text>
+  <text class="t-b" x="20" y="214">Each rollup point keeps: min, max, sum, count (average = sum / count).</text>
+  <text class="t-sm" x="20" y="238">Counters keep last value or rate; histograms keep bucket counts (sum of buckets stays valid).</text>
+  <text class="t-sm" x="20" y="258">Query planner picks the coarsest tier whose resolution is finer than the step requested.</text>
+</svg>
+<figcaption>Three retention tiers. Storage per tier is about the same order of magnitude because resolution drops as retention grows.</figcaption>
+</figure>
+<h3>9.1 What to keep per rollup point</h3>
+<p>If you store only the average, you lose spikes, and the average of averages is wrong when sample counts differ. Keeping <b>min, max, sum and count</b> lets you recompute averages correctly and still see the peak. Counters are special: you keep the last value of the window so that rate across the window still works (a rate is a difference of counter values over time, with resets handled). Percentiles are the trap: you cannot compute a p99 from p99s. The correct technique is to store <b>histograms</b> (bucket counts, which can be summed across series and windows) or mergeable sketches such as t-digest or DDSketch, then compute quantiles at query time from merged buckets. Averaging p99 values across 50 hosts yields a number that corresponds to nothing.</p>
+<h3>9.2 Recording rules versus background downsampling</h3>
+<table>
+<tr><th>Approach</th><th>What it is</th><th>Good for</th><th>Weakness</th></tr>
+<tr><td>Background downsampling in the compactor</td><td>Every series gets rolled up automatically</td><td>Long range queries over any series; no user effort</td><td>Costs storage for every series including ones nobody queries; one set of aggregates</td></tr>
+<tr><td>Recording rules</td><td>A scheduled query writes a new series (for example a per service rate) back to storage</td><td>Making dashboards and alerts cheap; reducing cardinality</td><td>Must be defined in advance; ad hoc questions on raw data still expensive</td></tr>
+</table>
+<p>We use both: automatic rollups for everything older than 15 days, and recording rules for the top 200 dashboards. The query frontend pushes the choice of tier down automatically: a request with a 5 minute step over 6 months is served from tier 3 and reads about 5,000 times fewer points than raw. Retention itself is enforced by the compactor deleting whole blocks past their age, which is just a delete of object keys, with no row-level deletes (the reason immutable blocks are valuable). Lifecycle policies (<a href="../chapters/21-object-storage.html">Chapter 21</a>) move old blocks into colder storage classes.</p>
+
+<h2 id="query">10. Query engine, dashboards and the logs path</h2>
+<h3>10.1 Metric query flow</h3>
+<figure class="diagram">
+<svg viewBox="0 0 960 330" role="img" aria-label="Query path sequence for a dashboard panel">
+  <rect class="ext" x="20" y="14" width="130" height="34" rx="8"/><text class="t-c t-b" x="85" y="36">Dashboard</text>
+  <rect class="box" x="200" y="14" width="140" height="34" rx="8"/><text class="t-c t-b" x="270" y="36">Query frontend</text>
+  <rect class="box" x="400" y="14" width="130" height="34" rx="8"/><text class="t-c t-b" x="465" y="36">Querier</text>
+  <rect class="box" x="590" y="14" width="150" height="34" rx="8"/><text class="t-c t-b" x="665" y="36">Ingesters</text>
+  <rect class="db" x="790" y="14" width="150" height="34" rx="8"/><text class="t-c t-b" x="865" y="36">Store gateway</text>
+  <path class="life" d="M85 48 L85 310"/><path class="life" d="M270 48 L270 310"/><path class="life" d="M465 48 L465 310"/><path class="life" d="M665 48 L665 310"/><path class="life" d="M865 48 L865 310"/>
+  <path class="arrow" d="M85 76 L268 76"/><text class="t-sm" x="92" y="68">1 query_range 24 h</text>
+  <path class="arrow dash" d="M270 100 L270 120 L340 120 L340 100"/><text class="t-sm" x="348" y="118">2 cache lookup, split by day</text>
+  <path class="arrow" d="M270 150 L463 150"/><text class="t-sm" x="290" y="142">3 sub-queries, per tenant queue</text>
+  <path class="arrow" d="M467 185 L663 185"/><text class="t-sm" x="478" y="177">4a last 2 h from head</text>
+  <path class="arrow" d="M467 220 L863 220"/><text class="t-sm" x="520" y="212">4b older blocks via index header cache</text>
+  <path class="arrow-g" d="M663 252 L467 252"/><path class="arrow-g" d="M863 252 L667 252" style="opacity:0"/>
+  <text class="t-sm" x="480" y="270">5 merge, dedupe replicas, evaluate</text>
+  <path class="arrow-g" d="M463 295 L87 295"/><text class="t-sm" x="120" y="288">6 result, cached by day</text>
+</svg>
+<figcaption>The frontend splits long ranges into daily pieces so they run in parallel and cache independently. Queriers merge fresh data from ingesters with old data from blocks.</figcaption>
+</figure>
+<p>The <b>query frontend</b> does three things worth naming. It splits a long range into per-day sub-queries executed in parallel, caches results (past days never change, so they cache forever; only the last day is recomputed), and holds a <b>fair queue per tenant</b> so one tenant's expensive query cannot starve others. Queriers must also enforce limits: maximum series returned, maximum samples scanned, maximum time range, and a timeout, because an unbounded <code>sum(rate(x[1y]))</code> on raw data can scan billions of samples. Dashboard load is highly repetitive (800 panel queries per second with many identical expressions and refresh cycles), so the results cache gets a high hit rate, in the spirit of <a href="../chapters/13-caching-patterns.html">Chapter 13</a>. Aligning query start and end to step multiples makes cache keys line up.</p>
+<h3>10.2 The logs path: structured logs and two storage designs</h3>
+<p>Logs are written once, read rarely (during incidents or audits), and contain huge amounts of text. The key idea for cost is to <b>index little and scan well</b>. First, make logs <b>structured</b>: JSON or key-value lines with fields like <code>level</code>, <code>service</code>, <code>trace_id</code>, <code>latency_ms</code>. Structure lets the platform extract fields once at ingest (or at query time) instead of regexes, and lets you correlate with traces and metrics by shared labels and ids (<a href="../chapters/52-microservice-observability.html">Chapter 52</a>).</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 340" role="img" aria-label="Two log storage designs compared">
+  <text class="t-b" x="20" y="24">A. Full inverted index (Elasticsearch style)</text>
+  <rect class="ext" x="20" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="85" y="70">log line</text>
+  <rect class="box" x="200" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="265" y="62">analyze</text><text class="t-c t-sm" x="265" y="78">tokenize every word</text>
+  <rect class="db" x="380" y="40" width="190" height="50" rx="8"/><text class="t-c t-b" x="475" y="62">inverted index</text><text class="t-c t-sm" x="475" y="78">token to doc ids + stored doc</text>
+  <path class="arrow" d="M150 65 L198 65"/><path class="arrow" d="M330 65 L378 65"/>
+  <text class="t-sm" x="600" y="55">+ any word search in milliseconds</text><text class="t-sm" x="600" y="73">- index size about 1 to 1.5 times raw</text><text class="t-sm" x="600" y="91">- CPU heavy ingest, shard and merge pressure</text>
+  <text class="t-b" x="20" y="150">B. Labels index + compressed chunks (Loki style)</text>
+  <rect class="ext" x="20" y="166" width="130" height="50" rx="8"/><text class="t-c t-b" x="85" y="196">log line</text>
+  <rect class="box" x="200" y="166" width="150" height="50" rx="8"/><text class="t-c t-b" x="275" y="188">group by stream</text><text class="t-c t-sm" x="275" y="204">labels: service, env</text>
+  <rect class="cache" x="400" y="166" width="150" height="50" rx="8"/><text class="t-c t-b" x="475" y="188">tiny index</text><text class="t-c t-sm" x="475" y="204">labels+time to chunk</text>
+  <rect class="db" x="400" y="236" width="150" height="50" rx="8"/><text class="t-c t-b" x="475" y="258">zstd chunks</text><text class="t-c t-sm" x="475" y="274">object storage</text>
+  <path class="arrow" d="M150 191 L198 191"/><path class="arrow" d="M350 191 L398 191"/><path class="arrow" d="M475 216 L475 234"/>
+  <text class="t-sm" x="600" y="181">+ index about 1 to 2 percent of raw</text><text class="t-sm" x="600" y="199">+ chunks cost object storage prices</text><text class="t-sm" x="600" y="217">- text search = parallel scan of matching chunks</text><text class="t-sm" x="600" y="235">- bad if label cardinality is high</text>
+  <text class="t-sm" x="20" y="320">Hybrid: Option B for everything; Option A only for a small set of streams that need instant free text search.</text>
+</svg>
+<figcaption>Design A pays for an index that covers every word. Design B indexes only the stream labels and relies on cheap scanning of compressed chunks.</figcaption>
+</figure>
+<table>
+<tr><th>Dimension</th><th>A: Inverted index (<a href="../chapters/22-search-engines.html">Ch 22</a>)</th><th>B: Label index + object storage (<a href="../chapters/21-object-storage.html">Ch 21</a>, <a href="../chapters/23-other-stores.html">Ch 23</a>)</th></tr>
+<tr><td>Storage at 43 TB/day raw</td><td>about 40 to 60 TB/day on SSD with replicas, 7 days is 300+ TB</td><td>about 5.4 TB/day on object storage, 30 days is 160 TB</td></tr>
+<tr><td>Query: "find 'timeout' in checkout last 1 h"</td><td>tens of milliseconds to 1 s</td><td>reads the matching chunks: about 1 h of one service, a few seconds when parallelized</td></tr>
+<tr><td>Query over all services for a rare token over 7 days</td><td>seconds</td><td>Scans everything: minutes, unless bloom filters or tokenized skip indexes are used</td></tr>
+<tr><td>Ingest CPU</td><td>High (analysis plus segment merges)</td><td>Low (compress, batch)</td></tr>
+<tr><td>Failure operations</td><td>Shard rebalancing, mapping explosions, heap pressure</td><td>Stateless queriers; object store handles durability</td></tr>
+<tr><td>Best for</td><td>Security search, product search, short retention, small volume</td><td>Operational logs at volume, where most lines are never read</td></tr>
+</table>
+<p>The choice: <b>design B as the default, design A for a small curated subset</b>. A log line costs about 1/10 as much in B and 99 percent of lines will never be read. Where scanning is too slow, add <b>sparse indexes</b> inside chunks: a min/max of timestamp and fields, and <b>bloom filters</b> over tokens or trace ids per chunk (or per 1 MB block), so a query for a trace id skips chunks that cannot contain it. A columnar format (Parquet, ClickHouse style) is a third option: store each field as a column, get 10 to 30× compression and fast aggregation on fields (<code>latency_ms &gt; 500</code>), with a sparse primary index on (service, time). This favors analytics over text grep. Which of B or columnar you prefer depends on whether queries are mostly "show me the lines" (B) or "count and group by field" (columnar). State your assumption.</p>
+<h3>10.3 Parsing, structure and sampling</h3>
+<p>Parsing happens in the agent (cheap, scales with hosts) or a pipeline stage (central, easier to change). We parse in the agent for container logs (JSON decode, extract level and trace id), and enrich with Kubernetes labels. <b>Sampling</b> reduces volume at the source: keep all warnings and errors, keep 10 percent of info logs, 1 percent of debug logs, and make the rate dynamic (when a service produces more than its budget, the sampler increases the drop ratio of low-severity lines and emits a counter "dropped lines by reason"). Sampling by hash of trace id keeps all lines of a sampled request together, which makes sampled logs still debuggable. Never sample audit and security streams; route them to a separate topic with strict durability.</p>
+
+<h2 id="alerting">11. Deep dive 3: the alerting engine</h2>
+<p>Alerting converts data into pages. A bad alerting system either misses outages or trains engineers to ignore pages. Concepts from SLOs and burn rate alerts live in <a href="../chapters/54-observability-slos.html">Chapter 54</a>; here we focus on mechanics.</p>
+<h3>11.1 Rule evaluation</h3>
+<p>A rule is a query plus a condition plus a duration: "<code>sum(rate(errors[5m])) / sum(rate(requests[5m])) &gt; 0.02 for 5m</code>". The <b>rule evaluator</b> runs every group at its interval (for example 30 s), executes the query, and tracks per series state. States: <b>inactive</b>, <b>pending</b> (condition true but not yet for the full duration), <b>firing</b>, and <b>resolved</b>. The "for" duration is the first noise filter. 50,000 rules at 30 s is about 1,670 evaluations per second, each a small query; they must run on dedicated evaluators reading directly from ingesters and recent blocks, not through the user facing query queue, so a dashboard storm cannot delay a page.</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 320" role="img" aria-label="Alert state machine and notification pipeline">
+  <rect class="hit" x="20" y="40" width="120" height="50" rx="8"/><text class="t-c t-b" x="80" y="70">Inactive</text>
+  <rect class="cache" x="200" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="265" y="62">Pending</text><text class="t-c t-sm" x="265" y="78">waiting for "for"</text>
+  <rect class="miss" x="400" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="465" y="70">Firing</text>
+  <rect class="hit" x="600" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="665" y="70">Resolved</text>
+  <path class="arrow" d="M140 65 L198 65"/><text class="t-sm" x="144" y="58">true</text>
+  <path class="arrow" d="M330 65 L398 65"/><text class="t-sm" x="338" y="58">still true</text>
+  <path class="arrow" d="M530 65 L598 65"/><text class="t-sm" x="540" y="58">false</text>
+  <path class="arrow dash" d="M265 90 L265 120 L80 120 L80 92"/><text class="t-sm" x="110" y="138">false again: back to inactive, no page</text>
+  <path class="arrow" d="M465 90 L465 160"/>
+  <rect class="box" x="360" y="160" width="210" height="50" rx="8"/><text class="t-c t-b" x="465" y="182">Alert manager (3 replicas)</text><text class="t-c t-sm" x="465" y="198">dedup, group, inhibit, silence</text>
+  <path class="arrow" d="M570 185 L640 185"/>
+  <rect class="box" x="640" y="160" width="150" height="50" rx="8"/><text class="t-c t-b" x="715" y="182">Router</text><text class="t-c t-sm" x="715" y="198">team, severity, hours</text>
+  <path class="arrow" d="M790 185 L850 160"/><path class="arrow" d="M790 185 L850 215"/>
+  <rect class="ext" x="850" y="136" width="92" height="40" rx="8"/><text class="t-c" x="896" y="161">Pager</text>
+  <rect class="ext" x="850" y="200" width="92" height="40" rx="8"/><text class="t-c" x="896" y="225">Chat</text>
+  <text class="t-sm" x="20" y="270">Gossip between replicas shares notification log and silences, so a page is sent once even if all three received it.</text>
+  <text class="t-sm" x="20" y="290">Flapping control: hysteresis (fire at 2 percent, clear below 1 percent), longer "for", and "keep firing for" window.</text>
+</svg>
+<figcaption>Rules produce state transitions; the alert manager cluster turns many raw alerts into a small number of notifications.</figcaption>
+</figure>
+<h3>11.2 Dedup, grouping, inhibition, silences, routing</h3>
+<ul>
+<li><b>Deduplication.</b> The rule evaluators run as an HA pair and both send the same firing alert every interval. The alert manager identifies an alert by its label set and treats repeats as one, only re-notifying every <b>repeat interval</b> (for example 4 hours).</li>
+<li><b>Grouping.</b> When a rack fails, 200 pods fire "instance down" alerts. Group by (cluster, alertname) and send one page with a list. Wait a few seconds of group wait to collect initial members.</li>
+<li><b>Inhibition.</b> If "datacenter unreachable" is firing, suppress "service down" alerts in that datacenter. This reduces cascading noise.</li>
+<li><b>Silences.</b> Time bounded matchers created by humans during maintenance.</li>
+<li><b>Routing.</b> A tree of label matchers sends alerts to owners: <code>team=payments, severity=page</code> to the payments pager, <code>severity=ticket</code> to a queue. Escalate if unacknowledged after 10 minutes. Ownership comes from the service catalog, not from guessing.</li>
+<li><b>Flapping.</b> A metric oscillating around its threshold generates repeated fire and resolve pages. Tools: the "for" window, hysteresis with two thresholds, a short "keep firing" period after clearing, and evaluating over a longer range (rate over 5 minutes, not 1 minute).</li>
+</ul>
+<p>The alert manager cluster is small (3 replicas), prioritises availability (AP in CAP terms, see <a href="../chapters/28-cap-consistency.html">Chapter 28</a>): replicas gossip a notification log and silences (<a href="../chapters/33-gossip-merkle.html">Chapter 33</a>). If gossip partitions, the failure mode is a <b>duplicate page</b> rather than a missed one, which is the right bias. Important failure: what if the alerting pipeline itself is broken? Use a <b>dead man's switch</b>: an always-firing "Watchdog" alert sent to an external service (outside our infrastructure) that pages when it stops arriving. And alert on the platform's own SLIs (ingest lag, rule evaluation lag) from a second, tiny, independent monitoring stack.</p>
+<div class="callout watch"><b>Watch out</b> Alert on symptoms users feel (error ratio, latency SLO burn) rather than causes (CPU high). Each cause alert is a page that may have no user impact, and the on-call learns to ignore pages.</div>
+
+<h2 id="tenancy">12. Multi-tenancy, quotas, backpressure and loss tolerance</h2>
+<p>A shared platform fails when one tenant's mistake takes everyone down. The tools are in <a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>; here is how they apply.</p>
+<table>
+<tr><th>Resource</th><th>Quota</th><th>Enforced where</th><th>On excess</th></tr>
+<tr><td>Metric samples per second</td><td>Token bucket per tenant (see <a href="../chapters/16-rate-limiting.html">Chapter 16</a>), burst 2×</td><td>Distributor</td><td>429 + Retry-After</td></tr>
+<tr><td>Active series</td><td>Per tenant, soft 80 percent, hard 100 percent</td><td>Distributor and ingester</td><td>Reject new series</td></tr>
+<tr><td>Log bytes per second per tenant and per stream</td><td>For example 20 MB/s tenant, 3 MB/s stream</td><td>Distributor</td><td>429, or drop lowest severity first</td></tr>
+<tr><td>Stream labels cardinality</td><td>For example 100k active streams</td><td>Distributor</td><td>Reject new streams</td></tr>
+<tr><td>Query cost</td><td>Max samples scanned, max range, concurrent queries</td><td>Query frontend, queriers</td><td>422 error, queued</td></tr>
+<tr><td>Alert rules, notification rate</td><td>Rules per tenant; pages per hour</td><td>Rule store, alert manager</td><td>Reject or rate limit with a meta alert</td></tr>
+</table>
+<p><b>Isolation</b>: tenants are sharded across ingesters with <b>shuffle sharding</b>: each tenant is assigned a random subset of, say, 5 out of 60 ingesters. A tenant who crashes their ingesters with bad data affects only that subset, so with 60 ingesters the chance that two tenants share all 5 is tiny. This reduces blast radius far more than a plain hash ring. For the largest tenants or compliance needs, give them a dedicated <b>cell</b> (an independent stack), and keep the control plane thin. Cost attribution is a by-product: the same per tenant counters (series, samples, bytes ingested, bytes scanned) feed a monthly cost report that tells teams the price of their labels.</p>
+<h3>12.1 Backpressure and loss tolerance</h3>
+<p>What happens when ingestion is faster than what storage can take? A system must pick between three behaviors per signal, on purpose, not by accident: <b>block</b> the producer, <b>buffer</b>, or <b>drop</b>. Producers here are applications that must never block on telemetry, so blocking is out at the app, and the correct stance is: <i>losing telemetry is better than hurting the product</i>, but loss should be bounded, visible and prioritized.</p>
+<ol>
+<li><b>App to agent:</b> local, non-blocking, bounded in-memory queue. If full, drop and count.</li>
+<li><b>Agent to distributor:</b> on 429/503, exponential backoff with jitter; buffer to local disk up to a cap (say 1 GB, or about 30 minutes at 500 KB/s per host). After the cap, drop oldest low priority data first (debug logs, then info), keep errors and metrics.</li>
+<li><b>Distributor to Kafka:</b> if Kafka is down, return 503 so the agents hold the data. Kafka is the shock absorber: during a downstream slowdown, consumer lag grows from 0 into minutes, and recovers when consumers catch up. We alarm at lag above 60 s, page above 300 s.</li>
+<li><b>Consumers:</b> if an ingester cannot keep up, it falls behind (freshness degrades) instead of losing data. Autoscale consumers on lag (<a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>).</li>
+<li><b>Overload shedding:</b> if lag exceeds the Kafka retention buffer (6 hours), data would be lost, so before that point we shed: drop sampled debug logs at the distributor, then raise log sampling globally, in a documented priority order.</li>
+</ol>
+<p>Loss tolerance differs per stream. Metrics: at-least-once delivery with duplicates harmless (same timestamp, same value is deduplicated). Logs: at-least-once, with duplicates removed by (stream, timestamp, line) identity, or tolerated. Audit logs: separate topic, replication factor 3, <code>min.insync.replicas=2</code>, no sampling, written also to a WORM (write once) bucket. See <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> for dedup keys and <a href="../chapters/35-messaging-patterns.html">Chapter 35</a> for delivery semantics.</p>
+
+<h2 id="scaling">13. Scaling, bottlenecks and hot spots</h2>
+<ul>
+<li><b>Ingesters are memory bound.</b> 10M series × 3 KB = 30 GB, with replication factor 3 for the in-memory head that is 90 GB across the fleet; spread over 30 ingesters of 8 GB heads each it is comfortable. Add ingesters, and partitions move by consumer group rebalance (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>) with series ownership following the partition.</li>
+<li><b>Hot series.</b> A single very busy series is just one partition's worth: samples per series are small. The real hotspot is a tenant whose series hash unevenly; sharding by series hash (not by tenant) spreads even a giant tenant.</li>
+<li><b>Hot partitions in logs.</b> A single noisy stream (one service printing 100 MB/s) saturates the partition that hashes to it. Fix: shard a stream across N partitions by adding a bucket suffix when the stream exceeds its per-stream rate and rely on timestamps for ordering at query time.</li>
+<li><b>Index cache and store gateway.</b> Old-block queries need index headers; we shard blocks across store gateways by block id hash with replication 2, and keep the compact index header (posting offsets) in memory, loading chunks from object storage on demand with a local cache. A cold query over 90 days reads tens of blocks in parallel.</li>
+<li><b>Compactor.</b> Merges 2 h blocks into 12 h and 24 h blocks to reduce the number of blocks queried and to remove duplicates produced by replicated ingestion. It is a batch job sharded by tenant, throttled to not starve the object store.</li>
+<li><b>Query fanout.</b> Large aggregations touch many series: push partial aggregation down to queriers and merge (a two level sum), set limits, and prefer recording rules.</li>
+<li><b>Sharding strategy summary.</b> Writes: hash(series) to partition. Reads: by time then by block then by tenant. See <a href="../chapters/25-sharding.html">Chapter 25</a> for rebalancing without hotspots.</li>
+</ul>
+
+<h2 id="failures">14. Failure modes, consistency and high availability of the platform itself</h2>
+<p>A monitoring system has a unique requirement: it must work during incidents, including incidents of its own dependencies. The principles are in <a href="../chapters/41-ha-dr.html">Chapter 41</a> and <a href="../chapters/40-resilience.html">Chapter 40</a>.</p>
+<table>
+<tr><th>Component</th><th>If it fails</th><th>If it slows or lies</th><th>Mitigation</th></tr>
+<tr><td>Node agent</td><td>That host's data is missing; the "up" series stops; an absent-data alert fires</td><td>Wrong labels pollute cardinality</td><td>Agents are tiny and supervised; local disk buffer; central validation of labels</td></tr>
+<tr><td>Distributor</td><td>Stateless; load balancer routes around it</td><td>Slow auth backend causes timeouts</td><td>Cache auth decisions; many replicas; timeouts and retry by agent</td></tr>
+<tr><td>Kafka broker</td><td>With RF 3 and min ISR 2, writes continue</td><td>Disk or network saturation raises produce latency</td><td>Over-provision 2×; alarm on ISR shrink; agent buffers cover short total outage</td></tr>
+<tr><td>Metric ingester</td><td>Replay Kafka from the last committed offset plus WAL, resume in minutes; queries for the recent window use a replica copy so no gap in dashboards</td><td>GC or memory pressure causes lag</td><td>Replication factor 3 for the head; zone aware placement; autoscale on lag</td></tr>
+<tr><td>Object storage</td><td>Uploads retry; ingesters keep blocks on local disk (budget 24 h); old data queries fail with a clear partial result</td><td>Slow reads raise query latency</td><td>Multi-AZ by design; local caches; cross-region replication for compliance streams</td></tr>
+<tr><td>Rule evaluator</td><td>Paired evaluators; the standby takes over; the alert manager dedups the overlap</td><td>Query lag makes alerts late</td><td>Dedicated read path; alert on evaluation lag; evaluation timeouts</td></tr>
+<tr><td>Alert manager</td><td>3 replicas gossip; any one is sufficient</td><td>Partitioned replicas send duplicates</td><td>Prefer duplicate to loss; Watchdog alert to external system</td></tr>
+<tr><td>Query path</td><td>Dashboards fail, but alerting and ingest still work</td><td>A heavy query hurts neighbors</td><td>Separate read pools, per-tenant queues, limits, query cost accounting</td></tr>
+<tr><td>Entire region or AZ</td><td>Zone aware replication keeps one AZ loss invisible; regional loss means failover to the secondary stack</td><td>Split brain between two stacks gives double alerts</td><td>Active/active ingestion to two regions with deduplicated queries; alerts evaluated in both with dedup</td></tr>
+</table>
+<h3>14.1 Consistency and idempotency</h3>
+<p>Monitoring data accepts eventual consistency: a dashboard may be 15 seconds behind and two replicas of a head may differ by a sample until merged. Queriers deduplicate replica data by series and timestamp (a "last one wins" or a "same value" check). Writes are idempotent as noted. The one place we need stronger guarantees is configuration (rules, silences, routes): a small replicated database (<a href="../chapters/24-replication.html">Chapter 24</a>) with versioning, so an old rule set is never silently resurrected. Time itself is a consistency issue: agent clocks drift, so the distributor rejects samples more than a few minutes in the future and old ones beyond the out-of-order window, and uses server receive time for logs without usable timestamps (<a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>).</p>
+<h3>14.2 Who monitors the monitor?</h3>
+<p>Run the platform's control plane in a <b>separate failure domain</b> from the workloads it watches: its own Kubernetes cluster or VM pool, own DNS and credentials, no dependency on the service mesh it observes. Keep a minimal second stack (a small Prometheus-style instance plus an external pager integration) which scrapes only the platform's own health endpoints: Kafka lag, ingester memory, rule evaluation delay, Watchdog. If the main platform dies, the second stack pages. This avoids the circular dependency in which an outage of the compute platform also kills the monitoring that would report it. Deployments use cells and staged rollout (<a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>); config and rule changes are canaried against one tenant first.</p>
+
+<h2 id="security-cost">15. Security, abuse, SLOs and cost</h2>
+<h3>15.1 Security and abuse</h3>
+<ul>
+<li>mTLS between agents and distributors, with per-tenant tokens mapping to a tenant id; the tenant id is set by the gateway and never trusted from the payload (<a href="../chapters/55-security.html">Chapter 55</a>).</li>
+<li>Logs contain secrets and personal data by accident: scrub known patterns (card numbers, tokens, emails) at the agent, deny list fields, and support deletion by user id for privacy laws (<a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>). Store logs per tenant prefix with per-tenant encryption keys for sensitive streams.</li>
+<li>Query authorization: a tenant can only read its own data; cross-tenant queries require explicit federation grants.</li>
+<li>Abuse: label bombs, huge lines (truncate at 256 KB), clock-skewed data, and expensive regex queries are all limited at the edge.</li>
+</ul>
+<h3>15.2 SLOs for the platform (brief)</h3>
+<table>
+<tr><th>SLI</th><th>Target</th></tr>
+<tr><td>Ingest availability (non-5xx at distributors)</td><td>99.95 percent</td></tr>
+<tr><td>Freshness: sample visible within 15 s</td><td>99 percent</td></tr>
+<tr><td>Alert evaluation delay: rule evaluated within 1 interval of schedule</td><td>99.9 percent</td></tr>
+<tr><td>Dashboard query latency (24 h range) under 2 s</td><td>95 percent</td></tr>
+<tr><td>Data loss (metrics samples dropped after ack)</td><td>below 0.01 percent</td></tr>
+</table>
+<h3>15.3 Cost</h3>
+<table>
+<tr><th>Item</th><th>Approximate figure</th><th>Lever</th></tr>
+<tr><td>Metrics storage (130 GB/day, tiered)</td><td>About 20 TB total across tiers, a few hundred dollars per month of object storage plus local SSD</td><td>Lower retention of raw, drop unused series</td></tr>
+<tr><td>Metrics compute (30 ingesters at 32 GB memory, queriers)</td><td>The largest metrics cost: memory per active series</td><td>Cardinality governance</td></tr>
+<tr><td>Log storage compressed 8×</td><td>About 5.4 TB/day; 30 days about 160 TB</td><td>Sampling, shorter retention for debug, cold storage class</td></tr>
+<tr><td>Log compute and Kafka</td><td>Kafka 1.5 GB/s of replicated writes; ingest CPU</td><td>Compress at agent (zstd), larger batches, fewer partitions</td></tr>
+<tr><td>Cross-AZ network</td><td>500 MB/s × 2/3 crossing zones: significant at cloud network prices</td><td>Compress before crossing zones; zone-local ingestion</td></tr>
+</table>
+<p>The top cost insights: logs dominate bytes; metrics memory dominates cardinality cost; ingesting is cheaper than querying badly; and the cheapest log line is the one never emitted, so <b>per-team showback of cost</b> is itself a control mechanism.</p>
+
+<h2 id="evolution">16. Evolution, phasing and alternatives</h2>
+<h3>16.1 Build order</h3>
+<ol>
+<li><b>Phase 1 (weeks):</b> agents with scrape and log tail, one metrics server with remote storage, a log chunk store on object storage, dashboards, basic alert rules with an alert manager pair. No multi-tenancy.</li>
+<li><b>Phase 2:</b> add Kafka, distributors and horizontally scaled ingesters; tenant ids and basic limits; query frontend with caching.</li>
+<li><b>Phase 3:</b> downsampling and tiered retention, shuffle sharding, cardinality tooling, showback, dedicated evaluators, second stack for self monitoring.</li>
+<li><b>Phase 4:</b> multi-region, exemplars linking metrics to traces, log to metric extraction, adaptive sampling, anomaly detection.</li>
+</ol>
+<h3>16.2 At 10× scale (100M series, 10M lines/s)</h3>
+<p>Ingestion scales linearly with more partitions and ingesters, but three things bend. First, the series index and head memory (300 GB of heads) force sharding the metric plane into multiple cells by tenant group, with a global query layer federating across cells. Second, the compactor and the number of blocks dominate; use larger blocks and per tenant sharded compaction. Third, log scan cost grows linearly, so skip indexes and columnar formats become mandatory rather than optional, and sampling policies tighten. At 100× you move to streaming pre-aggregation before storage (stream processing as in <a href="../chapters/37-batch-stream.html">Chapter 37</a>, and see <a href="c20-ad-click-aggregation.html">Case study 20</a>) so that only aggregates are stored for most metrics.</p>
+<h3>16.3 Alternatives not chosen</h3>
+<ul>
+<li><b>Everything in Elasticsearch</b> (metrics and logs): simple operationally at small scale but too expensive per byte and slow for metric aggregations at our scale.</li>
+<li><b>A general wide-column or key-value store for metrics</b> (see <a href="../chapters/20-nosql.html">Chapter 20</a>): works, but loses the 10× compression and the index tailored to label queries unless implemented on top.</li>
+<li><b>Pure push (agentless SDK to central)</b>: reduces moving parts but loses free liveness and complicates backpressure at the application.</li>
+<li><b>No Kafka</b> (agents write direct to ingesters): lower latency and fewer systems, but a restart or hot ingester creates loss and the write path couples to storage speed. Acceptable for smaller deployments.</li>
+<li><b>Buy a SaaS vendor</b>: the right answer for many companies; the cost model then is per series and per GB, so the same cardinality and sampling discipline applies, and the interview answer still shows you understand what is inside.</li>
+</ul>
+
+<h2 id="qa">17. Interview Q&amp;A</h2>
+<details><summary>Why put Kafka between the distributors and the ingesters instead of writing directly?</summary>
+<p>Kafka decouples receiving from storing. Without it, a slow or restarting ingester forces the distributor to either block, which pushes failure back to every agent, or drop data. With Kafka, the write is acknowledged once it is durable in a replicated log, and ingesters consume at their own speed, so a downstream slowdown becomes lag instead of loss. It also lets several consumers read the same stream (ingesters, rule evaluators, an archiver) and allows replay after a bug or a crash. The costs are one or two seconds of added freshness latency, the extra replicated disk (about 16 to 32 TB for 6 hours of logs), and another system to operate. For small deployments I would skip it, but at 500 MB/s of logs the buffer pays for itself during the first incident. See <a href="../chapters/34-queues-kafka.html">Chapter 34</a>.</p></details>
+<details><summary>A developer added a user_id label to a metric and ingesters are running out of memory. What do you do, and how do you prevent it?</summary>
+<p>First contain: identify the tenant and metric from per tenant series counters, and have the distributor reject new series for that metric or apply a drop rule on the offending label at the edge, so existing series continue and memory stops growing. Then restore: ingesters that restarted will replay from Kafka, so apply the drop rule before the replay or it recreates the series. Prevent it with a hard active series limit per tenant, label count and length limits, a cardinality dashboard with growth alerts, review of new metrics in the CI for instrumentation, and an education message that identifiers belong in logs and traces, not metric labels. Shuffle sharding limits which ingesters the tenant could have affected in the first place.</p></details>
+<details><summary>How do you compute a p99 latency over a year when you only store rollups?</summary>
+<p>You cannot derive a p99 from stored p99 values, or from averages, because quantiles are not additive. The fix is to store a mergeable representation: histogram bucket counts (cumulative counts of requests under each latency bound) or a sketch such as t-digest or DDSketch. Rollups then sum bucket counts over the window, and the quantile is estimated at query time from the merged buckets, with error bounded by bucket width. This costs more per series than a single gauge (for example 20 buckets means 20 series) but is the only correct approach; choose bucket boundaries around your SLO thresholds, for example 100 ms and 500 ms, so that SLO compliance is exact.</p></details>
+<details><summary>How does Gorilla style compression reach about 1.5 bytes per sample?</summary>
+<p>Timestamps are stored as delta of delta: with a regular scrape interval the second difference is zero and costs 1 bit. Values are XORed with the previous value: unchanged values cost 1 bit, and slowly changing ones leave few meaningful bits between long runs of leading and trailing zeros, so a dozen or so bits suffice. Averaged across real series, about 1.3 to 2 bytes remain per sample against 16 raw, which means one day of a million samples per second drops from 1.4 TB to about 130 GB. Noisy floating values and irregular timestamps compress worse, so the number is workload dependent, and I would say "typically".</p></details>
+<details><summary>Why not index logs in Elasticsearch? When would you?</summary>
+<p>An inverted index over every token makes any word searchable in milliseconds, but it roughly doubles to triples the storage on replicated SSD, burns ingest CPU on analysis and segment merging, and requires shard management. At 43 TB per day of raw logs, that is hundreds of terabytes of SSD for a week, an order of magnitude more than compressed chunks in object storage plus a small label index. Since most log lines are never read, paying to index all of them is wasteful. I would use Elasticsearch for streams where interactive free text search matters (security investigation, customer support lookup) at moderate volume and short retention, and use the label index plus scan design for everything else. Details of the engine are in <a href="../chapters/22-search-engines.html">Chapter 22</a>.</p></details>
+<details><summary>How do you avoid alert storms and flapping?</summary>
+<p>Several layers. In the rule, use a "for" duration and evaluate over a window so a single blip does not fire. Add hysteresis (fire above 2 percent, clear below 1 percent) and a short keep-firing period. In the alert manager, group alerts by cluster and name so 200 pod alerts become one page, inhibit symptoms when a root cause alert is firing, deduplicate repeated sends of the same alert, and silence during maintenance. At the design level, alert on user visible symptoms and SLO burn rates, not on every internal cause, and review alerts that page without action as bugs. These choices are rooted in <a href="../chapters/54-observability-slos.html">Chapter 54</a>.</p></details>
+<details><summary>What happens to the alerting system if the metrics store is down?</summary>
+<p>The goal is that alerting degrades more gracefully than dashboards. Rule evaluators read from ingesters and the recent window directly, on a dedicated path, with their own capacity, so a long-range query storm or object storage failure does not affect them. If even ingesters are unavailable, the evaluators produce "no data" results; we configure critical rules to treat absent data as an alert condition, and we have a Watchdog (dead man's switch) alert sent continuously to an external system that pages when it stops arriving. Finally a second, small independent monitoring stack watches the platform's own health. The principle is that the failure of any single component must not make the platform silently blind.</p></details>
+<details><summary>How do you handle a tenant that suddenly sends ten times more logs?</summary>
+<p>The distributor applies per tenant and per stream token buckets. Within burst allowance the data is accepted; beyond it the distributor returns 429 with Retry-After, and agents slow down and buffer locally. Because the quota is per tenant, other tenants' Kafka partitions and ingester capacity are unaffected, and shuffle sharding keeps the tenant on its own subset of ingesters. If the surge is legitimate (an incident), the platform team can raise the limit temporarily; if it is a bug (a log loop), the agent side sampler and the quota stop the flood after a short time. The tenant receives a notification with the top streams by volume, and showback charges them, which discourages chronic over-logging.</p></details>
+<details><summary>Pull or push for metrics, and why?</summary>
+<p>I choose a hybrid. Pull from a node-local agent gives free liveness detection (a failed scrape is a down signal), central control of the interval, and no need for applications to know where the platform lives. Push is necessary for short lived batch jobs that finish before a scrape, for logs, and for crossing firewalls, so the agent also accepts local pushes and then pushes outbound to the distributors in batches. Pure push has an ambiguity problem: silence could mean the app is dead or the network is broken. Pure pull has reachability and discovery burdens at scale. The agent design removes the disadvantages of each, at the cost of running an agent per host.</p></details>
+<details><summary>How would you make the monitoring platform itself highly available across zones and regions?</summary>
+<p>Inside a region, run every component across at least three zones: Kafka with rack-aware replicas and min ISR 2, ingesters with replication factor 3 placed in different zones, stateless distributors and queriers behind a load balancer, and object storage that is zone redundant. Losing a zone then leaves quorum for writes and a replica for reads. Across regions, two options: active/active, where agents send to the local region and the query layer federates and deduplicates; or active/passive with replicated object storage and a warm standby. For alerting, evaluate rules in both regions with dedup in a shared alert manager cluster or via gossip, so a regional failure does not lose pages. Keep a small self monitor outside the primary failure domain. The relevant theory is in <a href="../chapters/41-ha-dr.html">Chapter 41</a> and <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>.</p></details>
+<details><summary>How do you keep dashboards fast when 800 panel queries per second hit the system?</summary>
+<p>Most of that load is repetitive, so caching is the main tool. The query frontend splits a range into per day pieces; historical days are immutable and cached for a long time, while only the current partial day is recomputed, and cache keys use step aligned boundaries so different users share entries. Recording rules precompute expensive aggregations for the busiest dashboards, and the planner uses coarse rollup tiers when the step is large. Per tenant fair queues and scan limits stop one heavy query from slowing everyone, and queriers are sharded so a query is split across many cores. If the cache hit rate falls, check whether dashboards use relative ranges that change the key every refresh and align them to the step.</p></details>
+
+<h2 id="recap-sec">18. Connects to and recap</h2>
+<p class="connects"><b>Connects to:</b> <a href="../chapters/02-estimation.html">Chapter 2</a> (estimation), <a href="../chapters/16-rate-limiting.html">Chapter 16</a> (token buckets for quotas), <a href="../chapters/19-storage-engines.html">Chapter 19</a> (LSM versus append stores), <a href="../chapters/20-nosql.html">Chapter 20</a> and <a href="../chapters/23-other-stores.html">Chapter 23</a> (time-series stores), <a href="../chapters/21-object-storage.html">Chapter 21</a> (blocks and chunks), <a href="../chapters/22-search-engines.html">Chapter 22</a> (inverted index), <a href="../chapters/25-sharding.html">Chapter 25</a> (sharding), <a href="../chapters/34-queues-kafka.html">Chapter 34</a> (Kafka buffer), <a href="../chapters/37-batch-stream.html">Chapter 37</a> (stream aggregation), <a href="../chapters/41-ha-dr.html">Chapter 41</a> (HA), <a href="../chapters/42-multitenancy-cells.html">Chapter 42</a> (tenancy and cells), <a href="../chapters/52-microservice-observability.html">Chapter 52</a> and <a href="../chapters/54-observability-slos.html">Chapter 54</a> (observability, alerting, SLOs), <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a> (sketches). Related case study: <a href="c20-ad-click-aggregation.html">Case study 20</a>.</p>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>Two workloads: metrics (10M series, 1M samples/s, 130 GB/day compressed) and logs (1M lines/s, 500 MB/s, 5 TB/day compressed). Design them separately, share the buffer, tenancy and alerting.</li>
+<li>Node agents scrape locally (pull) and push outbound in batches: hybrid gets liveness, ephemeral job support and firewall friendliness.</li>
+<li>Kafka absorbs bursts and decouples ingestion from storage; ack after the durable write, apply later; lag is the pressure gauge.</li>
+<li>Time-series storage uses a memory head with WAL, immutable blocks with an inverted label index, and delta-of-delta plus XOR compression for about 1.5 bytes per sample.</li>
+<li>Cardinality is the main threat: series = product of label values; enforce per tenant limits, label rules and cardinality dashboards; identifiers belong in logs.</li>
+<li>Retention tiers: raw 15 days, 1 minute rollups 90 days, 5 minute rollups 13 months, with min/max/sum/count and histograms (never averaged percentiles).</li>
+<li>Logs: index labels only, store compressed chunks in object storage, add sparse and bloom indexes, use a search engine only for a curated hot subset; sample low severity, never audit logs.</li>
+<li>Alerting runs on an isolated path: for-durations, dedup, grouping, inhibition, routing, hysteresis against flapping, a replicated alert manager that prefers duplicates over loss, and a Watchdog dead man's switch.</li>
+<li>Multi-tenancy through quotas, shuffle sharding and fair query queues; backpressure with bounded buffers, 429 with retry, and prioritized, counted loss.</li>
+<li>Monitor the monitor from a separate failure domain; cost is driven by memory per series and bytes of logs, so showback and sampling are cost controls.</li>
+</ul></div>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

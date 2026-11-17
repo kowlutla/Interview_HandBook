@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 18: Relational Databases In Depth | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="18-relational-internals">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Chapter 18 · Module 3 · Component deep dive</div>
+<h1>Relational Databases In Depth</h1>
+<p class="lead">Most systems you will design keep their most important data in a relational database. This chapter opens the box: how a query actually runs, how indexes make it fast or useless, how transactions stay correct when many clients collide, and how far one database can scale before you must split it.</p>
+
+<h2 id="when">1. When to choose a relational database</h2>
+
+<p>A <b>relational database</b> stores data in <b>tables</b> made of rows and typed columns, links tables through keys, and is queried with SQL. Well-known examples are PostgreSQL, MySQL (with the InnoDB storage engine), MariaDB, Oracle, and SQL Server. They have been the default for decades for good reasons, and in an interview your default answer for "where does the core data live?" should be a relational database unless you can name a concrete reason against it.</p>
+
+<p>What you get from one:</p>
+<ul>
+  <li><b>Transactions with strong guarantees.</b> You can change several rows in several tables as one all-or-nothing unit (section 6). This is the single biggest reason: money, inventory, bookings, and permissions all need it.</li>
+  <li><b>A declarative query language.</b> You describe <i>what</i> you want (orders for this customer in the last week, with their items) and the database figures out <i>how</i> to fetch it. New questions can be answered later without redesigning storage, which matters because product requirements change.</li>
+  <li><b>Constraints that protect data.</b> Primary keys, unique constraints, foreign keys, NOT NULL, and CHECK rules make the database refuse invalid data no matter which application bug tries to write it.</li>
+  <li><b>Joins and ad-hoc analysis.</b> Normalized data (<a href="17-data-modeling.html">Chapter 17</a>) can be recombined in any way with joins.</li>
+  <li><b>Mature tooling.</b> Backups, point-in-time recovery, replication, monitoring, and a large pool of engineers who know it.</li>
+</ul>
+
+<p>Their limits are equally important to know. A single relational primary (the one node that accepts writes) is bounded by one machine's CPU, memory, disk, and network. Writes do not scale out by simply adding servers; reads can, through replicas (<a href="24-replication.html">Chapter 24</a>); writes need sharding (<a href="25-sharding.html">Chapter 25</a>), which gives up some of the relational conveniences. Schema changes on huge tables need care. And the model is a poor fit for a few shapes of data.</p>
+
+<table>
+<tr><th>Situation</th><th>Relational fits?</th><th>Why</th></tr>
+<tr><td>Orders, payments, inventory, bookings, user accounts</td><td>Yes, the default</td><td>Needs multi-row transactions, constraints, and flexible queries.</td></tr>
+<tr><td>Data with many relationships queried in many ways (admin tools, reporting)</td><td>Yes</td><td>Joins and ad-hoc SQL are the strength.</td></tr>
+<tr><td>Sustained writes far beyond one machine (millions of writes per second)</td><td>Not alone</td><td>Needs sharding, or a store built to scale writes; see <a href="20-nosql.html">Chapter 20</a> and <a href="19-storage-engines.html">Chapter 19</a>.</td></tr>
+<tr><td>Huge append-only event or metric streams</td><td>Usually not</td><td>Time-series or log stores compress and age data better.</td></tr>
+<tr><td>Full-text relevance search</td><td>Only basic</td><td>Use a search engine (<a href="22-search-engines.html">Chapter 22</a>); Postgres full-text is fine for small needs.</td></tr>
+<tr><td>Blobs such as images and videos</td><td>No</td><td>Store them in object storage (<a href="21-object-storage.html">Chapter 21</a>) and keep only the URL in the table.</td></tr>
+<tr><td>Wildly varying, schema-free documents</td><td>Maybe</td><td>A JSON column can work; a document store may be simpler at large scale.</td></tr>
+</table>
+
+<div class="callout tip"><b>Interview tip</b>
+Start with a relational database and say so. Then name the specific pressure that would make you leave it: write volume beyond one primary, a data shape such as time-series or graph, or a latency target that only an in-memory store meets. "I would use NoSQL because it scales" without a number is a weak answer; most products never outgrow one well-tuned primary with replicas (section 12 has numbers).
+</div>
+
+<h2 id="execution">2. How a query executes</h2>
+
+<p>When you send <code>SELECT * FROM orders WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 10</code>, the text passes through a fixed pipeline. Knowing the stages explains most performance behaviour you will be asked about.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Query execution pipeline from client through parser, planner, executor, buffer pool and disk">
+  <rect class="ext" x="20" y="100" width="100" height="56" rx="10"/><text class="t-c t-b" x="70" y="124">Client</text><text class="t-c t-sm" x="70" y="142">SQL text</text>
+  <rect class="box" x="160" y="100" width="120" height="56" rx="10"/><text class="t-c t-b" x="220" y="124">Parser</text><text class="t-c t-sm" x="220" y="142">syntax, names</text>
+  <rect class="box" x="320" y="100" width="130" height="56" rx="10"/><text class="t-c t-b" x="385" y="124">Planner</text><text class="t-c t-sm" x="385" y="142">picks cheapest plan</text>
+  <rect class="box" x="490" y="100" width="120" height="56" rx="10"/><text class="t-c t-b" x="550" y="124">Executor</text><text class="t-c t-sm" x="550" y="142">runs the plan</text>
+  <rect class="cache" x="650" y="100" width="130" height="56" rx="10"/><text class="t-c t-b" x="715" y="124">Buffer pool</text><text class="t-c t-sm" x="715" y="142">pages in RAM</text>
+  <rect class="db" x="650" y="200" width="130" height="50" rx="10"/><text class="t-c t-b" x="715" y="222">Disk</text><text class="t-c t-sm" x="715" y="240">data files + WAL</text>
+  <rect class="hit" x="320" y="14" width="130" height="50" rx="10"/><text class="t-c t-b" x="385" y="36">Statistics</text><text class="t-c t-sm" x="385" y="53">row counts, histograms</text>
+  <path class="arrow" d="M120 128 L156 128"/><path class="arrow" d="M280 128 L316 128"/><path class="arrow" d="M450 128 L486 128"/><path class="arrow" d="M610 128 L646 128"/>
+  <path class="arrow dash" d="M715 156 L715 196"/><text class="t-sm" x="726" y="182">on miss</text>
+  <path class="arrow dash" d="M385 64 L385 96"/>
+  <path class="arrow-g" d="M550 156 C550 200 200 200 90 160"/><text class="t-sm" x="250" y="214">rows returned to the client</text>
+</svg>
+<figcaption>Read left to right. The planner consults statistics to choose a plan; the executor asks the buffer pool for pages, which come from disk only when they are not already in memory.</figcaption>
+</figure>
+
+<h3>2.1 Parser</h3>
+<p>The parser checks that the text is valid SQL and turns it into a tree. It then resolves names: does table <code>orders</code> exist, does it have a column <code>customer_id</code>, are you allowed to read it. Errors such as a typo in a column name are reported here, before any data is touched.</p>
+
+<h3>2.2 Planner (optimizer)</h3>
+<p>SQL does not say how to get the data. The planner generates several candidate strategies and estimates a <b>cost</b> for each, using <b>statistics</b> the database collects about each table: row count, the number of distinct values per column, the most common values, and a histogram of value distribution. For our query it could scan the whole table and filter, or use an index on <code>customer_id</code>, or use an index on <code>(customer_id, created_at)</code> that also returns rows already in sorted order. It also chooses join order and join algorithm when several tables are involved (section 5.2). The plan with the lowest estimated cost wins.</p>
+<p>The key phrase is <i>estimated</i>. If statistics are stale (a big load just happened and the table was not re-analyzed), the planner can believe a filter returns 10 rows when it returns 10 million and pick a catastrophic plan. Keeping statistics fresh (<code>ANALYZE</code> in Postgres, automatic in most setups) is basic hygiene.</p>
+<p>Many databases also cache plans for <b>prepared statements</b>: you send the query shape once with placeholders and then run it many times with different values, saving parse and plan time and preventing SQL injection because values never mix with the query text.</p>
+
+<h3>2.3 Executor</h3>
+<p>The executor runs the chosen plan as a tree of small operators (scan, filter, sort, join, aggregate). Each operator asks its children for rows, typically one row at a time in a "pull" style, so a <code>LIMIT 10</code> can stop the whole tree early once ten rows have been produced. Operators that must see all input before emitting anything, such as a full sort or a hash build, hold memory; if they exceed their memory budget they spill temporary data to disk, which is a common cause of sudden slowness.</p>
+
+<h3>2.4 Pages and the buffer pool</h3>
+<p>Databases do not read individual rows from disk. Storage is divided into fixed-size blocks called <b>pages</b> (8 KB in PostgreSQL, 16 KB in InnoDB by default). A page holds many rows (or many index entries). The smallest unit that is read or written is a whole page. A row fetch therefore costs one page read, and reading 100 rows that sit on the same page costs one read, not 100.</p>
+<p>The <b>buffer pool</b> (also called shared buffers or the page cache) is a region of RAM holding recently used pages. When the executor needs a page, it looks in the buffer pool first. A <b>hit</b> costs about a microsecond; a <b>miss</b> means a disk read: roughly 100 microseconds on SSD, around 10 ms on a spinning disk. Pages modified in memory are called <b>dirty</b>; a background process writes them to disk later (section 7 explains why that is safe). The practical rules that follow:</p>
+<ul>
+  <li>If your <b>working set</b> (the hot data and indexes) fits in RAM, almost every read is a hit and the database is fast. When it no longer fits, the hit ratio falls and latency jumps. A cache hit ratio below roughly 99% on an OLTP database deserves attention.</li>
+  <li>Index pages compete with data pages for the same memory, so unneeded indexes also hurt cache efficiency.</li>
+  <li>A single large scan can push hot pages out of the pool. Databases use tricks (ring buffers for big scans) to limit this, but a rogue report query on the primary can still hurt everyone.</li>
+</ul>
+
+<h2 id="indexes">3. Indexes and the B-tree</h2>
+
+<p>An <b>index</b> is a separate, sorted data structure that lets the database find rows by some column values without reading the whole table. The analogy is the index at the back of a textbook: instead of reading every page looking for "deadlock", you look up the word in a sorted list and jump to the page numbers.</p>
+
+<p>Without an index, finding the orders of customer 42 means a <b>sequential scan</b>: read every page of the table and test every row. With 100 million rows that is gigabytes of reading. With an index it is typically 3 to 4 page reads. That difference, milliseconds versus minutes, is why indexing is the first tool for query performance.</p>
+
+<h3>3.1 How a B-tree works</h3>
+<p>Nearly every relational index is a <b>B-tree</b> (strictly a B+tree). It is a balanced tree whose nodes are pages. Each internal page holds sorted keys and pointers to child pages; each key range tells you which child to descend into. The bottom level, the <b>leaf</b> pages, holds all the keys in sorted order together with a pointer to the actual row (or the row itself, see clustered indexes below). Leaf pages are chained left to right in a linked list, so scanning a range is just walking along the leaves.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="B-tree with root, internal and leaf pages, and leaf pages linked together">
+  <rect class="box" x="360" y="20" width="180" height="46" rx="8"/><text class="t-c t-b" x="450" y="40">Root page</text><text class="t-c t-sm" x="450" y="57">keys: 300 | 600</text>
+  <rect class="box" x="90" y="130" width="180" height="46" rx="8"/><text class="t-c t-b" x="180" y="150">Internal page</text><text class="t-c t-sm" x="180" y="167">keys: 100 | 200</text>
+  <rect class="box" x="360" y="130" width="180" height="46" rx="8"/><text class="t-c t-b" x="450" y="150">Internal page</text><text class="t-c t-sm" x="450" y="167">keys: 400 | 500</text>
+  <rect class="box" x="630" y="130" width="180" height="46" rx="8"/><text class="t-c t-b" x="720" y="150">Internal page</text><text class="t-c t-sm" x="720" y="167">keys: 700 | 800</text>
+  <path class="arrow" d="M410 66 L200 126"/><path class="arrow" d="M450 66 L450 126"/><path class="arrow" d="M490 66 L700 126"/>
+  <rect class="db" x="20" y="260" width="130" height="50" rx="8"/><text class="t-c t-b" x="85" y="281">Leaf</text><text class="t-c t-sm" x="85" y="298">1 .. 99</text>
+  <rect class="db" x="165" y="260" width="130" height="50" rx="8"/><text class="t-c t-b" x="230" y="281">Leaf</text><text class="t-c t-sm" x="230" y="298">100 .. 199</text>
+  <rect class="db" x="310" y="260" width="130" height="50" rx="8"/><text class="t-c t-b" x="375" y="281">Leaf</text><text class="t-c t-sm" x="375" y="298">200 .. 399</text>
+  <rect class="hit" x="455" y="260" width="130" height="50" rx="8"/><text class="t-c t-b" x="520" y="281">Leaf</text><text class="t-c t-sm" x="520" y="298">400 .. 599</text>
+  <rect class="db" x="600" y="260" width="130" height="50" rx="8"/><text class="t-c t-b" x="665" y="281">Leaf</text><text class="t-c t-sm" x="665" y="298">600 .. 799</text>
+  <rect class="db" x="745" y="260" width="130" height="50" rx="8"/><text class="t-c t-b" x="810" y="281">Leaf</text><text class="t-c t-sm" x="810" y="298">800 .. 999</text>
+  <path class="arrow" d="M150 176 L100 256"/><path class="arrow" d="M200 176 L230 256"/>
+  <path class="arrow" d="M410 176 L375 256"/><path class="arrow-g" d="M470 176 L520 256"/>
+  <path class="arrow" d="M680 176 L665 256"/><path class="arrow" d="M750 176 L810 256"/>
+  <path class="arrow dash" d="M150 285 L161 285"/><path class="arrow dash" d="M295 285 L306 285"/><path class="arrow dash" d="M440 285 L451 285"/><path class="arrow dash" d="M585 285 L596 285"/><path class="arrow dash" d="M730 285 L741 285"/>
+  <text class="t-sm" x="20" y="332">Lookup key 450: root (300 &lt; 450 &lt; 600) → internal (400 | 500) → leaf 400..599 (green path). Dashed links chain the leaves for range scans.</text>
+</svg>
+<figcaption>A lookup walks from the root down one page per level. Because each page holds hundreds of keys, three or four levels cover hundreds of millions of rows.</figcaption>
+</figure>
+
+<p>Why does this work so well? A page is 8 to 16 KB, and an index entry for an integer key is a few dozen bytes, so one page holds hundreds of entries. This is the <b>fanout</b>. With a fanout of 300, one level covers 300 keys, two levels 90,000, three levels 27 million, and four levels 8 billion. So finding any row among billions costs about 4 page reads, and the root and upper levels are so hot that they live permanently in the buffer pool, so in practice only the leaf and the table page require disk I/O. The tree stays balanced because when a leaf page fills up it is <b>split</b> in two and a new separator key is pushed to the parent, possibly splitting that too, up to the root. Lookups, inserts, and deletes are all logarithmic.</p>
+
+<p>A B-tree supports: exact match (<code>id = 5</code>), range (<code>created_at BETWEEN a AND b</code>), prefix match (<code>name LIKE 'Smi%'</code>), and returning rows in sorted order for <code>ORDER BY</code> without a separate sort. It does not help with a suffix or middle match such as <code>LIKE '%son'</code>, because the sorted order is by the beginning of the string.</p>
+
+<h3>3.2 Clustered versus secondary indexes</h3>
+<p>Where do the row's other columns live? Two designs exist, and the difference is a classic interview topic.</p>
+<ul>
+  <li><b>Clustered index (InnoDB, SQL Server).</b> The table itself is stored as a B-tree ordered by the primary key; the leaf pages <i>are</i> the rows. Looking up by primary key is one tree walk with the full row at the end. Rows with nearby primary keys sit physically near each other, so range scans on the key are efficient. <b>Secondary indexes</b> in InnoDB store the indexed columns plus the primary key value; to get the full row the database performs a second lookup in the clustered index (a "bookmark lookup"). Consequence: a wide or random primary key (such as a random UUID) is copied into every secondary index, bloating them, and random inserts split pages all over the tree. Sequential or time-ordered keys insert at the right edge and are far kinder.</li>
+  <li><b>Heap table plus indexes (PostgreSQL).</b> The table is an unordered <b>heap</b> of pages. Every index, including the primary key index, is a separate B-tree whose leaf entries point to a physical row location (a tuple identifier, page number plus slot). A lookup is: walk the index, then fetch the heap page. PostgreSQL can optionally cluster a table once with the <code>CLUSTER</code> command, but the ordering is not maintained afterwards.</li>
+</ul>
+
+<h2 id="index-design">4. Designing indexes</h2>
+
+<h3>4.1 Composite indexes, column order and the leftmost prefix</h3>
+<p>A <b>composite</b> (multi-column) index sorts entries by the first column, then by the second within equal first values, and so on, exactly like a phone book sorted by last name then first name. This ordering gives the <b>leftmost prefix rule</b>: an index on <code>(a, b, c)</code> can efficiently serve conditions on <code>a</code>; on <code>a and b</code>; on <code>a, b and c</code>. It cannot efficiently serve a condition on <code>b</code> alone or <code>c</code> alone, because entries with the same <code>b</code> are scattered throughout the index, just as you cannot find everyone named "John" in a phone book sorted by last name without reading it all.</p>
+
+<p>The rule for choosing column order:</p>
+<ol>
+  <li>Put columns used with <b>equality</b> (<code>=</code>) first.</li>
+  <li>Then put the column used for a <b>range</b> or for <b>sorting</b> (<code>&gt;</code>, <code>BETWEEN</code>, <code>ORDER BY</code>) last. Columns after a range column cannot narrow the scan, because the range already spans many distinct values of the earlier column.</li>
+  <li>Among equality columns, prefer an order that lets one index serve several queries (the leftmost prefix reuse).</li>
+</ol>
+<p>Example. For "this customer's orders, newest first" (<code>WHERE customer_id = ? ORDER BY created_at DESC LIMIT 10</code>), the index <code>(customer_id, created_at)</code> is perfect: the database descends to customer 42, then reads the ten newest entries straight off the end of that customer's section, no sort, no extra rows read. An index on <code>(created_at, customer_id)</code> would be nearly useless for this query. The same <code>(customer_id, created_at)</code> index also serves plain <code>WHERE customer_id = ?</code>, so a separate index on <code>customer_id</code> alone is redundant and only adds write cost.</p>
+
+<h3>4.2 Covering indexes</h3>
+<p>If an index contains <i>every column the query needs</i>, the database can answer from the index alone and never touch the table. This is a <b>covering index</b>, shown in plans as an "index-only scan" (Postgres) or "Using index" (MySQL). It avoids the random heap or clustered lookup per row, which is often the dominant cost when a query returns many rows. PostgreSQL and SQL Server allow adding non-key columns with <code>INCLUDE (col)</code>: they are stored in the leaf entries for covering but are not part of the sort order. The tradeoff is a bigger index and more write work, so cover only your hottest queries. (PostgreSQL index-only scans also depend on the visibility map, which vacuum maintains; see section 9.)</p>
+
+<h3>4.3 Partial and expression indexes</h3>
+<ul>
+  <li><b>Partial index</b> (PostgreSQL, SQLite; filtered index in SQL Server): indexes only rows matching a condition, e.g. <code>CREATE INDEX ON orders (created_at) WHERE status = 'PENDING'</code>. If only 1% of orders are pending, the index is 100 times smaller, cheaper to maintain, and fits in cache. A partial <i>unique</i> index also expresses rules such as "a user can have at most one active subscription".</li>
+  <li><b>Expression (functional) index</b>: indexes the result of a function, e.g. <code>CREATE INDEX ON users (lower(email))</code>. The query must use the same expression (<code>WHERE lower(email) = ?</code>) for the planner to use it. Without it, wrapping a column in a function defeats a normal index (section 4.6).</li>
+</ul>
+
+<h3>4.4 Other index types</h3>
+<table>
+<tr><th>Type</th><th>Good for</th><th>Notes</th></tr>
+<tr><td>B-tree</td><td>Equality, ranges, sorting, prefix match</td><td>The default and right for most columns.</td></tr>
+<tr><td>Hash</td><td>Equality only</td><td>Slightly faster for pure equality; no ranges or ordering. In PostgreSQL it is rarely worth choosing over B-tree.</td></tr>
+<tr><td>GIN (generalized inverted index)</td><td>Values that contain many parts: array elements, JSONB keys, full-text words</td><td>Maps each element to the rows containing it, like a search engine's inverted index (<a href="22-search-engines.html">Chapter 22</a>). Fast reads, slower writes.</td></tr>
+<tr><td>GiST / SP-GiST</td><td>Geometric and spatial data, ranges, nearest-neighbour search</td><td>Used by PostGIS for "find places within 5 km". Trees over overlapping regions rather than totally ordered keys.</td></tr>
+<tr><td>BRIN (block range)</td><td>Huge tables whose column correlates with physical order, e.g. an append-only timestamp</td><td>Stores just the min and max per block range; tiny and cheap, but coarse.</td></tr>
+</table>
+
+<h3>4.5 What indexes cost, and selectivity</h3>
+<p>Indexes are not free. Every insert must add an entry to <i>every</i> index on the table; every delete or update of an indexed column must change them; each index consumes disk and competes for buffer-pool memory. A table with eight indexes does roughly nine times the write work of an unindexed one (the heap plus eight trees), and write amplification translates directly into lower write throughput, longer replication lag, and bigger backups. The discipline is: <b>index for the queries you actually run</b>, drop unused indexes (databases expose usage statistics), and avoid redundant prefixes.</p>
+
+<p><b>Selectivity</b> is the fraction of rows a condition matches: low fraction means high selectivity (good for indexing). A lookup by <code>email</code> returns one row in millions: highly selective, an index is a huge win. An index on a boolean <code>is_active</code> where 95% of rows are true is nearly worthless on its own, because reading 95% of the table through an index (a random page fetch per row) is slower than just scanning the table sequentially. The planner knows this and will skip the index. The common trick is to index the <i>rare</i> value with a partial index (<code>WHERE is_active = false</code>), or combine the low-selectivity column as the first column of a composite index with a selective one.</p>
+
+<h3>4.6 When an index is not used</h3>
+<p>If a query is slow despite an index, the usual culprits are:</p>
+<ul>
+  <li><b>A function or arithmetic on the column.</b> <code>WHERE date(created_at) = '2025-01-01'</code> or <code>WHERE price * 2 &gt; 100</code> hides the raw column from the index. Rewrite as a range (<code>created_at &gt;= '2025-01-01' AND created_at &lt; '2025-01-02'</code>) or add an expression index.</li>
+  <li><b>Type mismatch or implicit casts.</b> Comparing a string column to a number, or columns with different collations or character sets across a join, can force conversion of every row.</li>
+  <li><b>Leading wildcard.</b> <code>LIKE '%abc'</code> cannot use a B-tree. Use a trigram or full-text index, or a search engine.</li>
+  <li><b>Leftmost prefix violated.</b> The query filters on the second column of a composite index only.</li>
+  <li><b>Low selectivity.</b> The planner correctly decides a scan is cheaper.</li>
+  <li><b>Stale statistics.</b> The planner misjudges row counts and picks a scan or a bad join.</li>
+  <li><b>OR across different columns</b> and <b>NOT / != conditions</b> are often unindexable or need a combination (bitmap) plan.</li>
+  <li><b>Large OFFSET.</b> <code>OFFSET 100000 LIMIT 10</code> still reads and discards 100,000 entries. Use keyset pagination: <code>WHERE (created_at, id) &lt; (last_seen_created_at, last_seen_id) ORDER BY created_at DESC, id DESC LIMIT 10</code>.</li>
+</ul>
+
+<h2 id="plans">5. Reading query plans</h2>
+
+<p>You ask the database for its chosen plan with <code>EXPLAIN</code>, and for the plan together with real timings and actual row counts with <code>EXPLAIN ANALYZE</code> (PostgreSQL; MySQL has <code>EXPLAIN</code> and <code>EXPLAIN ANALYZE</code> too). Note that <code>EXPLAIN ANALYZE</code> actually runs the statement, so wrap data-changing statements in a transaction you roll back. A simplified Postgres output:</p>
+<pre><code>EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 10;
+
+Limit  (cost=0.57..8.30 rows=10 width=64) (actual time=0.04..0.06 rows=10 loops=1)
+  -&gt; Index Scan Backward using idx_orders_cust_created on orders
+       (cost=0.57..412.1 rows=533 width=64) (actual time=0.04..0.05 rows=10 loops=1)
+       Index Cond: (customer_id = 42)
+Planning Time: 0.2 ms   Execution Time: 0.1 ms</code></pre>
+<p>Read it from the innermost, most indented node outward. The pieces to look at: the node type (how rows are fetched), the <b>estimated</b> rows versus <b>actual</b> rows (a large mismatch means bad statistics and probably a bad plan), the actual time, and the <code>loops</code> count (a node inside a nested loop runs many times, so multiply). Also watch for "Rows Removed by Filter" being huge (you read many rows to keep few) and for sorts that report "external merge Disk" (spilled to disk).</p>
+
+<h3>5.1 Scan types</h3>
+<ul>
+  <li><b>Sequential scan:</b> read the whole table. Fine for small tables or when a large fraction of rows is needed; a red flag on a big table with a selective filter.</li>
+  <li><b>Index scan:</b> walk the index and fetch each matching row from the table. Good for few rows; random I/O if many.</li>
+  <li><b>Index-only scan:</b> answered entirely from a covering index.</li>
+  <li><b>Bitmap scan (Postgres):</b> collect the matching row locations from one or more indexes into a bitmap, sort them by physical page, then read pages in order. A middle ground when too many rows for an index scan but too few for a full scan, and the way two separate indexes are combined for an AND or OR.</li>
+</ul>
+
+<h3>5.2 Join algorithms</h3>
+<p>A join combines rows from two inputs. The planner picks among three algorithms, and which one is right depends on input sizes and available indexes.</p>
+<ul>
+  <li><b>Nested loop join.</b> For each row of the outer input, look up matching rows in the inner input. If the inner side has an index on the join column, each lookup is a cheap tree walk, so the cost is about <i>outer rows × log(inner)</i>. Excellent when the outer side is small (a few rows) and the inner is indexed; terrible if both are large and there is no index (cost outer × inner).</li>
+  <li><b>Hash join.</b> Build an in-memory hash table from the smaller input keyed on the join column, then scan the larger input once, probing the hash table for each row. Cost is roughly the sum of the two sizes. Excellent for large unsorted inputs with equality joins; needs memory (spills to disk in batches if the hash table is too big); only works for equality.</li>
+  <li><b>Merge join.</b> Sort both inputs on the join key (or read them already sorted from indexes) and walk through them together like merging two sorted lists. Cost is linear after sorting. Good when both inputs are large and already ordered, and it handles range-style join conditions.</li>
+</ul>
+
+<table>
+<tr><th>Algorithm</th><th>Best when</th><th>Needs</th><th>Bad when</th></tr>
+<tr><td>Nested loop</td><td>Outer input is tiny, inner has an index</td><td>Index on inner join column</td><td>Both inputs large with no index</td></tr>
+<tr><td>Hash join</td><td>Large inputs, equality condition</td><td>Memory for the smaller input</td><td>Memory is scarce; non-equality joins</td></tr>
+<tr><td>Merge join</td><td>Both inputs large and sorted (or cheap to sort)</td><td>Sorted inputs</td><td>Sorting a huge unsorted input</td></tr>
+</table>
+
+<h3>5.3 The N+1 query problem</h3>
+<p>The most common real-world slowdown is not in the database engine at all but in application code. <b>N+1</b> happens when code runs one query to fetch a list of N items, then one more query <i>per item</i> to fetch related data. Example: load 50 orders (1 query), then loop and load each order's customer (50 queries) and each order's items (50 more). Each query is individually fast, maybe 1 ms, but the total is 100+ round trips, each paying network latency, and under load this multiplies into connection exhaustion.</p>
+<p>The fixes: fetch with a <b>join</b> (one query returning orders with customers), or use a <b>batched lookup</b> (<code>WHERE id IN (...)</code> with all the ids gathered first, giving 2 queries total instead of 51). ORMs name these "eager loading" or "prefetch"; GraphQL servers use a batching layer (often called a data loader). If you see an interview design where a list endpoint calls the database inside a loop, call it out.</p>
+
+<h3>5.4 Common causes of slow queries</h3>
+<ol>
+  <li>Missing or unusable index (section 4.6); the plan shows a sequential scan on a big table.</li>
+  <li>Too much data returned: <code>SELECT *</code> on wide rows, no <code>LIMIT</code>, giant <code>OFFSET</code>.</li>
+  <li>Bad plan from stale statistics or skewed data (estimated rows far from actual).</li>
+  <li>Sorts or hashes spilling to disk because per-operation memory is too small.</li>
+  <li>N+1 patterns and chatty application code.</li>
+  <li>Lock waits: the query is not slow, it is blocked behind another transaction (section 10).</li>
+  <li>Long transactions and bloat (section 9) making scans read dead rows.</li>
+  <li>Working set no longer fits in memory; cache hit ratio drops.</li>
+  <li>Overloaded connections: too many concurrent queries thrashing CPU (section 11).</li>
+</ol>
+<p>The practical workflow: find the slow queries from the slow query log or statistics view (<code>pg_stat_statements</code> in Postgres), run <code>EXPLAIN ANALYZE</code> on the worst, fix the index or query, and verify in the plan.</p>
+
+<h2 id="acid">6. ACID explained with real failures</h2>
+
+<p>A <b>transaction</b> is a group of reads and writes that the database treats as one logical unit, bracketed by <code>BEGIN</code> and <code>COMMIT</code> (or <code>ROLLBACK</code> to abandon it). The guarantees are summarized by the acronym <b>ACID</b>. Each letter is easiest to understand by the failure it prevents.</p>
+
+<h3>6.1 Atomicity: all or nothing</h3>
+<p>Transferring 100 dollars means two writes: subtract from account A, add to account B. If the server crashes after the first write, without atomicity the money has vanished. With atomicity the database guarantees that either both writes take effect or neither does; after a crash, the half-finished transaction is undone. It also covers application errors: if the second statement fails a constraint, <code>ROLLBACK</code> erases the first. Note this is different from the "atomic" of concurrency (nothing else sees a half-done state), which is isolation.</p>
+
+<h3>6.2 Consistency: invariants hold</h3>
+<p>Here "consistency" means that a transaction moves the database from one valid state to another valid state, where valid is defined by your constraints: balance cannot go negative, every order references an existing customer, emails are unique. The database enforces the rules it knows about (unique, foreign key, CHECK, NOT NULL) and refuses a transaction that would break them. Rules the database does not know about, such as "total of all accounts is constant", are the application's responsibility, which is why ACID's C is partly a promise by <i>you</i>. (This is unrelated to the "C" in CAP, which is about replicas agreeing; see <a href="28-cap-consistency.html">Chapter 28</a>.)</p>
+
+<h3>6.3 Isolation: concurrent transactions do not trip over each other</h3>
+<p>Two customers buy the last ticket at the same instant. If both transactions read "1 left" and both write "0 left", you sold one ticket twice. Isolation controls how much concurrent transactions can see of each other's work. Perfect isolation (serializable) makes the outcome identical to running the transactions one after another, but costs performance, so databases offer weaker levels with known anomalies (section 8).</p>
+
+<h3>6.4 Durability: committed means it survives</h3>
+<p>Once <code>COMMIT</code> returns success, the data must survive a crash or power loss. The example failure: the database says "committed", the customer is shown a confirmation, then the machine loses power and, on restart, the order is gone. Durability is implemented by flushing a log record to non-volatile storage before acknowledging the commit (next section). It does not protect against losing the disk itself; that needs replication and backups.</p>
+
+<div class="callout watch"><b>Watch out</b>
+Durability is configurable. PostgreSQL's <code>synchronous_commit = off</code> and InnoDB's <code>innodb_flush_log_at_trx_commit = 2</code> acknowledge commits before the log is flushed, which is faster but can lose the last fraction of a second of commits on a crash (the database stays consistent, just slightly behind). Know that this knob exists and that the default is the safe setting.
+</div>
+
+<h2 id="wal">7. Write-ahead log and crash recovery</h2>
+
+<p>Here is the engineering puzzle. Data pages live in the buffer pool and are modified in memory. Writing every changed page to disk at commit would be slow, because a single transaction may touch pages scattered across the disk (random writes), and a page is 8 to 16 KB even if only 50 bytes changed. But if we only keep changes in memory, a crash loses them. The solution is the <b>write-ahead log (WAL)</b>, called the redo log in InnoDB.</p>
+
+<p>The rule is: <b>before a modified data page may be written to disk, and before a commit is acknowledged, the log record describing the change must be safely on disk.</b> The log is an append-only file. Appending to the end of a file is a sequential write, the fastest thing a disk does, and one flush can cover the log records of many transactions at once (<b>group commit</b>). The big scattered data pages are written later, lazily, by a background writer and at periodic <b>checkpoints</b>.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Write-ahead log flow: change in memory, log record flushed, commit acknowledged, data page written later">
+  <rect class="ext" x="20" y="110" width="110" height="50" rx="10"/><text class="t-c t-b" x="75" y="132">Client</text><text class="t-c t-sm" x="75" y="150">COMMIT</text>
+  <rect class="cache" x="230" y="30" width="190" height="60" rx="10"/><text class="t-c t-b" x="325" y="54">Buffer pool (RAM)</text><text class="t-c t-sm" x="325" y="74">page changed, marked dirty</text>
+  <rect class="box" x="230" y="190" width="190" height="60" rx="10"/><text class="t-c t-b" x="325" y="214">WAL buffer</text><text class="t-c t-sm" x="325" y="234">log record appended</text>
+  <rect class="db" x="560" y="190" width="200" height="60" rx="10"/><text class="t-c t-b" x="660" y="214">WAL file on disk</text><text class="t-c t-sm" x="660" y="234">sequential, fsync</text>
+  <rect class="db" x="560" y="30" width="200" height="60" rx="10"/><text class="t-c t-b" x="660" y="54">Data files on disk</text><text class="t-c t-sm" x="660" y="74">written later, at checkpoint</text>
+  <path class="arrow" d="M130 125 L226 70"/><text class="t-sm" x="132" y="86">1. modify</text>
+  <path class="arrow" d="M130 148 L226 210"/><text class="t-sm" x="132" y="196">2. log it</text>
+  <path class="arrow" d="M420 220 L556 220"/><text class="t-sm" x="436" y="212">3. flush</text>
+  <path class="arrow-g" d="M556 240 C400 280 200 280 90 164"/><text class="t-sm" x="300" y="280">4. only now: commit acknowledged</text>
+  <path class="arrow dash" d="M420 60 L556 60"/><text class="t-sm" x="436" y="52">5. later</text>
+</svg>
+<figcaption>The commit only waits for step 3, one sequential log flush. Step 5, writing the dirty data page, can happen minutes later because the log can rebuild the change after a crash.</figcaption>
+</figure>
+
+<h3>7.1 Crash recovery</h3>
+<p>Suppose the server loses power. On restart the database reads the log from the last checkpoint (a point at which all earlier changes were known to be on disk) and <b>replays</b> it, re-applying changes whose data pages never reached disk (<b>redo</b>). Transactions that were in flight and never committed have their changes <b>rolled back</b> (<b>undo</b>, using stored old values in InnoDB's undo log, or by simply treating their row versions as invisible in Postgres). The classic algorithm that defines this is called ARIES. The result is a state that contains every committed transaction and no uncommitted ones. Recovery time is bounded by how much log accumulated since the last checkpoint, which is why checkpoint frequency trades steady-state write cost against restart time.</p>
+
+<h3>7.2 What else the log is used for</h3>
+<ul>
+  <li><b>Replication.</b> Physical replicas in PostgreSQL stream and replay the WAL; MySQL replicates a separate logical <b>binary log</b> (binlog). Lag is the time a replica takes to apply what the primary logged. See <a href="24-replication.html">Chapter 24</a>.</li>
+  <li><b>Point-in-time recovery.</b> Keep a base backup plus all WAL since, then replay up to just before the accidental <code>DROP TABLE</code>. This is how you recover from human error, which replication cannot (a replica faithfully replays the mistake).</li>
+  <li><b>Change data capture.</b> Tools read the log to stream row changes into Kafka and search indexes.</li>
+</ul>
+<p>The same append-first idea underlies log-structured storage engines and is covered from the storage side in <a href="19-storage-engines.html">Chapter 19</a>. A subtle durability point: the log flush must really reach the device. <code>fsync</code> asks the operating system to push data to stable storage; disks and SSDs with volatile write caches can lie, which is why servers use battery or capacitor-backed caches.</p>
+
+<h2 id="isolation">8. Transactions and isolation levels</h2>
+
+<p>When transactions run at the same time, their reads and writes interleave. Without protection, interleaving produces results no serial order could produce. The SQL standard defines isolation levels in terms of which of these anomalies they permit. Learn the anomalies first.</p>
+
+<h3>8.1 The anomalies</h3>
+<ul>
+  <li><b>Dirty read.</b> Transaction T1 reads a value that T2 has written but not yet committed. If T2 then rolls back, T1 acted on data that never existed.</li>
+  <li><b>Non-repeatable read.</b> T1 reads a row, T2 commits a change to that row, T1 reads the same row again and gets a different value within the same transaction.</li>
+  <li><b>Phantom read.</b> T1 runs a query for a set of rows (all bookings in a time window), T2 commits a new row matching that condition, T1 runs the same query again and sees an extra row. The row itself is new, so locking existing rows could not have prevented it.</li>
+  <li><b>Lost update.</b> Two transactions read the same value, each computes a new value from it, and each writes; the second write silently overwrites the first. Example: both read stock = 10, both subtract 1, both write 9; one sale vanished.</li>
+  <li><b>Write skew.</b> Two transactions read an overlapping set of rows, then each writes a <i>different</i> row, and together they violate an invariant that each alone preserved. Example: a hospital requires at least one doctor on call. Two doctors, Alice and Bob, both on call, each check "are there at least 2 on call?" (yes), and each removes themselves. Both commit; nobody is on call. Neither wrote the row the other wrote, so row-level conflict detection never fires.</li>
+</ul>
+
+<h3>8.2 The levels</h3>
+<table>
+<tr><th>Level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom</th><th>Lost update</th><th>Write skew</th></tr>
+<tr><td>Read uncommitted</td><td>Possible</td><td>Possible</td><td>Possible</td><td>Possible</td><td>Possible</td></tr>
+<tr><td>Read committed</td><td>Prevented</td><td>Possible</td><td>Possible</td><td>Possible (for read-then-write)</td><td>Possible</td></tr>
+<tr><td>Repeatable read / snapshot isolation</td><td>Prevented</td><td>Prevented</td><td>Prevented in Postgres and by snapshot; in the SQL standard, allowed</td><td>Detected and aborted in Postgres; depends in MySQL</td><td>Possible</td></tr>
+<tr><td>Serializable</td><td>Prevented</td><td>Prevented</td><td>Prevented</td><td>Prevented</td><td>Prevented</td></tr>
+</table>
+
+<ul>
+  <li><b>Read uncommitted:</b> you may see uncommitted data. Rarely used; PostgreSQL silently treats it as read committed.</li>
+  <li><b>Read committed:</b> every statement sees only data committed before that statement began. The default in PostgreSQL, Oracle, and SQL Server. Two statements in one transaction can see different data. Good enough for many applications, but a read-then-write pattern is unsafe.</li>
+  <li><b>Repeatable read:</b> the standard says a row you read stays the same. Implementations differ: PostgreSQL's repeatable read is really <b>snapshot isolation</b>: at the transaction's first statement it takes a consistent snapshot of the database, and every read sees that snapshot, so even phantoms cannot appear. If you try to update a row that someone else committed a change to after your snapshot, Postgres aborts you with a serialization failure and you must retry. MySQL InnoDB's default is repeatable read: plain reads use a snapshot, but locking reads and writes see the latest committed data and use <b>gap locks</b> to block phantoms (section 10).</li>
+  <li><b>Snapshot isolation</b> as a named level (SQL Server has it; Oracle's "serializable" is really this): each transaction works from a point-in-time snapshot and conflicts are detected only when two transactions write the same row. It stops most anomalies and allows reads that never block writes, but still permits <b>write skew</b>.</li>
+  <li><b>Serializable:</b> outcomes equal some serial order. Implemented either by heavy locking (MySQL InnoDB turns plain reads into shared-lock reads; SQL Server) or, in PostgreSQL, by <b>Serializable Snapshot Isolation (SSI)</b>, which runs on snapshots but tracks read-write dependencies between transactions and aborts one when it detects a dangerous cycle. In both cases, the application must be prepared to <b>retry</b> aborted transactions.</li>
+</ul>
+
+<h3>8.3 Two anomalies as sequences</h3>
+<div class="two">
+<figure class="diagram">
+<svg viewBox="0 0 400 330" role="img" aria-label="Lost update sequence between two transactions">
+  <text class="t-c t-b" x="200" y="16">Lost update (stock = 10)</text>
+  <rect class="ext" x="20" y="28" width="110" height="30" rx="8"/><text class="t-c t-b" x="75" y="48">Txn A</text>
+  <rect class="db" x="165" y="28" width="70" height="30" rx="8"/><text class="t-c t-b" x="200" y="48">Row</text>
+  <rect class="ext" x="270" y="28" width="110" height="30" rx="8"/><text class="t-c t-b" x="325" y="48">Txn B</text>
+  <line class="life" x1="75" y1="58" x2="75" y2="320"/><line class="life" x1="200" y1="58" x2="200" y2="320"/><line class="life" x1="325" y1="58" x2="325" y2="320"/>
+  <path class="arrow" d="M75 84 L196 84"/><text class="t-sm" x="80" y="78">1. read: 10</text>
+  <path class="arrow" d="M325 114 L204 114"/><text class="t-sm" x="236" y="108">2. read: 10</text>
+  <path class="arrow" d="M75 154 L196 154"/><text class="t-sm" x="80" y="148">3. write 9, commit</text>
+  <path class="arrow-r" d="M325 194 L204 194"/><text class="t-sm" x="226" y="188">4. write 9, commit</text>
+  <rect class="miss" x="30" y="226" width="340" height="78" rx="8"/>
+  <text class="t-sm" x="42" y="248">Two sales happened, stock fell by only 1.</text>
+  <text class="t-sm" x="42" y="268">B computed from a stale read and overwrote A.</text>
+  <text class="t-sm" x="42" y="288">Fix: atomic UPDATE, row lock, or version check.</text>
+</svg>
+<figcaption>Both transactions read before either wrote. Read committed does not stop this; an atomic <code>SET stock = stock - 1</code> does.</figcaption>
+</figure>
+
+<figure class="diagram">
+<svg viewBox="0 0 400 330" role="img" aria-label="Write skew sequence with two on-call doctors">
+  <text class="t-c t-b" x="200" y="16">Write skew (on-call rule)</text>
+  <rect class="ext" x="20" y="28" width="110" height="30" rx="8"/><text class="t-c t-b" x="75" y="48">Alice txn</text>
+  <rect class="db" x="165" y="28" width="70" height="30" rx="8"/><text class="t-c t-b" x="200" y="48">Table</text>
+  <rect class="ext" x="270" y="28" width="110" height="30" rx="8"/><text class="t-c t-b" x="325" y="48">Bob txn</text>
+  <line class="life" x1="75" y1="58" x2="75" y2="320"/><line class="life" x1="200" y1="58" x2="200" y2="320"/><line class="life" x1="325" y1="58" x2="325" y2="320"/>
+  <path class="arrow" d="M75 84 L196 84"/><text class="t-sm" x="80" y="78">1. count on call: 2</text>
+  <path class="arrow" d="M325 114 L204 114"/><text class="t-sm" x="228" y="108">2. count: 2</text>
+  <path class="arrow" d="M75 154 L196 154"/><text class="t-sm" x="80" y="148">3. Alice off, commit</text>
+  <path class="arrow-r" d="M325 184 L204 184"/><text class="t-sm" x="222" y="178">4. Bob off, commit</text>
+  <rect class="miss" x="30" y="214" width="340" height="90" rx="8"/>
+  <text class="t-sm" x="42" y="236">Zero doctors on call: invariant broken.</text>
+  <text class="t-sm" x="42" y="256">Different rows written, so no row conflict.</text>
+  <text class="t-sm" x="42" y="276">Fix: serializable, or lock the rows read</text>
+  <text class="t-sm" x="42" y="294">(SELECT FOR UPDATE), or a constraint row.</text>
+</svg>
+<figcaption>Each transaction was correct alone. Snapshot isolation lets both commit; only serializable (or explicit locking of what was read) prevents it.</figcaption>
+</figure>
+</div>
+
+<div class="callout key"><b>Key idea</b>
+Isolation level is a dial between safety and concurrency. The default level of your database is usually weaker than people assume. Rather than raising the level globally, identify the specific read-then-write patterns that matter (counters, balances, uniqueness, "at least one" rules) and protect those with atomic updates, explicit row locks, or constraints. Use serializable for the few transactions where reasoning about interleavings is too hard, and always code retries.
+</div>
+
+<h2 id="mvcc">9. MVCC, vacuum and bloat</h2>
+
+<p>How can a database give one transaction a consistent snapshot while another is writing, without making readers wait for writers? The answer in PostgreSQL, MySQL InnoDB, Oracle, and others is <b>MVCC</b>, multi-version concurrency control. Instead of overwriting a row in place, an update creates a <i>new version</i> of the row and keeps the old version around for as long as some running transaction might still need it. Each version is stamped with the transaction ids that created and (if superseded) removed it. A reader compares those stamps to its snapshot and sees only the version that was current when its snapshot was taken. The result: <b>readers do not block writers, and writers do not block readers.</b> Only writers to the same row block each other.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 280" role="img" aria-label="MVCC row versions in Postgres and InnoDB">
+  <text class="t-b" x="20" y="22">PostgreSQL: new versions live in the table heap</text>
+  <rect class="miss" x="20" y="36" width="200" height="56" rx="8"/><text class="t-c t-b" x="120" y="58">Version 1: stock 10</text><text class="t-c t-sm" x="120" y="78">created tx 100, ended tx 120</text>
+  <rect class="hit" x="260" y="36" width="200" height="56" rx="8"/><text class="t-c t-b" x="360" y="58">Version 2: stock 9</text><text class="t-c t-sm" x="360" y="78">created tx 120, current</text>
+  <path class="arrow" d="M220 64 L256 64"/>
+  <text class="t-sm" x="500" y="56">Old version stays in the table until</text><text class="t-sm" x="500" y="74">vacuum removes it: dead space = bloat.</text>
+  <text class="t-b" x="20" y="146">InnoDB: newest row in place, old versions in the undo log</text>
+  <rect class="hit" x="20" y="160" width="200" height="56" rx="8"/><text class="t-c t-b" x="120" y="182">Row in clustered index</text><text class="t-c t-sm" x="120" y="202">stock 9 (latest)</text>
+  <rect class="miss" x="260" y="160" width="200" height="56" rx="8"/><text class="t-c t-b" x="360" y="182">Undo log record</text><text class="t-c t-sm" x="360" y="202">previous value: stock 10</text>
+  <path class="arrow" d="M220 188 L256 188"/><text class="t-sm" x="226" y="152">roll pointer</text>
+  <text class="t-sm" x="500" y="180">An old snapshot follows the pointer back</text><text class="t-sm" x="500" y="198">to rebuild the version it should see.</text>
+  <text class="t-sm" x="20" y="262">Both let readers see a consistent snapshot without blocking writers; they differ in where old versions are kept and who cleans them.</text>
+</svg>
+<figcaption>Same idea, different bookkeeping. Postgres stores whole row versions in the heap; InnoDB updates in place and reconstructs older versions from the undo log.</figcaption>
+</figure>
+
+<h3>9.1 Postgres versus InnoDB, at a high level</h3>
+<table>
+<tr><th>Aspect</th><th>PostgreSQL</th><th>MySQL InnoDB</th></tr>
+<tr><td>Where old versions live</td><td>In the table heap itself, alongside current rows</td><td>In the undo log (rollback segment); the clustered row holds the latest</td></tr>
+<tr><td>Update cost</td><td>Writes a new full row version, and new entries in indexes unless the update is "heap-only" (HOT) and touches no indexed column</td><td>Modifies the row in place and writes an undo record; secondary index entries change only if indexed columns change</td></tr>
+<tr><td>Cleanup</td><td><b>VACUUM</b> (and autovacuum) removes dead versions and is essential</td><td>A background <b>purge</b> thread discards undo records no snapshot needs</td></tr>
+<tr><td>Problem when cleanup lags</td><td>Table and index <b>bloat</b>, wasted space and slower scans</td><td>Undo log growth and a long history list, slower reads of old versions</td></tr>
+<tr><td>Rollback</td><td>Instant: the new version is simply never visible</td><td>Slower for big transactions: undo must be applied</td></tr>
+<tr><td>Default isolation</td><td>Read committed</td><td>Repeatable read</td></tr>
+</table>
+
+<h3>9.2 Vacuum and bloat</h3>
+<p>In PostgreSQL an <code>UPDATE</code> is internally an insert of a new version plus a mark on the old one, and a <code>DELETE</code> only marks a row dead. Dead versions occupy space until <b>VACUUM</b> reclaims it for reuse. <b>Autovacuum</b> runs in the background, triggered by the number of dead rows. It also freezes very old transaction ids; without that, the 32-bit transaction counter would eventually wrap around and make old rows appear to be in the future, so Postgres will force aggressive vacuum or even stop accepting writes to prevent data loss. That is the famous "transaction id wraparound" emergency.</p>
+<p><b>Bloat</b> is the accumulation of dead space: tables and indexes much larger than their live data, meaning more pages to read and a lower cache hit ratio. Causes and cures:</p>
+<ul>
+  <li><b>Long-running transactions</b> (an idle-in-transaction session, a forgotten report) hold back the oldest snapshot, so vacuum cannot remove any version newer than it. This is the number one cause. Set <code>idle_in_transaction_session_timeout</code> and alert on old transactions.</li>
+  <li>Heavy update/delete workloads outrun default autovacuum settings. Tune thresholds per table, use HOT-friendly designs (do not index frequently updated columns needlessly, leave free space with a lower fillfactor).</li>
+  <li>Plain <code>VACUUM</code> makes space reusable but rarely shrinks files; a badly bloated table needs a rewrite (<code>VACUUM FULL</code> takes an exclusive lock, so teams use online tools such as pg_repack) or a rebuilt index.</li>
+  <li>Queue-like tables with constant insert and delete bloat quickly; consider partitioning and dropping old partitions instead of deleting rows (section 12).</li>
+</ul>
+
+<h2 id="locking">10. Locking, deadlocks and concurrency control</h2>
+
+<p>MVCC lets readers proceed freely, but writers still need to coordinate. Databases use <b>locks</b> for that, at several granularities.</p>
+
+<h3>10.1 Lock types</h3>
+<ul>
+  <li><b>Row locks.</b> Taken automatically by <code>UPDATE</code> and <code>DELETE</code> on the rows they change, and explicitly by <code>SELECT ... FOR UPDATE</code>. A second transaction trying to modify the same row waits until the first commits or rolls back. Different rows never conflict, which is why row-level locking scales.</li>
+  <li><b>Table locks.</b> Coarser. Many DDL statements (<code>ALTER TABLE</code>, <code>DROP</code>, <code>TRUNCATE</code>, some index builds) take a strong lock that blocks reads and writes. A dangerous pattern: an <code>ALTER TABLE</code> waits behind one long-running transaction, and then every new query queues behind the waiting <code>ALTER</code>, so the whole table appears frozen. Set a <code>lock_timeout</code> for schema changes, and prefer online techniques such as <code>CREATE INDEX CONCURRENTLY</code> (<a href="26-multi-region-migrations.html">Chapter 26</a>).</li>
+  <li><b>Gap and next-key locks (InnoDB).</b> To prevent phantoms at repeatable read, InnoDB locks not just matching index records but also the <i>gaps</i> between them, so that nobody can insert a new row into the range you scanned. A locking query such as <code>SELECT ... WHERE id BETWEEN 10 AND 20 FOR UPDATE</code> blocks inserts of ids 11 to 19 even though those rows do not exist. This prevents anomalies but surprises people with unexpected lock waits and deadlocks on inserts. Using read committed in MySQL disables most gap locking.</li>
+  <li><b>Shared versus exclusive.</b> Shared locks (<code>FOR SHARE</code>) let many readers hold them but block writers; exclusive locks block everything else on that row. Foreign key checks take light shared-style locks on the referenced row.</li>
+</ul>
+
+<h3>10.2 Deadlocks</h3>
+<p>A <b>deadlock</b> occurs when two transactions each hold a lock the other needs, so neither can ever proceed. The database detects such cycles (by examining the wait-for graph after a short delay) and kills one transaction, which receives an error that your code must handle by retrying.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Deadlock between two transactions locking two rows in opposite order">
+  <rect class="ext" x="60" y="30" width="150" height="50" rx="10"/><text class="t-c t-b" x="135" y="52">Transaction A</text><text class="t-c t-sm" x="135" y="70">transfer 1 to 2</text>
+  <rect class="ext" x="690" y="30" width="150" height="50" rx="10"/><text class="t-c t-b" x="765" y="52">Transaction B</text><text class="t-c t-sm" x="765" y="70">transfer 2 to 1</text>
+  <rect class="db" x="60" y="170" width="150" height="50" rx="10"/><text class="t-c t-b" x="135" y="192">Row: account 1</text><text class="t-c t-sm" x="135" y="210">locked by A</text>
+  <rect class="db" x="690" y="170" width="150" height="50" rx="10"/><text class="t-c t-b" x="765" y="192">Row: account 2</text><text class="t-c t-sm" x="765" y="210">locked by B</text>
+  <path class="arrow-g" d="M135 80 L135 166"/><text class="t-sm" x="146" y="128">1. holds</text>
+  <path class="arrow-g" d="M765 80 L765 166"/><text class="t-sm" x="776" y="128">1. holds</text>
+  <path class="arrow-r dash" d="M210 50 L686 190"/><text class="t-sm" x="330" y="96">2. A now wants account 2 (waits for B)</text>
+  <path class="arrow-r dash" d="M690 60 L214 200"/><text class="t-sm" x="400" y="190">3. B now wants account 1 (waits for A)</text>
+  <text class="t-b" x="300" y="256">Cycle: A waits for B, B waits for A. The database aborts one of them.</text>
+</svg>
+<figcaption>Each transaction locked one row first and then reached for the row the other holds. Neither can ever finish without outside help.</figcaption>
+</figure>
+
+<p>How to avoid deadlocks, in order of effectiveness:</p>
+<ol>
+  <li><b>Acquire locks in a consistent global order.</b> If every transfer locks the lower account id first, a cycle cannot form. Use <code>SELECT ... WHERE id IN (1, 2) ORDER BY id FOR UPDATE</code>.</li>
+  <li><b>Keep transactions short.</b> Do no network calls, user waits, or slow computation while holding locks. Open the transaction late and commit early.</li>
+  <li><b>Touch fewer rows</b> and use indexes so locking queries do not lock (or gap-lock) many extra rows.</li>
+  <li><b>Use atomic single statements</b> (<code>UPDATE ... SET x = x - 1</code>) in place of read-modify-write.</li>
+  <li><b>Retry on deadlock</b> with a small randomized backoff. Even careful designs deadlock occasionally; treat it as an expected, retryable error rather than a bug.</li>
+</ol>
+
+<h3>10.3 Pessimistic versus optimistic concurrency</h3>
+<p><b>Pessimistic</b> control assumes conflicts are likely and prevents them by locking before touching data. <code>SELECT ... FOR UPDATE</code> reads the rows and takes an exclusive lock on them so that no one else can change them until you commit. Variants: <code>NOWAIT</code> fails immediately if the row is locked, and <code>SKIP LOCKED</code> skips locked rows, which is the standard trick to build a job queue where many workers pull different tasks without waiting for each other (<code>SELECT ... FOR UPDATE SKIP LOCKED LIMIT 10</code>).</p>
+<p><b>Optimistic</b> control assumes conflicts are rare, does not lock while thinking, and checks at write time that nothing changed. The usual implementation is a <b>version column</b>:</p>
+<pre><code>SELECT id, stock, version FROM items WHERE id = 7;      -- version = 12
+UPDATE items SET stock = 9, version = 13
+ WHERE id = 7 AND version = 12;                          -- affected rows = 0 means someone else won</code></pre>
+<p>If zero rows were updated, someone changed the row since you read it, so you re-read and retry (or tell the user). This works across long gaps, such as a user editing a form for several minutes, where holding a database lock would be unacceptable. HTTP ETags and compare-and-set in key-value stores follow the same idea.</p>
+<table>
+<tr><th>Approach</th><th>Choose when</th><th>Cost</th></tr>
+<tr><td>Pessimistic (<code>FOR UPDATE</code>)</td><td>High contention on the same rows (hot counter, last seat); short transactions; correctness is critical</td><td>Waiting, lock queues, deadlock risk, lower throughput on hot rows</td></tr>
+<tr><td>Optimistic (version check)</td><td>Low contention; work spans user think time or multiple requests</td><td>Wasted work and retries when conflicts do happen; under high contention it collapses into retry storms</td></tr>
+<tr><td>Atomic statement</td><td>The change is a simple function of the current value</td><td>Almost none; best option when it applies</td></tr>
+</table>
+
+<h3>10.4 Unique constraints and upserts</h3>
+<p>The only reliable way to guarantee uniqueness (one account per email, one vote per user per poll, one idempotency key per request) is a <b>unique constraint or index</b> enforced by the database. An application check ("SELECT, and if none then INSERT") has a race: two requests both see none and both insert. With the constraint, the second insert fails with a duplicate-key error, which your code treats as "already exists".</p>
+<p>An <b>upsert</b> performs "insert, or update if it exists" atomically: <code>INSERT ... ON CONFLICT (key) DO UPDATE ...</code> in PostgreSQL, <code>INSERT ... ON DUPLICATE KEY UPDATE</code> in MySQL, <code>MERGE</code> in standard SQL and others. Use <code>ON CONFLICT DO NOTHING</code> for idempotent inserts, which pairs naturally with retries and at-least-once message processing (<a href="32-idempotency-ids.html">Chapter 32</a>). A subtle cost: in Postgres every attempted insert that conflicts still consumes a sequence value, so ids can have gaps; never rely on gap-free ids.</p>
+
+<h2 id="pooling">11. Connection pooling</h2>
+
+<p>Each database connection is expensive. In PostgreSQL every connection is a separate operating-system process using several megabytes of memory, with its own backend state; MySQL uses a thread per connection. Opening one also costs a TCP and TLS handshake plus authentication, tens of milliseconds. And a database can only make use of a limited number of concurrent queries: beyond roughly a small multiple of the CPU core count, extra active connections just contend for CPU and locks and <i>reduce</i> total throughput. A common guideline for the useful number of concurrently active queries is a few times the core count, so a 16-core server is best served by dozens of active connections, not thousands.</p>
+
+<p>The problem appears when you have hundreds of application instances (or serverless functions), each with a pool of 20 connections: 200 instances times 20 is 4,000 connections, far beyond what the database handles well. A <b>connection pooler</b> sits between applications and the database, accepting many client connections and multiplexing them over a small set of real server connections. <b>PgBouncer</b> is the standard for PostgreSQL; ProxySQL and the cloud proxies (RDS Proxy, Cloud SQL's pooling) play this role for MySQL and managed services.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Many application connections multiplexed through PgBouncer onto few database connections">
+  <rect class="box" x="20" y="30" width="140" height="44" rx="8"/><text class="t-c t-b" x="90" y="57">App pod 1</text>
+  <rect class="box" x="20" y="95" width="140" height="44" rx="8"/><text class="t-c t-b" x="90" y="122">App pod 2</text>
+  <rect class="box" x="20" y="160" width="140" height="44" rx="8"/><text class="t-c t-b" x="90" y="187">App pod 3 ... 200</text>
+  <rect class="cache" x="360" y="80" width="190" height="80" rx="10"/><text class="t-c t-b" x="455" y="108">PgBouncer</text><text class="t-c t-sm" x="455" y="128">4,000 client connections in</text><text class="t-c t-sm" x="455" y="146">queue and multiplex</text>
+  <rect class="db" x="740" y="80" width="140" height="80" rx="10"/><text class="t-c t-b" x="810" y="108">PostgreSQL</text><text class="t-c t-sm" x="810" y="128">~50 server</text><text class="t-c t-sm" x="810" y="146">connections</text>
+  <path class="arrow" d="M160 52 L356 105"/><path class="arrow" d="M160 117 L356 120"/><path class="arrow" d="M160 182 L356 138"/>
+  <path class="arrow" d="M550 120 L736 120"/>
+  <text class="t-sm" x="20" y="240">Transaction pooling: a server connection is lent to a client only for the duration of one transaction, then returned.</text>
+</svg>
+<figcaption>The pooler lets thousands of cheap client connections share a few expensive server connections. Clients wait in a queue inside the pooler instead of piling onto the database.</figcaption>
+</figure>
+
+<p>PgBouncer has three modes:</p>
+<ul>
+  <li><b>Session pooling:</b> a server connection is held for the client's whole session. Safe but gives little multiplexing.</li>
+  <li><b>Transaction pooling:</b> a server connection is assigned only while a transaction runs, then returned. This gives the large multiplexing win and is the usual choice, but breaks features that rely on session state: session-level prepared statements (in older versions), <code>SET</code> variables, advisory locks held across transactions, <code>LISTEN/NOTIFY</code>, and temporary tables. Code must not depend on them.</li>
+  <li><b>Statement pooling:</b> returns the connection after every statement; multi-statement transactions are not allowed. Rare.</li>
+</ul>
+<p>Operational notes: size the pool from the database's capacity, not from client count; add a client-side pool limit and a timeout so that when the pool is exhausted requests fail fast instead of piling up; keep pooler instances redundant (it is a new component that can fail, so run several behind a load balancer); and remember that a pooler does not fix slow queries, only connection storms. A related failure is a <b>thundering herd</b> after a restart, when every app instance reconnects at once; connection limits and jittered retry help.</p>
+
+<h2 id="scaling">12. Scaling a relational database</h2>
+
+<p>Scale in this order, cheapest and least risky first. Many systems stop at step three.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Scaling ladder from tuning to sharding">
+  <rect class="hit" x="10" y="60" width="160" height="110" rx="10"/><text class="t-c t-b" x="90" y="84">1. Tune</text><text class="t-c t-sm" x="90" y="106">indexes, queries</text><text class="t-c t-sm" x="90" y="124">cache, pooling</text><text class="t-c t-sm" x="90" y="142">bigger hardware</text>
+  <rect class="hit" x="190" y="60" width="160" height="110" rx="10"/><text class="t-c t-b" x="270" y="84">2. Read replicas</text><text class="t-c t-sm" x="270" y="106">scale reads</text><text class="t-c t-sm" x="270" y="124">accept lag</text><text class="t-c t-sm" x="270" y="142">Chapter 24</text>
+  <rect class="cache" x="370" y="60" width="160" height="110" rx="10"/><text class="t-c t-b" x="450" y="84">3. Cache + split</text><text class="t-c t-sm" x="450" y="106">Redis in front</text><text class="t-c t-sm" x="450" y="124">move big data out</text><text class="t-c t-sm" x="450" y="142">Chapter 13</text>
+  <rect class="cache" x="550" y="60" width="160" height="110" rx="10"/><text class="t-c t-b" x="630" y="84">4. Partition</text><text class="t-c t-sm" x="630" y="106">split big tables</text><text class="t-c t-sm" x="630" y="124">inside one server</text><text class="t-c t-sm" x="630" y="142">drop old data fast</text>
+  <rect class="miss" x="730" y="60" width="160" height="110" rx="10"/><text class="t-c t-b" x="810" y="84">5. Shard</text><text class="t-c t-sm" x="810" y="106">split across servers</text><text class="t-c t-sm" x="810" y="124">scales writes</text><text class="t-c t-sm" x="810" y="142">Chapter 25</text>
+  <path class="arrow" d="M170 115 L186 115"/><path class="arrow" d="M350 115 L366 115"/><path class="arrow" d="M530 115 L546 115"/><path class="arrow" d="M710 115 L726 115"/>
+  <text class="t-sm" x="10" y="30">Complexity and operational risk increase to the right.</text>
+  <text class="t-sm" x="10" y="220">Do not skip ahead: sharding is the last resort because it changes how you query and transact.</text>
+</svg>
+<figcaption>Each step has a cost in complexity. Most products need only steps 1 to 3.</figcaption>
+</figure>
+
+<h3>12.1 Vertical scaling and its limits</h3>
+<p>Buy a bigger machine: more cores, more RAM, faster NVMe storage. It is the simplest move and goes surprisingly far. Rough, order-of-magnitude numbers for a well-tuned single node with SSD storage and a mostly in-memory working set: tens of thousands of simple indexed reads per second per node, and on the order of several thousand to low tens of thousands of write transactions per second, falling sharply for large rows, many indexes, or synchronous replication. Commodity cloud instances reach hundreds of cores and terabytes of RAM, and managed databases support multi-terabyte storage, though operations (backup restore time, vacuum, schema change, failover) get painful beyond a few terabytes. Treat these as rough guides; real workloads vary by a factor of ten either way, and your answer in an interview should be "measure it", with a ballpark.</p>
+
+<h3>12.2 Read replicas</h3>
+<p>Most applications read far more than they write. Add replicas that replay the primary's log and send read-only queries to them (<a href="24-replication.html">Chapter 24</a>). Caveats: replication is usually asynchronous, so a replica lags by milliseconds, occasionally seconds; a user who just wrote data may not see it on a replica (read-your-writes), so route a user's reads to the primary briefly after a write, or read from the primary for critical paths. Replicas do not scale writes, and each replica must apply every write, so write-heavy workloads gain little. Replicas also give availability: promote one when the primary dies.</p>
+
+<h3>12.3 Partitioning</h3>
+<p><b>Partitioning</b> splits one logical table into smaller physical pieces <i>within the same database server</i>, by a key: <b>range</b> (by month), <b>list</b> (by region), or <b>hash</b> (by user id modulo N). Queries that filter on the partition key touch only the relevant partitions (<b>partition pruning</b>), and each partition has smaller indexes that fit in memory better. The most valuable property for time-series-like data is cheap retention: dropping a month-old partition is an instant metadata operation, whereas deleting hundreds of millions of rows would generate huge logs and bloat. Costs: the partition key must be part of unique keys, queries without the key hit every partition, and too many partitions slow planning. Partitioning is not sharding; it does not add machines (the distinction and the cross-machine version are in <a href="25-sharding.html">Chapter 25</a>).</p>
+
+<h3>12.4 Sharding</h3>
+<p>When one primary cannot take the write volume or data size, split the data across several independent database servers by a <b>shard key</b>, with the application or a routing layer sending each query to the right shard. This scales writes and storage almost linearly, but you lose or must rework: cross-shard joins, cross-shard transactions (needing two-phase commit or sagas), global unique constraints, and simple secondary indexes; and resharding is operationally heavy. A well-chosen key (such as tenant id) keeps most queries and transactions inside one shard. Details, hot shards, and rebalancing are the subject of <a href="25-sharding.html">Chapter 25</a>.</p>
+
+<h2 id="newsql">13. NewSQL: distributed SQL databases</h2>
+
+<p><b>NewSQL</b> systems try to keep SQL and ACID transactions while scaling out horizontally, so you get sharding without writing the shard logic yourself. Representative products are Google Spanner, CockroachDB, YugabyteDB, TiDB, and Amazon Aurora DSQL.</p>
+<p>The common design: data is automatically split into small ranges (tablets, ranges, regions). Each range is replicated across machines (typically three or five) using a consensus protocol such as Raft or Paxos (<a href="29-consensus.html">Chapter 29</a>), with one replica as the range's leader accepting writes. A transaction touching several ranges commits using a distributed protocol (a form of two-phase commit across the leaders involved, itself made fault tolerant by consensus). Ranges split and move automatically as data grows or load shifts.</p>
+<ul>
+  <li><b>Spanner</b> additionally uses synchronized atomic-clock-based time (TrueTime) to give externally consistent, serializable transactions across continents; a write waits out a small clock-uncertainty window before commit becomes visible.</li>
+  <li><b>CockroachDB</b> offers serializable isolation by default, Postgres-compatible SQL, and survives the loss of a node, zone, or region depending on configuration; it uses hybrid logical clocks (<a href="27-failure-time-ordering.html">Chapter 27</a>) instead of special hardware.</li>
+</ul>
+<p>The tradeoffs matter in interviews. Every committed write needs a consensus round to a majority of replicas, so write latency is at least one round trip to the nearest majority: a few milliseconds within a region, tens to hundreds of milliseconds across regions. Cross-range transactions are slower than single-node ones. The systems are more complex to operate, and not every single-node feature or extension is available. Choose NewSQL when you need relational semantics with horizontal write scaling, built-in automatic failover, or multi-region consistency, and you can accept higher per-transaction latency. A single-node Postgres is faster and simpler for everything that fits on one machine.</p>
+
+<h2 id="failures">14. Failure modes and mitigations</h2>
+<table>
+<tr><th>Failure</th><th>What happens</th><th>Mitigation</th></tr>
+<tr><td>Primary crashes</td><td>Writes stop; WAL recovery runs on restart, or a replica must be promoted</td><td>Automated failover with a synchronous or near-synchronous replica; test failover; clients retry with backoff</td></tr>
+<tr><td>Async replica promoted with lag</td><td>The last moments of committed writes are lost; split-brain risk if the old primary returns</td><td>Fencing the old primary, semi-synchronous replication for critical data (<a href="24-replication.html">Chapter 24</a>)</td></tr>
+<tr><td>Replication lag spike</td><td>Stale reads, read-your-writes violations</td><td>Read from primary after writes, monitor lag, throttle bulk jobs</td></tr>
+<tr><td>Connection exhaustion</td><td>"Too many connections"; new requests fail</td><td>Pooler, client timeouts, per-service connection budgets</td></tr>
+<tr><td>Long transaction</td><td>Holds locks, blocks vacuum, bloats tables, delays DDL</td><td>Statement and idle-in-transaction timeouts, keep transactions short</td></tr>
+<tr><td>Lock pile-up</td><td>One blocked statement causes a queue of waiters and a pool full of blocked connections</td><td>Lock timeouts, avoid hot rows, run migrations with <code>lock_timeout</code></td></tr>
+<tr><td>Bad query plan after data change</td><td>A formerly fast query suddenly scans a huge table</td><td>Fresh statistics, query hints or plan pinning where available, query review, slow-query alerts</td></tr>
+<tr><td>Disk full</td><td>Database stops accepting writes; WAL cannot be written</td><td>Disk alerts at 70-80%, WAL archive monitoring, retention limits on replication slots</td></tr>
+<tr><td>Transaction id wraparound (Postgres)</td><td>Forced emergency vacuum or write stop</td><td>Healthy autovacuum, monitor oldest transaction age</td></tr>
+<tr><td>Deadlocks</td><td>One transaction aborted with an error</td><td>Consistent lock order, retries</td></tr>
+<tr><td>Accidental destructive change</td><td>Replicas copy the damage instantly</td><td>Point-in-time recovery, tested backups, delayed replica, restricted production access</td></tr>
+<tr><td>Corruption or hardware loss</td><td>Data pages unreadable</td><td>Checksums, replicas on separate hardware, restore drills</td></tr>
+</table>
+<div class="callout watch"><b>Watch out</b>
+A backup you have never restored is a hope, not a backup. Interviewers like to hear that you would measure restore time (it determines your real recovery-time objective) and rehearse failover.
+</div>
+
+<h2 id="worked">15. Worked example: decrementing inventory under concurrency</h2>
+
+<p><b>Scenario.</b> A flash sale offers 1,000 units of a product. Table <code>items(id, stock, version)</code>. At peak, 2,000 requests per second try to buy the same product. Each purchase must decrement the stock exactly once and must never oversell. Let us walk through four implementations, from wrong to right, with numbers.</p>
+
+<h3>15.1 Attempt 1: read, then write (broken)</h3>
+<pre><code>BEGIN;
+SELECT stock FROM items WHERE id = 7;      -- app checks stock &gt; 0
+UPDATE items SET stock = :stock - 1 WHERE id = 7;
+COMMIT;</code></pre>
+<p>At read committed, many transactions read the same stock (say 500) before any of them writes. Each writes 499. After 100 purchases the stock has dropped by maybe 1 or 2. This is the lost update from section 8. Oversold by roughly the concurrency level. Never do this.</p>
+
+<h3>15.2 Attempt 2: atomic conditional update (usually the right answer)</h3>
+<pre><code>UPDATE items SET stock = stock - 1
+ WHERE id = 7 AND stock &gt; 0;
+-- check affected rows: 1 = success, 0 = sold out</code></pre>
+<p>A single statement reads and writes under the row lock, so concurrent statements on the same row run one after another and each sees the previous result. The <code>stock &gt; 0</code> condition makes overselling impossible; you can add a <code>CHECK (stock &gt;= 0)</code> constraint as a second safety net. Cost: all 2,000 requests per second queue on one row lock. If each update holds the lock for about 0.5 ms (a log flush shared via group commit may stretch the row's lock hold to about a millisecond because the lock is released only at commit), the single row can sustain very roughly 1,000 to 2,000 updates per second. Latency for a request at the back of a queue is the queue length times the hold time; with 100 waiting that is about 100 ms. So one hot row is bounded by serialized lock hold time, not by CPU, and that is the real ceiling.</p>
+
+<h3>15.3 Attempt 3: pessimistic lock, when business logic is needed</h3>
+<pre><code>BEGIN;
+SELECT stock FROM items WHERE id = 7 FOR UPDATE;   -- lock the row
+-- apply rules: per-customer limit, price checks, insert order, insert reservation
+UPDATE items SET stock = stock - 1 WHERE id = 7;
+INSERT INTO orders (...) VALUES (...);
+COMMIT;</code></pre>
+<p>Use this when the decision involves several tables or rules that cannot be written as one conditional update. The lock is held for the whole transaction, so keep it short (no payment call inside!). Throughput on the hot row is now bounded by the entire transaction time, say 3 ms, giving only about 300 purchases per second per item. Better to reserve stock quickly and take payment afterwards (a reservation with expiry), as in the booking case studies.</p>
+
+<h3>15.4 Attempt 4: optimistic version check</h3>
+<p>Read stock and version, then <code>UPDATE ... WHERE id = 7 AND version = :v</code>. Under low contention this works, but with 2,000 concurrent buyers on one row almost every attempt fails the version check and retries, creating a retry storm that burns CPU and connections for the same final throughput. Optimistic control is the wrong tool for a hot row; it is right for the edit-a-profile case.</p>
+
+<h3>15.5 Going beyond one hot row</h3>
+<ul>
+  <li><b>Split the counter.</b> Store the 1,000 units across 10 rows (100 each). A buyer picks a random row and decrements it with the conditional update; if that one is empty, try another. Row-lock contention falls tenfold, and the ceiling rises to roughly 10,000 per second, at the cost of slightly more complex "total remaining" reads.</li>
+  <li><b>Admission in front.</b> Use an atomic decrement in Redis (<a href="13-caching-patterns.html">Chapter 13</a>) as a fast gate that admits only 1,000 buyers plus a margin, and write only the admitted orders to the database. The database remains the source of truth and the conditional update still guards correctness; Redis just absorbs the herd.</li>
+  <li><b>Queue.</b> Place purchase intents on a queue processed in order by a few workers, so the database sees a steady, serial stream instead of a stampede (<a href="34-queues-kafka.html">Chapter 34</a>).</li>
+  <li><b>Idempotency.</b> Give each purchase an idempotency key with a unique constraint so a client retry after a timeout cannot decrement twice.</li>
+</ul>
+<p><b>Result.</b> The answer interviewers want: an atomic conditional update (or a row lock for multi-table rules), a CHECK constraint as a backstop, an idempotency key, and, if one row cannot take the load, a split counter or an upstream gate, with the reasoning about why read-then-write and naive optimistic locking fail.</p>
+
+<h2 id="qa">16. Interview Q&amp;A</h2>
+
+<details><summary>Why would you choose PostgreSQL or MySQL over a NoSQL store for a new product?</summary>
+<p>Because the core data of most products is relational, needs multi-row transactions, and has query patterns you cannot fully predict yet. A relational database gives you constraints that protect integrity, joins for new features, and ACID transactions, so correctness work is done by the database instead of scattered across application code. A single well-tuned primary with replicas and a cache handles very large traffic, so the scale argument for NoSQL usually applies later, if ever. I would move specific data to another store only when a concrete need appears, such as huge write volume, time-series retention, or full-text search.</p></details>
+
+<details><summary>Walk me through what happens when I run a SELECT.</summary>
+<p>The parser checks syntax and resolves table and column names. The planner uses table statistics to enumerate candidate plans (scan versus index, join order, join algorithm) and picks the lowest estimated cost. The executor runs the plan as a tree of operators, asking the buffer pool for pages; pages already in memory are hits and others are read from disk and cached. Rows are returned as they are produced, so a <code>LIMIT</code> can stop work early. Performance problems come from a bad plan (stale statistics, missing index), too much data touched, or a working set larger than memory.</p></details>
+
+<details><summary>Why does the column order of a composite index matter?</summary>
+<p>The index is sorted by the first column, then the second within it, so it can only narrow a search along a leftmost prefix. An index on (customer_id, created_at) serves queries by customer and queries by customer plus time range, and can return a customer's rows already sorted by time, but it cannot help a query filtering only on created_at. The rule of thumb is equality columns first, then the range or sort column last, and to check the plan to confirm it is used. One composite index often replaces several single-column ones and costs less to maintain.</p></details>
+
+<details><summary>You added an index but the query is still slow. Why might that be?</summary>
+<p>First read the plan. Common reasons: the query wraps the column in a function or does a cast so the index cannot match; the filter is not selective, so the planner correctly prefers a scan; the leftmost prefix is violated; a leading wildcard in LIKE; stale statistics lead to a bad estimate; or the cost is elsewhere, such as sorting a huge result, a large OFFSET, N+1 calls from application code, or waiting on locks. I would run EXPLAIN ANALYZE, compare estimated and actual rows, and fix the specific cause instead of adding more indexes.</p></details>
+
+<details><summary>Explain the WAL and why it makes commits fast and durable.</summary>
+<p>The write-ahead log is an append-only record of every change, and the rule is that the log record reaches disk before the commit is acknowledged and before the corresponding data page is written. Appending to a log is a sequential write and one flush can cover many transactions, so commits are fast, while the big scattered data pages are written lazily in the background. After a crash the database replays the log from the last checkpoint to redo committed work and undo unfinished transactions. The same log feeds replication, point-in-time recovery, and change data capture.</p></details>
+
+<details><summary>Describe the isolation levels and which anomalies each allows.</summary>
+<p>Read uncommitted allows dirty reads; read committed prevents them but allows non-repeatable reads and phantoms because each statement sees the latest committed data. Repeatable read or snapshot isolation gives each transaction a stable snapshot, which prevents non-repeatable reads and, in Postgres, phantoms, but still allows write skew since two transactions can write different rows based on the same stale premise. Serializable prevents all of them, either with locking or with Postgres SSI, at the cost of aborts that the application must retry. Defaults are read committed in Postgres and repeatable read in InnoDB, and I would not assume they protect a read-then-write pattern.</p></details>
+
+<details><summary>What is write skew, and how do you prevent it?</summary>
+<p>Write skew is when two transactions read overlapping data, each decides an action is safe, and each writes a different row, so together they break an invariant, such as two on-call doctors both going off call. Row-level conflict detection misses it because no single row was written by both. Prevention options are the serializable level, locking the rows that were read with SELECT FOR UPDATE, materializing the invariant into one row that both transactions must update (so they conflict), or a database constraint or exclusion constraint where the rule can be expressed.</p></details>
+
+<details><summary>How does MVCC work, and what is the operational cost?</summary>
+<p>Updates create new row versions instead of overwriting, and each transaction reads the versions visible to its snapshot, so readers do not block writers. The cost is cleanup of old versions. In Postgres they sit in the table until vacuum removes them, so long-running transactions that hold an old snapshot cause bloat and slower scans, and vacuum must also prevent transaction id wraparound. In InnoDB, old versions live in the undo log and a purge thread removes them, so a long transaction makes the undo history grow. Either way, keeping transactions short is the main operational discipline.</p></details>
+
+<details><summary>How do you avoid deadlocks?</summary>
+<p>The most effective way is a consistent lock ordering, for example always locking accounts in ascending id order, so a cycle cannot form. Beyond that, keep transactions short and avoid slow work while holding locks, touch as few rows as possible with good indexes (which matters especially with InnoDB gap locks), and prefer single atomic statements. Because it can never be reduced to zero, the application should treat a deadlock error as retryable and retry with backoff. The database detects the cycle and aborts one victim, so deadlocks cost latency, not corruption.</p></details>
+
+<details><summary>Optimistic versus pessimistic locking: when do you use each?</summary>
+<p>Pessimistic locking (SELECT FOR UPDATE) takes the lock up front, which is right when contention on the same rows is high or when a conflict is expensive, as long as the transaction is short. Optimistic locking uses a version column and a conditional update, and fits low-contention cases or long user think times, like editing a document, where holding a lock is unacceptable. Under heavy contention optimistic control degrades into retry storms. For a plain counter, an atomic UPDATE with a condition beats both.</p></details>
+
+<details><summary>Why do you need a connection pooler like PgBouncer?</summary>
+<p>Database connections are heavy: in Postgres each is a process with its own memory, and throughput falls when too many are active at once. With many app instances each holding a pool, the total connection count can reach thousands. PgBouncer multiplexes many client connections onto a few server connections, typically in transaction mode, and queues clients in front of the database so it stays at a healthy concurrency. The tradeoff is losing session-level features such as session prepared statements, session variables, and advisory locks across transactions, and adding another component to keep highly available.</p></details>
+
+<details><summary>Your relational database is at its limits. What do you do, in order?</summary>
+<p>First measure and tune: slow queries, missing indexes, N+1 patterns, connection pooling, and a bigger instance. Then add read replicas for read-heavy load and a cache for hot reads, accepting replica lag. Move bulky or specialized data (blobs, search, time-series) to better stores. Partition large tables to keep indexes and retention manageable. Only if write volume or total size still exceeds one primary do I shard, choosing a shard key that keeps common queries and transactions within a shard, or adopt a distributed SQL database that does that splitting for me, accepting higher commit latency.</p></details>
+
+<details><summary>When would you pick CockroachDB or Spanner over sharded Postgres?</summary>
+<p>When I need relational transactions across a dataset too large or write-heavy for one node and do not want to build and operate routing, resharding, and cross-shard transaction logic myself. They replicate each range with consensus, so they give automatic failover and can survive zone or region loss with strongly consistent reads and writes. The price is higher write latency from the consensus round and cross-range commits, more operational complexity, and some feature gaps. If the data fits on one primary with replicas, plain Postgres is simpler and faster.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">17. Recap</h2>
+<ul>
+  <li>Default to a relational database for core data: transactions, constraints, joins, flexible queries. Leave it for a concrete reason such as write volume beyond one primary or a specialized data shape.</li>
+  <li>A query flows through parser, planner (cost-based, driven by statistics), executor, and buffer pool; data moves in 8 to 16 KB pages, and a working set that fits in RAM is the main performance lever.</li>
+  <li>A B-tree index gives logarithmic lookups with a very high fanout (3 to 4 levels for billions of rows). InnoDB clusters the table on the primary key; Postgres uses a heap with separate indexes.</li>
+  <li>Composite indexes follow the leftmost prefix rule: equality columns first, range or sort column last. Covering, partial, and expression indexes cut cost further; every index taxes every write.</li>
+  <li>Indexes fail when columns are wrapped in functions, selectivity is low, or statistics are stale. Read EXPLAIN ANALYZE, compare estimated to actual rows, know nested loop, hash, and merge joins, and eliminate N+1 queries.</li>
+  <li>ACID: atomicity and durability come from the write-ahead log (append first, replay after a crash); isolation is a dial with real anomalies: dirty read, non-repeatable read, phantom, lost update, write skew.</li>
+  <li>MVCC gives readers a snapshot without blocking writers, at the cost of vacuum/purge; keep transactions short to avoid bloat and lock trouble.</li>
+  <li>Prevent lost updates with atomic UPDATE statements, row locks, or version checks; prevent deadlocks with consistent lock order and retries; enforce uniqueness with constraints and upserts.</li>
+  <li>Pool connections (PgBouncer in transaction mode) so thousands of clients share dozens of server connections.</li>
+  <li>Scale in order: tune, replicas, cache, partition, then shard or use NewSQL (Spanner, CockroachDB), which trade commit latency for horizontal scale.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="17-data-modeling.html">Chapter 17</a> (modelling the tables you index and query) and <a href="13-caching-patterns.html">Chapter 13</a> (caching in front of the database). Leads to <a href="19-storage-engines.html">Chapter 19</a> (B-tree versus LSM engines and the WAL from the storage side), <a href="24-replication.html">Chapter 24</a> (replicas and failover), <a href="25-sharding.html">Chapter 25</a> (sharding), and <a href="28-cap-consistency.html">Chapter 28</a> (consistency models beyond one node).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

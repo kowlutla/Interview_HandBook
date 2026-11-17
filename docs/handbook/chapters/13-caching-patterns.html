@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 13: Caching I, Patterns | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="13-caching-patterns">
+
+<!-- Shared arrow-head markers, referenced by every diagram on this page -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+  </defs>
+</svg>
+
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+
+<main>
+<div class="kicker">Chapter 13 · Module 2</div>
+<h1>Caching I: Patterns</h1>
+<p class="lead">Caching is the single most common technique for making a system faster and cheaper to run. This chapter explains why it works, where caches sit, the ways data moves in and out of them, how a full cache decides what to drop, and how to keep cached data from going stale.</p>
+
+<!-- ======================= 1 ======================= -->
+<h2 id="what">1. The problem caching solves</h2>
+
+<p>Start with a concrete system. You run an online store. Every product page shows the product name, price, photos, description, average rating, and stock status. All of that lives in a relational database, spread over several tables: <code>products</code>, <code>prices</code>, <code>reviews</code>, <code>inventory</code>.</p>
+
+<p>Here is what happens, without any cache, each time someone opens a product page:</p>
+<ol>
+  <li>The request reaches an app server.</li>
+  <li>The app server sends a query to the database. To build one page, the query joins several tables and computes the average rating from thousands of review rows.</li>
+  <li>The database reads from its tables and indexes (partly from memory, partly from disk), does the join and the aggregation, and sends the result back.</li>
+  <li>The app server turns the result into HTML or JSON and replies.</li>
+</ol>
+
+<p>Suppose that query takes about 20 ms and uses a measurable amount of database CPU. A single database server can only do so much work at once. If it can run roughly 3,000 of these queries per second, then at 3,000 requests per second it is fully busy. At 20,000 requests per second, which is a normal peak for a popular store, the database falls behind. Queries queue up, each one waits longer, pages load slowly, and eventually the database stops responding and the whole site goes down.</p>
+
+<p>Now notice something about this workload. The product page for a popular phone is requested thousands of times per minute, and it is <b>the same page every time</b>. The database does the same expensive join, produces the same answer, and throws it away, thousands of times. Only a handful of times per day does the answer change (when the price or stock is updated).</p>
+
+<p>That is the opportunity. If we remember the answer after computing it once, and hand back the remembered answer for the next requests, we skip nearly all of the work. The place where we keep the remembered answers is a <b>cache</b>.</p>
+
+<div class="callout key"><b>Definition</b>
+A <b>cache</b> is a storage layer that keeps copies of data that is expensive to fetch or compute, in a place that is much faster to read from than the original source. The original source (here, the database) is called the <b>source of truth</b>. The cache never replaces it. It only holds copies.
+</div>
+
+<p>Think of the papers on your desk versus the filing cabinet in the next room. You keep the few papers you use all day on the desk. When you need something else, you walk to the cabinet, and often bring a copy back to the desk in case you need it again. The desk is small, but because most of your work uses the same few papers, it saves you hundreds of walks.</p>
+
+<p>Caching helps a system in three separate ways:</p>
+<ul>
+  <li><b>Lower latency.</b> Memory is thousands of times faster than disk, and avoiding a database round trip removes tens of milliseconds from the response. Users feel this directly.</li>
+  <li><b>Higher throughput.</b> One cache server holding data in memory can answer on the order of 100,000 simple reads per second. A database doing real query work answers far fewer. Moving reads to the cache raises how many requests the whole system can handle.</li>
+  <li><b>Protection for the backend.</b> The database only receives the requests the cache could not answer. If 95% of reads are served from the cache, the database sees one twentieth of the load. That often means you can run a smaller database, or put off the difficult work of sharding it (Chapter 25) for a long time.</li>
+</ul>
+
+<p>To feel the size of the gap, compare how long different operations take. These are rough figures, and they vary by hardware and network, but the ratios are what matter:</p>
+<table>
+  <tr><th>Operation</th><th>Rough time</th><th>Compared to RAM</th></tr>
+  <tr><td>Read from RAM</td><td>~100 nanoseconds</td><td>1×</td></tr>
+  <tr><td>Random read from an SSD</td><td>~100 microseconds</td><td>~1,000× slower</td></tr>
+  <tr><td>Round trip to a cache server in the same data center (Redis)</td><td>~0.5–1 ms</td><td>mostly network time</td></tr>
+  <tr><td>A typical database query over the network</td><td>~5–50 ms</td><td>tens of thousands of times slower</td></tr>
+  <tr><td>Round trip between regions</td><td>~50–150 ms</td><td>about a million times slower</td></tr>
+</table>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="locality">2. Why caching works: access is uneven</h2>
+
+<p>A cache is much smaller than the full dataset. If you have 50 million products, you cannot keep all of them in memory on a few cache servers. So why does a small cache help so much? Because real traffic is highly uneven. Two properties of how programs and people access data explain it.</p>
+
+<p><b>Temporal locality.</b> Data that was used recently is likely to be used again soon. A product that was just viewed is likely to be viewed again in the next few minutes, because it is trending, or was shared in a link, or is simply popular.</p>
+
+<p><b>Skewed popularity.</b> A small share of items receives most of the requests. In many systems, a rough rule of thumb is that about 20% of the items account for about 80% of the reads. The exact ratio varies, and for some workloads (a viral video, a front page) it is far more extreme, but the shape is almost always the same: a few very popular items and a very long tail of items that are rarely requested.</p>
+
+<p>Together these mean that a cache holding only the popular 5–20% of the data can answer most of the requests. The long tail still goes to the database, but it is a small share of the traffic.</p>
+
+<div class="callout key"><b>Key idea</b>
+Caching only pays off when some data is requested far more often than other data. If every item were requested exactly once, a cache would never be hit and would be wasted. Always check the access pattern before adding a cache: <i>is the same data read again and again?</i>
+</div>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="cost">3. What caching costs</h2>
+
+<p>Caching is not free, and in an interview it is worth showing that you know the costs, not just the benefits.</p>
+<ul>
+  <li><b>Stale data.</b> The cache holds a copy. If the original changes and the copy does not, readers see old data. Most of the engineering effort in caching goes into controlling this (see Invalidation, section 8).</li>
+  <li><b>Extra moving parts.</b> A cache is another system to deploy, monitor, size, secure, and keep available. It has its own failure modes.</li>
+  <li><b>Memory cost.</b> RAM is much more expensive than disk. Caching everything is rarely affordable.</li>
+  <li><b>More complicated code and debugging.</b> When a user reports a wrong value, you must now ask whether it came from the database or from a stale cache entry.</li>
+  <li><b>New failure scenarios.</b> If the cache goes down or is emptied, all traffic suddenly hits the database. A system that only works because of its cache can collapse when the cache disappears (Chapter 14).</li>
+</ul>
+
+<div class="callout watch"><b>When not to cache</b>
+Do not cache data that is almost never read twice, data that must always be exactly current (for example, the available balance right before a payment is authorized), or data that is cheap to read from the source anyway. A cache is an optimization for a measured problem, not a default.
+</div>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="where">4. Where can a cache live?</h2>
+
+<p>A request travels through several layers on the way from a user to the database, and a cache can sit at almost any of them. The general rule: <b>the closer to the user, the faster the answer, but the harder it is to keep fresh and the less you control it.</b></p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Layers a request passes through, with a cache at several of them">
+  <!-- row 1 -->
+  <rect class="ext" x="10"  y="30" width="150" height="56" rx="10"/><text class="t-c t-b" x="85"  y="55">User</text><text class="t-c t-sm" x="85" y="73">browser / app</text>
+  <rect class="cache" x="185" y="30" width="150" height="56" rx="10"/><text class="t-c t-b" x="260" y="55">Browser cache</text><text class="t-c t-sm" x="260" y="73">~0 ms</text>
+  <rect class="cache" x="360" y="30" width="150" height="56" rx="10"/><text class="t-c t-b" x="435" y="55">CDN / edge</text><text class="t-c t-sm" x="435" y="73">~10–30 ms</text>
+  <rect class="box"   x="535" y="30" width="150" height="56" rx="10"/><text class="t-c t-b" x="610" y="55">Load balancer</text><text class="t-c t-sm" x="610" y="73">+ gateway</text>
+  <rect class="box"   x="710" y="30" width="180" height="56" rx="10"/><text class="t-c t-b" x="800" y="55">App server</text><text class="t-c t-sm" x="800" y="73">business logic</text>
+  <path class="arrow" d="M160 58 L181 58"/><path class="arrow" d="M335 58 L356 58"/><path class="arrow" d="M510 58 L531 58"/><path class="arrow" d="M685 58 L706 58"/>
+  <!-- row 2 -->
+  <rect class="cache" x="710" y="190" width="180" height="56" rx="10"/><text class="t-c t-b" x="800" y="215">Local cache</text><text class="t-c t-sm" x="800" y="233">in-process · ~0.001 ms</text>
+  <rect class="cache" x="460" y="190" width="200" height="56" rx="10"/><text class="t-c t-b" x="560" y="215">Distributed cache</text><text class="t-c t-sm" x="560" y="233">Redis / Memcached · ~1 ms</text>
+  <rect class="db"    x="210" y="190" width="200" height="56" rx="10"/><text class="t-c t-b" x="310" y="215">Database</text><text class="t-c t-sm" x="310" y="233">source of truth · 5–50 ms</text>
+  <path class="arrow" d="M800 86 L800 186"/>
+  <path class="arrow" d="M760 86 L600 186"/>
+  <path class="arrow dash" d="M460 218 L414 218"/><text class="t-sm t-c" x="437" y="184">on miss</text>
+  <text class="t-sm" x="40" y="300">Left: faster and closer to the user, but harder to keep fresh.   Right: slower, but always up to date.</text>
+</svg>
+<figcaption><b>How to read this:</b> follow the arrows from the user. Yellow boxes are caches. The request stops at the first cache that has the answer, and only reaches the database if every cache misses.</figcaption>
+</figure>
+
+<h3>4.1 Browser cache</h3>
+<p>The user's own browser keeps copies of files it has downloaded: images, scripts, stylesheets, and sometimes API responses. The server controls this with HTTP headers. For example:</p>
+<pre>Cache-Control: public, max-age=86400
+ETag: "v42-abc"</pre>
+<p><code>max-age=86400</code> tells the browser it may reuse this response for 86,400 seconds (one day) without asking the server at all. After that, the browser can send a <b>conditional request</b> with <code>If-None-Match: "v42-abc"</code>. If the content has not changed, the server replies <code>304 Not Modified</code> with no body, which is very cheap. If it has changed, the server sends the new content.</p>
+<p>This layer is free and instant, but you cannot reach into a user's browser and delete an entry. If you serve a file with a one-day lifetime and then need to change it right now, some users will keep the old copy. The usual fix is to put a version or content hash in the file name (<code>app.3f9c1a.js</code>), so a new version is a new URL.</p>
+
+<h3>4.2 CDN (content delivery network)</h3>
+<p>A CDN is a network of cache servers placed in many cities around the world. A user in Singapore is served from a nearby edge server instead of from your data center in Virginia, which removes a long network round trip. With a <b>pull CDN</b>, the edge fetches content from your origin the first time someone asks for it, then keeps it for the configured lifetime. With a <b>push CDN</b>, you upload the content to the CDN ahead of time. CDNs are best for static or rarely changing content: images, video segments, scripts, and public pages. <a href="12-cdn.html">Chapter 12</a> covers them in detail.</p>
+
+<h3>4.3 In-process (local) cache</h3>
+<p>This is a data structure, such as a hash map with a size limit, inside your application's own memory. A read is just a memory access, with no network at all, so it takes microseconds or less. The catch: if you run 20 app servers, there are 20 separate local caches. Each one fills up on its own, wastes memory by holding duplicate copies, and can disagree with the others (server 3 may hold the old price while server 7 already has the new one). A local cache is a good fit for small, hot, rarely changing data, such as configuration, feature flags, or a list of countries, and usually with a short lifetime.</p>
+
+<h3>4.4 Distributed cache</h3>
+<p>This is a separate cluster of cache servers, such as <b>Redis</b> or <b>Memcached</b>, shared by all your application servers. Every app server sees the same cached data, so there is one copy to keep fresh, and the cache can be far larger than any one machine by spreading keys across several nodes (<a href="25-sharding.html">Chapter 25</a> explains how, with consistent hashing). The cost is one network hop per access, around 0.5–1 ms inside a data center. This is the layer most interview questions mean when they say "add a cache".</p>
+
+<h3>4.5 Database-level caches</h3>
+<p>Databases already cache internally. A relational database keeps recently used data pages in a <b>buffer pool</b> in memory, so repeated reads of the same rows avoid disk access. This is automatic and helps, but it still pays for query parsing, planning, joins, and the network round trip. An application cache stores the <i>final, assembled answer</i>, which skips all of that.</p>
+
+<table>
+  <tr><th>Layer</th><th>What it usually holds</th><th>Strength</th><th>Weakness</th></tr>
+  <tr><td><b>Browser</b></td><td>Static files, some API responses</td><td>Zero network cost</td><td>You cannot clear it remotely</td></tr>
+  <tr><td><b>CDN</b></td><td>Images, video, scripts, public pages</td><td>Close to users worldwide</td><td>Invalidation is slow and can be costly</td></tr>
+  <tr><td><b>In-process</b></td><td>Small, hot, rarely-changing data</td><td>Fastest possible read</td><td>Each server has its own copy, and copies can disagree</td></tr>
+  <tr><td><b>Distributed cache</b></td><td>Query results, sessions, assembled objects</td><td>Shared, scalable, one copy to invalidate</td><td>Extra network hop and another system to run</td></tr>
+  <tr><td><b>Database buffer</b></td><td>Raw data pages</td><td>Automatic</td><td>Not under your control, and still pays query cost</td></tr>
+</table>
+
+<div class="callout tip"><b>Interview tip</b>
+Strong answers use <b>layers</b>: "static assets go to a CDN, hot reference data sits in a short-lived local cache, and per-entity query results sit in Redis." Layering shows you understand that each cache protects the next layer down.
+</div>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="hit">5. Hit ratio, miss types, and sizing</h2>
+
+<p>Every lookup in a cache ends in one of two ways:</p>
+<ul>
+  <li>A <b>hit</b>: the data was in the cache and is returned directly.</li>
+  <li>A <b>miss</b>: the data was not in the cache, so the system has to fetch it from the source, and usually stores it in the cache for next time.</li>
+</ul>
+<p>The <b>hit ratio</b> is the fraction of lookups that are hits: <code>hits ÷ (hits + misses)</code>. It is the single most important number for judging whether a cache is working.</p>
+
+<h3>5.1 Why a few percent of hit ratio matters so much</h3>
+<p>Take a 1 ms cache in front of a 20 ms database. <b>Every</b> request pays for the cache lookup (1 ms). Only the misses also pay for the database (20 ms). So the average latency is <code>1 + (miss ratio × 20)</code>, and the load reaching the database is <code>requests × miss ratio</code>.</p>
+<table>
+  <tr><th>Hit ratio</th><th>Miss ratio</th><th>Average latency</th><th>DB load at 10,000 req/s</th></tr>
+  <tr><td>50%</td><td>50%</td><td>1 + 0.5 × 20 = <b>11 ms</b></td><td>5,000 req/s</td></tr>
+  <tr><td>90%</td><td>10%</td><td>1 + 0.1 × 20 = <b>3 ms</b></td><td>1,000 req/s</td></tr>
+  <tr><td>99%</td><td>1%</td><td>1 + 0.01 × 20 = <b>1.2 ms</b></td><td>100 req/s</td></tr>
+</table>
+<p>Going from 90% to 99% sounds like a small improvement, but it cuts the database load by a factor of ten. Think about it in terms of <b>misses</b>, not hits: 99% means one miss per 100 requests, 90% means ten. The database cares about the misses.</p>
+
+<div class="widget" id="hitCalc">
+  <h4>Try it: hit-ratio calculator</h4>
+  <div class="row">
+    <label>Cache ms <input id="hc-c" type="number" value="1" min="0" step="0.1" style="width:80px"></label>
+    <label>DB ms <input id="hc-d" type="number" value="20" min="0" step="1" style="width:80px"></label>
+    <label>Requests/s <input id="hc-r" type="number" value="10000" min="0" step="100" style="width:110px"></label>
+    <label>Hit ratio % <input id="hc-h" type="number" value="90" min="0" max="100" step="1" style="width:80px"></label>
+  </div>
+  <div id="hc-out" class="log"></div>
+</div>
+
+<h3>5.2 Three reasons a lookup misses</h3>
+<p>Knowing <i>why</i> misses happen tells you how to reduce them.</p>
+<ol>
+  <li><b>Cold (compulsory) miss.</b> The data has never been requested, or the cache was just started or emptied. Every item has to be loaded at least once. You reduce these with cache warming (section 10).</li>
+  <li><b>Capacity miss.</b> The item was in the cache, but the cache was full and evicted it to make room, and then it was requested again. You reduce these with more memory, a better eviction policy, or by caching smaller values.</li>
+  <li><b>Invalidation miss.</b> The item was deliberately removed or expired because the data changed or its lifetime ended. This is correct behavior, but a very short lifetime or very frequent updates cause many of these.</li>
+</ol>
+
+<h3>5.3 Sizing a cache</h3>
+<p>You do not need to cache everything, only the <b>working set</b>: the data actively being used over a period of time. A back-of-envelope example:</p>
+<ol>
+  <li>The catalog has 10 million products. Each cached product object (name, price, rating, a few fields) is about 2 KB.</li>
+  <li>Caching all of them would take 10,000,000 × 2 KB = 20 GB.</li>
+  <li>If traffic follows the 80/20 pattern, caching the hot 20% takes about 4 GB and serves about 80% of reads. Caching the hottest 5% (1 GB) may already cover 60–70%.</li>
+  <li>Real caches carry overhead for keys, pointers, and fragmentation, so budget roughly 1.3–2× the raw data size. 4 GB of values becomes about 6–8 GB of memory.</li>
+  <li>Then check the other limit: throughput. If a single Redis node comfortably handles about 100,000 operations per second and you need 200,000, you need at least a few nodes regardless of memory.</li>
+</ol>
+<p>The right way to confirm the numbers is to measure the real hit ratio as you grow the cache. The returns diminish: past a point, doubling the memory adds only a point or two of hit ratio, and it stops being worth the cost.</p>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="patterns">6. Caching patterns: how data gets in and out</h2>
+
+<p>The word "caching" hides a design decision: <b>who is responsible for putting data into the cache and keeping it correct, and when does that happen?</b> There are five standard answers. Each one is a pattern, and each has different effects on speed, freshness, and risk. Learn them as a group, because interviewers expect you to pick between them with reasons.</p>
+
+<h3>6.1 Cache-aside (also called lazy loading)</h3>
+<p>This is the most common pattern in practice. The <b>application code</b> is in charge. The cache is a passive key-value store and knows nothing about the database. The cache is filled "lazily", meaning only when someone asks for the data.</p>
+
+<h4>How a read works</h4>
+<ol>
+  <li>The app asks the cache for <code>product:123</code>.</li>
+  <li><b>Hit:</b> the cache returns the value and the app responds. The database is never touched.</li>
+  <li><b>Miss:</b> the cache says it has nothing. The app queries the database.</li>
+  <li>The app stores the result in the cache with a TTL (a time after which it expires), so the next request is a hit.</li>
+  <li>The app returns the result.</li>
+</ol>
+
+<h4>How a write works</h4>
+<ol>
+  <li>The app updates the row in the database. The database is the source of truth, so it is updated first.</li>
+  <li>The app <b>deletes</b> the cached entry for that key.</li>
+  <li>The next read finds no entry (a miss), reads the fresh value from the database, and caches it again.</li>
+</ol>
+
+<div class="two">
+<figure class="diagram">
+<svg viewBox="0 0 400 330" role="img" aria-label="Cache-aside read sequence">
+  <text class="t-c t-b" x="200" y="16">READ</text>
+  <rect class="box"   x="20"  y="28" width="90" height="30" rx="8"/><text class="t-c t-b" x="65"  y="48">App</text>
+  <rect class="cache" x="155" y="28" width="90" height="30" rx="8"/><text class="t-c t-b" x="200" y="48">Cache</text>
+  <rect class="db"    x="290" y="28" width="90" height="30" rx="8"/><text class="t-c t-b" x="335" y="48">Database</text>
+  <line class="life" x1="65" y1="58" x2="65" y2="320"/><line class="life" x1="200" y1="58" x2="200" y2="320"/><line class="life" x1="335" y1="58" x2="335" y2="320"/>
+  <path class="arrow" d="M65 90 L196 90"/><text class="t-sm" x="78" y="84">1. get(key)</text>
+  <path class="arrow-g dash" d="M196 125 L69 125"/><text class="t-sm" x="78" y="119" style="fill:var(--good)">hit → return data, done</text>
+  <path class="arrow-r dash" d="M196 160 L69 160"/><text class="t-sm" x="78" y="154" style="fill:var(--bad)">miss</text>
+  <path class="arrow" d="M65 200 L331 200"/><text class="t-sm" x="110" y="194">2. query</text>
+  <path class="arrow dash" d="M331 235 L69 235"/><text class="t-sm" x="110" y="229">3. data</text>
+  <path class="arrow" d="M65 275 L196 275"/><text class="t-sm" x="78" y="269">4. set(key, data, TTL)</text>
+  <text class="t-sm" x="65" y="305">return data to caller</text>
+</svg>
+<figcaption>Read: check the cache first. On a miss, read the database and fill the cache.</figcaption>
+</figure>
+
+<figure class="diagram">
+<svg viewBox="0 0 400 330" role="img" aria-label="Cache-aside write sequence">
+  <text class="t-c t-b" x="200" y="16">WRITE</text>
+  <rect class="box"   x="20"  y="28" width="90" height="30" rx="8"/><text class="t-c t-b" x="65"  y="48">App</text>
+  <rect class="cache" x="155" y="28" width="90" height="30" rx="8"/><text class="t-c t-b" x="200" y="48">Cache</text>
+  <rect class="db"    x="290" y="28" width="90" height="30" rx="8"/><text class="t-c t-b" x="335" y="48">Database</text>
+  <line class="life" x1="65" y1="58" x2="65" y2="320"/><line class="life" x1="200" y1="58" x2="200" y2="320"/><line class="life" x1="335" y1="58" x2="335" y2="320"/>
+  <path class="arrow" d="M65 100 L331 100"/><text class="t-sm" x="110" y="94">1. update the row</text>
+  <path class="arrow dash" d="M331 140 L69 140"/><text class="t-sm" x="110" y="134">ok</text>
+  <path class="arrow" d="M65 190 L196 190"/><text class="t-sm" x="78" y="184">2. delete(key)</text>
+  <rect class="hit" x="30" y="225" width="340" height="62" rx="8"/>
+  <text class="t-sm" x="44" y="248">The next read misses and reloads fresh data.</text>
+  <text class="t-sm" x="44" y="268">Delete, don't update: it avoids races (see below).</text>
+</svg>
+<figcaption>Write: update the database first, then delete the cached copy.</figcaption>
+</figure>
+</div>
+
+<h4>A concrete example</h4>
+<p>A user opens their profile. The app looks up <code>user:42</code> in Redis and gets nothing (the first visit today). It runs <code>SELECT * FROM users WHERE id = 42</code>, gets the row, stores it in Redis for 10 minutes, and returns it. The next 50 requests for that profile in the next 10 minutes are answered from Redis in about 1 ms each. If the user edits their name, the app updates the database and deletes <code>user:42</code>. The following request reloads the new name.</p>
+
+<h4>Why delete on write, instead of updating the cached value?</h4>
+<p>Updating the cache to the new value looks more efficient, since the next read would be a hit. But it opens a race condition, and it wastes work if the value is rarely read again. The diagram below shows the race that <b>deleting</b> avoids and that <b>updating</b> would make worse.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 820 340" role="img" aria-label="Stale cache race condition timeline">
+  <rect class="box"   x="40"  y="12" width="100" height="30" rx="8"/><text class="t-c t-b" x="90"  y="32">Reader</text>
+  <rect class="cache" x="250" y="12" width="100" height="30" rx="8"/><text class="t-c t-b" x="300" y="32">Cache</text>
+  <rect class="db"    x="460" y="12" width="100" height="30" rx="8"/><text class="t-c t-b" x="510" y="32">Database</text>
+  <rect class="box"   x="670" y="12" width="100" height="30" rx="8"/><text class="t-c t-b" x="720" y="32">Writer</text>
+  <line class="life" x1="90" y1="42" x2="90" y2="330"/><line class="life" x1="300" y1="42" x2="300" y2="330"/><line class="life" x1="510" y1="42" x2="510" y2="330"/><line class="life" x1="720" y1="42" x2="720" y2="330"/>
+
+  <path class="arrow" d="M90 80 L296 80"/><text class="t-sm" x="104" y="74">1. get(k) → miss</text>
+  <path class="arrow" d="M90 120 L506 120"/><text class="t-sm" x="104" y="114">2. SELECT → returns old value V1</text>
+  <path class="arrow" d="M720 160 L514 160"/><text class="t-sm" x="528" y="154">3. UPDATE → now V2</text>
+  <path class="arrow" d="M720 200 L304 200"/><text class="t-sm" x="318" y="194">4. delete(k)</text>
+  <path class="arrow-r" d="M90 240 L296 240"/><text class="t-sm" x="104" y="234" style="fill:var(--bad)">5. set(k, V1)  ← slow reader writes OLD value</text>
+  <rect class="miss" x="40" y="268" width="730" height="50" rx="8"/>
+  <text class="t-sm" x="54" y="290" style="fill:var(--bad)">Result: the cache holds V1 while the database holds V2. Every reader sees the old value</text>
+  <text class="t-sm" x="54" y="308" style="fill:var(--bad)">until the TTL expires. A short TTL bounds how long this stale value can live.</text>
+</svg>
+<figcaption>The reader loaded V1 before the update, but wrote it into the cache after the writer's delete. Time flows downward.</figcaption>
+</figure>
+
+<p>This race is rare, because it needs the reader's database read and cache write to straddle a writer's update, and the window is short. But under heavy traffic it will happen eventually, which is the main reason every cache entry should have a TTL: it puts a ceiling on how long a mistake like this can survive. Deleting is the safer choice than updating, because with updates two concurrent writers can also leave the cache holding the older of the two values.</p>
+
+<h4>Strengths and weaknesses</h4>
+<ul>
+  <li><b>Resilient.</b> If the cache is down, the app can still read from the database. It is slower, but it works.</li>
+  <li><b>Efficient on memory.</b> Only data that has actually been requested is cached, so the cache fills with what users use.</li>
+  <li><b>Flexible.</b> You can cache any shape of data, such as an assembled object built from several queries.</li>
+  <li><b>Cold misses.</b> The first request for each key always goes to the database.</li>
+  <li><b>Staleness.</b> Between a database change that bypassed the app and the next expiry, the cache can be wrong.</li>
+  <li><b>Caching logic lives in every code path.</b> If one service forgets to delete the key on update, readers see stale data. Wrapping cache calls in one shared library helps.</li>
+</ul>
+
+<h3>6.2 Read-through</h3>
+<p>Read-through is the same idea as cache-aside, but the <b>loading logic moves into the cache layer</b>. The application only ever asks the cache for data. If the cache has it, it returns it. If not, the cache itself calls a loader function (configured once) that reads the database, stores the result, and returns it. The app never talks to the database for reads.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 160" role="img" aria-label="Read-through flow">
+  <rect class="box"   x="30"  y="40" width="160" height="50" rx="10"/><text class="t-c t-b" x="110" y="70">App</text>
+  <rect class="cache" x="300" y="40" width="160" height="50" rx="10"/><text class="t-c t-b" x="380" y="70">Cache (with loader)</text>
+  <rect class="db"    x="570" y="40" width="160" height="50" rx="10"/><text class="t-c t-b" x="650" y="70">Database</text>
+  <path class="arrow" d="M190 55 L296 55"/><text class="t-sm t-c" x="243" y="48">get(key)</text>
+  <path class="arrow dash" d="M296 78 L194 78"/><text class="t-sm t-c" x="243" y="100">data</text>
+  <path class="arrow" d="M460 55 L566 55"/><text class="t-sm t-c" x="513" y="48">on miss: load</text>
+  <path class="arrow dash" d="M566 78 L464 78"/><text class="t-sm t-c" x="513" y="100">data (cached)</text>
+  <text class="t-sm" x="30" y="140">The app never talks to the database for reads. The cache layer does.</text>
+</svg>
+<figcaption>Same outcome as cache-aside. The difference is who does the loading.</figcaption>
+</figure>
+
+<p><b>Why choose it?</b> Application code becomes simpler (one call instead of get, check, query, set), and the loading logic lives in one place, so it cannot be done inconsistently. It also lets the cache layer do smart things on its own, such as making sure that when 100 requests miss the same key at the same moment, only one actually calls the database (Chapter 14).</p>
+<p><b>Costs:</b> it needs a cache product or library that supports loaders, so you cannot use a plain key-value store as is. The cache also becomes a hard dependency for reads. Every read path goes through it.</p>
+<p><b>Real example:</b> many managed caches and in-process libraries (such as Caffeine in Java with a <code>LoadingCache</code>) work this way.</p>
+
+<h3>6.3 Write-through</h3>
+<p>The two patterns above are about reads. Write-through is about <b>writes</b>. Every write goes to the cache <b>and</b> to the database as one synchronous operation. The caller is told "success" only after both are updated.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 160" role="img" aria-label="Write-through flow">
+  <rect class="box"   x="30"  y="40" width="160" height="50" rx="10"/><text class="t-c t-b" x="110" y="70">App</text>
+  <rect class="cache" x="300" y="40" width="160" height="50" rx="10"/><text class="t-c t-b" x="380" y="70">Cache</text>
+  <rect class="db"    x="570" y="40" width="160" height="50" rx="10"/><text class="t-c t-b" x="650" y="70">Database</text>
+  <path class="arrow" d="M190 55 L296 55"/><text class="t-sm t-c" x="243" y="48">1. write</text>
+  <path class="arrow" d="M460 55 L566 55"/><text class="t-sm t-c" x="513" y="48">2. write</text>
+  <path class="arrow-g dash" d="M566 78 L464 78"/><path class="arrow-g dash" d="M296 78 L194 78"/>
+  <text class="t-sm t-c" x="380" y="112" style="fill:var(--good)">ack returns to the app only after both succeed</text>
+</svg>
+<figcaption>Two synchronous hops on every write: slower, but the cache and DB always agree.</figcaption>
+</figure>
+
+<h4>Step by step</h4>
+<ol>
+  <li>The app writes the new value to the cache layer.</li>
+  <li>The cache layer writes the same value to the database.</li>
+  <li>When the database confirms, the cache layer confirms to the app.</li>
+</ol>
+<p><b>What you gain:</b> the cache is never stale for data written through it, because it was updated in the same operation. A read right after a write is a hit with the newest value. This removes the delete-then-reload gap of cache-aside.</p>
+<p><b>What you pay:</b> every write now costs two operations in sequence, so write latency is the cache's time plus the database's time. And you cache every written item even if nobody reads it. If your app writes 1 million log entries and reads 100, you filled the cache with 999,900 useless items, which may push out useful data.</p>
+<p><b>Failure case:</b> what if the cache write succeeds and the database write fails (or the other way around)? The two are now out of sync. Real implementations must either make both steps one transaction, or roll back the cache entry if the database write fails. This is why write-through is usually offered by a cache product that handles it, rather than coded by hand.</p>
+<p><b>Good fit:</b> data that is read a lot soon after it is written, where staleness is unacceptable, such as user session data or a user's own settings page.</p>
+
+<h3>6.4 Write-back (also called write-behind)</h3>
+<p>Write-back optimizes for write speed. The app writes to the cache, and the cache <b>acknowledges immediately</b>. The database is updated <b>later</b>, asynchronously, often by collecting many changes and writing them in one batch.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 170" role="img" aria-label="Write-back flow">
+  <rect class="box"   x="30"  y="40" width="160" height="50" rx="10"/><text class="t-c t-b" x="110" y="70">App</text>
+  <rect class="cache" x="300" y="40" width="160" height="50" rx="10"/><text class="t-c t-b" x="380" y="70">Cache</text>
+  <rect class="db"    x="570" y="40" width="160" height="50" rx="10"/><text class="t-c t-b" x="650" y="70">Database</text>
+  <path class="arrow" d="M190 55 L296 55"/><text class="t-sm t-c" x="243" y="48">1. write</text>
+  <path class="arrow-g dash" d="M296 78 L194 78"/><text class="t-sm t-c" x="243" y="100" style="fill:var(--good)">2. ack (fast)</text>
+  <path class="arrow dash" d="M460 65 L566 65"/><text class="t-sm t-c" x="513" y="58">3. async, batched</text>
+  <rect class="miss" x="300" y="120" width="430" height="34" rx="8"/>
+  <text class="t-sm" x="312" y="142" style="fill:var(--bad)">If the cache crashes before step 3, those writes are lost.</text>
+</svg>
+<figcaption>The database is behind the cache for a while. That window is the risk.</figcaption>
+</figure>
+
+<h4>Why it is attractive</h4>
+<p>Consider a video site counting views. Each view is a tiny write, and a popular video can get thousands per second. If every view required a database write, the database would be overwhelmed by trivial updates. With write-back, the cache increments the counter in memory (fast), and every few seconds a background job writes the latest total to the database in one operation. A thousand increments become one database write. This is called <b>write coalescing</b> and is the biggest benefit: many writes to the same key collapse into one.</p>
+<h4>The danger</h4>
+<p>Until the flush happens, the newest data exists <b>only in cache memory</b>. If that cache node crashes or restarts, the unflushed writes are gone forever. For view counts, losing a few seconds is acceptable. For a payment or an order, it is not. You can reduce the risk by replicating the cache across nodes or writing a log of pending changes to disk, but that adds complexity, and it never fully equals the safety of writing straight to the database.</p>
+<p>Other consequences: the database is briefly out of date, so anything reading the database directly (reports, other services) sees older data than the cache has.</p>
+<p><b>Good fit:</b> high-volume writes where small loss is tolerable and write coalescing helps: counters, "last seen" timestamps, analytics events, game scores.</p>
+
+<h3>6.5 Write-around</h3>
+<p>With write-around, writes go <b>directly to the database</b> and skip the cache entirely. The cache is only filled when something is read (as in cache-aside).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 180" role="img" aria-label="Write-around flow">
+  <rect class="box"   x="30"  y="30" width="160" height="50" rx="10"/><text class="t-c t-b" x="110" y="60">App</text>
+  <rect class="cache" x="300" y="30" width="160" height="50" rx="10" style="opacity:.55"/><text class="t-c t-b" x="380" y="60">Cache (skipped on write)</text>
+  <rect class="db"    x="570" y="30" width="160" height="50" rx="10"/><text class="t-c t-b" x="650" y="60">Database</text>
+  <path class="arrow" d="M110 82 L110 130 L650 130 L650 84"/>
+  <text class="t-sm t-c" x="380" y="122">writes go straight to the DB</text>
+  <text class="t-sm t-c" x="380" y="154">Reads still use the cache and fill it on a miss, as in cache-aside.</text>
+</svg>
+<figcaption>Good for data written once and rarely read, such as uploads and logs.</figcaption>
+</figure>
+
+<p><b>Why do it?</b> To avoid <b>cache pollution</b>: filling the cache with data that will probably never be read, and thereby evicting data that would have been. Imagine users uploading photos: each photo is written once, and most are viewed rarely or never. Caching each at write time would waste memory. Instead, you cache a photo only if someone actually looks at it.</p>
+<p><b>Downside:</b> the first read after a write is a guaranteed miss, because the data was never put in the cache. If data is read right after being written (a user uploads a photo and immediately views it), write-around is a poor choice.</p>
+<p>In practice, write-around is usually combined with cache-aside for reads, and cache-aside's "delete on write" is effectively a form of it.</p>
+
+<h3>6.6 A sixth idea: refresh-ahead</h3>
+<p>Instead of waiting for an entry to expire and then making the next user wait for a reload, the cache <b>refreshes popular entries in the background before they expire</b>. If an entry has a 10-minute lifetime and gets requested again in minute 9, the cache quietly reloads it from the database so it never actually expires. Users always see a hit for popular keys. The cost is wasted work refreshing entries that nobody asks for again, and the complexity of predicting what to refresh. It is useful for a small set of very hot, expensive-to-compute keys, and it helps avoid the stampede problem covered in Chapter 14.</p>
+
+<h3 id="choose">Choosing a pattern</h3>
+<table>
+  <tr><th>Pattern</th><th>Who loads or writes?</th><th>Read speed</th><th>Write speed</th><th>Consistency</th><th>Data-loss risk</th><th>Typical use</th></tr>
+  <tr><td><b>Cache-aside</b></td><td>The app, on read; the app deletes on write</td><td>Fast after warm-up</td><td>Normal</td><td>Eventual (bounded by TTL)</td><td>None</td><td>The general-purpose default</td></tr>
+  <tr><td><b>Read-through</b></td><td>The cache loads on a miss</td><td>Fast after warm-up</td><td>Normal</td><td>Eventual</td><td>None</td><td>Same as cache-aside, with simpler app code</td></tr>
+  <tr><td><b>Write-through</b></td><td>Writes go through the cache to the DB synchronously</td><td>Fast</td><td>Slower (two hops)</td><td>Strong</td><td>None</td><td>Data that is read soon after write and must be fresh</td></tr>
+  <tr><td><b>Write-back</b></td><td>Cache acks first, flushes to DB later</td><td>Fast</td><td>Fastest</td><td>Eventual</td><td><b>Yes</b> (unflushed writes)</td><td>High-volume, loss-tolerant writes (counters)</td></tr>
+  <tr><td><b>Write-around</b></td><td>Writes skip the cache</td><td>Miss right after a write</td><td>Normal</td><td>Eventual</td><td>None</td><td>Write-once, read-rarely data</td></tr>
+</table>
+
+<p>Read patterns (cache-aside, read-through) and write patterns (write-through, write-back, write-around) are <b>independent choices</b> and are combined. Two very common combinations are:</p>
+<ul>
+  <li><b>Cache-aside + delete on write.</b> Simple, robust, and the usual first answer.</li>
+  <li><b>Read-through + write-through.</b> The cache layer owns everything, and the cache is always current. Common when the cache product supports it.</li>
+</ul>
+
+<div class="callout tip"><b>Interview tip</b>
+Do not just name a pattern. Name the read pattern and the write pattern, say what you accept as a tradeoff, and tie it to the data: "Profiles use cache-aside with delete-on-write and a 10-minute TTL, because a few minutes of staleness is fine. View counters use write-back, because losing a few seconds of counts is acceptable and it saves a huge number of database writes."
+</div>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="eviction">7. Eviction: what to remove when the cache is full</h2>
+
+<p>A cache has a fixed amount of memory. Once it is full, adding a new item means removing an existing one. The rule for choosing which item to remove is the <b>eviction policy</b>. A good policy removes the items least likely to be needed again, which keeps the hit ratio high. A bad policy throws away useful data and fills the space with data nobody wants.</p>
+
+<p>Do not confuse <b>eviction</b> and <b>expiry</b>. Expiry (TTL) removes an item because it has become too old, even if the cache has plenty of room. Eviction removes an item because the cache is out of room, even if the item is still fresh. Real caches use both.</p>
+
+<h3>7.1 The common policies</h3>
+<table>
+  <tr><th>Policy</th><th>What it evicts</th><th>Strength</th><th>Weakness</th></tr>
+  <tr><td><b>LRU</b> (Least Recently Used)</td><td>The item that has gone unused the longest</td><td>Matches temporal locality. A good default.</td><td>A one-time scan over lots of data can push out the real hot items</td></tr>
+  <tr><td><b>LFU</b> (Least Frequently Used)</td><td>The item used the fewest times</td><td>Protects consistently popular items from a scan</td><td>Old items that were once popular can linger forever unless counts decay; new items start with low counts and may be evicted too soon</td></tr>
+  <tr><td><b>FIFO</b> (First In, First Out)</td><td>The item that was added earliest</td><td>Trivial to implement</td><td>Ignores usage, so it can evict the most popular item just because it is old</td></tr>
+  <tr><td><b>Random</b></td><td>A random item</td><td>No bookkeeping at all</td><td>No intelligence, but often performs surprisingly close to LRU</td></tr>
+  <tr><td><b>TTL-based</b></td><td>Items closest to expiring</td><td>Fits time-limited data</td><td>Ignores usage</td></tr>
+</table>
+
+<h3>7.2 LRU in detail</h3>
+<p>LRU rests on a simple belief: <i>if you have not used something for a long time, you probably will not use it soon.</i> It keeps items in order of how recently they were used. Every time an item is read or written, it moves to the "most recent" end. When space is needed, the item at the "least recent" end is dropped.</p>
+
+<p>Here is a cache of capacity 3, processing these accesses one at a time. The list is shown most recent first:</p>
+<table>
+  <tr><th>Step</th><th>Access</th><th>What happens</th><th>Cache contents (most recent → least recent)</th></tr>
+  <tr><td>1</td><td>put A</td><td>Room available, add A</td><td>A</td></tr>
+  <tr><td>2</td><td>put B</td><td>Room available, add B at the front</td><td>B, A</td></tr>
+  <tr><td>3</td><td>put C</td><td>Room available, add C at the front</td><td>C, B, A</td></tr>
+  <tr><td>4</td><td>get A</td><td>Hit. A moves to the front</td><td>A, C, B</td></tr>
+  <tr><td>5</td><td>put D</td><td>Full. Evict the least recent (B), add D</td><td>D, A, C</td></tr>
+  <tr><td>6</td><td>get B</td><td><b>Miss</b>, because B was evicted. Load it, which evicts C</td><td>B, D, A</td></tr>
+</table>
+<p>Step 4 is the important one: reading A "saved" it. Without that read, A would have been the one evicted at step 5.</p>
+
+<h4>Making LRU fast: O(1) operations</h4>
+<p>A naive version, scanning a list to find or reorder an item, would be slow for a big cache. The standard design uses two structures together:</p>
+<ul>
+  <li>A <b>hash map</b> from key to list node: finds any item in constant time.</li>
+  <li>A <b>doubly linked list</b> of items ordered by recency: because each node knows both its neighbors, a node can be unlinked and moved to the front in constant time, and the tail (the least recent item) can be dropped in constant time.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 210" role="img" aria-label="LRU cache: hash map plus doubly linked list">
+  <text class="t-b" x="20" y="24">Hash map (key → node)</text>
+  <rect class="ext" x="20"  y="36" width="70" height="30" rx="6"/><text class="t-c" x="55"  y="56">A →</text>
+  <rect class="ext" x="100" y="36" width="70" height="30" rx="6"/><text class="t-c" x="135" y="56">B →</text>
+  <rect class="ext" x="180" y="36" width="70" height="30" rx="6"/><text class="t-c" x="215" y="56">C →</text>
+  <rect class="ext" x="260" y="36" width="70" height="30" rx="6"/><text class="t-c" x="295" y="56">D →</text>
+
+  <text class="t-b" x="20" y="108">Doubly linked list (most recent → least recent)</text>
+  <text class="t-sm" x="20" y="132">head</text>
+  <rect class="cache" x="70"  y="116" width="90" height="40" rx="8"/><text class="t-c t-b" x="115" y="141">D</text>
+  <rect class="cache" x="200" y="116" width="90" height="40" rx="8"/><text class="t-c t-b" x="245" y="141">B</text>
+  <rect class="cache" x="330" y="116" width="90" height="40" rx="8"/><text class="t-c t-b" x="375" y="141">A</text>
+  <rect class="cache" x="460" y="116" width="90" height="40" rx="8"/><text class="t-c t-b" x="505" y="141">C</text>
+  <text class="t-sm" x="560" y="132">tail</text>
+  <path class="arrow" d="M160 130 L196 130"/><path class="arrow" d="M200 144 L164 144"/>
+  <path class="arrow" d="M290 130 L326 130"/><path class="arrow" d="M330 144 L294 144"/>
+  <path class="arrow" d="M420 130 L456 130"/><path class="arrow" d="M460 144 L424 144"/>
+  <rect class="hit"  x="620" y="60" width="220" height="50" rx="8"/><text class="t-sm" x="632" y="80">get(A): move A to the head</text><text class="t-sm" x="632" y="98">(it is now most recent)</text>
+  <rect class="miss" x="620" y="120" width="220" height="50" rx="8"/><text class="t-sm" x="632" y="140">put(E) when full: drop the tail</text><text class="t-sm" x="632" y="158">(C), then add E at the head</text>
+</svg>
+<figcaption>The map finds a node in O(1). The list moves it to the front or drops the tail in O(1).</figcaption>
+</figure>
+
+<div class="widget" id="lruWidget">
+  <h4>Try it: LRU cache with capacity 4</h4>
+  <div class="row">
+    <input id="lru-key" value="A" maxlength="3" style="width:70px" aria-label="key">
+    <button id="lru-put">put(key)</button>
+    <button id="lru-get">get(key)</button>
+    <button id="lru-reset" class="alt">reset</button>
+  </div>
+  <div class="lru" id="lru-view"></div>
+  <div class="log" id="lru-log">Add some keys. The most recently used key moves to the left. When the cache is full, the rightmost key is evicted.</div>
+</div>
+
+<h3>7.3 LFU, and why neither LRU nor LFU is perfect</h3>
+<p>LFU counts how often each item is used and evicts the one with the lowest count. Imagine a cache that serves a news site. Last week's big story had 5 million views, so its count is huge. Today, nobody reads it. Under pure LFU it stays in the cache for a very long time because of its old count, wasting space. Real LFU implementations fix this by <b>decaying</b> the counts over time, so old popularity fades.</p>
+<p>LRU has the opposite weakness. Suppose a batch job reads 10 million rarely used rows once. Each read moves a row to the "most recent" end, pushing out the genuinely hot items that real users need. This is called <b>cache pollution</b> by a scan. Smarter variants (such as 2Q, ARC, or TinyLFU) address both problems, and you rarely need to know their internals for an interview, but it is worth knowing that "LRU" in a production system is often a refined version.</p>
+
+<h3>7.4 What real systems do</h3>
+<p>Redis does not keep a perfect LRU list, because that would cost extra memory per key. Instead, when it needs to evict, it samples a small number of random keys (5 by default, set by <code>maxmemory-samples</code>) and evicts the least recently used of that sample. This approximate LRU is much cheaper and gets close to the result of real LRU. You choose the behavior with the <code>maxmemory-policy</code> setting:</p>
+<table>
+  <tr><th>Policy name in Redis</th><th>Meaning</th></tr>
+  <tr><td><code>noeviction</code></td><td>Never evict. When full, writes fail with an error. Reads still work.</td></tr>
+  <tr><td><code>allkeys-lru</code> / <code>allkeys-lfu</code></td><td>Evict from all keys by LRU or LFU. The usual choice for a pure cache.</td></tr>
+  <tr><td><code>volatile-lru</code> / <code>volatile-lfu</code></td><td>Evict only from keys that have a TTL set. Keys with no TTL are safe.</td></tr>
+  <tr><td><code>allkeys-random</code> / <code>volatile-random</code></td><td>Evict a random key.</td></tr>
+  <tr><td><code>volatile-ttl</code></td><td>Evict keys with the shortest remaining TTL first.</td></tr>
+</table>
+<p>The <code>volatile-*</code> policies are useful when the same Redis holds both disposable cache data (with a TTL) and data you must not lose (no TTL), though mixing the two in one instance is usually discouraged.</p>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="invalidation">8. Invalidation: keeping cached data correct</h2>
+<blockquote style="margin:10px 0;color:var(--muted)">"There are only two hard things in computer science: cache invalidation and naming things."</blockquote>
+
+<p>Every cached value is a copy. The moment the original changes, the copy is wrong. <b>Invalidation</b> is the work of making sure users do not keep seeing wrong copies. There is no single perfect solution, because it is a tradeoff between how fresh the data must be, how much work you can afford, and how complex the system can get. Here are the main techniques, from simplest to most involved.</p>
+
+<h3>8.1 Time-based expiry (TTL)</h3>
+<p>Give every entry a <b>time to live</b>. After that many seconds, the cache discards it automatically, and the next read reloads fresh data. It needs no coordination at all, and it also acts as a safety net for every other technique, because even if you forget to invalidate something, it eventually corrects itself.</p>
+<p>The tradeoff is that data can be stale for up to the TTL. A 60-second TTL means a price change can take up to a minute to show. A shorter TTL means fresher data but more misses and more database load. A longer TTL means a better hit ratio but older data. Choose the TTL from the business answer to "how stale is acceptable?"</p>
+
+<h3>8.2 Explicit invalidation on write</h3>
+<p>When the data changes, the code that changed it also deletes (or updates) the cached copy. This keeps data fresh within milliseconds, which TTL alone cannot. The difficulty is <b>completeness</b>: one fact can be cached in many places. If a product's price changes, you must remove <code>product:123</code>, but also the cached category page that lists it, the cached search results that include it, and a cached cart total. Missing one leaves stale data behind. For this reason, explicit invalidation is best for simple, well-understood keys, and combined with a TTL as a backstop.</p>
+
+<h3>8.3 Event-driven invalidation</h3>
+<p>Instead of the writing code knowing every cache to clear, the database change is <b>published as an event</b> (for example through change data capture, covered in <a href="36-event-driven.html">Chapter 36</a>, or a message queue). Any interested service listens and clears or refreshes its own cache entries. This works well across many services, because the writer does not need to know who is caching its data. The costs are infrastructure and the need for reliable delivery: if an event is lost, a cache may stay stale until its TTL expires.</p>
+
+<h3>8.4 Versioned keys</h3>
+<p>Instead of deleting an entry, include a version in the key: <code>user:42:v7</code>. When the user changes, the version becomes <code>v8</code> and the app starts reading <code>user:42:v8</code>, which does not exist yet and is loaded fresh. The old <code>v7</code> entry is never read again and is cleaned up by its TTL or by eviction. This avoids race conditions like the one shown earlier, since no one ever overwrites a key with stale data. You need to know the current version, which is usually stored in a small, fast place of its own (for example a counter in the database row or a tiny cache entry). The same idea is used for web files with content hashes in their names.</p>
+
+<h3>8.5 Choosing by data type: a staleness budget</h3>
+<p>Different data deserves different rules. A useful habit is to write down, for each kind of data, how stale it may be:</p>
+<table>
+  <tr><th>Data</th><th>Acceptable staleness</th><th>Suitable approach</th></tr>
+  <tr><td>Product description, images</td><td>Minutes to hours</td><td>Long TTL (1 hour), plus delete on edit</td></tr>
+  <tr><td>User profile display name</td><td>A few minutes</td><td>TTL 5–10 min, delete on update</td></tr>
+  <tr><td>Product price on the listing page</td><td>Seconds to a minute</td><td>Short TTL plus delete on change</td></tr>
+  <tr><td>Stock count on the listing page</td><td>Roughly accurate is fine</td><td>Short TTL. The real check happens at checkout.</td></tr>
+  <tr><td>Account balance used to authorize a payment</td><td>None</td><td>Do not cache. Read from the source of truth.</td></tr>
+  <tr><td>Static scripts and images</td><td>Until a new version ships</td><td>Very long TTL with versioned file names</td></tr>
+</table>
+<p>The "stock count" row shows a common trick: a cached value is allowed to be approximate for display, while the critical decision (can this order be placed?) always consults the real data.</p>
+
+<div class="callout tip"><b>Interview tip</b>
+Before choosing a TTL or an invalidation approach, ask the interviewer: "How stale can this data be?" That one question shows that you treat caching as a business tradeoff and not a purely technical trick.
+</div>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="keys">9. Designing cache keys and values</h2>
+
+<h3>9.1 Keys</h3>
+<p>A cache is a lookup table, so the key decides whether two requests share an entry. Two rules: <b>the key must contain everything that changes the answer</b>, and <b>it must not contain anything that does not</b>.</p>
+<ul>
+  <li>If the product page differs by language and currency, then the key needs both: <code>product:123:en-US:USD</code>. Leaving out the language would show French users the English page.</li>
+  <li>If you put something irrelevant in the key (a tracking parameter, a timestamp), every request gets a unique key, nothing is ever shared, and the hit ratio falls to zero.</li>
+  <li>Use a clear, consistent naming scheme with a <b>namespace</b> prefix: <code>service:entity:id:variant</code>. It makes keys easy to find, delete in groups, and debug.</li>
+  <li>Include a <b>schema version</b> (<code>v2</code>) when the shape of the cached value may change after a deployment, so new code does not try to read old-format data.</li>
+  <li>Keep keys reasonably short. Millions of long keys use real memory.</li>
+</ul>
+
+<h3>9.2 Values</h3>
+<ul>
+  <li><b>Cache the final answer, not the raw pieces.</b> If a page needs data from three queries, cache the assembled result, since the assembly is the expensive part.</li>
+  <li><b>Choose a compact format.</b> JSON is easy to read and debug but larger and slower to parse. Binary formats such as Protocol Buffers or MessagePack are smaller and faster. For large values, compression trades CPU time for memory.</li>
+  <li><b>Avoid very large values.</b> A single multi-megabyte value takes longer to transfer and can block a single-threaded server such as Redis while it is processed. Break large objects into parts, or keep them in object storage and cache only references.</li>
+  <li><b>Cache "not found" results too.</b> If a product ID does not exist, store a short-lived "empty" marker. Otherwise every request for that missing ID reaches the database, which is also a way an attacker can bypass your cache by requesting random IDs. This is called negative caching, and Chapter 14 covers it.</li>
+  <li><b>Think about shared vs per-user data.</b> A key like <code>product:123</code> is shared by all users and caches well. A key like <code>user:42:recommendations</code> serves a single user, so it gets far fewer hits for the same memory.</li>
+</ul>
+
+<h3>9.3 TTL with jitter</h3>
+<p>Always set a TTL, and add a small random amount (jitter) to it. Suppose you load 100,000 keys at startup, each with an exact 10-minute TTL. Ten minutes later they all expire at the same instant, and 100,000 requests hit the database together. With jitter (a TTL of 10 minutes ± up to 1 minute at random), expirations are spread out over time. Chapter 14 covers this "avalanche" in depth.</p>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="cold">10. Cold start and cache warming</h2>
+
+<p>A new or restarted cache is empty, so at first nearly every request is a miss. The hit ratio starts at 0% and climbs as popular items are loaded. During this period the database takes the full load that the cache normally absorbs. If the system relies on the cache to survive normal traffic, an empty cache at peak time can overload the database, and the problem gets worse because slow responses cause retries, which add even more load.</p>
+
+<p>Ways to handle it:</p>
+<ul>
+  <li><b>Cache warming.</b> Before sending traffic to a new cache, load it with the data you know will be needed: the most popular products, the previous day's top keys, or the result of replaying recent real queries.</li>
+  <li><b>Gradual traffic shift.</b> Route a small share of traffic to the new cache, let it fill, then increase.</li>
+  <li><b>Persistence.</b> Some caches (Redis with snapshots or an append-only log) can reload their data from disk after a restart, so they do not start empty.</li>
+  <li><b>Protect the database.</b> Rate limiting and load shedding (<a href="16-rate-limiting.html">Chapter 16</a>) keep a cold start from becoming an outage.</li>
+</ul>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="example">11. Putting it together: a worked example</h2>
+
+<p><b>Problem.</b> A product detail page receives 20,000 reads per second at peak and about 50 writes per second (price and stock changes). A single database handles about 3,000 of these queries per second. Design the caching.</p>
+
+<h4>Step 1: Look at the workload</h4>
+<p>20,000 reads against 50 writes is 400 reads for every write. It is strongly read-heavy and the same pages are read repeatedly, so caching is a good fit. The database can handle 3,000/s, so we need to remove at least 17,000/s of reads from it, which is 85% of them. We need a hit ratio comfortably above 85%.</p>
+
+<h4>Step 2: Pick patterns</h4>
+<p>Reads use <b>cache-aside</b> on a Redis cluster. Writes update the database, then <b>delete</b> the key. Every entry gets a <b>5-minute TTL with jitter</b> as a safety net.</p>
+
+<h4>Step 3: Check the load</h4>
+<table>
+  <tr><th>Hit ratio</th><th>Reads reaching the DB</th><th>Verdict</th></tr>
+  <tr><td>85%</td><td>20,000 × 0.15 = 3,000/s</td><td>Exactly at the DB limit, no headroom</td></tr>
+  <tr><td>90%</td><td>2,000/s</td><td>Works, but little spare capacity</td></tr>
+  <tr><td>95%</td><td>1,000/s</td><td>Comfortable. <b>Target this.</b></td></tr>
+</table>
+
+<h4>Step 4: Size the cache</h4>
+<p>With 2 million products at about 2 KB each, the full set is 4 GB. Because traffic is skewed, caching all of it may be affordable here, which gives an excellent hit ratio. With overhead, plan around 8 GB. Throughput: 19,000 reads per second at 95% means about 19,000 cache lookups per second, which a few Redis nodes handle easily, and two or more nodes give redundancy.</p>
+
+<h4>Step 5: Add a second layer for the hottest items</h4>
+<p>The top ~100 products might receive 30% of all traffic. A tiny in-process cache on each app server, with a 10-second TTL, answers those without even the Redis hop. The 10-second TTL limits the inconsistency between servers.</p>
+
+<h4>Step 6: Walk through a day in the life of one product</h4>
+<table>
+  <tr><th>Time</th><th>Event</th><th>What the cache does</th></tr>
+  <tr><td>09:00:00</td><td>First request for product 123 of the day</td><td>Miss. Read DB (20 ms), store with a 5-min TTL (plus jitter), return</td></tr>
+  <tr><td>09:00:01 – 09:04:59</td><td>About 300,000 requests (at 1,000/s for this product)</td><td>All hits, about 1 ms each. The DB sees none of them.</td></tr>
+  <tr><td>09:02:30</td><td>Price changes from $99 to $89</td><td>The app updates the DB and deletes <code>product:123</code></td></tr>
+  <tr><td>09:02:30.010</td><td>Next request</td><td>Miss. Reload the new price from the DB and cache it.</td></tr>
+  <tr><td>09:07:35</td><td>TTL expires</td><td>Next request reloads the entry. No one has seen anything wrong.</td></tr>
+</table>
+
+<h4>Step 7: List what is left unsolved</h4>
+<p>At 1,000 requests per second on one key, what happens at the moment the entry expires and hundreds of requests all miss together? What if one product goes viral and overloads the single Redis node holding its key? What happens after a Redis restart? These are the failure modes of <a href="14-caching-failures.html">Chapter 14</a>, and naming them yourself in an interview is a strong signal.</p>
+
+<div class="callout good"><b>Check the math</b>
+At a 95% hit ratio: 20,000 × (1 − 0.95) = 1,000 reads/s reach the database, plus 50 writes/s, which is about 1,050 operations per second against a limit of 3,000. That is about 35% utilization, enough headroom for traffic spikes.
+</div>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="preview">12. What can go wrong (preview of Chapter 14)</h2>
+<p>Caches create their own failure modes. You do not need the solutions yet, but you should recognize the names:</p>
+<ul>
+  <li><b>Cache stampede (thundering herd):</b> a popular entry expires and many requests all miss at once and hit the database together.</li>
+  <li><b>Cache avalanche:</b> a large number of entries expire at the same time, or the whole cache goes down, and the database takes the full load.</li>
+  <li><b>Cache penetration:</b> requests for data that does not exist always miss, so each one reaches the database.</li>
+  <li><b>Hot key:</b> one key receives so much traffic that the single cache node holding it becomes the bottleneck.</li>
+  <li><b>Inconsistency:</b> the cache and database disagree because of races or lost invalidations.</li>
+</ul>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="qa">13. Common interview questions</h2>
+<details><summary>What is the difference between cache-aside and read-through?</summary>
+<p>They give the same result. The difference is who is responsible for loading data on a miss. In cache-aside, the application checks the cache, queries the database itself, and fills the cache. In read-through, the application only talks to the cache, and the cache layer loads from the database through a configured loader. Cache-aside is more flexible and works with any plain cache. Read-through is simpler for the application but needs cache support, and makes the cache a hard dependency for reads.</p></details>
+<details><summary>Why delete the cached entry on a write, instead of updating it?</summary>
+<p>Updating risks leaving the wrong value in the cache. With concurrent operations, a slower earlier operation can overwrite a newer value, and the cache stays stale until the TTL expires. Deleting is safe: the next read reloads whatever the database holds at that moment. It is also cheaper when the value might never be read again, because you avoid building and storing a value nobody asks for.</p></details>
+<details><summary>When would you choose write-back, and what is the risk?</summary>
+<p>Write-back fits very high write volumes where losing a short window of recent writes is acceptable, and where many writes hit the same key, such as view counters. The cache acknowledges writes immediately and flushes to the database in batches, turning thousands of writes into one. The risk is that unflushed data exists only in cache memory and is lost if the cache node crashes. Reduce that risk with replication or a write-ahead log on the cache, but do not use write-back for data like payments or orders.</p></details>
+<details><summary>How do you choose a TTL?</summary>
+<p>Start from the business: how stale may this data be before users or money are affected? Then consider how often the data changes and how expensive a miss is. Choose the longest TTL the business accepts, since longer TTLs raise the hit ratio. Add random jitter so entries do not expire together, and treat the TTL as a safety net even when you also invalidate explicitly.</p></details>
+<details><summary>What is the difference between eviction and expiry?</summary>
+<p>Expiry removes an entry because its time to live has run out, even if the cache has free space. Eviction removes an entry because the cache is full and needs room, even if the entry is still fresh. Eviction is chosen by a policy such as LRU or LFU.</p></details>
+<details><summary>How does an LRU cache achieve O(1) operations?</summary>
+<p>By combining a hash map from keys to nodes with a doubly linked list ordered by recency. The map finds an entry in constant time. Because each node links to both neighbors, it can be unlinked and moved to the head in constant time on every access, and the tail node is always the eviction candidate.</p></details>
+<details><summary>What happens to your system if the cache goes down?</summary>
+<p>With cache-aside, the application falls back to the database and keeps working, but slowly, and the database suddenly takes the full read load. If it cannot handle that, the whole system fails. So you need: redundant cache nodes, rate limiting and load shedding to protect the database (Chapter 16), and capacity planning that considers the no-cache case. The recovery problem is the cold cache (section 10).</p></details>
+<details><summary>When should you not use a cache?</summary>
+<p>When data is rarely read more than once, when it must always be exactly current (such as balances used for authorization), when the source is already fast enough, or when the added complexity and staleness outweigh the gain. Measure first, and add a cache to fix a measured problem.</p></details>
+<details><summary>Where would you put caches in a typical web system?</summary>
+<p>In layers: the browser and CDN for static assets and public pages, a small in-process cache for tiny hot reference data, a distributed cache such as Redis for query results and entities, and the database's own buffer pool underneath. Each layer shields the next one.</p></details>
+
+<!-- ======================= 14 ======================= -->
+<div class="recap" id="recap">
+<h2 style="border:none;margin-top:14px">14. Recap</h2>
+<ul>
+  <li>Caching works because access is skewed: a small set of data gets most of the reads. It buys lower latency, higher throughput, and a protected database, and costs you freshness, memory, and extra failure modes.</li>
+  <li>Caches live in layers: browser, CDN, in-process, distributed, and database buffer. Closer to the user is faster but harder to keep fresh.</li>
+  <li>The <b>hit ratio</b> is the key measure. Small improvements near the top cut backend load dramatically, so think in misses.</li>
+  <li>There are five core patterns: <b>cache-aside</b> and <b>read-through</b> for reads, <b>write-through</b>, <b>write-back</b>, and <b>write-around</b> for writes. They combine, and each trades speed, freshness, and loss risk differently.</li>
+  <li>Delete on write instead of updating, and always keep a TTL as a safety net.</li>
+  <li><b>LRU</b> is the usual eviction policy (hash map plus doubly linked list for O(1)). Eviction (no room) differs from expiry (too old).</li>
+  <li>Invalidation is the hard part. Decide a staleness budget for each kind of data, and use TTL, explicit delete, events, or versioned keys accordingly.</li>
+  <li>Design keys to contain everything that changes the answer, jitter your TTLs, and plan for a cold cache.</li>
+</ul>
+</div>
+<p class="connects"><b>Connects to:</b> builds on <a href="02-estimation.html">Chapter 2</a> (estimation and metrics) and <a href="08-scalability-concurrency.html">Chapter 8</a> (stateless scaling). Leads to <a href="14-caching-failures.html">Chapter 14</a> (stampede, avalanche, penetration, hot keys, and distributed caches), <a href="12-cdn.html">Chapter 12</a> (CDN in depth), <a href="24-replication.html">Chapter 24</a> (replication lag, which shows up as cache staleness), and <a href="36-event-driven.html">Chapter 36</a> (change data capture for event-driven invalidation).</p>
+
+</main>
+</div>
+
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+<script>
+// Helpers: build DOM with textContent only (no HTML string injection).
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+// parts: array of plain strings, or { b: 'bold text' }
+function setParts(node, parts) {
+  node.textContent = '';
+  parts.forEach(function (p) {
+    if (typeof p === 'string') node.appendChild(document.createTextNode(p));
+    else node.appendChild(el('b', null, p.b));
+  });
+}
+
+// ---- Hit-ratio calculator ----
+(function () {
+  const ids = ['hc-c', 'hc-d', 'hc-r', 'hc-h'];
+  const out = document.getElementById('hc-out');
+  function calc() {
+    const v = ids.map(function (i) { return parseFloat(document.getElementById(i).value) || 0; });
+    const c = v[0], d = v[1], r = v[2], h = v[3];
+    const hr = Math.min(Math.max(h, 0), 100) / 100;
+    const avg = c + (1 - hr) * d;               // every request pays the cache lookup; misses also pay the DB
+    setParts(out, [
+      'Average latency: ', { b: avg.toFixed(2) + ' ms' },
+      '   |   DB load: ', { b: Math.round(r * (1 - hr)).toLocaleString() + ' req/s' },
+      '   |   Cache absorbs: ', { b: Math.round(r * hr).toLocaleString() + ' req/s' }
+    ]);
+  }
+  ids.forEach(function (i) { document.getElementById(i).addEventListener('input', calc); });
+  calc();
+})();
+
+// ---- LRU widget ----
+(function () {
+  const CAP = 4;
+  let list = [];                                   // index 0 = most recently used
+  const view = document.getElementById('lru-view');
+  const log = document.getElementById('lru-log');
+  const keyEl = document.getElementById('lru-key');
+
+  function render(newKey) {
+    view.textContent = '';
+    view.appendChild(el('span', 'end', 'most recent'));
+    list.forEach(function (k) {
+      view.appendChild(el('div', 'slot' + (k === newKey ? ' new' : ''), k));
+    });
+    for (let i = list.length; i < CAP; i++) {
+      const s = el('div', 'slot', '·');
+      s.style.opacity = '.25';
+      view.appendChild(s);
+    }
+    view.appendChild(el('span', 'end', 'least recent'));
+  }
+  function key() { return (keyEl.value || '').trim().toUpperCase(); }
+
+  document.getElementById('lru-put').onclick = function () {
+    const k = key(); if (!k) return;
+    const i = list.indexOf(k);
+    let parts;
+    if (i >= 0) { list.splice(i, 1); parts = ['put(' + k + '): already cached, moved to the front.']; }
+    else if (list.length >= CAP) { const ev = list.pop(); parts = ['put(' + k + '): cache full, evicted ', { b: ev }, ' (least recently used).']; }
+    else { parts = ['put(' + k + '): added to the front.']; }
+    list.unshift(k); setParts(log, parts); render(k);
+  };
+  document.getElementById('lru-get').onclick = function () {
+    const k = key(); if (!k) return;
+    const i = list.indexOf(k);
+    if (i >= 0) { list.splice(i, 1); list.unshift(k); setParts(log, ['get(' + k + '): ', { b: 'hit' }, ', moved to the front.']); render(k); }
+    else { setParts(log, ['get(' + k + '): ', { b: 'miss' }, '. In cache-aside you would now read the DB and put(' + k + ').']); render(); }
+  };
+  document.getElementById('lru-reset').onclick = function () { list = []; log.textContent = 'Reset.'; render(); };
+  ['A', 'B', 'C'].forEach(function (k) { list.unshift(k); });
+  render();
+})();
+</script>
+</body>
+</html>

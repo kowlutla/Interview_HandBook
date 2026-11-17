@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 12: Design a Web Crawler | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c12-web-crawler">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 12 · Worked solutions</div>
+<h1>Design a Web Crawler</h1>
+<p class="lead">A web crawler discovers pages by following links, downloads them politely, and hands them to an indexing system. This worked solution designs one that fetches 1 billion pages a month, and spends most of its time on the parts an interviewer probes: the URL frontier, politeness, deduplication, spider traps, and recrawl scheduling.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is usually one sentence: "Design a web crawler." That sentence hides many decisions, so the first minutes go to questions, as described in <a href="../chapters/01-interview-framework.html">Chapter 1</a>. A <b>web crawler</b> (also called a spider or robot) is a program that starts from a set of known URLs, downloads each page, extracts the links in it, and repeats for the newly found links. Search engines use crawlers to build their index; other users are price comparison, archives such as the Internet Archive, security scanners, and machine learning data collection.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>What is the crawler for?</td><td>Feeding a general web search index. It must also keep content reasonably fresh.</td></tr>
+<tr><td>Scale?</td><td>1 billion pages fetched per month, sustained, with the ability to burst to about 2.5x the average.</td></tr>
+<tr><td>What content types?</td><td>HTML first. PDFs and images are fetched only if a downstream consumer asks; we store them but do not parse in v1.</td></tr>
+<tr><td>JavaScript-rendered pages?</td><td>A minority (assume 10 to 15 percent) need a headless browser. We design a separate, more expensive rendering path.</td></tr>
+<tr><td>Freshness?</td><td>News and high-change pages within minutes to hours; typical pages in days to weeks; static pages monthly or less.</td></tr>
+<tr><td>Must we obey robots.txt and crawl delays?</td><td>Yes. Politeness is a hard requirement, both ethical and practical (we do not want to be blocked).</td></tr>
+<tr><td>Who consumes the output?</td><td>An indexing pipeline. We hand over raw pages plus metadata; ranking and the inverted index are out of scope (<a href="../chapters/22-search-engines.html">Chapter 22</a>).</td></tr>
+<tr><td>Single or multi region?</td><td>Start in one region. The design must allow fetchers in several regions later.</td></tr>
+<tr><td>How long do we keep pages?</td><td>The latest version plus a limited history (say the last 3 versions) in object storage.</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements and out of scope</h2>
+<h3>2.1 Functional</h3>
+<ul>
+<li>Accept seed URLs and discover new URLs by extracting links from fetched pages.</li>
+<li>Fetch pages over HTTP and HTTPS, follow a bounded number of redirects, and honor robots.txt rules including <code>Crawl-delay</code> where given.</li>
+<li>Avoid downloading the same URL twice in a crawl cycle, and avoid storing duplicate content found under different URLs.</li>
+<li>Recrawl pages on a schedule driven by how often they change and how important they are.</li>
+<li>Store the raw page in durable storage and publish an event so the indexer can pick it up.</li>
+<li>Render JavaScript-dependent pages on a separate path.</li>
+</ul>
+<h3>2.2 Non-functional</h3>
+<ul>
+<li><b>Scalability:</b> 1 billion fetches a month, growing horizontally by adding machines.</li>
+<li><b>Politeness:</b> never overload a single host. A small site must not feel a crawl as an attack.</li>
+<li><b>Robustness:</b> the open web is hostile and broken: malformed HTML, endless redirects, tarpit servers, infinite URL spaces. Nothing a remote server does should crash or stall the crawler.</li>
+<li><b>Extensibility:</b> new content types (images, PDFs) plug in as new processors without redesigning the core.</li>
+<li><b>Freshness vs. cost:</b> spend crawl budget where change and importance are highest.</li>
+<li><b>Fault tolerance:</b> a machine failure must lose at most a few minutes of work and never leave URLs permanently lost or permanently stuck.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Ranking, the inverted index, query serving, spam classification, and full-site archival of media. We also exclude the deep web behind logins and forms. We define the handoff to the indexer but not its internals.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>Estimation, covered in <a href="../chapters/02-estimation.html">Chapter 2</a>, tells us which parts are hard. Here the surprise is that raw fetch rate is modest; the hard parts are the bookkeeping per URL and per host.</p>
+<h3>3.1 Throughput</h3>
+<ul>
+<li>One month is about 30 x 86,400 = 2.59 million seconds.</li>
+<li>Average fetch rate: 1,000,000,000 / 2,590,000 = about <b>385 pages per second</b>. We round to 400.</li>
+<li>Peak (catching up after an outage, or a recrawl wave): 2.5 x 400 = <b>1,000 pages per second</b>.</li>
+<li>JavaScript-rendered share: 10 percent = about 40 renders per second average, 100 at peak.</li>
+</ul>
+<h3>3.2 Concurrency and fleet size</h3>
+<p>A fetch is mostly waiting: DNS lookup, TCP and TLS handshakes, server think time, transfer. Assume the average end-to-end fetch takes 1 second, with slow hosts and timeouts pulling the mean up. By Little's law, in-flight requests = rate x latency = 1,000/s x 1 s = about 1,000 concurrent connections at peak (we will provision for 2,000 to absorb slow hosts). An asynchronous fetcher process on one machine comfortably handles 200 to 500 concurrent connections, so we need roughly <b>8 to 10 fetcher machines</b>, and we plan for 16 for headroom and failures. Headless browsers are 50 to 100 times costlier: assume one browser tab uses about 300 MB and a render takes 4 seconds, so 100 renders per second means 400 concurrent tabs, around 120 GB of RAM, or about 15 machines with 8 to 16 GB each devoted to tabs.</p>
+<h3>3.3 Bandwidth</h3>
+<ul>
+<li>Average HTML page: about 500 KB uncompressed, about 100 KB on the wire when servers send gzip or brotli (typical 4 to 5x on HTML). We cap downloads at 5 MB.</li>
+<li>Download: 400/s x 100 KB = 40 MB/s average = 320 Mbit/s. Peak 1,000/s x 100 KB = 100 MB/s = 800 Mbit/s. Modest: a few 10 Gbit NICs are plenty.</li>
+<li>Monthly download: 1B x 100 KB = 100 TB.</li>
+</ul>
+<h3>3.4 Storage</h3>
+<ul>
+<li>Raw pages: we store the compressed form (about 100 KB). 1B x 100 KB = <b>100 TB per month</b>. Keeping the latest 3 versions of recrawled pages raises long-run use, but only for pages that are recrawled. Assume the crawl corpus holds 3 billion distinct pages after some months (recrawls cover the same pages repeatedly): 3B x 100 KB x about 2 average versions = 600 TB. This is plainly object storage territory (<a href="../chapters/21-object-storage.html">Chapter 21</a>), with a cheap infrequent-access tier for old versions.</li>
+<li>URL metadata (one row per known URL): normalized URL (about 80 bytes on average), content hash 8 bytes, simhash 8 bytes, last fetch time, next fetch time, change-rate estimate, ETag/Last-Modified hint, HTTP status, depth, priority: about 200 bytes. If the system knows 6 billion URLs (many discovered but not yet fetched): 6B x 200 B = <b>1.2 TB</b>. That fits a sharded key-value store (<a href="../chapters/20-nosql.html">Chapter 20</a>) but not one machine.</li>
+<li>Link discovery rate: assume 40 outgoing links per page. 400 pages/s x 40 = <b>16,000 URL candidates per second</b> that must be normalized and checked for "have I seen this?". Peak: 40,000/s. This number, not the fetch rate, drives the dedup design.</li>
+</ul>
+<h3>3.5 Dedup memory</h3>
+<p>Exact "seen URL" set for 6 billion URLs, storing 8-byte hashes: 6B x 8 B = 48 GB, still fine for a sharded cluster. A Bloom filter (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>) at 10 bits per element and 7 hash functions gives about a 1 percent false positive rate: 6B x 10 bits = 60 Gbit = <b>7.5 GB</b> total, or about 120 MB per shard when there are 64 shards. Content fingerprints: 1B simhashes x 8 bytes = 8 GB. All cheap. The case for a Bloom filter is therefore speed and cache residency, not just memory.</p>
+<h3>3.6 Politeness arithmetic</h3>
+<p>If each host is fetched at most once per second (a common default), then 1,000 pages/s needs at least 1,000 distinct hosts being crawled at the same moment. The web has hundreds of millions of hosts, so that is easy overall, but the distribution is skewed: a single large site may have 100 million URLs. At 1 request per second, that one site alone would take 100,000,000 / 86,400 = 1,157 days. So for giant hosts, politeness caps freshness, and the crawl budget per host (section 12) becomes a real policy knob. We usually negotiate higher rates through Search Console style verification or by using the host's sitemaps and conditional requests rather than hammering.</p>
+<table>
+<tr><th>Quantity</th><th>Average</th><th>Peak</th></tr>
+<tr><td>Fetches per second</td><td>400</td><td>1,000</td></tr>
+<tr><td>Concurrent connections</td><td>about 400</td><td>about 1,000 (provision 2,000)</td></tr>
+<tr><td>Download bandwidth</td><td>320 Mbit/s</td><td>800 Mbit/s</td></tr>
+<tr><td>URL candidates checked per second</td><td>16,000</td><td>40,000</td></tr>
+<tr><td>Renders per second</td><td>40</td><td>100</td></tr>
+<tr><td>Raw storage added</td><td colspan="2">100 TB per month</td></tr>
+<tr><td>URL metadata</td><td colspan="2">1.2 TB for 6B URLs</td></tr>
+<tr><td>Bloom filter</td><td colspan="2">7.5 GB total at 1 percent false positives</td></tr>
+</table>
+
+<h2 id="api">4. API design</h2>
+<p>A crawler is mostly a batch system with no end-user traffic, but it still has interfaces: a control API for operators and customers, and internal contracts between stages.</p>
+<h3>4.1 Control API</h3>
+<pre>POST /v1/seeds            { "urls": ["https://example.com/"], "priority": 5 }
+GET  /v1/urls/{urlHash}   -> { url, status, lastFetch, nextFetch, contentHash, depth }
+POST /v1/recrawl          { "url": "...", "reason": "operator|sitemap_ping" }   (priority bump)
+PUT  /v1/hosts/{host}/policy  { "crawlDelayMs": 2000, "maxConcurrent": 1, "dailyBudget": 50000 }
+GET  /v1/hosts/{host}/stats -> { fetched24h, errors24h, avgLatencyMs, robotsAge }</pre>
+<h3>4.2 Internal contracts</h3>
+<ul>
+<li><b>Frontier lease:</b> <code>lease(partition, n, leaseSeconds)</code> returns up to n URLs that are due, each with a <code>leaseId</code>. <code>ack(leaseId, outcome, nextFetchHint)</code> completes it; an unacknowledged lease expires and the URL becomes due again. This is the heart of failure handling.</li>
+<li><b>Fetch result event</b> (on the queue, <a href="../chapters/34-queues-kafka.html">Chapter 34</a>): <code>{url, finalUrl, status, fetchedAt, contentHash, simhash, blobKey, etag, lastModified, headers subset, redirectChain}</code>. The body is not in the event; it lives in object storage and the event holds its key.</li>
+<li><b>Discovered links event:</b> <code>{sourceUrl, links: [{url, anchorText, rel}]}</code>, routed to the frontier by host hash.</li>
+<li><b>Page-stored event for indexing:</b> <code>{url, blobKey, version, contentType, language, fetchedAt}</code>.</li>
+</ul>
+<div class="callout tip"><b>Interview tip</b> Say out loud that the frontier hands out <i>leases</i>, not deletions. That one word shows you have thought about worker crashes.</div>
+
+<h2 id="data">5. Data model and storage choices</h2>
+<table>
+<tr><th>Data</th><th>Store</th><th>Why</th></tr>
+<tr><td>Raw page bodies (compressed HTML, PDFs)</td><td>Object storage keyed by <code>urlHash/version</code> (<a href="../chapters/21-object-storage.html">Chapter 21</a>)</td><td>Hundreds of TB, write once, read sequentially by the indexer, cheap per GB, tiering for old versions.</td></tr>
+<tr><td>URL metadata (state, next fetch time, change stats)</td><td>Sharded wide-column or LSM key-value store partitioned by host hash (<a href="../chapters/20-nosql.html">Chapter 20</a>, <a href="../chapters/19-storage-engines.html">Chapter 19</a>)</td><td>1.2 TB, huge write rate (every fetch updates a row), lookups by key, range scans by host and due time. LSM trees absorb write-heavy loads well.</td></tr>
+<tr><td>Frontier ready queues (in-memory working set)</td><td>In-memory per-partition structures backed by the URL store; hot data in Redis style memory (<a href="../chapters/15-redis.html">Chapter 15</a>)</td><td>Per-host next-allowed-time and heap of due hosts must be fast, but the durable truth lives in the URL store so a crash only loses a cache.</td></tr>
+<tr><td>Seen-URL filter</td><td>In-memory Bloom filter per partition, snapshotted to disk or object storage</td><td>Absorbs 16,000 to 40,000 checks per second at microsecond cost.</td></tr>
+<tr><td>Content fingerprints</td><td>Simhash index, sharded; exact hash in the URL row</td><td>Near-duplicate lookup needs a special index (section 9).</td></tr>
+<tr><td>robots.txt cache</td><td>Per-host record in the host table, plus fetcher-local memory</td><td>One small document per host, refreshed daily.</td></tr>
+<tr><td>DNS answers</td><td>Local resolver cache in each fetcher</td><td>Avoid a lookup per fetch (section 8).</td></tr>
+<tr><td>Fetch and discover events</td><td>Kafka style log (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>)</td><td>Decouples fetcher, parser, storage, and indexer; replayable.</td></tr>
+</table>
+<p>Two tables matter. The <b>host table</b> is keyed by host name: <code>{host, robotsBody, robotsFetchedAt, crawlDelayMs, nextAllowedAt, errorStreak, budgetToday, politenessClass}</code>. The <b>URL table</b> is keyed by <code>(hostHash, urlHash)</code>, so all URLs of one host sit together, which makes "give me the due URLs for this host" a short range scan.</p>
+
+<h2 id="simple">6. A first, simple design</h2>
+<p>Start with the textbook loop on a single machine: a queue of URLs, a worker that pops one, fetches it, parses links, adds unseen ones to the queue, and saves the page to disk.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 190" role="img" aria-label="Single machine crawler: queue, fetch, parse, seen set, disk">
+  <rect class="ext" x="20" y="60" width="130" height="56" rx="8"/><text class="t-c t-b" x="85" y="86">Seed URLs</text><text class="t-c t-sm" x="85" y="104">operator input</text>
+  <rect class="cache" x="200" y="60" width="140" height="56" rx="8"/><text class="t-c t-b" x="270" y="86">URL queue</text><text class="t-c t-sm" x="270" y="104">FIFO list</text>
+  <rect class="box" x="390" y="60" width="130" height="56" rx="8"/><text class="t-c t-b" x="455" y="86">Fetcher</text><text class="t-c t-sm" x="455" y="104">one thread</text>
+  <rect class="box" x="570" y="60" width="130" height="56" rx="8"/><text class="t-c t-b" x="635" y="86">Parser</text><text class="t-c t-sm" x="635" y="104">extract links</text>
+  <rect class="db" x="750" y="20" width="130" height="50" rx="8"/><text class="t-c t-b" x="815" y="42">Seen set</text><text class="t-c t-sm" x="815" y="60">hash set in RAM</text>
+  <rect class="db" x="750" y="110" width="130" height="50" rx="8"/><text class="t-c t-b" x="815" y="132">Local disk</text><text class="t-c t-sm" x="815" y="150">HTML files</text>
+  <path class="arrow" d="M150 88 L196 88"/><path class="arrow" d="M340 88 L386 88"/><path class="arrow" d="M520 88 L566 88"/>
+  <path class="arrow" d="M700 78 L746 50"/><path class="arrow" d="M700 98 L746 130"/>
+  <path class="arrow dash" d="M815 20 L815 8 L270 8 L270 56"/><text class="t-sm" x="400" y="26">new unseen links go back</text>
+</svg>
+<figcaption>The naive crawler. Everything breaks as it grows: one thread is slow, the seen set outgrows RAM, no politeness, no robots handling, no crash recovery.</figcaption>
+</figure>
+<p>Why this fails at scale, in order of how soon it hurts:</p>
+<ol>
+<li><b>One thread is slow.</b> With 1 second per fetch you get 1 page per second. We need 400 to 1,000.</li>
+<li><b>FIFO order is impolite.</b> A breadth-first queue drains the links of one site together, so the crawler sends hundreds of consecutive requests to the same host and gets banned.</li>
+<li><b>FIFO order ignores importance.</b> A press release and a spam page wait in the same line.</li>
+<li><b>The seen set outgrows RAM</b> and a crash loses it.</li>
+<li><b>No recrawl.</b> It never revisits anything.</li>
+<li><b>Traps.</b> A calendar page that links to "next month" forever will consume the whole crawl.</li>
+</ol>
+<p>The rest of the design replaces each box by a distributed, policy-aware version, with the <b>URL frontier</b> as the replacement for the naive queue.</p>
+
+<h2 id="architecture">7. Scaled high-level architecture</h2>
+<p>The pipeline has these components: frontier, fetcher fleet with DNS cache, a renderer pool for JavaScript pages, a raw store, a parser and link extractor, a URL filter and dedup stage, a content dedup stage, and an indexing handoff. Everything is partitioned by <b>host hash</b>, so that all the state needed to be polite to a host (its queue, robots rules, next allowed time) lives in one place.</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 420" role="img" aria-label="Scaled crawler architecture">
+  <rect class="ext" x="20" y="170" width="110" height="50" rx="8"/><text class="t-c t-b" x="75" y="192">Seeds and</text><text class="t-c t-sm" x="75" y="209">sitemaps</text>
+  <rect class="cache" x="170" y="130" width="170" height="130" rx="10"/><text class="t-c t-b" x="255" y="156">URL frontier</text><text class="t-c t-sm" x="255" y="178">priority queues</text><text class="t-c t-sm" x="255" y="196">per-host queues</text><text class="t-c t-sm" x="255" y="214">robots + rate state</text><text class="t-c t-sm" x="255" y="240">N partitions by host</text>
+  <rect class="box" x="390" y="40" width="150" height="56" rx="8"/><text class="t-c t-b" x="465" y="64">Fetcher fleet</text><text class="t-c t-sm" x="465" y="82">async HTTP, DNS cache</text>
+  <rect class="box" x="390" y="300" width="150" height="56" rx="8"/><text class="t-c t-b" x="465" y="324">Render pool</text><text class="t-c t-sm" x="465" y="342">headless browsers</text>
+  <rect class="db" x="620" y="40" width="150" height="56" rx="8"/><text class="t-c t-b" x="695" y="64">Raw page store</text><text class="t-c t-sm" x="695" y="82">object storage</text>
+  <rect class="cache" x="620" y="160" width="150" height="56" rx="8"/><text class="t-c t-b" x="695" y="184">Event log</text><text class="t-c t-sm" x="695" y="202">Kafka topics</text>
+  <rect class="box" x="620" y="250" width="150" height="56" rx="8"/><text class="t-c t-b" x="695" y="274">Parser + links</text><text class="t-c t-sm" x="695" y="292">normalize, extract</text>
+  <rect class="box" x="810" y="250" width="130" height="56" rx="8"/><text class="t-c t-b" x="875" y="274">URL filter</text><text class="t-c t-sm" x="875" y="292">Bloom + rules</text>
+  <rect class="box" x="810" y="160" width="130" height="56" rx="8"/><text class="t-c t-b" x="875" y="184">Content dedup</text><text class="t-c t-sm" x="875" y="202">hash + simhash</text>
+  <rect class="ext" x="810" y="40" width="130" height="56" rx="8"/><text class="t-c t-b" x="875" y="64">Indexer</text><text class="t-c t-sm" x="875" y="82">downstream</text>
+  <rect class="db" x="170" y="330" width="170" height="56" rx="8"/><text class="t-c t-b" x="255" y="354">URL / host store</text><text class="t-c t-sm" x="255" y="372">sharded KV, 1.2 TB</text>
+  <path class="arrow" d="M130 195 L166 195"/>
+  <path class="arrow" d="M340 160 L386 80"/><text class="t-sm" x="300" y="116">lease</text>
+  <path class="arrow" d="M340 235 L386 320"/>
+  <path class="arrow" d="M540 68 L616 68"/>
+  <path class="arrow" d="M540 80 L616 175"/>
+  <path class="arrow" d="M540 330 L616 205"/>
+  <path class="arrow" d="M695 216 L695 246"/>
+  <path class="arrow" d="M770 278 L806 278"/>
+  <path class="arrow" d="M770 188 L806 188"/>
+  <path class="arrow" d="M875 160 L875 100"/>
+  <path class="arrow dash" d="M875 306 L875 400 L345 400 L345 365" />
+  <path class="arrow dash" d="M255 330 L255 264"/>
+  <text class="t-sm" x="520" y="394">new URLs and recrawl updates written to the store</text>
+</svg>
+<figcaption>Read left to right: seeds enter the frontier, fetchers lease due URLs, bodies go to object storage and an event goes on the log, the parser extracts links, the URL filter drops known URLs and writes survivors to the store, and the frontier picks them up. Content dedup gates what reaches the indexer.</figcaption>
+</figure>
+<p>Two design choices frame everything. First, the <b>frontier is the brain</b>: all scheduling, politeness, and priority decisions happen there, and fetchers are dumb workers that only fetch what they are leased. Second, <b>the log decouples stages</b> so a slow parser never blocks fetching, and we can replay events if the parser had a bug (<a href="../chapters/36-event-driven.html">Chapter 36</a>).</p>
+
+<h3>7.1 Request flow for crawling one URL</h3>
+<figure class="diagram">
+<svg viewBox="0 0 940 440" role="img" aria-label="Sequence diagram for fetching a URL">
+  <rect class="cache" x="20" y="14" width="120" height="30" rx="8"/><text class="t-c t-b" x="80" y="34">Frontier</text>
+  <rect class="box" x="190" y="14" width="120" height="30" rx="8"/><text class="t-c t-b" x="250" y="34">Fetcher</text>
+  <rect class="ext" x="360" y="14" width="120" height="30" rx="8"/><text class="t-c t-b" x="420" y="34">DNS / site</text>
+  <rect class="db" x="530" y="14" width="120" height="30" rx="8"/><text class="t-c t-b" x="590" y="34">Object store</text>
+  <rect class="cache" x="700" y="14" width="100" height="30" rx="8"/><text class="t-c t-b" x="750" y="34">Log</text>
+  <rect class="box" x="840" y="14" width="90" height="30" rx="8"/><text class="t-c t-b" x="885" y="34">Parser</text>
+  <line class="life" x1="80" y1="44" x2="80" y2="430"/><line class="life" x1="250" y1="44" x2="250" y2="430"/><line class="life" x1="420" y1="44" x2="420" y2="430"/><line class="life" x1="590" y1="44" x2="590" y2="430"/><line class="life" x1="750" y1="44" x2="750" y2="430"/><line class="life" x1="885" y1="44" x2="885" y2="430"/>
+  <path class="arrow" d="M250 80 L84 80"/><text class="t-sm" x="100" y="74">1. lease(n URLs)</text>
+  <path class="arrow dash" d="M84 118 L246 118"/><text class="t-sm" x="100" y="112">2. URLs + leaseId (due, polite)</text>
+  <path class="arrow" d="M250 156 L416 156"/><text class="t-sm" x="262" y="150">3. DNS (cache) + robots check</text>
+  <path class="arrow" d="M250 194 L416 194"/><text class="t-sm" x="262" y="188">4. GET (If-None-Match)</text>
+  <path class="arrow dash" d="M416 232 L254 232"/><text class="t-sm" x="262" y="226">5. 200 body, or 304</text>
+  <path class="arrow" d="M250 270 L586 270"/><text class="t-sm" x="330" y="264">6. put compressed body</text>
+  <path class="arrow" d="M250 308 L746 308"/><text class="t-sm" x="400" y="302">7. publish FetchResult(blobKey, hash)</text>
+  <path class="arrow" d="M250 346 L84 346"/><text class="t-sm" x="100" y="340">8. ack(leaseId, status, hints)</text>
+  <path class="arrow dash" d="M750 384 L881 384"/><text class="t-sm" x="760" y="378">9. consume</text>
+  <path class="arrow" d="M885 412 L84 412 "/><text class="t-sm" x="400" y="406">10. new links to frontier (host-hash routed)</text>
+</svg>
+<figcaption>The fetcher asks for work, checks robots and DNS, fetches conditionally, stores the body before publishing the event, then acknowledges. If the fetcher dies before step 8, the lease expires and the URL is retried.</figcaption>
+</figure>
+<ol>
+<li>The frontier partition owning a set of hosts returns URLs whose host is allowed to be contacted now.</li>
+<li>The fetcher resolves the host through its DNS cache, checks the cached robots rules, and sends a conditional GET using the stored ETag or Last-Modified.</li>
+<li>On 200 it computes a content hash, writes the compressed body to object storage, and publishes the event. On 304 it only publishes a "not modified" event and the frontier lengthens the revisit interval.</li>
+<li>It acknowledges with the outcome. The frontier updates the host's <code>nextAllowedAt</code> and the URL's <code>nextFetchAt</code>.</li>
+<li>The parser consumes the event, extracts links, normalizes them, and sends them to the owning frontier partition for the filter and enqueue.</li>
+</ol>
+<div class="callout key"><b>Key idea</b> Write the body to object storage <i>before</i> publishing the event and acknowledging. Then an event always points at data that exists. The cost of the opposite order is an event referring to a missing blob, which is a harder failure to recover from than a duplicate blob.</div>
+
+<h2 id="frontier">8. Deep dive 1: the URL frontier</h2>
+<p>The <b>URL frontier</b> is the data structure that decides which URL to fetch next. It must satisfy two conflicting goals at once. <b>Priority:</b> important and fast-changing pages should be fetched first. <b>Politeness:</b> no host should be contacted faster than its allowed rate, and ideally only one connection at a time. A single global priority queue serves the first goal and wrecks the second, because the top-priority URLs often belong to a handful of hosts. The classic solution, from the Mercator crawler, is a two-level structure: <b>front queues for priority</b> and <b>back queues for politeness</b>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 940 440" role="img" aria-label="Frontier with front priority queues and back per-host queues">
+  <text class="t-b" x="20" y="22">Incoming URLs</text>
+  <rect class="ext" x="20" y="34" width="130" height="50" rx="8"/><text class="t-c t-b" x="85" y="58">Prioritizer</text><text class="t-c t-sm" x="85" y="75">score 1 to 5</text>
+  <text class="t-b" x="200" y="22">Front queues (priority)</text>
+  <rect class="cache" x="200" y="34" width="180" height="40" rx="8"/><text class="t-c" x="290" y="59">P1 breaking news</text>
+  <rect class="cache" x="200" y="82" width="180" height="40" rx="8"/><text class="t-c" x="290" y="107">P2 popular / fast change</text>
+  <rect class="cache" x="200" y="130" width="180" height="40" rx="8"/><text class="t-c" x="290" y="155">P3 normal</text>
+  <rect class="cache" x="200" y="178" width="180" height="40" rx="8"/><text class="t-c" x="290" y="203">P4 low value</text>
+  <rect class="cache" x="200" y="226" width="180" height="40" rx="8"/><text class="t-c" x="290" y="251">P5 rarely changing</text>
+  <rect class="box" x="420" y="90" width="120" height="100" rx="8"/><text class="t-c t-b" x="480" y="125">Biased</text><text class="t-c t-b" x="480" y="143">selector</text><text class="t-c t-sm" x="480" y="165">weighted by</text><text class="t-c t-sm" x="480" y="180">priority</text>
+  <text class="t-b" x="580" y="22">Back queues (one per host)</text>
+  <rect class="hit" x="580" y="34" width="190" height="40" rx="8"/><text class="t-c" x="675" y="59">a.com  ready now</text>
+  <rect class="miss" x="580" y="82" width="190" height="40" rx="8"/><text class="t-c" x="675" y="107">b.org  wait 1.4 s</text>
+  <rect class="hit" x="580" y="130" width="190" height="40" rx="8"/><text class="t-c" x="675" y="155">c.net  ready now</text>
+  <rect class="miss" x="580" y="178" width="190" height="40" rx="8"/><text class="t-c" x="675" y="203">d.io   wait 0.3 s</text>
+  <rect class="miss" x="580" y="226" width="190" height="40" rx="8"/><text class="t-c" x="675" y="251">e.com  robots delay 10 s</text>
+  <rect class="box" x="810" y="90" width="110" height="100" rx="8"/><text class="t-c t-b" x="865" y="125">Host heap</text><text class="t-c t-sm" x="865" y="145">ordered by</text><text class="t-c t-sm" x="865" y="160">nextAllowedAt</text>
+  <path class="arrow" d="M150 59 L196 54"/><path class="arrow" d="M150 70 L196 100"/>
+  <path class="arrow" d="M380 54 L416 120"/><path class="arrow" d="M380 150 L416 140"/><path class="arrow" d="M380 246 L416 170"/>
+  <path class="arrow" d="M540 140 L576 100"/><path class="arrow" d="M540 140 L576 150"/>
+  <path class="arrow" d="M770 54 L806 120"/><path class="arrow" d="M770 150 L806 150"/>
+  <path class="arrow-g" d="M865 190 L865 330 L300 330"/>
+  <rect class="box" x="120" y="300" width="180" height="60" rx="8"/><text class="t-c t-b" x="210" y="326">Fetcher lease</text><text class="t-c t-sm" x="210" y="344">pop earliest ready host</text>
+  <text class="t-sm" x="20" y="400">Rule: a host is in the heap only if its back queue is non-empty; after a fetch it re-enters with</text>
+  <text class="t-sm" x="20" y="418">nextAllowedAt = now + max(crawlDelay, 10 x lastFetchDuration). Back queues refill from front queues.</text>
+</svg>
+<figcaption>Front queues order URLs by importance. A selector biased toward high priority moves URLs into per-host back queues. A heap keyed by next allowed time tells fetchers which host may be contacted now.</figcaption>
+</figure>
+<h3>8.1 Front queues: priority</h3>
+<p>The <b>prioritizer</b> assigns each URL a score using signals that are cheap to compute: the site's importance (link counts or a PageRank-like score from the previous crawl), the URL's depth from a seed (shallower is usually more valuable), the page's historical change rate, the type (news, forum, product), and whether it came from a sitemap with a recent <code>lastmod</code>. The score selects one of F front queues (say 5 to 10). The <b>biased selector</b> then picks a front queue randomly with weights (for example 50, 25, 12, 8, 5 percent) so high priority gets most throughput but low priority never starves. Strict priority would let a flood of important URLs starve everything else forever.</p>
+<h3>8.2 Back queues: politeness</h3>
+<p>Each back queue holds URLs of exactly one host. A <b>host heap</b> orders hosts by <code>nextAllowedAt</code>. A fetcher asks for work; the frontier pops the host with the earliest time that is already in the past, hands out one URL (or a small batch for a slow-start host), and later re-inserts the host with <code>nextAllowedAt = now + delay</code>. Good delay choices:</p>
+<ul>
+<li>The <code>Crawl-delay</code> value from robots.txt when present. Note that Google ignores this directive, but many other crawlers honor it, and honoring it is the polite default for a new crawler.</li>
+<li>Otherwise a default of 1 second, adaptive: a common rule is to wait about 10 times the duration of the last fetch, so a slow struggling server is automatically relieved, and a fast CDN-backed one is crawled faster, bounded by a configured ceiling.</li>
+<li>Back off sharply on 429 (Too Many Requests) and 503 responses, honoring <code>Retry-After</code>, with exponential backoff (1 minute, 2, 4, up to hours), and reset after success.</li>
+<li>At most one in-flight connection per host unless the host is known to be a large CDN-backed site with an agreed higher limit.</li>
+</ul>
+<p>When a back queue empties, the frontier removes that host from the heap and refills a back queue for a new host by pulling URLs from the front queues, so the number of active back queues stays around the number of in-flight fetch slots times a safety factor (say 3x), keeping memory bounded.</p>
+<h3>8.3 robots.txt</h3>
+<p><b>robots.txt</b> is a text file at the root of a host that tells crawlers which paths they may fetch (<code>Disallow</code>, <code>Allow</code>), optionally a crawl delay, and sitemap locations, grouped by <code>User-agent</code>. The robots exclusion protocol is now an IETF standard (RFC 9309). Implementation rules:</p>
+<ul>
+<li>Fetch robots.txt before the first URL of a host, and refresh at most daily (cache lifetime up to 24 hours, honoring cache headers). A refresh is itself a polite fetch scheduled through the same back queue.</li>
+<li>Per RFC 9309, a 4xx response (file missing) means "no restrictions"; a 5xx or unreachable robots.txt means treat the host as <b>fully disallowed</b> for now and retry later, and if it stays unavailable for a long time (the RFC suggests beyond 30 days) the crawler may treat it as missing. A temporary robots outage must not become a license to crawl everything.</li>
+<li>Parse leniently, using the longest-match rule for Allow versus Disallow, and cap the parsed file size (the RFC says at least 500 KiB must be handled).</li>
+<li>Check the rules on every URL at lease time, because a URL may have been enqueued before the host changed its rules.</li>
+<li>Send an honest, identifiable <code>User-Agent</code> with a contact URL so a site owner can reach us.</li>
+</ul>
+<h3>8.4 Frontier storage and the lease</h3>
+<p>The frontier cannot live purely in RAM: 6 billion URLs at 200 bytes would be 1.2 TB. So the durable frontier is the URL store, with rows ordered by <code>(hostHash, priority, nextFetchAt)</code>. Each frontier partition keeps only an <b>in-memory working set</b>: the heap of active hosts and the next few hundred URLs for each. When a back queue drains it is refilled from the store with a range scan. Leasing marks the row <code>inFlight until T</code> (T about 2 to 5 minutes), implemented as an atomic conditional update in the store. A crashed fetcher therefore costs only the lease duration; when the lease lapses the URL reappears. This is the same visibility-timeout idea used by message queues (<a href="../chapters/35-messaging-patterns.html">Chapter 35</a>).</p>
+<table>
+<tr><th>Frontier design</th><th>Pros</th><th>Cons</th><th>Verdict</th></tr>
+<tr><td>Single global priority queue (Kafka topic or Redis sorted set)</td><td>Trivial; strict priority.</td><td>No politeness, hot hosts dominate, single bottleneck.</td><td>Reject.</td></tr>
+<tr><td>One queue per host only (no priority)</td><td>Perfectly polite, simple.</td><td>No notion of importance; huge hosts fill the system.</td><td>Insufficient alone.</td></tr>
+<tr><td>Front priority queues + back host queues (Mercator)</td><td>Both goals; bounded memory; well proven.</td><td>More moving parts; host heap needs care for correctness.</td><td><b>Chosen.</b></td></tr>
+<tr><td>Pure message broker with delayed messages</td><td>Off the shelf.</td><td>Per-host rate state still has to be built outside; millions of timers; no range scan by host.</td><td>Use only for events, not as the frontier.</td></tr>
+</table>
+
+<h2 id="fetching">9. Fetcher fleet, DNS, and failure at the HTTP layer</h2>
+<p>The <b>fetcher</b> is an asynchronous HTTP client. Using non-blocking I/O (an event loop, or lightweight threads) one process holds hundreds of open connections without hundreds of threads. Each fetch is bounded by several timeouts, because the open web contains tarpits (servers that send one byte per minute):</p>
+<ul>
+<li>Connect timeout: 5 seconds. TLS handshake: 5 seconds. Time to first byte: 10 seconds.</li>
+<li>Total deadline per fetch: 30 seconds.</li>
+<li>Maximum body size: 5 MB, enforced while streaming, so a 10 GB file is cut off. A minimum transfer rate check kills slow-drip responses.</li>
+<li>Maximum redirects: 5 (a redirect loop is detected by tracking visited URLs in the chain). Each hop is a new URL that must pass the robots and politeness checks for <i>its</i> host, because a redirect can cross hosts.</li>
+<li>Accept only expected content types, determined from the header and verified by sniffing the first bytes.</li>
+<li>Send <code>Accept-Encoding: gzip, br</code> and decompress with a size limit (guard against zip bombs by capping the decompressed size too).</li>
+</ul>
+<h3>9.1 DNS caching</h3>
+<p>A DNS lookup (<a href="../chapters/04-dns.html">Chapter 4</a>) costs from a few milliseconds to over a second for a cold, distant name, and a crawler touches millions of distinct hostnames. If every fetch resolved its host, DNS would become the bottleneck, and might get us rate limited by public resolvers. The answer has layers. Each fetcher process holds an <b>in-process cache</b> keyed by host with a TTL. Because the frontier groups work by host, the same fetcher sees many URLs of one host in a row, so even a small cache has an extreme hit rate. Behind it runs a <b>local caching resolver</b> shared by the machine (and a few of our own recursive resolvers per data center) rather than a public one. We honor TTLs but clamp them: minimum 5 minutes to avoid churn, maximum 1 day. We also cache failures (NXDOMAIN for 1 hour; SERVFAIL for a few minutes) so dead hosts do not generate repeated lookups. Finally, <b>prefetch</b>: when the frontier selects the next batch of hosts, it can resolve them ahead of the lease. Connection reuse (HTTP keep-alive, and HTTP/2 where offered) shrinks handshakes: ten pages from the same host share one connection, which fits with our one-connection-per-host politeness rule.</p>
+<div class="callout watch"><b>Watch out</b> Resolve, then connect to the resolved IP while sending the original <code>Host</code> header. Check the IP against a deny list of private ranges (10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16 and cloud metadata addresses) <i>after</i> resolution and on every redirect, or an attacker's page can make your crawler fetch internal services (server-side request forgery). Re-resolution tricks (DNS rebinding) are avoided by pinning the checked IP for the connection.</div>
+<h3>9.2 Handling outcomes</h3>
+<table>
+<tr><th>Outcome</th><th>Action</th></tr>
+<tr><td>200 OK</td><td>Store, publish, schedule next visit from change estimate.</td></tr>
+<tr><td>304 Not Modified</td><td>Cheap success: no body stored, interval multiplied (for example x1.5, up to a cap).</td></tr>
+<tr><td>301 / 308 permanent redirect</td><td>Record the new canonical URL; enqueue the target; mark the source as an alias, stop recrawling it frequently.</td></tr>
+<tr><td>302 / 307 temporary</td><td>Follow within the hop limit; keep the original as the identity.</td></tr>
+<tr><td>404 / 410</td><td>Mark gone. 410 is stronger. Retry a 404 once or twice later in case of a flapping site, then back off to monthly checks, and tell the indexer to remove after confirmation.</td></tr>
+<tr><td>429 / 503</td><td>Slow the host, honor Retry-After, exponential backoff.</td></tr>
+<tr><td>5xx, timeout, connection reset</td><td>Retry with backoff up to a limit (3 tries over a day), counting a per-host error streak; if the streak is long, the host is deprioritized for a while.</td></tr>
+<tr><td>TLS or DNS failure</td><td>Cache the failure, retry much later; permanent after many retries over weeks.</td></tr>
+</table>
+
+<h2 id="parsing">10. Parsing, link extraction, and URL normalization</h2>
+<p>The <b>parser</b> consumes fetch events, reads the body from object storage (or receives it in memory when co-located), and produces: cleaned text and structured metadata for the indexer, plus the list of outgoing links. HTML found in the wild is frequently invalid, so the parser must be a tolerant, standards-based HTML5 parser that never throws on bad markup, with a size limit and a time limit. Because parsing is CPU heavy and fetching is I/O heavy, they run on different fleets scaled separately; the log between them provides buffering.</p>
+<p>Links come from <code>&lt;a href&gt;</code>, but also <code>&lt;link rel="canonical"&gt;</code>, <code>&lt;link rel="next"&gt;</code>, frames, image sources if we crawl images, sitemaps, and (with the render path) links created by JavaScript. The parser respects <code>&lt;base href&gt;</code>, resolves relative references against the page URL, honors <code>rel="nofollow"</code> (record it but do not use it for priority; many crawlers still may fetch), and the page-level <code>&lt;meta name="robots" content="noindex,nofollow"&gt;</code> and the <code>X-Robots-Tag</code> header.</p>
+<h3>10.1 URL normalization</h3>
+<p>The same page can be written as many different strings. Without <b>normalization</b> (canonicalization), the seen-URL check sees each spelling as a new page and the crawler downloads the same page many times. Apply, in a fixed order:</p>
+<ol>
+<li>Lowercase the scheme and host (<code>HTTP://Example.COM</code> becomes <code>http://example.com</code>); the path stays case sensitive.</li>
+<li>Remove the default port (<code>:80</code> for http, <code>:443</code> for https) and a trailing dot on the host.</li>
+<li>Decode percent-escapes of unreserved characters and uppercase the hex digits of the rest (<code>%7e</code> becomes <code>~</code>, <code>%c3%a9</code> becomes <code>%C3%A9</code>). Convert internationalized hostnames to punycode.</li>
+<li>Resolve dot segments (<code>/a/b/../c</code> becomes <code>/a/c</code>).</li>
+<li>Remove the fragment (<code>#section</code>), since fragments never reach the server.</li>
+<li>Sort query parameters alphabetically, and drop known tracking parameters (<code>utm_*</code>, <code>fbclid</code>, <code>gclid</code>) and session IDs (<code>PHPSESSID</code>, <code>jsessionid</code>). Keep a per-host learned list of parameters that do not change content (section 11.3).</li>
+<li>Normalize an empty path to <code>/</code>; optionally strip default index files (<code>/index.html</code>) only when the host is known to treat them the same.</li>
+<li>Prefer the <code>rel=canonical</code> target when the page declares one and it is on the same site (trust, but verify cross-domain claims).</li>
+</ol>
+<p>Be conservative: over-aggressive rules merge distinct pages and silently lose content. Treat safe rules (1 to 5) as universal and the others (6 to 8) as policies with per-host overrides.</p>
+<p>Example: <code>HTTP://Example.com:80/a/./b/../c?b=2&amp;a=1&amp;utm_source=x#top</code> becomes <code>http://example.com/a/c?a=1&amp;b=2</code>. Each outgoing link is then hashed (64-bit hash, or 128-bit if collisions worry us) to a <code>urlHash</code> and routed by <code>hostHash</code> to its frontier partition.</p>
+
+<h2 id="dedup">11. Deep dive 2: deduplication of URLs and content</h2>
+<p>There are two distinct questions: "have I already got this URL?" (URL dedup, runs 16,000 to 40,000 times per second) and "does this page say the same thing as one I already have, under a different URL?" (content dedup, runs once per fetched page, 400 to 1,000 times per second).</p>
+<figure class="diagram">
+<svg viewBox="0 0 940 300" role="img" aria-label="Dedup pipeline: normalize, Bloom filter, store check, fetch, content hash, simhash">
+  <rect class="ext" x="10" y="110" width="110" height="60" rx="8"/><text class="t-c t-b" x="65" y="136">Extracted</text><text class="t-c t-b" x="65" y="152">link</text>
+  <rect class="box" x="150" y="110" width="110" height="60" rx="8"/><text class="t-c t-b" x="205" y="136">Normalize</text><text class="t-c t-sm" x="205" y="154">then hash</text>
+  <rect class="cache" x="290" y="110" width="120" height="60" rx="8"/><text class="t-c t-b" x="350" y="136">Bloom filter</text><text class="t-c t-sm" x="350" y="154">in memory</text>
+  <rect class="miss" x="290" y="210" width="120" height="50" rx="8"/><text class="t-c t-b" x="350" y="232">Probably seen</text><text class="t-c t-sm" x="350" y="249">drop (about 1%)</text>
+  <rect class="hit" x="440" y="40" width="130" height="60" rx="8"/><text class="t-c t-b" x="505" y="66">Definitely new</text><text class="t-c t-sm" x="505" y="84">add to store</text>
+  <rect class="db" x="440" y="170" width="130" height="60" rx="8"/><text class="t-c t-b" x="505" y="196">URL store</text><text class="t-c t-sm" x="505" y="214">exact check</text>
+  <rect class="box" x="610" y="110" width="110" height="60" rx="8"/><text class="t-c t-b" x="665" y="136">Fetch</text><text class="t-c t-sm" x="665" y="154">frontier</text>
+  <rect class="box" x="750" y="40" width="180" height="60" rx="8"/><text class="t-c t-b" x="840" y="66">Exact content hash</text><text class="t-c t-sm" x="840" y="84">identical body?</text>
+  <rect class="box" x="750" y="170" width="180" height="60" rx="8"/><text class="t-c t-b" x="840" y="196">Simhash lookup</text><text class="t-c t-sm" x="840" y="214">near duplicate?</text>
+  <path class="arrow" d="M120 140 L146 140"/><path class="arrow" d="M260 140 L286 140"/>
+  <path class="arrow-g" d="M410 125 L436 80"/><path class="arrow-r" d="M350 170 L350 206"/>
+  <path class="arrow" d="M410 155 L436 190"/><text class="t-sm" x="405" y="125">?</text>
+  <path class="arrow" d="M570 70 L640 70 L660 106"/><path class="arrow" d="M720 140 L850 104"/><path class="arrow" d="M720 150 L750 190"/>
+</svg>
+<figcaption>URL dedup is a cheap in-memory test with an exact backup; content dedup runs after the body is fetched and uses an exact hash first, then a similarity fingerprint.</figcaption>
+</figure>
+<h3>11.1 URL dedup with a Bloom filter</h3>
+<p>A <b>Bloom filter</b> (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>) is a bit array of m bits and k hash functions. To add an item, set the k bits its hashes select; to query, check whether all k bits are set. If any is zero the item was <i>definitely never added</i>; if all are set it was <i>probably</i> added, since other items may have set those bits (a false positive). There are no false negatives and no deletions. The false positive rate is approximately (1 - e^(-kn/m))^k, and the best k is (m/n) x ln 2. With m/n = 10 bits per item and k = 7, the rate is about 0.8 percent, near 1 percent.</p>
+<p>For the crawler, a false positive means a genuinely new URL is wrongly considered seen and <b>skipped</b>. At a 1 percent rate that loses 1 percent of newly discovered URLs, which for a crawl is acceptable because those pages are usually reachable from other links (a page with 20 inbound links is missed only if all 20 hit false positives), and the miss is not permanent if the filter is rebuilt each cycle. It is a good trade because the filter answers in about a microsecond from RAM, absorbing 99 percent of the 16,000 to 40,000 lookups per second that would otherwise hit the URL store.</p>
+<p>Our arrangement: one filter per frontier partition (so it covers only that partition's hosts and needs no cross-machine lookups), sized for 120 million URLs per partition at 10 bits each = 150 MB. Because Bloom filters cannot delete, and URLs do get recrawled, we split the roles. The filter answers only "<b>is this URL known at all</b>" for <i>newly discovered</i> links. Recrawls come from the store by schedule, never through the filter. When the filter's fill grows beyond its design capacity, the false positive rate climbs fast, so we use a <b>scalable Bloom filter</b> (add a bigger layer) or rebuild it periodically from the URL store, which is the source of truth. For known-new cases where a skip would be costly, the filter's "probably seen" can be double-checked against the store for high-priority sources such as sitemaps.</p>
+<table>
+<tr><th>Seen-URL structure</th><th>Memory for 6B URLs</th><th>Lookup</th><th>Errors</th><th>Fit</th></tr>
+<tr><td>Exact set of 8-byte hashes in RAM</td><td>48 GB plus overhead (about 100 GB with a hash table)</td><td>Fast, but sharded across machines</td><td>None (64-bit hash collisions negligible, about 1 in 10^9 overall)</td><td>Possible but costly</td></tr>
+<tr><td>Bloom filter, 10 bits per URL</td><td>7.5 GB</td><td>1 microsecond, local</td><td>1 percent false positives, no false negatives</td><td><b>Chosen as first-level filter</b></td></tr>
+<tr><td>Exact check in URL store only</td><td>1.2 TB on disk and SSD</td><td>0.2 to 2 ms per random read</td><td>None</td><td>Backing truth, called for the 1 percent survivors and for priority sources</td></tr>
+<tr><td>Cuckoo filter</td><td>Similar to Bloom, a little smaller at low error rates</td><td>Fast</td><td>False positives, supports deletes</td><td>Good alternative if deletions are needed</td></tr>
+</table>
+<p>The flow for a discovered link: normalize and hash; route to the owning partition; test the Bloom filter; if it says "definitely new", add to the filter and insert a row in the store as <code>state=new</code> with a priority score; if "probably seen" drop it (optionally record an in-link count increment, which feeds the importance score, in a batched counter so we do not lose the valuable signal that many pages link here).</p>
+<h3>11.2 Content dedup</h3>
+<p>The web is full of duplicates: mirrors, the same article syndicated, the same product at five URLs, printer-friendly versions, HTTP and HTTPS versions, and "www" versus bare domain. Storing and indexing all copies wastes space, pollutes search results, and wastes crawl budget.</p>
+<p><b>Exact duplicates:</b> compute a strong hash (SHA-256 truncated to 128 bits, or a 64-bit hash for this purpose) of the cleaned body, ideally of the extracted main text, not the raw HTML, which carries ads, timestamps, and nonces that differ per request. Keep a table <code>contentHash -> canonicalUrl</code>. If the hash exists the new URL is marked a duplicate of the canonical one, its body is not stored again, and the indexer is told about the alias.</p>
+<p><b>Near duplicates:</b> pages that differ by a banner, a date, or a comment count have different exact hashes. <b>Simhash</b> (Charikar's locality-sensitive fingerprint, used at Google for crawling) produces a 64-bit fingerprint such that similar documents get fingerprints that differ in only a few bits. To compute: split the text into features (word shingles of 3 to 5 words), hash each to 64 bits, keep a vector of 64 counters; for every feature, add its weight to counter i if bit i is 1 and subtract it if 0; the fingerprint's bit i is 1 if counter i is positive. Two pages are near duplicates if their fingerprints differ in at most 3 bits (Hamming distance, tuned empirically; at 8 billion pages Google used 3 bits). </p>
+<p>Finding all fingerprints within 3 bits of a query among a billion is the hard part, since scanning all is too slow. The standard trick uses the pigeonhole principle: split the 64 bits into 4 blocks of 16 bits. If two fingerprints differ in at most 3 bits, then at least one of the four blocks is identical. So keep 4 tables (or sorted permutations), each indexed by one 16-bit block; to query, look up each of the 4 block values, collect candidates (a small bucket each), and check the full Hamming distance. Each table has 65,536 distinct keys, so with 1 billion fingerprints a bucket holds about 15,000, which is still large; production systems use more blocks with a permuted layout (for example 6 blocks of about 11 bits, matching any 3 of the 6 combos) for smaller buckets. For this design we use a sharded simhash index with block-based lookups, accept a few milliseconds per page, which is easy at 1,000 pages per second.</p>
+<table>
+<tr><th>Technique</th><th>Catches</th><th>Cost</th><th>Misses</th></tr>
+<tr><td>Exact hash of body</td><td>Byte-identical pages</td><td>Trivial</td><td>Any trivial difference (timestamp, ad)</td></tr>
+<tr><td>Exact hash of extracted main text</td><td>Same article, different chrome</td><td>Needs boilerplate removal</td><td>Edited copies</td></tr>
+<tr><td>Simhash, 64 bit, distance of 3 or less</td><td>Near duplicates, mirrored sites</td><td>Index with block lookups; 8 GB for 1B</td><td>Semantic duplicates with reworded text; short pages (too few features)</td></tr>
+<tr><td>MinHash with LSH bands</td><td>Jaccard similarity of shingle sets</td><td>Bigger signatures (100+ numbers per page)</td><td>Costlier to store; more tunable</td></tr>
+</table>
+<p>We choose exact text hash first (cheap, certain), then simhash for the remainder. Neither blocks fetching; they decide what we <i>store as new</i> and <i>send to the indexer</i>, and they feed back into the frontier: if a host's pages are 90 percent duplicates of another host, lower its priority.</p>
+<h3>11.3 Spider traps</h3>
+<p>A <b>spider trap</b> is a set of URLs that is infinite, or effectively so, and is sometimes deliberately malicious but usually accidental. Examples: a calendar with "next month" links forever (<code>/cal?month=2031-04</code>), session IDs appended to every link (every visit generates "new" URLs), relative-link loops (<code>/a/b/a/b/a/b/...</code> created by a misconfigured server that returns the same page for any path), faceted search with combinatorial filters (<code>?color=red&amp;size=m&amp;sort=price...</code> giving billions of combinations), and tarpits that generate pages on demand. A crawler without defenses will pour its budget into one site. Defenses, layered:</p>
+<ul>
+<li><b>Maximum URL length</b> (for example 2,048 characters) and a maximum number of path segments (for example 15); repeated segments (<code>/a/b/a/b</code>) are detected by pattern.</li>
+<li><b>Maximum depth</b> from a seed (for example 15 to 20 hops) and a lower depth ceiling for low-priority hosts.</li>
+<li><b>Per-host crawl budget:</b> a daily and total page cap scaled by the host's importance. A small blog gets at most a few thousand pages; a major news site gets millions. A trap thus costs at most its host's budget.</li>
+<li><b>Duplicate-content ratio per host:</b> if the last 1,000 fetches from a host produced 95 percent duplicate or near-duplicate content by simhash, or if the number of distinct URLs grows while distinct content does not, flag the host or the URL pattern and throttle it.</li>
+<li><b>URL pattern clustering:</b> convert URLs into templates (digits replaced by <code>N</code>, parameter values stripped) and count distinct URLs per template per host. A template producing 100,000 URLs with one-third of one percent distinct content is a trap; stop expanding it.</li>
+<li><b>Parameter stripping</b> learned per host: if toggling a parameter never changes the content hash, add it to the host's ignorable set and normalize it away.</li>
+<li><b>Human review queue:</b> hosts that trip alarms appear in a dashboard; an operator can add a block rule that applies to the host's partition.</li>
+</ul>
+<p>No single rule catches every trap, so the budget is the safety net: the worst case is bounded.</p>
+
+<h2 id="recrawl">12. Deep dive 3: recrawl scheduling by change frequency</h2>
+<p>Fetching a page once is not enough, since the web changes. But recrawling everything on a fixed cycle wastes crawl budget on pages that never change and starves pages that change hourly. With 1 billion fetches per month and a corpus of, say, 3 billion pages, the average page can only be fetched every 3 months if we spread evenly. The scheduler must decide which pages deserve more.</p>
+<figure class="diagram">
+<svg viewBox="0 0 940 300" role="img" aria-label="Adaptive recrawl interval: timeline of fetches with interval growing or shrinking">
+  <text class="t-b" x="20" y="22">Page A: changes rarely. Interval grows after every 304.</text>
+  <line x1="20" y1="60" x2="920" y2="60" stroke="var(--fg)"/>
+  <circle cx="40" cy="60" r="7" class="box"/><circle cx="110" cy="60" r="7" class="hit"/><circle cx="220" cy="60" r="7" class="hit"/><circle cx="400" cy="60" r="7" class="hit"/><circle cx="700" cy="60" r="7" class="hit"/>
+  <text class="t-sm" x="26" y="86">day 0</text><text class="t-sm" x="85" y="40">+1d</text><text class="t-sm" x="165" y="40">+2d</text><text class="t-sm" x="300" y="40">+4d</text><text class="t-sm" x="540" y="40">+8d</text><text class="t-sm" x="800" y="40">next +16d ...</text>
+  <text class="t-b" x="20" y="140">Page B: changed at the last fetch. Interval halves.</text>
+  <line x1="20" y1="180" x2="920" y2="180" stroke="var(--fg)"/>
+  <circle cx="40" cy="180" r="7" class="box"/><circle cx="300" cy="180" r="7" class="miss"/><circle cx="430" cy="180" r="7" class="miss"/><circle cx="495" cy="180" r="7" class="miss"/><circle cx="527" cy="180" r="7" class="miss"/>
+  <text class="t-sm" x="26" y="206">day 0</text><text class="t-sm" x="150" y="160">+8d</text><text class="t-sm" x="350" y="160">+4d</text><text class="t-sm" x="445" y="160">+2d</text><text class="t-sm" x="480" y="230">+1d</text><text class="t-sm" x="560" y="186">floor: min interval (for example 15 minutes for news)</text>
+  <rect class="hit" x="20" y="260" width="16" height="16" rx="3"/><text class="t-sm" x="42" y="273">not modified (304 or same hash)</text>
+  <rect class="miss" x="300" y="260" width="16" height="16" rx="3"/><text class="t-sm" x="322" y="273">changed (new content hash)</text>
+</svg>
+<figcaption>Additive-style adaptation: shrink the revisit interval when a fetch finds a change, stretch it when nothing changed, within a floor and ceiling per page class.</figcaption>
+</figure>
+<h3>12.1 Estimating change rate</h3>
+<p>Treat page changes as a Poisson process with rate lambda (changes per day). Each visit observes only whether it changed since the last visit, not how many times. If the page was fetched at intervals of I days and changed in c out of n visits, a reasonable estimator is lambda about -ln(1 - c/n) / I (the maximum likelihood estimator for a detect-only process, biased low when c equals n, so cap it). Simple production heuristics approximate it with multiplicative interval adaptation: changed means interval x 0.5; unchanged means interval x 1.5 (or x2), clamped between a floor and a ceiling. The ceiling (for example 90 days) guarantees even stable pages are rechecked.</p>
+<h3>12.2 Choosing what to fetch given the budget</h3>
+<p>More frequent fetching of a page has diminishing returns. If a page changes with rate lambda and we recrawl every I days, the expected fraction of time our copy is stale is about 1 - (1 - e^(-lambda I)) / (lambda I). A well known result is that, with a fixed budget, the best policy does not simply revisit the fastest changing pages the most: pages that change faster than we can follow are not worth chasing because the copy is stale almost regardless, so the optimum visits moderately changing pages most. Practical systems therefore combine: expected benefit = importance x probability the page changed since last fetch, and sort the due queue by benefit per unit cost. Importance comes from link-based scores and query-log click data; probability of change is 1 - e^(-lambda x age).</p>
+<table>
+<tr><th>Policy</th><th>Idea</th><th>Strength</th><th>Weakness</th></tr>
+<tr><td>Uniform interval</td><td>Every page every N days</td><td>Simple, even load</td><td>Wastes budget; news stale, static over-crawled</td></tr>
+<tr><td>Adaptive multiplicative interval</td><td>Halve on change, grow on no change</td><td>Cheap, per-page state is one number, self-tuning</td><td>Slow to learn for new pages; oscillates for bursty pages</td></tr>
+<tr><td>Poisson rate estimate + importance weighting</td><td>Maximize freshness value per fetch</td><td>Near optimal for a fixed budget</td><td>Needs statistics and tuning; harder to explain</td></tr>
+<tr><td>Signal-driven (sitemap lastmod, WebSub, RSS pings, IndexNow style push)</td><td>Hosts tell us when pages change</td><td>Cheapest and freshest when honest</td><td>Not all hosts publish; lastmod values are sometimes wrong, so verify with conditional GET</td></tr>
+</table>
+<p>We choose a hybrid: adaptive interval as the default for all pages; a Poisson style estimate plus importance only for the top few percent of pages; a fast lane for pages announced through sitemaps, feeds, or push pings; and conditional GET always. <b>Conditional GET</b> sends <code>If-None-Match</code> with the stored ETag and/or <code>If-Modified-Since</code>; the server answers 304 with no body. This costs a round trip but saves bandwidth and parser work, and when our unchanged fraction is high, a large share of fetches become cheap. For servers that do not support validators, we still skip downstream work when the content hash is unchanged.</p>
+<p>Implementation: each URL row has <code>nextFetchAt</code>. A per-partition scanner moves rows whose <code>nextFetchAt</code> has passed into the frontier's front queues, scored by benefit. Because the table is ordered by <code>(hostHash, ...)</code> and also has a secondary index by due-time bucket (hour granularity), the scan is a small range read, not a full table sweep. To avoid thundering herds after downtime, we spread due times with random jitter of about 10 percent of the interval. Scheduling logic generally mirrors <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>.</p>
+<p>Crawl budget per tier, as an example split of 1B monthly fetches: 5 percent (50M) for the news and fast-changing tier recrawled hourly to daily; 25 percent (250M) for popular pages revisited weekly; 50 percent (500M) for the long tail revisited every 1 to 3 months; 20 percent (200M) for discovery of new URLs. Discovery has a deliberate share so the crawl keeps growing.</p>
+
+<h2 id="partition">13. Distributed partitioning by host hash</h2>
+<p>All the per-host state (back queue, robots rules, next allowed time, error streak, budget, DNS entry, the host's slice of the URL table and the Bloom filter) benefits from living on one machine. So we partition the entire crawl by <code>hash(host)</code>, not by URL hash. If URLs of one host were scattered, each machine would need to coordinate with all others to respect the per-host rate, which means distributed locks or constant communication; with host partitioning the rate limit is a purely local variable.</p>
+<figure class="diagram">
+<svg viewBox="0 0 940 340" role="img" aria-label="Partitioning by host hash with consistent hashing ring and routing of discovered links">
+  <rect class="box" x="20" y="30" width="150" height="56" rx="8"/><text class="t-c t-b" x="95" y="54">Parser output</text><text class="t-c t-sm" x="95" y="72">link: a.com/x</text>
+  <rect class="cache" x="230" y="30" width="170" height="56" rx="8"/><text class="t-c t-b" x="315" y="54">Router</text><text class="t-c t-sm" x="315" y="72">p = hash(host) mod ring</text>
+  <path class="arrow" d="M170 58 L226 58"/>
+  <rect class="cache" x="470" y="20" width="200" height="130" rx="10"/><text class="t-c t-b" x="570" y="42">Partition 17</text><text class="t-sm" x="486" y="64">hosts: a.com, k.org ...</text><text class="t-sm" x="486" y="82">frontier + host heap</text><text class="t-sm" x="486" y="100">Bloom filter slice</text><text class="t-sm" x="486" y="118">URL rows (host range)</text><text class="t-sm" x="486" y="136">robots + budgets</text>
+  <rect class="cache" x="470" y="180" width="200" height="60" rx="10"/><text class="t-c t-b" x="570" y="206">Partition 18</text><text class="t-c t-sm" x="570" y="226">other hosts</text>
+  <rect class="cache" x="470" y="260" width="200" height="60" rx="10"/><text class="t-c t-b" x="570" y="286">Partition 19</text><text class="t-c t-sm" x="570" y="306">other hosts</text>
+  <path class="arrow" d="M400 58 L466 70"/><path class="arrow dash" d="M400 70 L466 200"/><path class="arrow dash" d="M400 76 L466 285"/>
+  <rect class="box" x="740" y="40" width="180" height="50" rx="8"/><text class="t-c t-b" x="830" y="62">Fetchers (stateless)</text><text class="t-c t-sm" x="830" y="80">assigned partitions</text>
+  <rect class="box" x="740" y="190" width="180" height="50" rx="8"/><text class="t-c t-b" x="830" y="212">Fetchers (stateless)</text><text class="t-c t-sm" x="830" y="230">assigned partitions</text>
+  <path class="arrow" d="M670 70 L736 66"/><path class="arrow" d="M670 210 L736 214"/>
+</svg>
+<figcaption>A link is routed to the partition that owns its host, so the owner alone decides dedup and politeness. Fetchers are stateless workers that lease from the partitions assigned to them.</figcaption>
+</figure>
+<ul>
+<li><b>How many partitions:</b> choose more partitions than machines, for example 256 partitions on 16 machines, so rebalancing moves whole partitions. Use consistent hashing or a partition-to-node map in a coordination service (<a href="../chapters/25-sharding.html">Chapter 25</a>, <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>, <a href="../chapters/30-coordination-locks.html">Chapter 30</a>).</li>
+<li><b>Hot hosts:</b> a few giant hosts (a social site with 10^9 pages) concentrate on one partition. Because politeness caps their rate at roughly 1 to 10 requests per second, the load is small; the issue is storage and the count of URLs, handled by sub-partitioning big hosts by <code>(host, hash(path prefix) mod s)</code> with each sub-partition still obeying a share of the host rate through a small shared token counter, or simply by treating the host's rate as the sum of fixed per-sub-partition allowances (for example 4 sub-partitions at 1 request per 4 seconds each).</li>
+<li><b>Stateless fetchers:</b> fetchers hold no durable state, so any fetcher can serve any partition; a coordinator assigns partitions to fetchers (or each fetcher leases from all partitions round-robin). A fetcher that dies loses only its leases.</li>
+<li><b>Cross-partition traffic:</b> every parsed link goes through the router, so partition traffic is about 16,000 messages per second, small. Messages are batched per destination (for example 1,000 links per batch) and sent on a Kafka topic keyed by partition, which also gives ordering and replay.</li>
+<li><b>Geography:</b> later we can place fetcher clusters near hosts (a European cluster for .eu hosts) to cut latency and to meet data-locality rules; the partition owner stays the same, the fetcher location is a policy field on the host.</li>
+</ul>
+
+<h2 id="storage">14. Storage of raw pages and the indexing handoff</h2>
+<p>The raw page store is object storage (<a href="../chapters/21-object-storage.html">Chapter 21</a>). Keys are <code>hostHash/urlHash/fetchTime</code>. Small objects are expensive in object stores (a request charge per PUT and per GET, plus per-object metadata), and 100 KB is small relative to the ideal. So the fetcher batches pages into larger <b>WARC</b>-style container files (WARC is the Web ARChive format used by the Internet Archive and Common Crawl) of 64 to 256 MB, each holding thousands of pages, each page compressed and with its HTTP headers and fetch metadata. The URL row stores <code>(containerKey, offset, length)</code>, which lets a reader fetch one page by an HTTP range request. This cuts the object count from 1 billion per month to about 780,000 (100 TB / 128 MB), roughly a thousand times fewer.</p>
+<p>Lifecycle: the latest version stays in the standard tier; older versions move to an infrequent-access tier after 30 days and expire after the 3 version limit or 1 year. A deleted or 410 page is tombstoned. Bodies from duplicate content are not stored; the row references the canonical one.</p>
+<h3>14.1 Indexing handoff</h3>
+<p>The crawler's contract with the indexer is an event log, not a database dump. When a page is stored and not a duplicate (or changed meaningfully), the system publishes <code>PageStored{url, canonicalUrl, containerKey, offset, length, contentHash, simhash, fetchedAt, httpStatus, language, inlinkCount}</code> to a topic partitioned by URL hash. The indexer (<a href="../chapters/22-search-engines.html">Chapter 22</a>) consumes at its own speed. Design points:</p>
+<ul>
+<li><b>At-least-once delivery with idempotent consumption:</b> events may repeat after a retry; the indexer keys documents by <code>urlHash</code> and ignores events whose <code>fetchedAt</code> is not newer than what it holds (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>).</li>
+<li><b>Backpressure:</b> if the indexer falls behind, the log absorbs events (retention of several days). If lag crosses a threshold, the frontier lowers the share of recrawl work so storage and consumers are not flooded; discovery of important new content still continues.</li>
+<li><b>Deletes and noindex:</b> the crawler emits tombstone events for 404/410 and for pages with noindex directives, so the index removes them.</li>
+<li><b>Replays:</b> since bodies persist, the indexer can be rebuilt with a new analyzer by re-reading containers without refetching the web. This is the main advantage of keeping raw pages.</li>
+</ul>
+
+<h2 id="js">15. JavaScript-rendered pages</h2>
+<p>Many sites ship a nearly empty HTML shell and build the content in the browser with JavaScript (single-page applications). A plain HTTP fetch sees only the shell, without text and without most links. To see what a user sees, the crawler must execute the page in a <b>headless browser</b> (a real browser engine such as Chromium without a visible window), which loads scripts, runs them, waits for the page to settle, and then reads the resulting DOM (the live page structure).</p>
+<p>Rendering is 50 to 100 times costlier than fetching: tens of requests per page (scripts, styles, API calls), seconds of CPU, hundreds of MB of RAM. So we do not render everything. We use a <b>two-wave strategy</b>:</p>
+<ol>
+<li><b>Wave 1:</b> plain fetch and parse, as usual. Everything gets a cheap pass.</li>
+<li><b>Render decision:</b> after parsing, a classifier flags the page as "needs rendering" if the visible text is tiny while the script payload is big, if the body is a known framework shell (a single root element and bundle script tags), or if the host is on a render-required list learned from earlier results. Only these go to the render queue, a separate lower-rate frontier lane (the 10 to 15 percent in our estimate, 40 to 100 renders per second).</li>
+<li><b>Wave 2:</b> the renderer pool loads the URL in a sandboxed browser, blocks heavy irrelevant resources (images, fonts, media, analytics, ads), sets a hard timeout of 10 to 15 seconds, waits for network idle, extracts the final DOM, text, and links, and publishes the same event type, flagged <code>rendered=true</code>. New links go through the same normalizer and dedup.</li>
+</ol>
+<p>Important details. Subresource requests made by the browser (scripts, API calls) count against the host's politeness budget and robots rules just like pages, so the renderer routes all its traffic through the same per-host limiter rather than reaching the internet directly. Each tab runs in a locked-down container (no access to our network, memory and CPU limits, destroyed after use), because we are executing untrusted code from the entire web. Infinite scroll and timers are bounded: scroll a fixed number of times, or not at all. Rendered results are cached by content hash of the shell plus script versions to avoid rendering unchanged pages again. An alternative that avoids rendering is to look for server-side rendered or "dynamic rendering" variants, a sitemap, or direct JSON API calls the page makes; cheaper but fragile. We pick the renderer for generality and limit its blast radius with budgets.</p>
+<table>
+<tr><th>Approach</th><th>Cost per page</th><th>Fidelity</th><th>Use</th></tr>
+<tr><td>Plain HTTP fetch + HTML parse</td><td>about 1 unit</td><td>Misses JS-built content</td><td>Default, 85 to 90 percent of pages</td></tr>
+<tr><td>Headless browser render</td><td>50 to 100 units</td><td>Sees the real page, including lazy content</td><td>Flagged pages only</td></tr>
+<tr><td>Intercept JSON APIs the page calls</td><td>about 2 to 5 units</td><td>Structured but site specific</td><td>High-value hosts with custom adapters</td></tr>
+</table>
+
+<h2 id="scaling">16. Scaling, bottlenecks, and hot spots</h2>
+<ul>
+<li><b>Fetch rate is not the bottleneck.</b> 1,000 per second is a few machines. The bottlenecks are the URL store write rate (every fetch updates a row; every new URL inserts one: roughly 400 updates plus up to 16,000 insert candidates per second, reduced to a few thousand by the Bloom filter), per-host politeness limits, and the parser CPU.</li>
+<li><b>URL store write amplification:</b> batch updates per partition (group by host range into 100 to 500 row batches), and use an LSM-based store whose sequential writes handle this well (<a href="../chapters/19-storage-engines.html">Chapter 19</a>). Keep hot working state (next allowed time) in memory and flush to the store lazily; lease records need durability but only for minutes.</li>
+<li><b>Parser CPU:</b> scale the parser consumer group horizontally; 1,000 pages per second at 20 ms CPU each needs about 20 cores, trivial. HTML parse plus simhash plus text extraction is perhaps 30 to 50 ms in practice, so about 50 cores at peak.</li>
+<li><b>Network egress:</b> 800 Mbit/s at peak; ensure the crawler has multiple outbound IP addresses on separate subnets so sites do not see all traffic from one address and so IP-based blocks do not cripple everything. Publish the IP ranges and reverse DNS so sites can verify us.</li>
+<li><b>Caching:</b> robots rules (per host, daily), DNS, negative results, the host heap, and the Bloom filter are all caches in front of slower truth. Cache the parsed robots file as a compiled structure.</li>
+<li><b>Hot hosts</b> discussed in section 13: bounded by politeness; sub-partition large ones.</li>
+<li><b>Rebalancing:</b> moving a partition means moving its Bloom filter snapshot, its URL rows, and its frontier state; since the URL store is the truth and the rest is rebuilt from it, a move is "stop, copy rows, rebuild caches", taking minutes.</li>
+</ul>
+
+<h2 id="failures">17. Failure modes, consistency, and idempotency</h2>
+<table>
+<tr><th>Component</th><th>Failure</th><th>Effect</th><th>Mitigation</th></tr>
+<tr><td>Fetcher crash</td><td>Machine dies mid-fetch</td><td>Leased URLs in flight</td><td>Lease expires in a few minutes; URL becomes due; fetches are idempotent (safe GETs), duplicates are caught by content hash.</td></tr>
+<tr><td>Fetcher slow</td><td>Hang on slow hosts</td><td>Connection slots tied up</td><td>Hard timeouts, minimum transfer rate, per-host in-flight limit, separate pools for known slow hosts.</td></tr>
+<tr><td>Frontier partition node dies</td><td>Partition unavailable</td><td>Its hosts are not crawled</td><td>Partition state is rebuildable from the replicated URL store; a standby loads the partition in minutes. Other partitions continue. Replicate the store (<a href="../chapters/24-replication.html">Chapter 24</a>).</td></tr>
+<tr><td>Frontier state lost (RAM)</td><td>Host heap and queues gone</td><td>Temporary stall</td><td>Rebuild from the store by range scan of due rows; jitter spreads the restart; a polite delay applies since nextAllowedAt may be lost, so start with a conservative delay per host.</td></tr>
+<tr><td>Bloom filter lost or corrupted</td><td>Seen set gone</td><td>Re-enqueue of known URLs, wasted fetches</td><td>Rebuild from the URL store (6B rows scan at tens of MB/s per partition parallel, under an hour); meanwhile fall back to an exact store check on every new link (slower but correct).</td></tr>
+<tr><td>URL store slow or unavailable</td><td>Writes back up</td><td>Fetchers keep going but results cannot be recorded</td><td>Buffer events on the log (the log is the write-ahead record); pause leasing when lag exceeds a threshold; resume and replay in order.</td></tr>
+<tr><td>Object storage unavailable</td><td>PUT fails</td><td>Bodies unsaved</td><td>Retry with backoff, spill to local disk briefly, do not ack the lease until stored, so URL is fetched again later.</td></tr>
+<tr><td>Parser bug or crash loop</td><td>Bad extraction</td><td>Missing or wrong links</td><td>Raw pages and fetch events are retained; fix and replay. A poison page is moved to a dead-letter queue after N tries (<a href="../chapters/35-messaging-patterns.html">Chapter 35</a>).</td></tr>
+<tr><td>Wrong data</td><td>Soft 404 (200 with "not found" text), cloaking, truncated body</td><td>Junk indexed</td><td>Soft 404 classifier on templates, length sanity checks, compare with prior version, quarantine drastic changes from high-value pages.</td></tr>
+<tr><td>Remote site misbehaves</td><td>Tarpit, bomb, malicious redirect</td><td>Resource drain</td><td>Limits in section 9, SSRF checks, sandboxed parsing, per-host error streaks that push the host out of rotation.</td></tr>
+<tr><td>DNS provider outage</td><td>Resolution fails</td><td>All fetches fail</td><td>Multiple resolvers, stale-if-error cached answers for a while, breaker pauses the fleet instead of burning retries (<a href="../chapters/40-resilience.html">Chapter 40</a>).</td></tr>
+</table>
+<h3>17.1 Consistency and idempotency</h3>
+<p>The crawler does not need strong consistency: the URL store can be eventually consistent between replicas, because the cost of a rare duplicate fetch is tiny. What matters is that the <b>lease protocol is safe</b>: each state change is a conditional write (compare-and-set on <code>leaseId</code>), so two fetchers never both complete the same lease and a late ack from a stale fetcher is rejected. Fetching and storing are idempotent: the blob key includes the fetch time and content hash, and the indexer ignores older versions. Link events can be delivered twice; inserting a URL that exists is a no-op. We therefore run the whole pipeline at-least-once with idempotent consumers, the cheaper and more robust choice than exactly-once. The one place needing care is the politeness limit: after a frontier restart the lost <code>nextAllowedAt</code> must be replaced by a conservative guess, otherwise a failover could momentarily burst on a host.</p>
+<h3>17.2 Multi region</h3>
+<p>Later, fetchers can run in several regions, each closer to some hosts, all leasing from the partition owners through an API (or the owner placed in each region for its hosts). The URL store replicates asynchronously to a second region for disaster recovery (<a href="../chapters/41-ha-dr.html">Chapter 41</a>, <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>); on failover we lose seconds of updates, meaning a few URLs get refetched. Crawl output is stored per region and replicated to the indexer's region with an object-store replication rule, so cross-region transfer is done once in bulk, compressed, rather than per page.</p>
+
+<h2 id="legal">18. Security, abuse, ethics, and legal</h2>
+<p>A crawler is a guest on other people's servers, and it also executes untrusted content. Both sides need attention.</p>
+<h3>18.1 Being a good citizen</h3>
+<ul>
+<li>Obey robots.txt and meta robots/X-Robots-Tag directives. Use a descriptive user agent such as <code>ExampleBot/1.0 (+https://example.com/bot)</code> and a working contact address; publish a page explaining what the bot does and how to opt out or request a lower rate.</li>
+<li>Keep load low and adaptive: 1 connection per host, delays based on response time, instant back off on 429/503. A crawler that takes down a small site generates complaints and legal letters.</li>
+<li>Provide a way to verify the crawler (published IP ranges and reverse DNS), since impostors use famous bot names to scrape.</li>
+<li>Support opt-out requests promptly, including the removal of cached copies.</li>
+<li>Respect <code>noindex</code>, <code>nosnippet</code>, and <code>noarchive</code> signals downstream.</li>
+</ul>
+<h3>18.2 Legal and policy considerations</h3>
+<p>These are design inputs to flag to an interviewer, not legal advice. Robots.txt is a convention, not law, but ignoring it weakens any legal position. Copyright: storing and indexing copies of pages is treated differently by jurisdiction; search indexing has often been held acceptable while republishing full content is not, so the stored raw copies are internal and the serving layer shows only snippets. Terms of service may forbid scraping and, in some cases, courts have addressed access to publicly available data differently from access to data behind a login; we never crawl behind authentication. Personal data: pages can contain personal information, so privacy law such as GDPR affects retention, deletion requests, and processing (<a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>); keep deletion tooling, and avoid storing anything from pages that signal not to. Respect the regional requirements on where data may be stored. Do not fetch known illegal-content sources; block lists and hash-matching against known abusive material are part of the content pipeline in a real product. AI training use of crawled data is an area of changing norms: sites increasingly use specific user-agent tokens in robots.txt to opt out, so the crawler should use separate user-agent names for separate purposes (search versus model training) so owners can choose.</p>
+<h3>18.3 Protecting ourselves</h3>
+<ul>
+<li>SSRF defense and egress allow lists, described in section 9.</li>
+<li>Sandboxed renderers and parsers (separate processes with seccomp style syscall limits, no credentials on the machine, ephemeral containers) because a browser exploit is a real threat (<a href="../chapters/55-security.html">Chapter 55</a>).</li>
+<li>Malware and phishing pages: never execute downloaded binaries; hash and scan content types we store; flag hosts known for malware so the indexer can demote.</li>
+<li>Poisoning: a malicious site can stuff the crawl with spam pages and link farms, bounded by budgets and quality scoring.</li>
+<li>Control API authentication and audit: only authorized operators may override robots-related policy or raise rate limits; such overrides are logged and need approval.</li>
+</ul>
+
+<h2 id="ops">19. Monitoring, SLOs, and cost</h2>
+<p>For general practice see <a href="../chapters/54-observability-slos.html">Chapter 54</a>. The metrics specific to a crawler:</p>
+<table>
+<tr><th>Metric</th><th>Why it matters</th><th>Example SLO or alert</th></tr>
+<tr><td>Fetch throughput and success ratio (2xx plus 304 over attempts)</td><td>Basic health</td><td>Success above 85 percent over 1 hour; alert on a 20 percent drop</td></tr>
+<tr><td>Frontier freshness: age of oldest due URL per priority class</td><td>Are we keeping up?</td><td>P1 class lag under 15 minutes; P3 lag under 3 days</td></tr>
+<tr><td>Politeness violations: requests to a host under its delay</td><td>Reputation and legal exposure</td><td>Zero tolerance; page on any burst above 2x host limit</td></tr>
+<tr><td>Per-host error streak count and 429 rate</td><td>Are we hurting sites?</td><td>Trigger automatic slowdown above 5 percent 429</td></tr>
+<tr><td>Duplicate content ratio, new URLs per fetch, trap suspects</td><td>Budget wasted</td><td>Alert when a host exceeds 80 percent duplicates</td></tr>
+<tr><td>Bloom filter fill ratio and measured false positive rate</td><td>Filter capacity</td><td>Rebuild before fill exceeds the design capacity</td></tr>
+<tr><td>DNS cache hit rate and lookup latency</td><td>Hidden bottleneck</td><td>Hit rate above 95 percent</td></tr>
+<tr><td>Indexer lag (events not yet consumed)</td><td>Handoff health</td><td>Under 1 hour</td></tr>
+<tr><td>Freshness SLO on the corpus: share of top-10M pages fetched within their target interval</td><td>Product outcome</td><td>Above 95 percent</td></tr>
+</table>
+<h3>19.1 Cost</h3>
+<ul>
+<li><b>Fetcher machines:</b> 16 instances. <b>Parsers:</b> about 10. <b>Renderers:</b> about 15 larger machines (the single largest compute line per page).</li>
+<li><b>Storage:</b> 100 TB new per month, at about 23 dollars per TB-month in a standard object tier means about 2,300 dollars for each month's batch, falling to a fraction in the cold tier. Request costs are low thanks to container batching: 780,000 PUTs a month is nothing, whereas 1 billion small PUTs at 5 dollars per million would cost 5,000 dollars a month on its own.</li>
+<li><b>Network:</b> inbound traffic is typically free; outbound is small. Crawling from a cloud region is cheap, but a few large providers throttle or block cloud IP ranges, so some crawlers rent dedicated ranges.</li>
+<li><b>URL store:</b> 1.2 TB, replicated 3x, on SSD: a small cluster of 6 to 12 nodes.</li>
+<li>The cost lever with the highest payoff is conditional GET and adaptive intervals: cutting wasted recrawls by 30 percent saves 30 percent of everything downstream.</li>
+</ul>
+<p>All dollar figures above are rough, illustrative list-price orders of magnitude and vary by provider and negotiation.</p>
+
+<h2 id="evolution">20. Evolution, phasing, and alternatives</h2>
+<h3>20.1 What to build first</h3>
+<ol>
+<li><b>Phase 1 (weeks 1 to 4):</b> a single partition: URL store, a simple two-level frontier with per-host delay, a fetcher with timeouts and robots.txt, normalization, an exact seen-set, local object storage, a log for fetch events. Target 20 pages per second. Learn the real shape of the data.</li>
+<li><b>Phase 2:</b> partition by host hash, add the Bloom filter, DNS cache, content hash dedup, conditional GET, adaptive recrawl, trap defenses and host budgets, and the indexer feed. Target 400 per second.</li>
+<li><b>Phase 3:</b> simhash near-dup, render pool, sitemap and feed integration, priority scoring from link analysis, multi-IP and multi-region fetchers.</li>
+</ol>
+<h3>20.2 At 10x scale (10 billion pages a month, 4,000 per second average)</h3>
+<ul>
+<li>Fetchers go from 16 to about 150 machines; network to roughly 3.2 Gbit/s average.</li>
+<li>The URL store grows to 12 TB and needs about 100 partitions with automatic splitting; the Bloom filter total is 75 GB, so more partitions of the same size.</li>
+<li>Link candidates rise to 160,000 per second, so the router and log need partition-aware batching and the Bloom filter must be strictly local.</li>
+<li>Politeness arithmetic changes meaning: at 4,000 per second and 1 per second per host, you need 4,000 hosts active at once; the long tail is plenty, but giant sites become the binding constraint on freshness, which pushes you toward push signals (sitemaps, IndexNow style pings, feeds) and cooperative agreements.</li>
+<li>Storage reaches 1 PB of new data per month, so aggressive dedup, stronger compression (zstd with a shared dictionary can beat gzip noticeably on HTML), and a retention policy keeping only changed versions become necessary.</li>
+</ul>
+<h3>20.3 Alternatives not chosen</h3>
+<table>
+<tr><th>Alternative</th><th>Why not</th></tr>
+<tr><td>Partition URLs by URL hash, not host hash</td><td>Spreads load evenly but forces cross-node coordination for politeness and robots, and breaks host-local range scans.</td></tr>
+<tr><td>One global message queue as the frontier</td><td>No per-host rate control or priority mix; hot-host starvation.</td></tr>
+<tr><td>Exact seen-set only</td><td>Works at this scale in RAM across nodes, but costs 10x the memory of a Bloom filter; keep as a fallback. At 10x scale the Bloom filter wins more clearly.</td></tr>
+<tr><td>Render every page</td><td>50 to 100 times the compute for pages that do not need it.</td></tr>
+<tr><td>BFS-only crawl order</td><td>Ignores importance and freshness; fine for a one-off archive, wrong for a search index.</td></tr>
+<tr><td>Fully peer-to-peer decentralized crawler</td><td>Appealing for failure isolation, but coordination of politeness, dedup, and quality is much harder; a partitioned design with a central control plane is simpler to operate.</td></tr>
+</table>
+
+<h2 id="qa">21. Interview Q&amp;A</h2>
+<details><summary>How do you make sure the crawler never hits one site too hard, even though many fetchers run in parallel?</summary>
+<p>We partition the whole frontier by host hash, so exactly one frontier partition owns each host, and that partition alone hands out URLs for that host. It stores a <code>nextAllowedAt</code> time per host in a heap, and a URL for a host is leased only when the time has passed, after which the host is reinserted with the delay added. Because the rate decision is one local variable rather than a distributed lock, parallel fetchers cannot violate it; they only receive work the owner has approved. The delay itself is the larger of the robots crawl delay and a multiple of the previous fetch time, with strong backoff on 429 or 503.</p></details>
+<details><summary>Why use a Bloom filter for seen URLs, and what are the downsides?</summary>
+<p>Each page yields about 40 links, so we must answer "have I seen this?" some 16,000 to 40,000 times per second, and a Bloom filter does so from memory in about a microsecond with roughly 10 bits per URL, so 6 billion URLs fit in 7.5 GB. The downside is the false positive: about 1 percent of new URLs are wrongly seen as known and skipped, and a Bloom filter cannot delete entries or tell you when a URL was last fetched. We accept the loss because pages usually have several inbound links and the filter is rebuilt from the URL store, and we use the store (not the filter) to drive recrawls. Fill must be monitored, because exceeding the designed capacity raises the false positive rate quickly.</p></details>
+<details><summary>How do you detect near-duplicate pages at billion scale?</summary>
+<p>We compute a 64-bit simhash of the main text, a fingerprint where similar texts differ in only a few bits, and call pages near duplicates if their Hamming distance is at most 3. Scanning a billion fingerprints per query is impossible, so we use the pigeonhole principle: split the fingerprint into blocks, and any two fingerprints within 3 bits differ in at most three blocks, so they must share at least one exactly equal block when we use four or more blocks. We keep tables indexed by blocks, look up candidates by each block, and verify the full distance. An exact hash of the extracted text is checked first because it is cheaper and certain.</p></details>
+<details><summary>What is a spider trap and how do you protect the crawl budget from one?</summary>
+<p>A spider trap is an effectively infinite URL space, such as endless calendar pages, session IDs in links, repeated path segments, or faceted filters with combinatorial parameters. We layer defenses: maximum URL length and depth, normalization that strips session and tracking parameters, URL template clustering to spot patterns that yield huge numbers of URLs with little unique content, a duplicate ratio per host, and above all a per-host crawl budget so that the worst case is bounded and the trap hurts only its own host. Suspect hosts go to an operator dashboard for rule changes.</p></details>
+<details><summary>How do you decide how often to recrawl each page?</summary>
+<p>We keep per-URL state with the last fetch time, the content hash, validators, and an interval. Each fetch compares the new content hash or receives a 304; a change halves the interval, no change multiplies it by about 1.5, clamped between a floor and a ceiling. For the most important pages we estimate a Poisson change rate and order the due queue by importance times the probability of change since the last fetch. Sitemap lastmod, feeds, and push pings jump the queue but are verified with a conditional GET. Fixed-interval recrawling wastes budget on static pages and leaves news stale, so adaptation is worth the extra state.</p></details>
+<details><summary>What happens if a fetcher crashes halfway through downloading a page?</summary>
+<p>Nothing permanent happens. The frontier gave the URL out under a lease with an expiry of a few minutes; the fetcher never acknowledged, so the lease lapses and the URL becomes due again. Since a GET is idempotent and the blob key and indexer events are keyed by URL and content hash, a repeat fetch produces at most a duplicate that is caught by the hash check. The only risk is the per-host politeness, which we keep by recording the host's next allowed time at lease time rather than at completion.</p></details>
+<details><summary>Why partition by host rather than by URL?</summary>
+<p>Politeness, robots rules, DNS, error streaks, budgets, and trap detection are all per-host concepts. If one host's URLs spread over many machines, every one of them would need to coordinate on a shared counter to respect a 1 request per second limit, which means distributed locking at 1,000 operations per second. Host partitioning puts all of that state on one node, makes range scans by host cheap, and keeps the dedup filters local. The cost is skew from giant hosts, which we handle with sub-partitions that each own a share of the host's rate.</p></details>
+<details><summary>How do you handle sites that render with JavaScript without making the crawler ten times more expensive?</summary>
+<p>Render selectively. Every page gets the cheap plain fetch and parse; a classifier flags pages with little visible text and a big script payload, or hosts that have been seen to need rendering, and only those go to a separate rendering lane with its own budget. The renderer blocks images, fonts, and trackers, uses short timeouts, runs in a locked-down sandbox, and sends all its network requests through the same per-host politeness limiter. Results are cached against the shell and script versions, so unchanged pages are not rendered again. For high-value hosts we may call their underlying JSON APIs directly.</p></details>
+<details><summary>How do you treat robots.txt failures: missing, error, or timeouts?</summary>
+<p>Following RFC 9309, a 4xx answer such as 404 means the site has no rules and we may crawl; a 5xx answer or an unreachable server means we must assume everything is disallowed for the moment and retry later, since an outage must not become a licence to crawl everything. We cache a good copy for up to a day, refresh it politely through the host's own queue, re-check rules at lease time for each URL, and limit the parsed size. If robots is unavailable for a long period (the RFC mentions about 30 days) we may treat the site as unrestricted.</p></details>
+<details><summary>How would the design change if you needed to crawl one very large site, such as a marketplace with 500 million pages, within a week?</summary>
+<p>The politeness limit would be the binding constraint: 500 million pages in 7 days is about 827 requests per second to one host, which no site should receive by default. We would negotiate an agreement or use the site's provided feeds, sitemaps, or an API, then raise the host's limit explicitly with its sub-partitions, each with a small share and connection pool, and watch response times and error rates for backoff. Without cooperation we cannot finish in a week politely, and we say so; the budget and priority policy decides which pages come first (new and popular items) and the rest arrive over months.</p></details>
+<details><summary>How do you test and roll out changes safely, given the crawler touches the whole internet?</summary>
+<p>Changes to politeness, normalization, and robots handling are the dangerous ones, because mistakes harm third parties or silently merge distinct pages. We run new versions in shadow mode on a replay of recorded fetch events, compare normalization output with the old version, and roll out per partition with a canary partition first. Rate limit logic has a hard safety layer in the fetcher (a global per-host cap that no frontier bug can exceed), and we have a kill switch that pauses a host or the entire fleet in seconds.</p></details>
+
+<h2 id="recap-sec">22. Recap</h2>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li><b>Numbers:</b> 1B pages/month is about 400 per second average and 1,000 at peak, 1,000 connections, 800 Mbit/s, 100 TB of new compressed pages per month, 1.2 TB of URL metadata, and 16,000 to 40,000 URL checks per second. The bookkeeping, not the fetching, is hard.</li>
+<li><b>Frontier:</b> front queues for priority with a biased selector, back queues per host with a heap keyed by next allowed time; leases with expiry for crash safety; rate from robots crawl delay or 10x last fetch time, with strong backoff on 429 and 503.</li>
+<li><b>Fetching:</b> async fetcher with strict timeouts and size limits, DNS caching at several layers, SSRF protection, conditional GET, and outcome-specific handling.</li>
+<li><b>URLs:</b> normalize carefully, dedup with a per-partition Bloom filter (10 bits per URL, 1 percent false positives) backed by the exact URL store; recrawls never go through the filter.</li>
+<li><b>Content:</b> exact text hash then 64-bit simhash with block-based lookup; traps are bounded by length, depth, templates, duplicate ratios and per-host budgets.</li>
+<li><b>Recrawl:</b> adaptive intervals plus benefit-based ordering for important pages, sitemaps and push signals, jitter against herds.</li>
+<li><b>Partition by host hash</b> so all per-host state is local; stateless fetchers; big hosts sub-partitioned.</li>
+<li><b>Storage:</b> WARC-style containers in object storage, event log to the indexer, at-least-once with idempotent consumers, replay possible.</li>
+<li><b>JS pages:</b> two waves, render only flagged pages in sandboxes behind the same politeness limiter.</li>
+<li><b>Ethics and law:</b> obey robots.txt, identify the bot, stay gentle, honor opt-outs and privacy requests, never crawl behind logins.</li>
+</ul></div>
+<p class="connects"><b>Connects to:</b> builds on <a href="../chapters/01-interview-framework.html">Chapter 1</a> (framework), <a href="../chapters/02-estimation.html">Chapter 2</a> (estimation), <a href="../chapters/04-dns.html">Chapter 4</a> (DNS), <a href="../chapters/15-redis.html">Chapter 15</a> (in-memory state), <a href="../chapters/19-storage-engines.html">Chapter 19</a> and <a href="../chapters/20-nosql.html">Chapter 20</a> (URL store), <a href="../chapters/21-object-storage.html">Chapter 21</a> (raw pages), <a href="../chapters/22-search-engines.html">Chapter 22</a> (indexing handoff), <a href="../chapters/25-sharding.html">Chapter 25</a> (partitioning), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotency), <a href="../chapters/34-queues-kafka.html">Chapter 34</a> (event log), <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a> (scheduling), <a href="../chapters/40-resilience.html">Chapter 40</a> (resilience), <a href="../chapters/55-security.html">Chapter 55</a> (security), and <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a> (Bloom filters, simhash, consistent hashing). Related case studies: <a href="c01-url-shortener.html">Case study 1</a> (URL hashing) and <a href="c11-autocomplete.html">Case study 11</a> (consumes crawled text).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

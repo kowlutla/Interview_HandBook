@@ -1,28 +1,22 @@
-# System Design
+# System Design (HLD) Interview Prep
 
-A practical learning repository for High-Level Design (HLD) and system design interviews.
+A complete, offline-friendly website for learning and revising high-level system design. Pure static HTML, inline SVG diagrams, no build step, no external dependencies.
 
-## 📘 System Design Mastery
+**Live site:** enable GitHub Pages (Settings, Pages, Source: `main` branch, folder `/docs`) and open `https://<your-user>.github.io/System-Design/`.
 
-A first-principles textbook covering the fundamentals needed to reason about production systems: requirements, capacity, networking, interfaces, data, caching, distributed systems, messaging, reliability, security, observability, cloud delivery, and client-side architecture.
+## What is inside
+- **Handbook** (`docs/handbook`): 61 chapters from first principles to microservices, 32 worked case studies, 4 cheat sheets and an A-Z glossary.
+- **Quick Notes** (`docs/quicknotes`): 14 revision sheets (including a 60-question practice bank) and 32 case sheets, in plain words with diagrams and interview Q&A.
+- **Search** (`docs/search.html`) across everything, with the home page at `docs/index.html`.
 
-Start here:
+## Run locally
+Open `docs/index.html`, or run `python -m http.server` inside `docs` and visit `http://localhost:8000`.
 
-- [System Design Mastery](system-design-mastery/README.md) — textbook overview and chapter index.
-- [Learning Roadmap](system-design-mastery/ROADMAP.md) — recommended reading order and checkpoints.
-- [Curriculum](system-design-mastery/CURRICULUM.md) — scope and mandatory topic inventory.
-- [Glossary](system-design-mastery/GLOSSARY.md) — concise definitions of core terms.
-- [Research and Reference Library](system-design-mastery/references/README.md) — standards, foundational papers, and technical documentation.
+## Maintain
+- `python -I docs/tools/build_site.py` regenerates Quick Notes navigation, indexes and the home page.
+- `python -I docs/tools/build_search.py` rebuilds the search index.
+- `python -I docs/tools/check_site.py` checks every link and anchor.
+- Page quality checkers: `docs/handbook/tools/check.py` and `docs/quicknotes/tools/check_quick.py`.
 
-The textbook has 20 chapters. Begin with the [first chapter: Thinking in Systems and Architecture](system-design-mastery/chapters/01-thinking-in-systems/README.md).
-
-## 🧩 Real-World System Design Examples
-
-The [Real-World Examples index](real-world-examples/README.md) contains 45 numbered case studies, including URL shorteners, rate limiters, news feeds, chat, storage, search, payments, booking, distributed queues, and observability systems.
-
-## Suggested study sequence
-
-1. Read the System Design Mastery chapters in order.
-2. Practise explaining the core concepts and trade-offs without notes.
-3. Apply them to the case studies in [Real-World System Design Examples](real-world-examples/README.md).
-4. For each design, state requirements and assumptions, estimate capacity, draw the architecture, define data and API contracts, and discuss failure modes and operational trade-offs.
+## Archive
+`archive/` holds the earlier markdown notes, real-world example summaries, books and course PDFs. It is not part of the site.

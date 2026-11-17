@@ -1,0 +1,866 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 21: Object Storage (S3-style) | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="21-object-storage">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+
+<main>
+<div class="kicker">Chapter 21 · Module 3 · The Data Layer</div>
+<h1>Object Storage (S3-style)</h1>
+<p class="lead">Object storage is the place where the internet keeps its photos, videos, backups, logs, and data lakes: an enormous, cheap, extremely durable bucket of immutable blobs, reached over HTTP. This chapter explains what it offers, how a system like Amazon S3 is built inside (metadata service, storage nodes, erasure coding, repair), what it costs, how to use it well, and how to answer "design your own S3" in an interview.</p>
+
+<!-- ======================= 1 ======================= -->
+<h2 id="why">1. Why object storage exists</h2>
+
+<p>Almost every product eventually has to store large amounts of unstructured data: user-uploaded images, video files, PDF invoices, machine learning datasets, database backups, application logs. You could put these in a relational database as BLOB columns, but that is a poor fit. Databases are tuned for small, structured, frequently updated rows with transactions. Large blobs bloat the database, slow down backups and replication, and make every byte expensive because database storage sits on fast, costly disks and is replicated with heavyweight machinery.</p>
+
+<p>You could also use a file server (NFS or a clustered file system), but file systems carry a lot of baggage: a hierarchical directory tree that must stay consistent, file locks, in-place partial writes, and permission models designed for a single organization. Scaling a file system to billions of files and hundreds of petabytes is a hard problem that few organizations solve well.</p>
+
+<p><b>Object storage</b> takes a deliberately simpler contract. You store a whole blob (an <b>object</b>) under a name (a <b>key</b>) inside a container (a <b>bucket</b>). You can read it back, replace it entirely, or delete it. You cannot edit the middle of it in place, and you cannot take a lock on it. In exchange for giving up those features, the system can scale almost without limit, spread data across data centers, store it cheaply with <b>erasure coding</b> instead of full copies, and promise durability that is far stronger than any single disk or server could offer.</p>
+
+<div class="callout key"><b>Key idea</b>
+Object storage trades POSIX file-system features (in-place edits, directories, locks, rename) for scale, durability, and low cost per gigabyte. The contract is: whole objects, written once, read many times, addressed by a key, over HTTP.
+</div>
+
+<p>In this chapter, "S3-style" means the interface and guarantees popularized by Amazon S3 and copied by Google Cloud Storage, Azure Blob Storage, Cloudflare R2, MinIO, Ceph's RADOS Gateway, and others. We use S3 numbers and vocabulary because they are the best known, but the design ideas are common to all of them.</p>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="types">2. Block vs file vs object storage</h2>
+
+<p>Storage comes in three fundamental flavors. Interviewers often ask you to pick one, so understand what each is and when it is right.</p>
+
+<h3>2.1 Block storage</h3>
+<p><b>Block storage</b> exposes a raw device made of fixed-size blocks (for example 4 KB) addressed by number. A server attaches it like a disk (Amazon EBS, a SAN volume, a local NVMe drive). The operating system puts a file system or a database engine on top. Block storage gives the lowest latency (sub-millisecond to a few milliseconds), supports small random reads and writes in place, and is what databases and virtual machine disks need. It is usually attached to one machine at a time, is limited to terabytes per volume, and costs the most per gigabyte.</p>
+
+<h3>2.2 File storage</h3>
+<p><b>File storage</b> exposes a shared hierarchical file system over a network protocol such as NFS or SMB (Amazon EFS, a NAS appliance). Many machines can mount the same directory tree, open files, read and write byte ranges in place, and rely on directories, permissions, and sometimes locks. It is the right tool when existing software expects a normal file system and several machines must share it, such as home directories or a content management system. It scales less far than object storage and costs more per gigabyte.</p>
+
+<h3>2.3 Object storage</h3>
+<p><b>Object storage</b> exposes a flat namespace of immutable objects over HTTP. Each request is independent (no mounted session, no open file handle). Latency is higher (tens of milliseconds to first byte), but throughput is huge when you read many objects or many ranges in parallel, capacity is effectively unbounded, and cost per gigabyte is the lowest of the three.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Comparison of block, file and object storage">
+  <rect class="cache" x="20" y="20" width="270" height="260" rx="10"/>
+  <text class="t-c t-b" x="155" y="46">Block storage</text>
+  <text class="t-c t-sm" x="155" y="70">Raw numbered blocks</text>
+  <rect class="box" x="50" y="90" width="50" height="30" rx="4"/><rect class="box" x="110" y="90" width="50" height="30" rx="4"/><rect class="box" x="170" y="90" width="50" height="30" rx="4"/><rect class="box" x="230" y="90" width="30" height="30" rx="4"/>
+  <text class="t-c t-sm" x="75" y="110">0</text><text class="t-c t-sm" x="135" y="110">1</text><text class="t-c t-sm" x="195" y="110">2</text><text class="t-c t-sm" x="245" y="110">3</text>
+  <text class="t-c t-sm" x="155" y="150">Access: one server mounts it</text>
+  <text class="t-c t-sm" x="155" y="172">Edits: any byte, in place</text>
+  <text class="t-c t-sm" x="155" y="194">Latency: lowest (ms)</text>
+  <text class="t-c t-sm" x="155" y="216">Used for: databases, VM disks</text>
+  <text class="t-c t-sm" x="155" y="258">Cost per GB: highest</text>
+
+  <rect class="box" x="315" y="20" width="270" height="260" rx="10"/>
+  <text class="t-c t-b" x="450" y="46">File storage</text>
+  <text class="t-c t-sm" x="450" y="70">Shared directory tree</text>
+  <text class="t-sm" x="395" y="92">/home</text><text class="t-sm" x="410" y="110">/ana/cv.pdf</text><text class="t-sm" x="410" y="128">/bo/notes.txt</text>
+  <text class="t-c t-sm" x="450" y="156">Access: many servers (NFS/SMB)</text>
+  <text class="t-c t-sm" x="450" y="178">Edits: byte ranges, locks</text>
+  <text class="t-c t-sm" x="450" y="200">Latency: low (ms)</text>
+  <text class="t-c t-sm" x="450" y="222">Used for: shared home dirs, legacy apps</text>
+  <text class="t-c t-sm" x="450" y="258">Cost per GB: medium</text>
+
+  <rect class="db" x="610" y="20" width="270" height="260" rx="10"/>
+  <text class="t-c t-b" x="745" y="46">Object storage</text>
+  <text class="t-c t-sm" x="745" y="70">Flat keys over HTTP</text>
+  <text class="t-sm" x="640" y="92">photos/2026/cat.jpg</text><text class="t-sm" x="640" y="110">backups/db-0117.gz</text><text class="t-sm" x="640" y="128">logs/app/10/part-7</text>
+  <text class="t-c t-sm" x="745" y="156">Access: anyone with HTTP + auth</text>
+  <text class="t-c t-sm" x="745" y="178">Edits: replace the whole object</text>
+  <text class="t-c t-sm" x="745" y="200">Latency: higher (tens of ms)</text>
+  <text class="t-c t-sm" x="745" y="222">Used for: media, backups, data lakes</text>
+  <text class="t-c t-sm" x="745" y="258">Cost per GB: lowest</text>
+</svg>
+<figcaption>Block is a raw disk, file is a shared tree, object is a flat key-to-blob map. Moving right, you give up in-place edits and low latency and gain scale and cheapness.</figcaption>
+</figure>
+
+<table>
+  <tr><th></th><th>Block</th><th>File</th><th>Object</th></tr>
+  <tr><td>Unit</td><td>Fixed-size block</td><td>File in a directory</td><td>Whole object with metadata</td></tr>
+  <tr><td>Partial update</td><td>Yes, any block</td><td>Yes, any byte range</td><td>No, rewrite the object (or use multipart tricks)</td></tr>
+  <tr><td>Namespace</td><td>None (numbered blocks)</td><td>Hierarchical tree</td><td>Flat keys (slashes are just characters)</td></tr>
+  <tr><td>Protocol</td><td>iSCSI, NVMe, cloud volume API</td><td>NFS, SMB</td><td>HTTP REST (S3 API)</td></tr>
+  <tr><td>Typical scale per system</td><td>TBs per volume</td><td>TBs to low PBs</td><td>Exabytes across a region</td></tr>
+  <tr><td>Durability approach</td><td>RAID or replicated volumes</td><td>Replication or RAID</td><td>Erasure coding across failure domains</td></tr>
+</table>
+
+<div class="callout tip"><b>Interview tip</b>
+A one-line decision rule: if a database or an operating system needs to modify it in place with low latency, use block. If many machines need a shared POSIX tree, use file. If it is a blob you write once and read many times at large scale, use object. Most "store user uploads" requirements are object storage.
+</div>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="model">3. The object model</h2>
+
+<h3>3.1 Buckets and objects</h3>
+<p>A <b>bucket</b> is a named top-level container. In S3 bucket names are globally unique across all customers, because the name appears in the URL (<code>my-bucket.s3.amazonaws.com</code>). A bucket carries configuration that applies to everything inside: region, access policy, versioning, encryption default, lifecycle rules, logging, event notifications. An account normally has a limited number of buckets, so buckets are for organizing configuration, not for one-per-user designs. If you have a million users, use one bucket with a key prefix per user.</p>
+
+<p>An <b>object</b> consists of three things: a <b>key</b> (its name inside the bucket, up to about 1 KB of UTF-8), the <b>data</b> (an opaque sequence of bytes, from zero bytes to 5 TB in S3), and <b>metadata</b>. System metadata includes size, last-modified time, ETag, content type, storage class, and encryption details. User metadata is a small set of custom key-value pairs you attach at upload time (for example <code>x-amz-meta-owner: ana</code>). Many systems also support <b>tags</b>, key-value labels that can drive lifecycle and access rules.</p>
+
+<h3>3.2 Flat namespace and prefixes</h3>
+<p>Object storage has no real directories. The key <code>photos/2026/cat.jpg</code> is one single string. The slashes are ordinary characters. Consoles and tools <i>pretend</i> there are folders by letting you list with a <b>prefix</b> (<code>photos/2026/</code>) and a <b>delimiter</b> (<code>/</code>). The LIST call then returns the keys that start with the prefix, and groups keys that share the next delimiter into "common prefixes", which look like subfolders.</p>
+<p>This has practical consequences. Renaming a "folder" means copying every object to a new key and deleting the old ones, because there is no directory node to rename. Moving a single object is also copy plus delete. An "empty folder" does not exist unless someone created a zero-byte placeholder object whose key ends with a slash. And listing is a range scan over sorted keys, which is why key design (section 14) matters for performance.</p>
+
+<h3>3.3 Immutability and overwrite</h3>
+<p>Objects are <b>immutable</b>: there is no "append 10 bytes" or "change bytes 100 to 200". A PUT to an existing key replaces the whole object atomically. Readers see either the old object or the new one, never a mixture. That atomic whole-object replacement is a simple and powerful property, and it is what lets the internal design avoid locks and in-place update machinery (section 7).</p>
+<p>Some systems offer a narrow exception: Google Cloud Storage can "compose" several objects into one, and Azure supports append blobs. S3 added an append-style feature only in a limited form on a special bucket class. For an interview, treat objects as write-whole, read-whole-or-ranges.</p>
+
+<h3>3.4 Versioning</h3>
+<p>When <b>versioning</b> is enabled on a bucket, a PUT to an existing key does not destroy the old data. Each write creates a new <b>version</b> with a unique version ID, and the key points at the latest. A plain DELETE does not remove anything: it adds a <b>delete marker</b> as the newest version, so ordinary GETs return "not found" while older versions remain recoverable. You can GET, restore, or permanently delete a specific version ID. Versioning protects against accidental overwrites and deletions (and against some ransomware), at the cost of storing every version until a lifecycle rule expires the old ones.</p>
+
+<h3>3.5 Immutability policies: object lock</h3>
+<p><b>Object Lock</b> (S3), bucket locks and retention policies (GCS), and immutable blob storage (Azure) provide <b>WORM</b> (write once, read many) behavior. You set a retention period or a legal hold on an object version, and for that time nobody, including the account root user in compliance mode, can delete or overwrite it. This is how regulated industries meet record-keeping rules and how backup teams make backups ransomware-proof.</p>
+
+<h3>3.6 Names and URLs</h3>
+<p>A typical object URL looks like <code>https://my-bucket.s3.us-east-1.amazonaws.com/photos/2026/cat.jpg</code> (virtual-hosted style) or <code>https://s3.us-east-1.amazonaws.com/my-bucket/photos/2026/cat.jpg</code> (path style). The bucket and region choose the cluster, and the key is passed to the metadata layer. Choose key names that are stable, URL-safe, and designed for how you will list and partition them.</p>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="api">4. API semantics</h2>
+
+<p>The S3 REST API is the de facto standard. Learn the core calls and their behavior. Everything is an HTTP request signed with credentials (section 16).</p>
+
+<table>
+  <tr><th>Operation</th><th>HTTP form</th><th>What it does and notes</th></tr>
+  <tr><td><b>PUT object</b></td><td><code>PUT /bucket/key</code></td><td>Stores the whole object, replacing any existing one atomically. Up to 5 GB in a single request in S3; use multipart above that. Returns an ETag.</td></tr>
+  <tr><td><b>GET object</b></td><td><code>GET /bucket/key</code></td><td>Returns the bytes and metadata. Supports ranges and conditional headers.</td></tr>
+  <tr><td><b>HEAD object</b></td><td><code>HEAD /bucket/key</code></td><td>Returns only the metadata (size, ETag, type). Cheap existence check.</td></tr>
+  <tr><td><b>DELETE object</b></td><td><code>DELETE /bucket/key</code></td><td>Removes the key (or adds a delete marker when versioned). Idempotent: deleting a missing key still succeeds.</td></tr>
+  <tr><td><b>LIST objects</b></td><td><code>GET /bucket?prefix=&amp;delimiter=&amp;continuation-token=</code></td><td>Returns up to 1,000 keys per page in lexicographic (alphabetical) order, plus a token for the next page.</td></tr>
+  <tr><td><b>COPY</b></td><td><code>PUT /bucket/key</code> with a copy-source header</td><td>Server-side copy, with no data passing through the client.</td></tr>
+  <tr><td><b>Multipart upload</b></td><td>initiate, upload parts, complete</td><td>For big files (section 5).</td></tr>
+</table>
+
+<h3>4.1 Range reads</h3>
+<p>A GET can carry a header such as <code>Range: bytes=0-1048575</code> to fetch only that slice, returning <code>206 Partial Content</code>. Ranges let a video player jump to the middle of a file, let a download manager resume, and let analytics engines read only the footer and the needed column chunks of a Parquet file. Because each range is an independent request, a client can fetch many ranges in parallel and reach very high aggregate throughput from a single object. The system does not need to read the whole object to serve a range, because it stores objects as chunks (section 8).</p>
+
+<h3>4.2 Conditional requests</h3>
+<p>Standard HTTP conditionals work on objects. <code>If-None-Match</code> and <code>If-Modified-Since</code> on a GET let a client ask "send it only if it changed", answered with <code>304 Not Modified</code> and no body, which is how a CDN revalidates cached copies (see <a href="12-cdn.html">Chapter 12</a>). On writes, conditional headers give you a basic concurrency control. Modern S3 supports <code>If-None-Match: *</code> on PUT, meaning "create this key only if it does not already exist" (a compare-and-create), and conditional writes against an ETag for compare-and-swap in newer versions. This makes it possible to build simple leader-election or commit protocols directly on object storage, which table formats for data lakes rely on. Say "supported by major providers in recent years" and avoid claiming exact semantics for each vendor.</p>
+
+<h3>4.3 The ETag</h3>
+<p>The <b>ETag</b> is an identifier of the object's content version. For a simple, unencrypted single-part upload it is the MD5 hash of the bytes. For multipart uploads or some encryption modes it is not a plain MD5; for multipart it is a hash of the part hashes with a dash and part count. Treat the ETag as an opaque version token for equality checks, not as a guaranteed content hash. If you need a verifiable content hash, ask for a checksum (SHA-256 or CRC) which modern S3 supports natively, or store your own hash in metadata.</p>
+
+<h3>4.4 Presigned URLs</h3>
+<p>A <b>presigned URL</b> is a normal object URL with a time limit and a signature baked into the query string. Your backend, which holds credentials, computes the signature for a specific method on a specific key (for example "PUT this key within 15 minutes"). Anyone who has the URL can perform exactly that action until it expires, without having any credentials of their own. This is the standard pattern for letting browsers and mobile apps upload and download directly from the object store, so large files never pass through your application servers (section 16.3).</p>
+
+<h3>4.5 Errors and retries</h3>
+<p>Calls can fail with <code>503 Slow Down</code> when you exceed a partition's request rate, and with ordinary network errors. The correct client behavior is exponential backoff with jitter. Since PUT replaces the whole object atomically and DELETE is idempotent, retrying is safe. A retried PUT may create a second version if versioning is on, but never a corrupted object.</p>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="multipart">5. Large uploads: multipart, resumability, and dedup</h2>
+
+<p>Uploading a 20 GB video as one HTTP request is fragile: if the connection drops at 19 GB you start over, a single TCP stream is limited in speed, and a server would need to handle an enormous request body. <b>Multipart upload</b> solves this by splitting the file into <b>parts</b> uploaded independently.</p>
+
+<h3>5.1 How multipart upload works</h3>
+<ol>
+  <li><b>Initiate.</b> The client calls "create multipart upload" for the key. The service returns an <b>upload ID</b>.</li>
+  <li><b>Upload parts.</b> The client sends each part (S3: 5 MB to 5 GB each, up to 10,000 parts, so up to 5 TB total; the last part can be smaller) with its part number and the upload ID. Parts can be sent in any order and in parallel across several connections. Each upload returns the part's ETag.</li>
+  <li><b>Complete.</b> The client sends the list of part numbers and ETags. The service stitches the parts into one object, and only then does the key become visible. Until completion, readers see nothing (or the previous object).</li>
+  <li><b>Or abort.</b> The client aborts, and the service discards all uploaded parts.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Multipart upload sequence">
+  <rect class="ext"   x="60"  y="12" width="120" height="32" rx="8"/><text class="t-c t-b" x="120" y="33">Client</text>
+  <rect class="box"   x="400" y="12" width="140" height="32" rx="8"/><text class="t-c t-b" x="470" y="33">S3 API tier</text>
+  <rect class="db"    x="740" y="12" width="140" height="32" rx="8"/><text class="t-c t-b" x="810" y="33">Storage + metadata</text>
+  <line class="life" x1="120" y1="44" x2="120" y2="350"/><line class="life" x1="470" y1="44" x2="470" y2="350"/><line class="life" x1="810" y1="44" x2="810" y2="350"/>
+  <path class="arrow" d="M120 76 L466 76"/><text class="t-sm" x="140" y="70">1. initiate upload for videos/big.mp4</text>
+  <path class="arrow dash" d="M466 104 L124 104"/><text class="t-sm" x="140" y="98">2. upload ID = u-77</text>
+  <path class="arrow" d="M120 140 L466 140"/><text class="t-sm" x="140" y="134">3. part 1 (parallel)</text>
+  <path class="arrow" d="M120 160 L466 160"/><text class="t-sm" x="140" y="174">3. part 2 (parallel)</text>
+  <path class="arrow" d="M120 194 L466 194"/><text class="t-sm" x="140" y="188">3. part 3 (parallel)</text>
+  <path class="arrow" d="M474 150 L806 150"/><text class="t-sm" x="560" y="144">parts stored, not yet visible</text>
+  <path class="arrow dash" d="M466 222 L124 222"/><text class="t-sm" x="140" y="216">4. ETag for each part (retry any that fail)</text>
+  <path class="arrow" d="M120 258 L466 258"/><text class="t-sm" x="140" y="252">5. complete: [(1,e1),(2,e2),(3,e3)]</text>
+  <path class="arrow" d="M474 270 L806 270"/><text class="t-sm" x="540" y="264">write one manifest, publish the key</text>
+  <path class="arrow dash" d="M466 312 L124 312"/><text class="t-sm" x="140" y="306">6. 200 OK, final ETag; object now visible</text>
+  <text class="t-sm" x="140" y="344">Abandoned uploads keep paying for part storage until aborted or expired by a lifecycle rule.</text>
+</svg>
+<figcaption>Parts travel in parallel and can be retried individually. The object appears atomically only at the final "complete" call.</figcaption>
+</figure>
+
+<h3>5.2 Why it is better</h3>
+<ul>
+  <li><b>Parallelism:</b> several connections together saturate a fast link, which one TCP stream often cannot.</li>
+  <li><b>Resumability:</b> if the connection drops, the client re-sends only the missing parts. It can ask the service to list parts already uploaded under the upload ID, which is how an upload survives an app restart or a laptop going to sleep.</li>
+  <li><b>Retry cost is small:</b> a failed 64 MB part is retried, not the whole 20 GB.</li>
+  <li><b>Unknown total size:</b> the client can start uploading parts of a stream (a live recording) before it knows the final size.</li>
+  <li><b>Atomic visibility:</b> readers never see a half-uploaded object.</li>
+</ul>
+
+<h3>5.3 Choosing part size</h3>
+<p>Larger parts mean fewer requests and less overhead, but a failure wastes more work, and memory use rises with parts in flight. Smaller parts retry cheaply but cost more requests (each request is billed) and hit the 10,000 part limit sooner. A common choice is 8 to 64 MB; for a 20 GB file, 64 MB parts give about 320 parts. A reasonable rule is to use multipart above about 100 MB and choose a part size so the part count stays well below 10,000.</p>
+
+<h3>5.4 Resumable uploads in your own product</h3>
+<p>For consumer apps, the flow is usually: the client asks your API to start an upload. Your API creates the multipart upload (or a resumable session in a provider with a different mechanism, such as GCS resumable uploads or the tus protocol) and returns presigned URLs for each part. The client uploads the parts directly to object storage, in parallel, remembering which parts finished (in local storage). On completion the client calls your API, which calls "complete", records the object in your database, and enqueues processing such as virus scanning or transcoding. Your application servers never touch the bytes.</p>
+
+<h3>5.5 Deduplication by hash</h3>
+<p>If many users upload the same file (a popular video, an identical attachment), storing it once saves money. The idea is <b>content-addressed</b> storage: compute a cryptographic hash (SHA-256) of the data, use the hash as the storage key (or look it up in an index), and store only one copy no matter how many logical files refer to it. At upload time the client can compute the hash first and ask "do you already have this hash?"; if yes the upload is skipped entirely (instant upload). You can dedup whole files, or split files into chunks (fixed size, or content-defined chunking so an insertion does not shift every boundary) and dedup per chunk, which is what backup and file-sync systems do. See the Dropbox-style design in the file-sync case study (<a href="../case-studies/c09-file-sync.html">Case study: file sync</a>).</p>
+<p>Dedup has costs to name: you need an index from hash to location, you need <b>reference counting</b> or garbage collection to know when a chunk is no longer used by any file, a cross-user dedup can leak information ("this file already exists" tells an attacker someone else has it), and encryption with per-user keys defeats dedup unless you use convergent encryption. Object stores themselves normally do not dedup across objects; dedup is a layer you build on top.</p>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="arch">6. How an object store is built: the big picture</h2>
+
+<p>The central design idea is a hard split between two planes. The <b>data plane</b> stores the bytes. The <b>metadata plane</b> stores the mapping from names to the places where bytes live, plus everything about the object (size, version, ACLs, tags). Separating them lets each be scaled and optimized on its own terms: the data plane is a huge number of cheap disks optimized for throughput and capacity, the metadata plane is a smaller, sharded, low-latency, strongly consistent database.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 420" role="img" aria-label="Object store architecture: front-end tier, metadata service, placement, storage nodes, background services">
+  <rect class="ext" x="20" y="170" width="110" height="50" rx="10"/><text class="t-c t-b" x="75" y="200">Clients</text>
+
+  <rect class="box" x="190" y="150" width="170" height="90" rx="10"/>
+  <text class="t-c t-b" x="275" y="176">Front-end / API tier</text>
+  <text class="t-c t-sm" x="275" y="196">stateless, many instances</text>
+  <text class="t-c t-sm" x="275" y="212">auth, throttle, checksums</text>
+  <text class="t-c t-sm" x="275" y="228">erasure-code the bytes</text>
+
+  <rect class="cache" x="440" y="30" width="200" height="110" rx="10"/>
+  <text class="t-c t-b" x="540" y="56">Metadata service</text>
+  <text class="t-c t-sm" x="540" y="76">sharded index of keys</text>
+  <text class="t-c t-sm" x="540" y="94">key -&gt; version, size, chunk map</text>
+  <text class="t-c t-sm" x="540" y="112">strongly consistent per shard</text>
+  <text class="t-c t-sm" x="540" y="130">(own replication, e.g. consensus)</text>
+
+  <rect class="cache" x="440" y="170" width="200" height="50" rx="10"/>
+  <text class="t-c t-b" x="540" y="190">Placement service</text><text class="t-c t-sm" x="540" y="208">picks nodes and failure domains</text>
+
+  <rect class="db" x="720" y="40" width="160" height="60" rx="10"/><text class="t-c t-b" x="800" y="66">Storage node</text><text class="t-c t-sm" x="800" y="84">many disks, local index</text>
+  <rect class="db" x="720" y="120" width="160" height="60" rx="10"/><text class="t-c t-b" x="800" y="146">Storage node</text><text class="t-c t-sm" x="800" y="164">in another rack</text>
+  <rect class="db" x="720" y="200" width="160" height="60" rx="10"/><text class="t-c t-b" x="800" y="226">Storage node</text><text class="t-c t-sm" x="800" y="244">in another zone</text>
+
+  <rect class="miss" x="190" y="310" width="690" height="90" rx="10"/>
+  <text class="t-b" x="210" y="334">Background services (never in the request path)</text>
+  <text class="t-sm" x="210" y="356">Scrubber: re-read data and verify checksums.   Repair: rebuild lost shards.   Rebalancer: spread data to new disks.</text>
+  <text class="t-sm" x="210" y="376">Garbage collector: reclaim deleted and orphaned data.   Lifecycle engine: transition and expire objects.</text>
+  <text class="t-sm" x="210" y="392">Replicator: cross-region copy.   Event publisher: notifications.</text>
+
+  <path class="arrow" d="M130 195 L186 195"/>
+  <path class="arrow" d="M360 175 L436 110"/><text class="t-sm" x="352" y="132">1</text>
+  <path class="arrow" d="M360 195 L436 195"/><text class="t-sm" x="394" y="188">2</text>
+  <path class="arrow" d="M360 215 L716 150"/><text class="t-sm" x="560" y="262">3 write shards in parallel</text>
+  <path class="arrow dash" d="M360 225 L716 225"/>
+  <path class="arrow dash" d="M360 205 L716 70"/>
+  <path class="arrow dash" d="M540 308 L540 224"/>
+</svg>
+<figcaption>Numbered steps for a PUT: (1) metadata service tracks the key, (2) placement chooses nodes, (3) the front end writes shards to the storage nodes in parallel. Background services keep the system healthy off the request path.</figcaption>
+</figure>
+
+<h3>6.1 The components in detail</h3>
+<ul>
+  <li><b>Front-end (API) tier.</b> A fleet of stateless servers behind a load balancer (<a href="09-load-balancing.html">Chapter 9</a>). They terminate TLS, authenticate and authorize the request (section 16), enforce rate limits, parse the S3 API, compute or verify checksums, stream bytes to and from storage nodes, and talk to the metadata service. Because they are stateless, you scale them by adding machines.</li>
+  <li><b>Metadata service.</b> A distributed, sharded, strongly consistent database holding, for every object version, the key, size, checksum, timestamps, user metadata, ACL pointers, and the <b>chunk map</b> (which storage nodes and disks hold which shards). It also supports ordered range scans for LIST. Section 7 covers it.</li>
+  <li><b>Placement service.</b> Decides which storage nodes get the shards of a new object, subject to failure-domain rules (never put two shards of one object on the same disk, preferably not in the same rack, and for a multi-zone class, spread across zones) and to capacity balance.</li>
+  <li><b>Storage nodes.</b> Servers each with many disks (for example 30 to 100 large HDDs). A node stores shards as blobs in large append-only files on its local file system or directly on raw disk, keeps a small local index of shard location within those files, and serves reads and writes by shard ID. They are intentionally simple.</li>
+  <li><b>Background workers.</b> Scrubbing, repair, rebalancing, garbage collection, lifecycle, replication, and notifications (sections 9, 10, 11, 18).</li>
+</ul>
+
+<h3>6.2 Why split metadata from data</h3>
+<p>The two workloads are opposites. Metadata operations are tiny (hundreds of bytes), extremely numerous (billions of objects, many of them small), latency-sensitive, and need strong consistency and ordered scans. Data operations are large, bandwidth-bound, and need only durable, cheap storage. If you combined them, you would force either expensive low-latency storage for all bytes or slow storage for the index. Split, the metadata service can live on SSDs with a consensus protocol (<a href="29-consensus.html">Chapter 29</a>) while the data plane lives on dense HDDs, and each is sized by its own growth curve: metadata grows with the <i>number</i> of objects, data grows with total <i>bytes</i>.</p>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="metadata">7. The metadata service</h2>
+
+<h3>7.1 What it stores and why it is hard</h3>
+<p>Think of it as one gigantic sorted table: <code>(bucket, key, version) -&gt; record</code>. A large region can hold trillions of rows. The record holds the fields above. The table must support: point lookup by key (every GET and HEAD), atomic insert or replace (every PUT), delete, and ordered range scan by prefix (LIST). It also has to be <b>strongly consistent</b>, since users now expect read-after-write (section 12), and highly available and durable, because losing metadata means losing every object even if the bytes are intact.</p>
+
+<h3>7.2 Sharding by key range</h3>
+<p>You cannot put a trillion rows on one machine, so the key space is <b>partitioned</b> into ranges (see <a href="25-sharding.html">Chapter 25</a>). Because LIST must return keys in sorted order, <b>range partitioning</b> on <code>(bucket, key)</code> is natural: each shard owns a contiguous slice of the sorted key space, say all keys from <code>photos/2026/a</code> to <code>photos/2026/m</code>. A LIST with a prefix touches one or a few shards, in order. A hash partition would spread load evenly but would turn a LIST into a scatter-gather across all shards followed by a merge.</p>
+<p>Range sharding brings the <b>hot partition</b> problem. If clients write keys with a monotonically increasing prefix such as a timestamp (<code>2026-11-17-12-00-01.log</code>), all new writes land in the last range, which becomes a hot shard. The service reacts by <b>splitting</b> hot ranges automatically and moving the halves to different machines (the same mechanism as in Bigtable-style tablets and HBase regions), but a split takes time, and a sudden spike can hit the limit before splits catch up. That is why S3 documentation talks about request rates "per prefix" and why high-throughput clients randomize or spread prefixes (section 14).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Metadata key space range partitions and a hot range split">
+  <text class="t-b" x="20" y="22">Sorted key space of one bucket, cut into range shards</text>
+  <rect class="cache" x="20"  y="40" width="200" height="70" rx="8"/><text class="t-c t-b" x="120" y="66">Shard 1</text><text class="t-c t-sm" x="120" y="86">a... to f...</text><text class="t-c t-sm" x="120" y="102">3 replicas</text>
+  <rect class="cache" x="230" y="40" width="200" height="70" rx="8"/><text class="t-c t-b" x="330" y="66">Shard 2</text><text class="t-c t-sm" x="330" y="86">f... to m...</text><text class="t-c t-sm" x="330" y="102">3 replicas</text>
+  <rect class="miss"  x="440" y="40" width="220" height="70" rx="8"/><text class="t-c t-b" x="550" y="66">Shard 3 (hot)</text><text class="t-c t-sm" x="550" y="86">m... to t...  (logs/2026-11-17-...)</text><text class="t-c t-sm" x="550" y="102">all new writes land here</text>
+  <rect class="cache" x="670" y="40" width="210" height="70" rx="8"/><text class="t-c t-b" x="775" y="66">Shard 4</text><text class="t-c t-sm" x="775" y="86">t... to z...</text><text class="t-c t-sm" x="775" y="102">3 replicas</text>
+
+  <path class="arrow-r" d="M550 114 L550 160"/>
+  <text class="t-sm" x="565" y="140">automatic split when load or size crosses a threshold</text>
+
+  <rect class="hit" x="440" y="170" width="105" height="70" rx="8"/><text class="t-c t-b" x="492" y="196">Shard 3a</text><text class="t-c t-sm" x="492" y="216">m... to p...</text><text class="t-c t-sm" x="492" y="232">node X</text>
+  <rect class="hit" x="555" y="170" width="105" height="70" rx="8"/><text class="t-c t-b" x="607" y="196">Shard 3b</text><text class="t-c t-sm" x="607" y="216">p... to t...</text><text class="t-c t-sm" x="607" y="232">node Y</text>
+
+  <text class="t-sm" x="20" y="180">LIST prefix "logs/" reads shards in order and stitches the pages.</text>
+  <text class="t-sm" x="20" y="202">A PUT touches exactly one shard (a single-shard atomic write).</text>
+  <text class="t-sm" x="20" y="224">Each shard is itself replicated, usually with a consensus group.</text>
+  <text class="t-sm" x="20" y="268">A directory lookup service maps key ranges to shards and is cached by the front ends.</text>
+</svg>
+<figcaption>Metadata is a sorted table cut into contiguous ranges. A shard that gets too hot or too big splits in two and the halves move to different machines.</figcaption>
+</figure>
+
+<h3>7.3 Atomicity and strong consistency</h3>
+<p>Every object write is a single-row operation, so it lands on exactly one shard and can be made atomic with that shard's replication protocol (a Paxos or Raft-style group, or a quorum-replicated log). The key invariant for correctness is the <b>commit point</b>: an object becomes visible exactly when its metadata row is committed. Bytes are written to storage nodes first. Only after enough shards are durably stored does the front end commit the metadata row. If the front end crashes before the commit, the shards on storage nodes are <b>orphans</b>: bytes that no key points to. They are harmless (invisible) and are cleaned up later by garbage collection (section 11). If the commit succeeds, the object is visible and the data is already safe. This ordering, data first and metadata commit last, is the single most important idea in the write path.</p>
+
+<h3>7.4 Where the metadata itself lives</h3>
+<p>Metadata shards are stored on SSD-backed nodes and replicated (often 3 or 5 copies) across zones, because they must answer in a few milliseconds. Indexes for hot ranges are cached in memory. The metadata service is the real scaling bottleneck of an object store, which is why "small objects" (section 14.3) are a problem: ten billion 1 KB objects need as much metadata as ten billion 1 GB objects, though they hold a millionth of the bytes.</p>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="write">8. The data plane: write and read paths</h2>
+
+<h3>8.1 Chunking and shards</h3>
+<p>A big object is first divided into <b>chunks</b> (or "stripes"), commonly several megabytes each. This lets reads of different ranges be served by different nodes in parallel, and keeps unit sizes manageable. Each chunk is then protected either by replication or by erasure coding (section 9), producing several <b>shards</b>, each stored on a different disk, rack, or zone. Small objects are often packed together into one larger container file on disk so the node does not manage millions of tiny files.</p>
+
+<h3>8.2 The write (PUT) path step by step</h3>
+<ol>
+  <li>The client sends <code>PUT /bucket/key</code>. The front end authenticates the caller, checks the bucket policy and quota, and starts streaming the body.</li>
+  <li>The front end asks the placement service for a set of target nodes for the object's chunks (for 6+3 coding, nine nodes in distinct failure domains).</li>
+  <li>As bytes arrive, the front end computes a checksum, splits the data into 6 data pieces, computes 3 parity pieces, and writes the 9 shards to the 9 storage nodes <b>in parallel</b>. Each node writes the shard durably to disk (flushing to stable storage) and returns an acknowledgment with its own checksum.</li>
+  <li>When enough shards are acknowledged (typically all of them, or a write quorum that still leaves the required safety margin), the front end commits the metadata row, atomically replacing the old version of the key.</li>
+  <li>Only now does the front end return <code>200 OK</code> with the ETag. From this moment any GET or LIST must see the new object.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="PUT sequence: front end, placement, storage nodes, metadata">
+  <rect class="ext"   x="20"  y="12" width="100" height="32" rx="8"/><text class="t-c t-b" x="70" y="33">Client</text>
+  <rect class="box"   x="200" y="12" width="120" height="32" rx="8"/><text class="t-c t-b" x="260" y="33">Front end</text>
+  <rect class="cache" x="400" y="12" width="120" height="32" rx="8"/><text class="t-c t-b" x="460" y="33">Placement</text>
+  <rect class="db"    x="600" y="12" width="120" height="32" rx="8"/><text class="t-c t-b" x="660" y="33">Storage nodes</text>
+  <rect class="cache" x="780" y="12" width="100" height="32" rx="8"/><text class="t-c t-b" x="830" y="33">Metadata</text>
+  <line class="life" x1="70" y1="44" x2="70" y2="370"/><line class="life" x1="260" y1="44" x2="260" y2="370"/><line class="life" x1="460" y1="44" x2="460" y2="370"/><line class="life" x1="660" y1="44" x2="660" y2="370"/><line class="life" x1="830" y1="44" x2="830" y2="370"/>
+  <path class="arrow" d="M70 74 L256 74"/><text class="t-sm" x="80" y="68">1. PUT bytes</text>
+  <path class="arrow" d="M260 106 L456 106"/><text class="t-sm" x="276" y="100">2. choose 9 nodes</text>
+  <path class="arrow dash" d="M456 134 L264 134"/><text class="t-sm" x="276" y="128">3. node list</text>
+  <rect class="hit" x="170" y="150" width="180" height="26" rx="6"/><text class="t-sm" x="178" y="167">4. checksum, split 6+3</text>
+  <path class="arrow" d="M264 204 L656 204"/><text class="t-sm" x="360" y="198">5. write 9 shards in parallel</text>
+  <path class="arrow dash" d="M656 232 L264 232"/><text class="t-sm" x="360" y="226">6. durable acks + checksums</text>
+  <path class="arrow" d="M264 270 L826 270"/><text class="t-sm" x="500" y="264">7. COMMIT row: key, version, chunk map</text>
+  <path class="arrow dash" d="M826 298 L264 298"/><text class="t-sm" x="500" y="292">8. committed</text>
+  <path class="arrow dash" d="M256 330 L74 330"/><text class="t-sm" x="80" y="324">9. 200 OK + ETag</text>
+  <text class="t-sm" x="80" y="360">Crash before step 7 leaves orphan shards (invisible, collected later). After step 7 the object is durable and visible.</text>
+</svg>
+<figcaption>Data first, metadata commit last. The key becomes visible only when the commit succeeds, so a failed write never exposes a partial object.</figcaption>
+</figure>
+
+<h3>8.3 The read (GET) path</h3>
+<ol>
+  <li>The front end authenticates, then looks up <code>(bucket, key)</code> in the metadata service and obtains the latest version's record and chunk map.</li>
+  <li>For a range request it computes which chunks cover the range.</li>
+  <li>It requests shards from the storage nodes. With erasure coding, the 6 <i>data</i> shards are enough to reassemble the chunk, so it normally reads those 6 with no decoding work. If one is slow or missing, it reads a parity shard instead and decodes. Many systems issue a few extra reads and use the first 6 that arrive, trimming tail latency (a "hedged" request).</li>
+  <li>The front end verifies the shard checksums as it streams data back. If a checksum fails, it discards that shard, reconstructs from others, and flags the bad shard for repair.</li>
+</ol>
+<p>Reads need no coordination between nodes and no locks, because shards are immutable once written. That is a large part of why object stores scale reads so well.</p>
+
+<h3>8.4 Storage node internals</h3>
+<p>On a storage node, shards are appended to big log-like <b>extent files</b> (for example 1 GB) rather than stored as one file per shard, which avoids file-system overhead and keeps writes sequential, the ideal pattern for hard disks. A small index (often a key-value store such as RocksDB on an SSD) maps shard ID to (extent, offset, length, checksum). Deletion marks space dead; compaction later rewrites extents that are mostly dead, to reclaim space (see log-structured storage in <a href="19-storage-engines.html">Chapter 19</a>).</p>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="durability">9. Durability: replication vs erasure coding</h2>
+
+<p>A single disk fails with an annual probability of very roughly 1 to 2 percent. At the scale of an object store with hundreds of thousands of disks, disks fail every day, and entire servers, racks, and occasionally zones fail too. Durability means that despite this, your bytes are not lost. The system achieves it by storing redundancy across independent <b>failure domains</b> (disk, server, rack, zone) and by <b>repairing</b> quickly after each failure.</p>
+
+<h3>9.1 Option A: replication</h3>
+<p>Store N full copies (commonly 3) on different failure domains. Reads can be served by any copy. Writes go to all copies. Recovery from a lost copy is simple: read one surviving copy and write a new one. The downside is cost: 3 copies is a <b>3x storage overhead</b> (raw bytes stored divided by logical bytes), which is expensive at exabyte scale. Replication is still used for hot, small data, for metadata, and for places where simplicity and read latency matter more than cost.</p>
+
+<h3>9.2 Option B: erasure coding</h3>
+<p><b>Erasure coding</b> (EC) is the technique behind RAID 5 and 6, generalized. Split a piece of data into <b>k data shards</b> and compute <b>m parity shards</b> using a code such as Reed-Solomon, so you store <b>n = k + m</b> shards in total. The magic property: <b>any k of the n shards are enough to reconstruct the original data</b>. So the system survives the loss of any m shards. Storage overhead is n / k.</p>
+
+<p>Take <b>6+3</b>: 6 data shards and 3 parity shards, 9 in total. The data survives any 3 simultaneous shard losses, and the overhead is 9 / 6 = <b>1.5x</b>. Compare with 3-way replication, which survives 2 losses at 3x. So EC 6+3 is both cheaper (1.5x vs 3x) and safer (tolerates 3 failures vs 2). Other common schemes are 8+4 (1.5x, survives 4), 10+4 (1.4x), or very wide codes at 1.2x for cold data.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Erasure coding 6+3 layout across failure domains and reconstruction after losing three shards">
+  <text class="t-b" x="20" y="22">One chunk (for example 12 MB) split into 6 data shards (2 MB each) and 3 parity shards (2 MB each)</text>
+  <rect class="box" x="20"  y="40" width="86" height="46" rx="6"/><text class="t-c t-b" x="63" y="68">D1</text>
+  <rect class="box" x="116" y="40" width="86" height="46" rx="6"/><text class="t-c t-b" x="159" y="68">D2</text>
+  <rect class="box" x="212" y="40" width="86" height="46" rx="6"/><text class="t-c t-b" x="255" y="68">D3</text>
+  <rect class="box" x="308" y="40" width="86" height="46" rx="6"/><text class="t-c t-b" x="351" y="68">D4</text>
+  <rect class="box" x="404" y="40" width="86" height="46" rx="6"/><text class="t-c t-b" x="447" y="68">D5</text>
+  <rect class="box" x="500" y="40" width="86" height="46" rx="6"/><text class="t-c t-b" x="543" y="68">D6</text>
+  <rect class="cache" x="620" y="40" width="86" height="46" rx="6"/><text class="t-c t-b" x="663" y="68">P1</text>
+  <rect class="cache" x="716" y="40" width="86" height="46" rx="6"/><text class="t-c t-b" x="759" y="68">P2</text>
+  <rect class="cache" x="812" y="40" width="68" height="46" rx="6"/><text class="t-c t-b" x="846" y="68">P3</text>
+
+  <text class="t-sm" x="20" y="112">Each of the 9 shards goes to a different node, spread over racks and zones (placement rule):</text>
+  <rect class="db" x="20"  y="124" width="270" height="70" rx="8"/><text class="t-c t-b" x="155" y="146">Zone A</text><text class="t-c t-sm" x="155" y="166">D1, D2, D3 (three racks)</text>
+  <rect class="db" x="315" y="124" width="270" height="70" rx="8"/><text class="t-c t-b" x="450" y="146">Zone B</text><text class="t-c t-sm" x="450" y="166">D4, D5, D6 (three racks)</text>
+  <rect class="db" x="610" y="124" width="270" height="70" rx="8"/><text class="t-c t-b" x="745" y="146">Zone C</text><text class="t-c t-sm" x="745" y="166">P1, P2, P3 (three racks)</text>
+
+  <text class="t-b" x="20" y="226">Lose any 3 shards (here D2, D5, P1): read any 6 survivors, decode, rebuild the 3 lost shards</text>
+  <rect class="box" x="20"  y="240" width="86" height="40" rx="6"/><text class="t-c" x="63" y="265">D1</text>
+  <rect class="miss" x="116" y="240" width="86" height="40" rx="6"/><text class="t-c" x="159" y="265">D2 lost</text>
+  <rect class="box" x="212" y="240" width="86" height="40" rx="6"/><text class="t-c" x="255" y="265">D3</text>
+  <rect class="box" x="308" y="240" width="86" height="40" rx="6"/><text class="t-c" x="351" y="265">D4</text>
+  <rect class="miss" x="404" y="240" width="86" height="40" rx="6"/><text class="t-c" x="447" y="265">D5 lost</text>
+  <rect class="box" x="500" y="240" width="86" height="40" rx="6"/><text class="t-c" x="543" y="265">D6</text>
+  <rect class="miss" x="620" y="240" width="86" height="40" rx="6"/><text class="t-c" x="663" y="265">P1 lost</text>
+  <rect class="cache" x="716" y="240" width="86" height="40" rx="6"/><text class="t-c" x="759" y="265">P2</text>
+  <rect class="cache" x="812" y="240" width="68" height="40" rx="6"/><text class="t-c" x="846" y="265">P3</text>
+  <text class="t-sm" x="20" y="308">6 survivors remain (D1, D3, D4, D6, P2, P3) = exactly k, so the chunk is still fully recoverable. A 4th loss would lose it.</text>
+</svg>
+<figcaption>With 6+3, any six of the nine shards rebuild the data. Placing shards across zones means even a whole-zone outage costs only three shards.</figcaption>
+</figure>
+
+<h3>9.3 How erasure coding works (intuition)</h3>
+<p>The simplest example is a single parity shard: store data shards D1 and D2 plus P = D1 XOR D2. If D1 is lost, D1 = D2 XOR P. This is k=2, m=1 (RAID 5 style). Reed-Solomon generalizes this using arithmetic over a finite field, so each parity shard is a different linear combination of the data shards. Any k of the n shards give k independent equations, enough to solve for the k unknown data shards. You do not need to know the math in an interview; you need to know "any k of n suffice", the overhead n/k, and that decoding costs CPU and requires reading k shards.</p>
+
+<h3>9.4 The tradeoff: storage overhead vs repair cost vs latency</h3>
+<table>
+  <tr><th></th><th>3x replication</th><th>EC 6+3</th><th>EC 10+4 (wider)</th></tr>
+  <tr><td>Storage overhead</td><td>3.0x</td><td>1.5x</td><td>1.4x</td></tr>
+  <tr><td>Failures tolerated</td><td>2</td><td>3</td><td>4</td></tr>
+  <tr><td>Data read to rebuild one lost shard of size S</td><td>1 S (copy one replica)</td><td>6 S (read 6 shards)</td><td>10 S</td></tr>
+  <tr><td>Normal read</td><td>1 node, simple</td><td>6 nodes in parallel</td><td>10 nodes in parallel</td></tr>
+  <tr><td>Small object cost</td><td>3 small files</td><td>9 tiny shards (inefficient)</td><td>14 tiny shards</td></tr>
+  <tr><td>CPU</td><td>None</td><td>Encode on write, decode on degraded read</td><td>More</td></tr>
+  <tr><td>Best for</td><td>Hot data, small objects, metadata</td><td>General purpose large objects</td><td>Cold, large, cost-focused</td></tr>
+</table>
+<p>The key tension: <b>wider codes are cheaper in raw storage but costlier to repair</b>. Rebuilding one lost 2 MB shard under 6+3 means reading six 2 MB shards (12 MB) across the network, a 6x amplification. Under 10+4 it is 10x. During a large failure (a rack going down), repair traffic can become a significant load on the network and disks, and a longer repair window means a higher chance of additional failures overlapping. Some systems use <b>locally repairable codes</b> (LRC), which add a few local parity shards so that a single lost shard can be rebuilt from a small group (say 6 neighbors rather than 12), trading slightly higher overhead for much cheaper common-case repair. Azure storage uses an LRC design.</p>
+<p>Common practice is a hybrid: small objects and fresh hot data are stored replicated (3 copies), and a background process converts large and older data to erasure-coded form, getting the low overhead where it counts.</p>
+
+<h3>9.5 Durability math</h3>
+<p>Let us estimate the chance of losing an object using plain assumptions (they are optimistic, because failures are not perfectly independent, but they show the shape).</p>
+<ul>
+  <li>Disk annual failure rate (AFR): 2 percent. A disk dies on average once in 50 years.</li>
+  <li>Repair window: after any shard is lost, the system restores it in about 24 hours. During that window the remaining shards must not suffer enough additional failures to exceed tolerance.</li>
+  <li>Probability a given disk fails in one 24-hour window: p = 0.02 / 365, about 5.5 x 10<sup>-5</sup>.</li>
+</ul>
+<p><b>Three-way replication.</b> Data is lost if all 3 copies are gone in the same window: roughly p<sup>3</sup> = 1.7 x 10<sup>-13</sup> per window. Over 365 windows, about 6 x 10<sup>-11</sup> per year. That is already around 10 nines of annual durability.</p>
+<p><b>Erasure code 6+3 (9 shards).</b> Data is lost if 4 or more of the 9 shards fail in the same window. The number of ways to pick 4 of 9 is 126. So the probability is about 126 x p<sup>4</sup> = 126 x (5.5 x 10<sup>-5</sup>)<sup>4</sup> = 126 x 9.2 x 10<sup>-18</sup> = 1.2 x 10<sup>-15</sup> per window, and about 4 x 10<sup>-13</sup> per year. That is about 12 nines, <b>better than 3x replication at half the storage cost</b>.</p>
+<p>Real systems get close to or better than these figures by spreading shards across zones, repairing in a few hours instead of a day, scrubbing so latent errors are caught, and designing for correlated failures (a bad firmware batch, a power event). Equally, real failure rates have correlated tails that the independent model ignores, which is why providers invest in diversity (different disk vintages and racks) and why the largest durability risks are often <i>software bugs and human mistakes</i> (an operator deleting the wrong thing), not random disk death.</p>
+
+<div class="callout watch"><b>Watch out</b>
+Durability math assumes failures are independent and repair finishes within the window. If repair is starved (network saturated, a backlog of failed disks), the effective window grows and the probability of loss grows with the cube or fourth power of it. Repair speed is therefore a first-class durability control, not an afterthought.
+</div>
+
+<h3>9.6 Cross-region replication</h3>
+<p>Spreading shards across zones protects against a zone outage. It does not protect against a whole-region disaster, a destructive bug, or an account compromise. For that, enable <b>cross-region replication</b>: an asynchronous service copies each new object (and optionally deletes and metadata) to a bucket in another region, usually within seconds to minutes, with an SLA of 15 minutes for most objects on some providers. Replication is asynchronous, so there is a replication lag and the destination is eventually consistent relative to the source. Combine it with versioning and object lock so that a malicious delete is not propagated destructively.</p>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="integrity">10. Checksums, scrubbing, and background repair</h2>
+
+<p>Disks do not only die cleanly. They also suffer <b>silent corruption</b>: a flipped bit, a misdirected write, a bad sector that returns wrong data without an error. If a system trusted what it read, corruption would spread into repairs and replicas, producing bad data with good durability numbers. So integrity checking is built into every layer.</p>
+
+<h3>10.1 Checksums everywhere</h3>
+<ul>
+  <li>The <b>client</b> can send a checksum (CRC32C, SHA-256) with the upload, and the service verifies that the bytes it received match, so corruption in transit is caught. Modern S3 clients compute these by default.</li>
+  <li>The <b>front end</b> computes a checksum per chunk and stores it in the metadata record.</li>
+  <li>Each <b>shard</b> carries its own checksum, checked by the storage node on every read and by the front end after receiving it.</li>
+  <li>Checksums are re-verified when data moves (repair, rebalancing, replication) so a bad copy never replaces a good one.</li>
+</ul>
+
+<h3>10.2 Scrubbing</h3>
+<p>Cold data may sit for years without being read, so latent corruption could accumulate unnoticed until the day you need it, by which time several shards may be bad. A <b>scrubber</b> is a background process that continuously reads every shard at a low rate (rate-limited so as not to hurt user traffic), recomputes the checksum, and reports mismatches. The goal is to detect corruption within a bounded period, such as every shard verified every few weeks. A bad shard is marked lost and handed to the repair system. Scrubbing is what makes the "repair window" assumption in the durability math true for data nobody reads.</p>
+
+<h3>10.3 Repair</h3>
+<p>The repair system maintains the invariant "every chunk has all n shards healthy". It learns of problems from several sources: the node that holds a shard went down (heartbeat timeout), a disk was ejected, the scrubber found corruption, or a client read hit a bad checksum. For each affected chunk it reads enough surviving shards, rebuilds the missing shards, and writes them to new healthy locations chosen by placement, then updates the chunk map in metadata.</p>
+<p>Repair is prioritized by <b>risk</b>: a chunk that has lost 3 of 9 shards (one more loss away from data loss) is repaired before a chunk that lost 1. Repair is also <b>rate-managed</b>: fast enough to keep the window small, but bounded so a mass failure does not starve foreground traffic. Because the lost disk's contents are spread over thousands of other disks (each chunk's shards are placed on different sets), the rebuild work is parallelized across the whole cluster. A failed 20 TB disk is rebuilt not by one disk reading at 100 MB/s (which would take over two days) but by thousands of disks each contributing a little, finishing in hours.</p>
+
+<h3>10.4 Handling node failures vs temporary outages</h3>
+<p>A node that is merely rebooting should not trigger a mass rebuild. Repair systems apply a delay (for example 15 minutes to an hour) before treating a missing node as lost, because reconstructing a node's worth of data when it was only briefly offline wastes network. During the delay, reads of affected chunks work in degraded mode using other shards.</p>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="gc">11. Garbage collection and deletes</h2>
+
+<p>Deleting an object in an object store is a two-stage affair, because the metadata and the data live in different systems and because multi-step operations can fail midway.</p>
+<ol>
+  <li><b>Logical delete.</b> DELETE removes (or version-marks) the metadata row, atomically. From that instant the object is gone to every client.</li>
+  <li><b>Physical reclaim.</b> The shards on storage nodes are no longer referenced. A <b>garbage collector</b> finds and frees them, typically after a safety delay.</li>
+</ol>
+
+<p>Two kinds of garbage exist. <b>Deleted data</b> is shards whose metadata was removed. <b>Orphans</b> are shards that were written for a PUT or multipart part whose metadata commit never happened (the front end crashed, the client abandoned the upload). GC finds both by comparing what storage nodes hold against what the metadata service references: shards not referenced by any live metadata row (and older than a grace period) are deleted. The grace period matters, since a shard written a few seconds ago may belong to an in-flight upload whose commit has not yet landed; deleting it would corrupt the new object. Typical designs only collect orphans older than hours or days.</p>
+
+<p>Further sources of garbage: unfinished multipart uploads (use a lifecycle rule "abort incomplete multipart uploads after 7 days"), old noncurrent versions of versioned objects (lifecycle rule "expire noncurrent versions after 30 days"), and delete markers with no remaining versions. On disk, deleted shards leave holes in extent files; <b>compaction</b> rewrites mostly-dead extents to reclaim space.</p>
+
+<div class="callout tip"><b>Interview tip</b>
+Lead with the invariant: "bytes first, metadata commit last, delete metadata first, bytes last." Under that ordering, a crash anywhere can leave only unreferenced garbage, never a dangling pointer to missing data. Garbage is a cost problem, not a correctness problem, and a periodic sweep fixes it.
+</div>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="consistency">12. Durability vs availability, and the consistency model</h2>
+
+<h3>12.1 What "eleven nines" means</h3>
+<p>S3 Standard advertises <b>99.999999999% (eleven nines) durability</b> of objects over a given year. It means the expected annual loss rate is about 10<sup>-11</sup> per object: if you store 10 million objects, you can expect to lose one object every 10,000 years on average. It is a statistical design target derived from failure and repair models like the one in section 9.5, not a guarantee about any one object and not a promise you will never lose data to your own mistakes (a deleted object is "durably deleted").</p>
+<p>It says nothing about whether you can <i>reach</i> the data right now. That is <b>availability</b>: the fraction of requests that succeed. S3 Standard is designed for around 99.99% availability (about 53 minutes of unavailability per year), and its SLA is lower still. Durability and availability are independent properties: a system can lose no data and still be down for an hour. Cheaper classes (infrequent access, one-zone) keep high durability inside their scope but have lower availability designs, and one-zone classes are explicitly vulnerable to losing the whole zone.</p>
+
+<table>
+  <tr><th></th><th>Durability</th><th>Availability</th></tr>
+  <tr><td>Question answered</td><td>"Will my data still exist?"</td><td>"Can I read or write it right now?"</td></tr>
+  <tr><td>Achieved by</td><td>Redundancy across failure domains, checksums, scrubbing, fast repair</td><td>Stateless front ends, replicated metadata, retries, multi-AZ design</td></tr>
+  <tr><td>Typical S3 Standard target</td><td>11 nines per year</td><td>About 4 nines (99.99%)</td></tr>
+  <tr><td>How you add more</td><td>Cross-region replication, versioning, backups elsewhere</td><td>Multi-region access, retries, fallback origin</td></tr>
+</table>
+
+<h3>12.2 Consistency model</h3>
+<p>Historically S3 had a confusing mixed model: read-after-write consistency for new object PUTs but only <b>eventual consistency</b> for overwrite PUTs, DELETEs, and LIST. A client could overwrite an object and then read the old version for a short while, or list a bucket and not see a key it just wrote. This broke many applications, especially big data jobs that wrote files and then listed them to find outputs, and required workarounds (an external consistency layer such as S3Guard).</p>
+<p>Since December 2020, S3 provides <b>strong read-after-write consistency</b> for all operations in all regions: after a successful PUT or DELETE, any subsequent GET, HEAD, or LIST reflects it. Google Cloud Storage and Azure Blob Storage offer strong consistency as well. The enabler is the strongly consistent metadata layer from section 7: because every operation goes through the single authoritative shard for the key, which is replicated with a consensus-style protocol, a read after an acknowledged write always sees it, and LIST scans the same ordered, consistent index.</p>
+<p>What strong consistency does <b>not</b> give you:</p>
+<ul>
+  <li><b>No transactions across objects.</b> Writing two keys is two independent operations. Another client can see one without the other. There is no atomic multi-object rename or commit. Systems like Apache Iceberg, Delta Lake, and Hudi build table commits using a single atomic metadata-file swap (a conditional PUT).</li>
+  <li><b>Concurrent writers to one key:</b> last writer wins, with the order defined by the commit order at the metadata shard. There is no locking; use conditional writes or versioning if you need to detect conflicts.</li>
+  <li><b>Cross-region replication is asynchronous,</b> so a replica bucket in another region lags the source.</li>
+  <li><b>Caches in front</b> (a CDN, a browser, a client SDK) can serve stale copies according to their TTLs.</li>
+</ul>
+<p>Not every S3-compatible product is strongly consistent for listing, so for portable designs state your assumption explicitly.</p>
+
+<h3>12.3 List semantics</h3>
+<p>LIST returns keys in ascending lexicographic (UTF-8 byte) order, at most 1,000 per call, with a continuation token. Listing a bucket of billions of keys is slow and expensive (each page is a billed request), so never design an application that needs to list the whole bucket on a hot path. Keep your own index of objects in a database, and use LIST for administration and batch jobs, or use the provider's <b>inventory</b> feature, which delivers a daily file listing all objects.</p>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="failures">13. Failure modes</h2>
+
+<table>
+  <tr><th>Failure</th><th>What happens</th><th>How the design copes</th></tr>
+  <tr><td><b>Disk dies</b></td><td>Shards on it are lost</td><td>Repair rebuilds them elsewhere from the other shards, spread across many disks</td></tr>
+  <tr><td><b>Node or rack fails</b></td><td>Many shards are temporarily or permanently unreachable</td><td>Placement keeps each chunk's shards in different racks, so no chunk loses more than one or two. Degraded reads use parity. Repair after a grace delay</td></tr>
+  <tr><td><b>Zone outage</b></td><td>A third of shards in 3-zone classes unreachable</td><td>6+3 spread 3 per zone still reads using the other 6 shards. Metadata is replicated across zones</td></tr>
+  <tr><td><b>Silent corruption</b></td><td>A shard returns wrong bytes</td><td>Checksums detect it on read or scrub, data is reconstructed, the bad shard rewritten</td></tr>
+  <tr><td><b>Front end crash mid-PUT</b></td><td>Shards written, no metadata commit</td><td>Client sees an error and retries. Orphans are garbage collected</td></tr>
+  <tr><td><b>Metadata shard leader fails</b></td><td>Writes to that key range stall briefly</td><td>Consensus group elects a new leader in seconds. Clients retry</td></tr>
+  <tr><td><b>Hot key range</b></td><td>503 Slow Down responses</td><td>Automatic range splitting, client backoff, spreading key prefixes</td></tr>
+  <tr><td><b>Repair storm</b></td><td>A large failure floods the network with rebuild traffic</td><td>Repair is prioritized by risk and rate-limited. Local-repair codes reduce traffic</td></tr>
+  <tr><td><b>Region outage</b></td><td>The whole region is unreachable</td><td>Cross-region replication and failover in the application (see <a href="41-ha-dr.html">Chapter 41</a>)</td></tr>
+  <tr><td><b>Operator or software bug</b></td><td>Wrong data deleted or overwritten</td><td>Versioning, object lock, soft-delete windows, delayed GC, staged rollouts</td></tr>
+  <tr><td><b>Client-side mistakes</b></td><td>Accidentally public bucket, leaked credentials, ransomware delete</td><td>Block Public Access settings, least privilege, MFA delete, versioning plus object lock</td></tr>
+</table>
+
+<!-- ======================= 14 ======================= -->
+<h2 id="perf">14. Performance: partitions, request rates, small objects, throughput</h2>
+
+<h3>14.1 Latency and throughput profile</h3>
+<p>A GET has a first-byte latency of roughly 10 to 100 ms for hot data in the standard class (a metadata lookup plus a disk seek on an HDD fleet), and then streams at the speed of the client connection. A single connection might reach 50 to 100 MB/s. Aggregate throughput is practically limited only by how many parallel requests you issue and by your network interface. Object storage is therefore excellent for bulk throughput and mediocre for chatty small random I/O. If you need single-digit-millisecond access, put a cache (<a href="13-caching-patterns.html">Chapter 13</a>) or a CDN (<a href="12-cdn.html">Chapter 12</a>) in front, or use a premium low-latency class (such as S3 Express One Zone), which keeps data on SSD in one zone.</p>
+
+<h3>14.2 Prefix partitioning and request rates</h3>
+<p>Because the metadata is range-partitioned (section 7.2), request rate scales with the number of partitions your keys occupy. S3 documents that a bucket supports at least 3,500 write requests per second (PUT, COPY, POST, DELETE) and 5,500 read requests per second (GET, HEAD) <b>per prefix</b>, with no limit to the number of prefixes. In practice the service splits partitions as load grows, but a sudden step in load, or concentrating on one narrow range, returns 503 Slow Down until splits catch up.</p>
+<p>Guidance for key design:</p>
+<ul>
+  <li><b>Avoid sequential hot prefixes</b> if you will write at thousands per second. Keys like <code>logs/2026-11-17-12-00-01-123.json</code> concentrate on the tail. Put a short hash or random-looking component early: <code>logs/a3/2026-11-17-...</code> or hash the user ID (<code>users/9f/ana/...</code>) so load spreads over many ranges.</li>
+  <li><b>But keep listing in mind.</b> Randomized prefixes make "list everything for date X" harder. Many designs use a stable partition prefix (a hash into, say, 256 buckets) plus a date, and run 256 parallel listings.</li>
+  <li><b>Put the grouping you list by near the front</b> (tenant, then date), and the high-cardinality part later.</li>
+  <li><b>Avoid reading and writing the same key at huge rates</b>: a single object is served from one place and cannot scale beyond a hot-object limit. Replicate copies under different keys, or front it with a CDN.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Sequential key prefix hits one partition while hashed prefix spreads across partitions">
+  <text class="t-b" x="20" y="22">Sequential keys: logs/2026-11-17-... (all writes hit the newest range)</text>
+  <rect class="cache" x="20"  y="36" width="120" height="50" rx="8"/><text class="t-c t-sm" x="80" y="66">old range (idle)</text>
+  <rect class="cache" x="150" y="36" width="120" height="50" rx="8"/><text class="t-c t-sm" x="210" y="66">old range (idle)</text>
+  <rect class="miss"  x="280" y="36" width="170" height="50" rx="8"/><text class="t-c t-b" x="365" y="58">newest range</text><text class="t-c t-sm" x="365" y="76">503 Slow Down</text>
+  <path class="arrow-r" d="M600 61 L454 61"/><text class="t-sm" x="470" y="104">all writers</text>
+  <rect class="ext" x="610" y="36" width="120" height="50" rx="8"/><text class="t-c t-b" x="670" y="66">Writers</text>
+
+  <text class="t-b" x="20" y="150">Hashed prefix: logs/a3/2026-11-17-... (writes fan out)</text>
+  <rect class="hit" x="20"  y="166" width="100" height="50" rx="8"/><text class="t-c t-sm" x="70" y="196">range 00-3f</text>
+  <rect class="hit" x="130" y="166" width="100" height="50" rx="8"/><text class="t-c t-sm" x="180" y="196">range 40-7f</text>
+  <rect class="hit" x="240" y="166" width="100" height="50" rx="8"/><text class="t-c t-sm" x="290" y="196">range 80-bf</text>
+  <rect class="hit" x="350" y="166" width="100" height="50" rx="8"/><text class="t-c t-sm" x="400" y="196">range c0-ff</text>
+  <rect class="ext" x="610" y="166" width="120" height="50" rx="8"/><text class="t-c t-b" x="670" y="196">Writers</text>
+  <path class="arrow-g" d="M606 180 L454 180"/>
+  <text class="t-sm" x="20" y="250">Trade-off: a listing for one date now needs one LIST per hash bucket, run in parallel.</text>
+</svg>
+<figcaption>Range-partitioned metadata means the leading part of the key determines which partition takes the load. Spreading the leading part spreads the load.</figcaption>
+</figure>
+
+<h3>14.3 The small objects problem</h3>
+<p>Object stores are efficient for objects of megabytes and up. They are inefficient for billions of tiny objects (a few KB) for several reasons:</p>
+<ul>
+  <li>Metadata cost per object is roughly constant, so a 2 KB object costs the same index space as a 2 GB one, and may cost more in metadata than in data.</li>
+  <li>Erasure coding a tiny object produces nine tiny shards, wasting overhead on headers and padding; many systems replicate or pack small objects instead.</li>
+  <li>Request charges and latency are per request, so reading a million 1 KB objects costs a million requests, about 1,000 times more per byte than reading one 1 GB object.</li>
+  <li>Minimum billable sizes (for example 128 KB in infrequent-access classes) and minimum storage durations penalize small objects.</li>
+</ul>
+<p>The standard fix is <b>batching small items into larger objects</b>: concatenate many records into one file (log batches, Parquet or ORC files in a data lake, tar or zip archives, a custom packfile with an index), and use range reads to fetch one record by offset. You keep a small index (in a database) mapping record ID to (object key, offset, length). This is the technique behind Facebook's Haystack for photos and many log pipelines.</p>
+
+<h3>14.4 Tuning throughput</h3>
+<ul>
+  <li><b>Parallelize:</b> use many concurrent connections, and split large GETs into ranged GETs (for example 8 to 16 MB each) run in parallel. Use multipart for uploads.</li>
+  <li><b>Keep connections warm</b> (HTTP keep-alive, connection pooling) to avoid repeated TLS handshakes (<a href="03-networking-essentials.html">Chapter 3</a>).</li>
+  <li><b>Co-locate compute and data in the same region</b> (and ideally zone) to cut latency and avoid transfer fees. Use a VPC gateway endpoint so traffic stays on the provider's network.</li>
+  <li><b>Retry with backoff and jitter,</b> and retry slow requests (a request taking much longer than the median is re-issued) to trim tail latency.</li>
+  <li><b>Right-size objects</b> to about 64 MB to 1 GB for analytics workloads, so each task does a few large sequential reads instead of many small ones.</li>
+  <li><b>Use transfer acceleration or a CDN</b> for users far from the bucket's region.</li>
+</ul>
+
+
+<!-- ======================= 15 ======================= -->
+<h2 id="classes">15. Storage classes, lifecycle policies, and the cost model</h2>
+
+<h3>15.1 Storage classes</h3>
+<p>Most data is accessed heavily when it is new and rarely afterwards: a photo is viewed constantly for a week, a log file is searched for a day, a backup is read only in a disaster. Object stores exploit this by offering <b>storage classes</b> (tiers) that trade access speed and price. Colder tiers charge much less per gigabyte-month, but charge more per retrieval, impose minimum storage durations, and may add retrieval delay.</p>
+
+<table>
+  <tr><th>Tier</th><th>Example (S3 names)</th><th>Access pattern</th><th>First-byte latency</th><th>Relative storage price</th></tr>
+  <tr><td><b>Hot</b></td><td>Standard</td><td>Frequent</td><td>Milliseconds</td><td>1x (highest storage, lowest access fees)</td></tr>
+  <tr><td><b>Warm</b></td><td>Standard-Infrequent Access, One Zone-IA</td><td>Roughly monthly</td><td>Milliseconds</td><td>About 0.5x, with per-GB retrieval fee and 30-day minimum</td></tr>
+  <tr><td><b>Cold</b></td><td>Glacier Instant Retrieval</td><td>Roughly quarterly</td><td>Milliseconds</td><td>About 0.2x, higher retrieval fee, 90-day minimum</td></tr>
+  <tr><td><b>Archive</b></td><td>Glacier Flexible Retrieval</td><td>Rare</td><td>Minutes to hours (restore first)</td><td>About 0.15x</td></tr>
+  <tr><td><b>Deep archive</b></td><td>Glacier Deep Archive</td><td>Compliance, almost never</td><td>Hours (about 12 or more)</td><td>About 0.04x (cheapest, 180-day minimum)</td></tr>
+  <tr><td><b>Automatic</b></td><td>Intelligent-Tiering</td><td>Unknown or changing</td><td>Milliseconds</td><td>The service moves objects between tiers by access pattern, for a small per-object monitoring fee</td></tr>
+</table>
+<p>Ratios are rough and change over time and region, so quote them as orders of magnitude. Other providers have equivalents (GCS Standard, Nearline, Coldline, Archive; Azure Hot, Cool, Cold, Archive). How can archive be so cheap? Internally, it often means data on very dense disks or tape libraries, spun down or powered off, with wide erasure codes and batched, scheduled retrieval, so the cost per gigabyte falls sharply while latency rises. "Restore" from archive is an asynchronous job: you request it, wait, and the object becomes readable for a number of days as a temporary copy.</p>
+
+<h3>15.2 Lifecycle policies</h3>
+<p>You rarely move objects between classes by hand. A <b>lifecycle policy</b> is a set of rules on a bucket, matching objects by prefix or tag, that automatically <i>transition</i> objects to colder classes and <i>expire</i> (delete) them as they age. A background lifecycle engine scans the metadata (an efficient range scan) and performs the transitions and deletes.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Lifecycle timeline from hot to archive to expiry with relative price">
+  <line class="arrow" x1="30" y1="120" x2="870" y2="120"/>
+  <text class="t-b" x="30" y="30">Object age</text>
+  <rect class="miss" x="40"  y="60" width="180" height="46" rx="8"/><text class="t-c t-b" x="130" y="80">Hot: Standard</text><text class="t-c t-sm" x="130" y="98">day 0 to 30</text>
+  <rect class="cache" x="240" y="60" width="180" height="46" rx="8"/><text class="t-c t-b" x="330" y="80">Warm: Infrequent</text><text class="t-c t-sm" x="330" y="98">day 30 to 90</text>
+  <rect class="box" x="440" y="60" width="180" height="46" rx="8"/><text class="t-c t-b" x="530" y="80">Cold: Instant Retr.</text><text class="t-c t-sm" x="530" y="98">day 90 to 365</text>
+  <rect class="ext" x="640" y="60" width="130" height="46" rx="8"/><text class="t-c t-b" x="705" y="80">Archive</text><text class="t-c t-sm" x="705" y="98">day 365 to 2555</text>
+  <rect class="hit" x="790" y="60" width="80" height="46" rx="8"/><text class="t-c t-b" x="830" y="88">Delete</text>
+  <text class="t-c t-sm" x="130" y="146">$$$$</text><text class="t-c t-sm" x="330" y="146">$$</text><text class="t-c t-sm" x="530" y="146">$</text><text class="t-c t-sm" x="705" y="146">cents</text>
+  <text class="t-sm" x="30" y="190">Rule: transition to Infrequent after 30 days, to Instant Retrieval after 90, to Archive after 365, expire after 7 years (2555 days).</text>
+  <text class="t-sm" x="30" y="212">Companion rules: abort incomplete multipart uploads after 7 days; expire noncurrent versions after 30 days.</text>
+  <text class="t-sm" x="30" y="234">Watch minimum durations and per-transition request fees: moving millions of tiny objects can cost more than it saves.</text>
+</svg>
+<figcaption>A lifecycle policy walks each object down the price ladder as it ages and finally removes it, with no application code involved.</figcaption>
+</figure>
+
+<h3>15.3 The cost model</h3>
+<p>Object storage bills along three axes. Knowing them is how you decide between designs.</p>
+<ol>
+  <li><b>Storage:</b> per gigabyte-month, by class. Roughly 2 cents per GB-month for hot storage at major providers (about $23 per TB-month), a fraction of that for cold. Versioning, noncurrent versions, incomplete multipart parts, and replicas all count.</li>
+  <li><b>Requests:</b> per thousand or per million operations. Writes, lists, and copies cost roughly an order of magnitude more than reads (on the order of $0.005 per 1,000 PUTs and $0.0004 per 1,000 GETs for the hot class). Colder tiers charge more per request. Small objects make request cost dominate.</li>
+  <li><b>Data transfer (egress):</b> bytes leaving the provider's network to the internet, around 5 to 9 cents per GB at list price, falling with volume. Ingress is free. Transfer within a region is generally free, and cross-region or cross-zone transfer has a smaller fee. Egress is often the largest line item for media-serving workloads, and is the main reason to use a CDN with cheaper transfer, or an egress-free provider such as Cloudflare R2, or to keep compute in the same region as the data.</li>
+</ol>
+<p>Numbers drift, so in an interview round them and state they are list-price approximations. Show the structure: "storage is cheap, requests are cheap per call but add up with small objects, egress is the surprise."</p>
+
+<!-- ======================= 16 ======================= -->
+<h2 id="security">16. Access control and encryption</h2>
+
+<h3>16.1 Who can do what</h3>
+<p>Every request must be authenticated (who are you) and authorized (are you allowed). S3-style systems layer several mechanisms:</p>
+<ul>
+  <li><b>Identity-based policies (IAM):</b> attached to users or roles ("this role may <code>GetObject</code> on <code>arn:aws:s3:::my-bucket/reports/*</code>"). This is how your services get access, normally through short-lived role credentials rather than long-lived keys.</li>
+  <li><b>Resource-based bucket policies:</b> attached to the bucket, JSON documents granting or denying actions to principals, including other accounts, with conditions (source IP range, require TLS, require encryption headers, VPC endpoint, MFA).</li>
+  <li><b>ACLs:</b> legacy per-object or per-bucket grants. Modern guidance is to disable them and use policies.</li>
+  <li><b>Block Public Access:</b> an account or bucket level master switch that overrides any policy that would make data public. Leaving this on prevents the most common breach: a misconfigured public bucket.</li>
+  <li><b>Evaluation rule:</b> an explicit Deny anywhere wins. Otherwise access requires an Allow from identity policy or resource policy (within one account), and for cross-account access both sides must allow.</li>
+</ul>
+<p>Requests are authenticated by a <b>signature</b> (AWS Signature Version 4): the client computes an HMAC over the canonical request (method, path, headers, payload hash, timestamp) with a secret key derived from its credentials. The server recomputes it. The secret never travels, replays are limited by the timestamp, and the payload hash makes tampering detectable. This is the same mechanism that presigned URLs use.</p>
+
+<h3>16.2 Encryption</h3>
+<p><b>In transit:</b> TLS (HTTPS) for every request, enforceable by a bucket policy that denies non-TLS requests.</p>
+<p><b>At rest</b> has several variants. In all of them the object is encrypted with a unique <b>data key</b>, and the data key is itself encrypted ("wrapped") by a master key. This is <b>envelope encryption</b>, and it keeps the master key in a small, well-guarded key management service (KMS) while the bulk data is encrypted at line speed on the storage tier.</p>
+<table>
+  <tr><th>Mode</th><th>Who holds the key</th><th>Notes</th></tr>
+  <tr><td><b>SSE-S3</b> (server-side, provider-managed keys)</td><td>Provider</td><td>Default, free, no setup. Encrypts all new objects by default today.</td></tr>
+  <tr><td><b>SSE-KMS</b> (keys in a KMS you control)</td><td>You control key policy and rotation, provider's KMS does the crypto</td><td>Audit trail of every key use, ability to revoke by disabling the key. Adds a KMS call per request (cost and rate limits, mitigated with bucket keys).</td></tr>
+  <tr><td><b>SSE-C</b> (customer-provided key per request)</td><td>You send the key with every request</td><td>Provider never stores the key. You must manage and transmit keys safely.</td></tr>
+  <tr><td><b>Client-side encryption</b></td><td>You, before upload</td><td>Provider only sees ciphertext. Strongest control, but you lose server features such as server-side processing, and key loss means data loss.</td></tr>
+</table>
+
+<h3>16.3 Presigned URLs and the upload pattern</h3>
+<p>The most common architecture for user content: the browser or mobile app never receives long-term credentials. It asks your API "I want to upload a profile picture". Your API authenticates the user, picks the object key (never let the client choose it freely, to avoid overwriting others' data or path tricks), optionally constrains content type and maximum size through a presigned POST policy, and returns a short-lived URL. The client uploads straight to object storage. For downloads of private content, your API checks permission and returns a presigned GET URL valid for a few minutes. The user never sees credentials, your servers carry no file bytes, and costs and bandwidth scale on the object store rather than on your fleet. A signed URL is a bearer token, so keep expiries short and avoid logging full URLs.</p>
+
+<div class="callout watch"><b>Watch out</b>
+Do not trust uploaded files. Treat the bucket as untrusted input: scan for malware, validate content type rather than extension, serve user-uploaded HTML from a separate domain so scripts cannot run on your main origin, and process uploads asynchronously (queue plus worker) triggered by an event notification (section 18).
+</div>
+
+<!-- ======================= 17 ======================= -->
+<h2 id="uses">17. Common uses: CDN origin, data lake, backup target</h2>
+
+<h3>17.1 Origin for a CDN</h3>
+<p>Object storage is the most common <b>origin</b> behind a CDN (<a href="12-cdn.html">Chapter 12</a>). The bucket holds images, video segments, downloads, and static websites. The CDN caches objects at the edge so most requests never reach the bucket, which cuts latency and egress cost dramatically (CDN transfer is usually cheaper than direct egress, and the origin-to-CDN transfer is often discounted or free). Details that matter:</p>
+<ul>
+  <li><b>Lock the bucket to the CDN.</b> Keep the bucket private and let only the CDN's identity read it (origin access control), so users cannot bypass the cache and the bucket cannot be scraped directly.</li>
+  <li><b>Immutable, versioned keys.</b> Because objects are write-once, name them by content hash (<code>/img/9f3c.../medium.webp</code>) and set <code>Cache-Control: public, max-age=31536000, immutable</code> as object metadata. Updates become new keys, so no purge is needed.</li>
+  <li><b>Set the right metadata</b> at upload: <code>Content-Type</code>, <code>Cache-Control</code>, <code>Content-Encoding</code> (when pre-compressed), because the origin passes these on.</li>
+  <li><b>Range requests</b> from video players and download managers pass through the CDN to the object store, which supports them natively.</li>
+  <li><b>Protect hot-object limits:</b> the CDN's origin shield collapses misses so the bucket sees one request per object per cache lifetime.</li>
+</ul>
+
+<h3>17.2 Data lake foundation</h3>
+<p>Analytics platforms use object storage as a <b>data lake</b>: raw and curated datasets stored as files, typically in a columnar format such as Parquet or ORC, partitioned by key prefix (<code>events/dt=2026-11-17/part-0001.parquet</code>). Compute engines (Spark, Trino, Presto, Athena, Snowflake external tables) are separate from storage, so you scale and pay for each independently and can spin compute up and down. Range reads let an engine fetch just the footer and the column chunks it needs. Large append-friendly files and parallel reads match the object store's strengths.</p>
+<p>The gap is database semantics. Plain files on object storage have no transactions, no atomic multi-file commits, no schema evolution, and slow listing. <b>Open table formats</b> (Apache Iceberg, Delta Lake, Apache Hudi) add a layer of metadata files on top: a table snapshot is a manifest of data files, and a commit atomically swaps a pointer to the new manifest (relying on conditional writes or a small catalog). That provides ACID commits, time travel, and efficient planning without listing. See <a href="37-batch-stream.html">Chapter 37</a> for batch pipelines.</p>
+
+<h3>17.3 Backup and archive target</h3>
+<p>Object storage is the default destination for database dumps, snapshots, log archives, and compliance records because it is cheap, durable, and offsite. Good practice: enable versioning, write backups with <b>object lock</b> in compliance mode for ransomware resilience, replicate to another region or account, use lifecycle rules to move to archive tiers and expire after the retention period, encrypt with KMS keys, and <b>test restores</b> regularly (a backup you have never restored is a hope, not a backup). Read costs and archive restore delays matter for recovery time objectives, so keep recent backups in a fast tier (see <a href="41-ha-dr.html">Chapter 41</a>).</p>
+
+<h3>17.4 Other uses</h3>
+<p>Static website hosting, software artifact and container image registries (whose layers are content-addressed blobs), machine learning datasets and model checkpoints, user-generated media, log and metrics archives, and as the large-payload side of the claim-check pattern (put the big payload in a bucket and send only the key through a queue; see <a href="35-messaging-patterns.html">Chapter 35</a>).</p>
+
+<!-- ======================= 18 ======================= -->
+<h2 id="events">18. Event notifications</h2>
+
+<p>Object stores can emit an <b>event</b> when something happens to an object: created (PUT, POST, copy, multipart complete), removed (delete, delete marker), restored from archive, lifecycle transition or expiration, replication failure, and so on. You configure a bucket to send matching events (filtered by prefix and suffix, such as <code>uploads/</code> and <code>.jpg</code>) to a destination: a message queue, a pub/sub topic, an event bus, or a serverless function.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Upload event pipeline from object store to queue to workers">
+  <rect class="ext" x="20" y="90" width="110" height="50" rx="10"/><text class="t-c t-b" x="75" y="120">Client</text>
+  <rect class="db" x="200" y="90" width="150" height="50" rx="10"/><text class="t-c t-b" x="275" y="112">Bucket</text><text class="t-c t-sm" x="275" y="130">uploads/ prefix</text>
+  <rect class="cache" x="430" y="90" width="130" height="50" rx="10"/><text class="t-c t-b" x="495" y="112">Queue / topic</text><text class="t-c t-sm" x="495" y="130">durable buffer</text>
+  <rect class="box" x="640" y="30" width="200" height="44" rx="10"/><text class="t-c t-b" x="740" y="57">Thumbnail worker</text>
+  <rect class="box" x="640" y="100" width="200" height="44" rx="10"/><text class="t-c t-b" x="740" y="127">Virus scan worker</text>
+  <rect class="box" x="640" y="170" width="200" height="44" rx="10"/><text class="t-c t-b" x="740" y="197">Metadata indexer</text>
+  <path class="arrow" d="M130 115 L196 115"/><text class="t-sm" x="132" y="106">1 presigned PUT</text>
+  <path class="arrow dash" d="M350 115 L426 115"/><text class="t-sm" x="352" y="106">2 ObjectCreated</text>
+  <path class="arrow" d="M560 105 L636 55"/><path class="arrow" d="M560 115 L636 122"/><path class="arrow" d="M560 125 L636 190"/>
+  <text class="t-sm" x="20" y="240">Delivery is at-least-once and can be duplicated or delayed: make handlers idempotent (key + version + sequencer).</text>
+</svg>
+<figcaption>An upload triggers an event. The queue buffers it, and independent workers process the new object without the uploader waiting.</figcaption>
+</figure>
+
+<p>Design points to mention: delivery is generally <b>at-least-once</b>, so handlers must be <b>idempotent</b> (<a href="32-idempotency-ids.html">Chapter 32</a>), keyed by bucket, key, and version ID; events for the same key can arrive out of order (use the sequencer or version to detect staleness); the notification path is separate from the write path, so there is a small delay and a rare chance of a missed event, so for critical flows pair events with a periodic reconciliation scan (the inventory report). Send events to a queue (<a href="34-queues-kafka.html">Chapter 34</a>) rather than directly to a slow consumer to get buffering and retries. Do not write the output back to the same prefix that triggers the event, or you create an infinite loop.</p>
+
+<!-- ======================= 19 ======================= -->
+<h2 id="alternatives">19. Alternatives and implementations</h2>
+
+<table>
+  <tr><th>System</th><th>What it is</th><th>When to choose it</th></tr>
+  <tr><td><b>Amazon S3, Google Cloud Storage, Azure Blob</b></td><td>Managed cloud object stores</td><td>The default. No operations burden, eleven-nines durability, rich ecosystem.</td></tr>
+  <tr><td><b>Cloudflare R2, Backblaze B2, Wasabi</b></td><td>S3-compatible managed stores with different pricing</td><td>Egress-heavy workloads (R2 charges no egress fee), cost-driven archives.</td></tr>
+  <tr><td><b>MinIO</b></td><td>Open source, S3-compatible, written in Go, erasure coded across drives and nodes</td><td>On-premises, edge, or Kubernetes deployments needing an S3 API. Simple to run. Strong consistency inside a deployment.</td></tr>
+  <tr><td><b>Ceph (RADOS Gateway)</b></td><td>Distributed storage platform offering object (S3/Swift), block (RBD), and file (CephFS) on one cluster, using the CRUSH placement algorithm</td><td>Large private clouds wanting one unified storage layer. Powerful but operationally heavy.</td></tr>
+  <tr><td><b>HDFS</b></td><td>Hadoop's distributed file system: a NameNode holds the namespace, DataNodes hold 128 MB blocks replicated 3x (or erasure coded in Hadoop 3)</td><td>Legacy on-prem big data where compute runs next to data. Real directories and atomic rename, but a NameNode memory limit (small files hurt) and coupled compute and storage. Mostly replaced by object storage plus table formats.</td></tr>
+  <tr><td><b>OpenStack Swift</b></td><td>Open source object store with a ring-based placement and eventual consistency</td><td>Existing OpenStack clouds.</td></tr>
+  <tr><td><b>Distributed file systems (GFS/Colossus, Lustre, GPFS)</b></td><td>Parallel file systems</td><td>HPC and workloads needing POSIX semantics at scale.</td></tr>
+</table>
+
+<p>Two design contrasts worth stating. <b>HDFS vs object store:</b> HDFS gives a real hierarchy with cheap directory rename and data locality (compute scheduled where blocks live), but it is a single-namenode design with memory-bound metadata and requires you to run the cluster. Object stores give effectively infinite scale and separated storage and compute, with slower renames and no locality (the network is fast enough in modern clouds). <b>Ceph vs MinIO:</b> Ceph decides placement by computing it (CRUSH) from a cluster map, so there is no central lookup of where an object lives. Its metadata for S3 buckets lives in a separate index. MinIO is simpler: objects are erasure coded as whole sets across a fixed group of drives, with no separate metadata database, and metadata is stored alongside the data. Both are valid answers to "how do you find an object": by a sharded lookup (S3-style) or by a deterministic hash function (Ceph, Swift rings, consistent hashing; see <a href="57-hashing-probabilistic.html">Chapter 57</a>).</p>
+
+<!-- ======================= 20 ======================= -->
+<h2 id="design">20. Interview form: "design your own S3"</h2>
+
+<p>This question appears as "design a blob store", "design Dropbox storage", or "design S3". A structured way to answer in 40 minutes:</p>
+
+<h3>20.1 Requirements and scope (5 minutes)</h3>
+<p><b>Functional:</b> create buckets, PUT, GET (including ranges), DELETE, LIST by prefix, multipart upload for large files, versioning, access control. <b>Non-functional:</b> extreme durability (state a target such as eleven nines), high availability (four nines), strong read-after-write consistency, scale to trillions of objects and exabytes, cost-efficient for cold data, objects from bytes to 5 TB. Explicitly out of scope unless asked: in-place edits, POSIX semantics, transactions across objects, low-latency random IO. Do a quick size estimate (section 21 shows one).</p>
+
+<h3>20.2 API and data model (3 minutes)</h3>
+<p>Lay out the REST calls from section 4, the bucket and key model, immutable objects with whole-object atomic replace, versioning. Name the central decision: <b>metadata plane separate from data plane.</b></p>
+
+<h3>20.3 High-level design (10 minutes)</h3>
+<p>Draw section 6's diagram: load balancer, stateless front ends, metadata service, placement service, storage nodes, background workers. Walk the PUT path and the GET path (section 8). State the commit-point invariant: bytes first, metadata last.</p>
+
+<h3>20.4 Deep dives (15 minutes), pick based on interviewer interest</h3>
+<ul>
+  <li><b>Metadata scaling:</b> range partitioning on (bucket, key), splitting hot ranges, replication via consensus per shard, directory service caching the range map, LIST by range scan.</li>
+  <li><b>Durability:</b> erasure coding 6+3 or 8+4, shards across zones, failure-domain-aware placement, the durability math, scrubbing, prioritized repair, hybrid replicated-then-EC for small and hot data.</li>
+  <li><b>Large uploads:</b> multipart with parallel parts, resume, atomic complete, abort and lifecycle cleanup.</li>
+  <li><b>Garbage collection:</b> orphans, deleted data, grace periods, compaction.</li>
+  <li><b>Consistency:</b> why metadata through a consensus group gives read-after-write and consistent LIST.</li>
+  <li><b>Hot spots and small objects:</b> prefix design, batching, packing.</li>
+  <li><b>Tiering and cost:</b> lifecycle engine, moving data to wide EC or archive media.</li>
+  <li><b>Security:</b> signed requests, IAM and bucket policies, envelope encryption, presigned URLs.</li>
+</ul>
+
+<h3>20.5 Wrap up (5 minutes)</h3>
+<p>Failure scenarios (disk, rack, zone, metadata leader, repair storm), monitoring (durability risk metrics such as the count of chunks with fewer than n healthy shards, repair backlog, scrub coverage, error rates by partition, p99 latency), and what you would build later (cross-region replication, events, inventory, object lock).</p>
+
+<div class="callout tip"><b>Interview tip</b>
+The strongest answers name the tradeoffs explicitly: "I chose range partitioning for ordered LIST at the price of hot-range risk, which I mitigate with auto-splitting." "I chose 6+3 over 3x replication because it halves storage and tolerates one more failure, at the price of 6x read amplification during repair and poor efficiency for tiny objects, so I replicate objects under 1 MB." Do not just list components.
+</div>
+
+<!-- ======================= 21 ======================= -->
+<h2 id="example">21. Worked example: sizing a photo and video store</h2>
+
+<p><b>Problem.</b> A social app has 50 million daily active users. Each user uploads on average 0.4 items per day (photos and short videos). Items average 3 MB (a blend: 2 MB photos, 30 MB video clips for a small fraction). Keep each item for at least 5 years. Each item is viewed about 20 times in its first week, almost never after a month. Design the storage tier and cost it roughly.</p>
+
+<h4>Step 1: Write and read load</h4>
+<ul>
+  <li>Uploads per day: 50,000,000 x 0.4 = 20 million items per day, so about 230 per second on average, and about 700 per second at a 3x peak.</li>
+  <li>Ingest bytes per day: 20,000,000 x 3 MB = 60 TB per day, an average of about 5.6 Gbps (60 x 10<sup>12</sup> x 8 / 86,400).</li>
+  <li>Views per day: 20 million x 20 = 400 million GETs per day within a week of upload, about 4,600 per second on average and 14,000 per second at peak. With a 95 percent CDN hit ratio (<a href="12-cdn.html">Chapter 12</a>), the bucket sees about 700 GETs per second at peak.</li>
+</ul>
+
+<h4>Step 2: Capacity</h4>
+<ul>
+  <li>Logical growth: 60 TB per day x 365 = about 22 PB per year. Over 5 years, about 110 PB logical (ignoring growth and thumbnails).</li>
+  <li>With 6+3 erasure coding (1.5x): 165 PB raw. With 3x replication it would be 330 PB, so EC saves 165 PB of disks.</li>
+  <li>Thumbnails and transcodes add maybe 20 percent, so budget about 200 PB raw. With 20 TB drives at 75 percent target fill (leaving headroom for repair and growth), each drive holds 15 TB usable: 200 PB / 15 TB is about 13,300 drives. At 60 drives per node, that is about 220 storage nodes.</li>
+  <li>Object count: 20 million per day x 365 x 5 = 36.5 billion objects, plus variants (say 4 per upload) so about 150 billion objects. At roughly 300 bytes of metadata per record, that is 45 TB of metadata, times 3 replicas = about 135 TB on SSD across the metadata shards. If each metadata shard holds 500 GB, that is about 90 shards, which is easily sharded and shows metadata is far smaller than data.</li>
+</ul>
+
+<h4>Step 3: Durability check (6+3, spread over 3 zones)</h4>
+<p>From section 9.5, per-chunk annual loss probability is about 4 x 10<sup>-13</sup> in the model, or around twelve nines. Across 150 billion objects, the expected loss is 150 x 10<sup>9</sup> x 4 x 10<sup>-13</sup>, which is 0.06 objects per year in this simple model. Real durability targets are lower than the ideal model, so the design is consistent with an "eleven nines" claim. A zone outage leaves 6 of 9 shards reachable, so reads continue (degraded, using parity) and nothing is lost.</p>
+
+<h4>Step 4: Repair load</h4>
+<p>Assume a 2 percent annual failure rate across 13,300 drives: about 266 drive failures per year, roughly 0.7 per day. Each failed 20 TB drive (at 75 percent full, 15 TB of data) requires reading 6 x 15 TB = 90 TB to rebuild 15 TB. If 1,000 drives contribute 50 MB/s each for repair (50 GB/s), the rebuild finishes in 90,000 GB / 50 GB/s = 1,800 seconds, about 30 minutes of cluster-wide effort, in practice hours with throttling. Daily repair traffic is about 0.7 x 90 TB = 63 TB, a small fraction of the network, which shows that 6+3 is operationally comfortable. A rack failure (about 40 nodes) is a larger event but the same mechanism works.</p>
+
+<h4>Step 5: Cost with tiering</h4>
+<ul>
+  <li>Hot data: most views occur in the first week and fall off within a month. Keep the last 30 days in Standard: 60 TB x 30 = 1.8 PB, at about $23 per TB-month is about $41,000 per month.</li>
+  <li>Move older data to Infrequent Access after 30 days and to cold Instant Retrieval after 90: roughly 108 PB x about $4.6 per TB-month (0.2x) is about $500,000 per month at steady state. If everything stayed in Standard, 110 PB x $23 is about $2.5 million per month. Lifecycle tiering cuts the bill by about 5x. (Cloud providers give volume discounts and you might run your own hardware instead, but the proportions are what an interviewer wants to see.)</li>
+  <li>Egress: with a 95 percent CDN hit ratio, the bucket serves origin traffic of only the 5 percent of views that miss: 5 percent of 1.2 PB per day is about 60 TB per day, mostly discounted origin-to-CDN transfer. Direct egress without a CDN would be 1.2 PB per day, around $100,000 per day at $0.09 per GB, a clear reason for the CDN.</li>
+</ul>
+
+<h4>Step 6: Upload and processing flow</h4>
+<p>The app asks the API for an upload. The API authenticates, picks a key such as <code>u/&lt;hash-of-user&gt;/&lt;uuid&gt;</code> (hash first, so writes spread over key ranges), and returns presigned multipart URLs (videos) or a single presigned PUT (photos). The client uploads straight to the bucket. An object-created event goes to a queue, workers scan the file, generate thumbnails and transcodes into <code>v/&lt;hash&gt;/...</code>, and write rows into a database recording the owner, key, and status. Reads go through the CDN with versioned URLs, and private items use short-lived signed URLs. A lifecycle rule cleans abandoned multipart uploads after 3 days.</p>
+
+<div class="callout good"><b>What the interviewer wants to hear</b>
+You sized throughput, capacity (with EC overhead), metadata, and repair; you separated hot and cold with lifecycle tiering; you kept bytes off your app servers with presigned URLs; you protected the bucket with a CDN; and you explained how durability holds with a failed disk, rack, or zone.
+</div>
+
+<!-- ======================= 22 ======================= -->
+<h2 id="qa">22. Common interview questions</h2>
+
+<details><summary>When would you use object storage instead of a database or a file system?</summary>
+<p>Use object storage for large, immutable-or-rarely-changed blobs such as images, video, backups, logs, and datasets, especially when the volume is large or growing without a known limit. A database is a poor and expensive place for big blobs, and a file system gets hard to scale and replicate beyond a few hundred terabytes. The tradeoff is that you cannot edit in place and latency is tens of milliseconds, so keep the structured metadata about the blobs (owner, status, permissions) in a database and store only the bytes in the bucket.</p></details>
+
+<details><summary>Why does an object store separate metadata from data?</summary>
+<p>The two have opposite shapes: metadata is tiny, numerous, latency-sensitive, and needs strong consistency and ordered range scans, while data is large, throughput-bound, and just needs cheap durable bytes. Separating them lets metadata live in a sharded, consensus-replicated, SSD-backed index and the data on dense, inexpensive disks. Each scales along its own axis: metadata with the object count and data with the byte count. It also makes the commit point crisp: an object exists when its metadata row commits.</p></details>
+
+<details><summary>Explain erasure coding and why 6+3 can be better than 3x replication.</summary>
+<p>Erasure coding splits data into k data shards and adds m computed parity shards, so that any k of the n = k+m shards can rebuild the data. With 6+3 you store 9 shards for every 6 shards of data, a 1.5x overhead, and survive the loss of any 3. Three-way replication costs 3x and survives only 2 losses, so EC is half the cost and tolerates more failures. The price is higher repair cost (rebuilding one shard reads six), CPU for encoding and decoding, and inefficiency for tiny objects, which is why small and hot data is often replicated instead.</p></details>
+
+<details><summary>What does "eleven nines of durability" mean, and is it the same as availability?</summary>
+<p>Eleven nines means an annual object loss probability of about 10<sup>-11</sup>, so with ten million objects you expect to lose one every ten thousand years. It is a design target from redundancy and repair models, not a promise about any single object. It is not availability: availability is the fraction of requests that succeed, typically about 99.99 percent for standard classes. A system can be fully durable and still be unreachable for an hour. You raise durability with redundancy, scrubbing, and cross-region copies, and raise availability with stateless front ends, replicated metadata, and retries.</p></details>
+
+<details><summary>What is the consistency model of S3 today, and how do you get it?</summary>
+<p>Since 2020 S3 provides strong read-after-write consistency for PUT, DELETE, GET, and LIST, so a successful write is immediately visible to every later read in the same bucket. It works because every operation for a key goes through its authoritative metadata shard, which replicates with a consensus protocol, and the object becomes visible only when the metadata row commits, after the data is safely stored. It does not give multi-object transactions or atomic rename, and cross-region replication stays asynchronous, so those need application-level designs or table formats like Iceberg.</p></details>
+
+<details><summary>How does multipart upload work, and why use it?</summary>
+<p>The client initiates an upload and gets an upload ID, then uploads numbered parts (5 MB to 5 GB each in S3) independently, possibly in parallel and in any order, and finally sends a complete request listing the part numbers and their ETags, which stitches them into one object that becomes visible atomically. It gives parallel throughput, cheap retries of a failed part, resumability after a crash, and support for files over the 5 GB single-PUT limit. You should add a lifecycle rule to abort incomplete uploads, since the stored parts are billed until aborted.</p></details>
+
+<details><summary>How would you deduplicate uploaded files?</summary>
+<p>Use content addressing: hash the file (or fixed-size or content-defined chunks) with SHA-256, and use the hash as the storage identity, keeping an index from hash to location with a reference count. The client can compute the hash first and ask the server whether it already has it, skipping the upload entirely. You need garbage collection driven by reference counts to delete chunks no file uses. The caveats are the extra index, the cross-user privacy leak of confirming that a file already exists, and the fact that per-user encryption keys defeat dedup unless you use convergent schemes.</p></details>
+
+<details><summary>What happens if the server crashes in the middle of a PUT?</summary>
+<p>The write path stores the data shards first and commits the metadata row last, so a crash before the commit leaves only orphan shards that no key refers to. The client never got a success response, so it retries, and the object appears atomically when a retry commits. The orphans are found by garbage collection, which compares what storage nodes hold with what the metadata references, and are deleted after a grace period so that in-flight uploads are not damaged. A crash after the commit is harmless because the data was already durable.</p></details>
+
+<details><summary>Why can high request rates cause 503 errors, and how do you design keys to avoid it?</summary>
+<p>The metadata index is range-partitioned by key, so the leading part of a key decides which partition handles it. Sequential prefixes such as timestamps send all new writes to the newest range, which saturates before automatic splitting can spread it. To avoid it, put a hashed or well-distributed component early in the key so load fans out over many partitions, and have clients retry with exponential backoff and jitter. The tradeoff is that listing by time then needs parallel listings across the hash buckets, so keep your own index for lookups.</p></details>
+
+<details><summary>How do you handle billions of tiny objects?</summary>
+<p>Avoid storing them as individual objects, because per-object metadata, per-request fees, and erasure-coding overhead make them expensive and slow. Batch many small records into larger files (a few tens to hundreds of megabytes), keep an index in a database mapping each record to its file, offset, and length, and fetch individual records with range reads. This is how photo stores such as Haystack and log pipelines work, and why data lakes use big Parquet files rather than one file per row.</p></details>
+
+<details><summary>How do you let a mobile app upload a large video securely without passing it through your servers?</summary>
+<p>The app calls your API, which authenticates the user, chooses the object key, creates a multipart upload, and returns short-lived presigned URLs for each part (or for a single PUT if small). The app uploads parts directly to the bucket in parallel, tracking progress so it can resume, then calls your API to complete, which verifies the object and records it in your database and enqueues processing via an event. Credentials never reach the client, your servers carry no file bytes, and expiry and size constraints on the presigned URL limit abuse.</p></details>
+
+<details><summary>How would you reduce the cost of a 5 PB bucket where most data is rarely read?</summary>
+<p>First measure access patterns using storage analytics or inventory. Then apply lifecycle rules to transition aging data to infrequent, cold, and archive classes, or use automatic tiering when access is unpredictable, while accounting for minimum durations, retrieval fees, and per-transition costs. Clean up incomplete multipart uploads and old noncurrent versions, compress and batch small files, and put a CDN in front of popular content to cut egress. Keep compute in the same region as the data to avoid transfer fees.</p></details>
+
+<details><summary>How do you protect against accidental deletion and ransomware?</summary>
+<p>Turn on versioning so deletes only add a marker and overwrites keep old versions, add object lock in compliance mode for backup data so that nobody can delete it within the retention period, require MFA for destructive operations, apply least-privilege IAM and separate backup accounts, and replicate to another region or account. Also enable Block Public Access and monitor with access logs and event alerts. Finally, test restores, since protection only counts if recovery works.</p></details>
+
+<!-- ======================= 23 ======================= -->
+<div class="recap" id="recap">
+<h2 style="border:none;margin-top:14px">23. Recap</h2>
+<ul>
+  <li><b>Object storage</b> stores whole, immutable blobs under flat keys in buckets, accessed over HTTP. Compared with block (in-place, low latency, one host) and file (shared tree), it gives the largest scale and lowest cost per gigabyte.</li>
+  <li>The API is PUT, GET (with ranges and conditionals), HEAD, DELETE, LIST by prefix, and <b>multipart upload</b> for large files. <b>Presigned URLs</b> let clients transfer directly without credentials.</li>
+  <li>The design splits a <b>metadata plane</b> (sharded, consistent, ordered index of keys to chunk locations) from a <b>data plane</b> (storage nodes holding shards). Write bytes first and commit metadata last, so a crash leaves only collectable orphans.</li>
+  <li><b>Erasure coding</b> (for example 6+3) gives 1.5x overhead and survives three losses, versus 3x for triple replication. The price is repair read amplification, CPU, and poor fit for tiny objects.</li>
+  <li><b>Checksums, scrubbing, prioritized background repair, and garbage collection</b> keep durability true over time. Durability (eleven nines) and availability (about four nines) are different properties.</li>
+  <li><b>Strong read-after-write consistency</b> for all operations is standard today, but there are no multi-object transactions.</li>
+  <li>Performance: range-partitioned metadata means <b>spread key prefixes</b>, retry with backoff, parallelize ranges and parts, and <b>batch small objects</b>.</li>
+  <li><b>Storage classes and lifecycle rules</b> cut cost as data cools. Watch the three cost axes: storage, requests, egress.</li>
+  <li>Secure with IAM, bucket policies, Block Public Access, envelope encryption (SSE-S3, SSE-KMS), and short-lived presigned URLs. Use events plus idempotent consumers for processing.</li>
+  <li>Typical roles: <b>CDN origin</b>, <b>data lake base</b> (with table formats), <b>backup target</b> (versioning plus object lock). Alternatives: HDFS, Ceph, MinIO, Swift.</li>
+</ul>
+</div>
+<p class="connects"><b>Connects to:</b> builds on <a href="12-cdn.html">Chapter 12</a> (CDN with object storage as origin), <a href="19-storage-engines.html">Chapter 19</a> (log-structured storage), <a href="25-sharding.html">Chapter 25</a> (range partitioning), <a href="24-replication.html">Chapter 24</a> (replication), and <a href="29-consensus.html">Chapter 29</a> (consensus for metadata). Leads to <a href="34-queues-kafka.html">Chapter 34</a> (queues for event notifications), <a href="37-batch-stream.html">Chapter 37</a> (data lakes and batch), <a href="41-ha-dr.html">Chapter 41</a> (backup and disaster recovery), and the <a href="../case-studies/c09-file-sync.html">file sync</a> and <a href="../case-studies/c10-video-streaming.html">video streaming</a> case studies.</p>
+
+</main>
+</div>
+
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

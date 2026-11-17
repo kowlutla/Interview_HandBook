@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 59: Sorted Sets, Top-K, CRDTs and OT | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="59-sorted-sets-crdt">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Chapter 59 · Module 9 · Data structures for ranking and collaboration</div>
+<h1>Sorted Sets, Top-K, CRDTs and OT</h1>
+<p class="lead">This chapter covers two families of ideas that appear again and again in system design interviews. The first is keeping data in sorted order and answering "who are the top K?" cheaply, from skip lists and heaps to leaderboards and streaming heavy hitters. The second is letting many people edit the same data at once without a central lock, using operational transformation (OT) and conflict-free replicated data types (CRDTs).</p>
+
+<h2 id="why">1. Why these structures matter</h2>
+
+<p>Many product features boil down to one of two questions. The first: "show me the best N things right now." This is a game leaderboard, a "trending hashtags" list, the "top 10 most viewed videos this hour", a list of the heaviest-traffic IP addresses during an attack. The second: "two people changed the same thing at the same time; what should the result be?" This is a shared document, a shared shopping cart, a counter that is incremented in two data centers at once, a note that was edited on a phone while offline.</p>
+
+<p>These look unrelated, but both are about <b>maintaining a useful summary of a changing collection without scanning all of it, and without a single point that every update must pass through</b>. For ranking, the trick is an ordered structure so that insertion, deletion and "give me the top K" are all fast. For collaboration, the trick is giving operations or data a mathematical shape (commutative, associative, idempotent) so that replicas converge regardless of the order in which updates arrive.</p>
+
+<p>The chapter is organized in two halves. Sections 2 to 9 are about ordered data and top-K. Sections 10 to 18 are about collaborative editing and conflict-free data. The case study <a href="../case-studies/c16-collaborative-editor.html">Design a Collaborative Editor</a> applies the second half end to end; this chapter provides the machinery.</p>
+
+<h2 id="ordered">2. Ordered structures: balanced trees recap</h2>
+
+<p>A <b>sorted set</b> is a collection of unique members, each with a numeric <b>score</b>, that can be read back in score order. The operations we want are: add or update a member's score, remove a member, find a member's score, get the <b>rank</b> of a member (its position in sorted order), and read a range by rank or by score. A plain array kept sorted gives fast reads but O(n) inserts, because everything after the insertion point must shift. A hash map gives O(1) lookup by member but no order. We need both at once.</p>
+
+<h3>2.1 Binary search trees and why balance matters</h3>
+<p>A <b>binary search tree (BST)</b> stores one key per node, with every key in the left subtree smaller than the node and every key in the right subtree larger. Searching walks from the root, going left or right at each node, so the cost is the height of the tree. If keys arrive in random order, the height is about log<sub>2</sub> n and everything is O(log n). But if keys arrive already sorted (1, 2, 3, 4, ...), a naive BST degenerates into a linked list of height n, and every operation becomes O(n).</p>
+
+<p><b>Self-balancing trees</b> prevent this by rearranging nodes (<i>rotations</i>) after inserts and deletes so the height stays O(log n) in the worst case. Common variants:</p>
+<ul>
+  <li><b>AVL tree:</b> keeps the heights of two child subtrees within 1 of each other. Strictly balanced, so lookups are slightly faster, but inserts need more rotations.</li>
+  <li><b>Red-black tree:</b> colors nodes red or black with rules that keep the longest path at most twice the shortest. Looser balance, fewer rotations on writes. This is what many standard libraries use for ordered maps (for example Java's TreeMap and C++ std::map are typically red-black trees).</li>
+  <li><b>B-tree and B+ tree:</b> each node holds many keys (a whole disk page), giving a very wide, very shallow tree. This is what database indexes use (see <a href="18-relational-internals.html">Chapter 18</a> and <a href="19-storage-engines.html">Chapter 19</a>), because on disk the cost that matters is the number of pages read, not comparisons.</li>
+</ul>
+
+<p>To support <b>rank queries</b> ("what is the position of this member?") a balanced tree can be <i>augmented</i>: each node also stores the size of its subtree. Rank is then computed on the way down by summing the sizes of the left subtrees you skip. This gives O(log n) rank and O(log n) "find the k-th element". Augmentation is the same idea Redis uses with skip lists, as we will see next.</p>
+
+<h3>2.2 The weakness of balanced trees</h3>
+<p>Balanced trees are correct and fast, but they are awkward in two ways. First, rebalancing is intricate code: rotations change several pointers at once, and getting a delete wrong in a red-black tree is a classic source of bugs. Second, rebalancing touches nodes near the root, which makes <b>concurrent</b> updates hard: a rotation near the root conflicts with nearly every other operation, so a concurrent tree typically needs coarse locking. These two weaknesses are the main reasons for the structure in the next section.</p>
+
+<h2 id="skiplist">3. The skip list</h2>
+
+<p>A <b>skip list</b>, invented by William Pugh in 1990, gets the same expected O(log n) behavior as a balanced tree using only linked lists and a coin flip. The idea starts from a sorted linked list. Searching a sorted linked list is O(n) because you must walk one node at a time. What if some nodes had "express lanes" that skip ahead?</p>
+
+<h3>3.1 Levels and random promotion</h3>
+<p>Imagine a bottom-level (level 0) linked list that contains <b>every</b> element in sorted order. Build a second list above it containing roughly half of the elements, a third list containing roughly a quarter, and so on. Each element that appears in a higher list is linked to its own copy below. A search starts at the top-left, moves right along the sparse top list as long as the next key is not past the target, then drops down a level and repeats. The upper levels let you skip large stretches; the lower levels give precision.</p>
+
+<p>How do we decide which elements appear in higher levels? <b>Randomly.</b> When inserting a new element, flip a coin repeatedly: the element is always in level 0; with probability p (commonly 1/2, and Redis uses 1/4) it is also promoted to level 1; with probability p again from level 1 to level 2, and so on, up to a maximum level cap (Redis uses 32). The number of levels an element occupies is its <b>height</b>. The expected number of elements at level i is n times p<sup>i</sup>, which is exactly the halving pattern we wanted, with no rebalancing code at all.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Skip list with four levels and a search path for key 70">
+  <text class="t-b" x="20" y="22">Skip list holding keys 10 to 90. Search for 70 follows the green path.</text>
+  <text class="t-sm" x="20" y="68">Level 3</text><text class="t-sm" x="20" y="118">Level 2</text><text class="t-sm" x="20" y="168">Level 1</text><text class="t-sm" x="20" y="218">Level 0</text>
+  <rect class="ext" x="90" y="50" width="60" height="30" rx="6"/><text class="t-c t-b" x="120" y="70">HEAD</text>
+  <rect class="ext" x="90" y="100" width="60" height="30" rx="6"/><text class="t-c t-b" x="120" y="120">HEAD</text>
+  <rect class="ext" x="90" y="150" width="60" height="30" rx="6"/><text class="t-c t-b" x="120" y="170">HEAD</text>
+  <rect class="ext" x="90" y="200" width="60" height="30" rx="6"/><text class="t-c t-b" x="120" y="220">HEAD</text>
+
+  <rect class="box" x="230" y="50" width="50" height="30" rx="6"/><text class="t-c" x="255" y="70">30</text>
+  <rect class="box" x="230" y="100" width="50" height="30" rx="6"/><text class="t-c" x="255" y="120">30</text>
+  <rect class="box" x="230" y="150" width="50" height="30" rx="6"/><text class="t-c" x="255" y="170">30</text>
+  <rect class="box" x="230" y="200" width="50" height="30" rx="6"/><text class="t-c" x="255" y="220">30</text>
+
+  <rect class="box" x="330" y="200" width="50" height="30" rx="6"/><text class="t-c" x="355" y="220">40</text>
+  <rect class="box" x="330" y="150" width="50" height="30" rx="6"/><text class="t-c" x="355" y="170">40</text>
+  <rect class="box" x="330" y="100" width="50" height="30" rx="6"/><text class="t-c" x="355" y="120">40</text>
+
+  <rect class="box" x="430" y="200" width="50" height="30" rx="6"/><text class="t-c" x="455" y="220">50</text>
+
+  <rect class="box" x="530" y="200" width="50" height="30" rx="6"/><text class="t-c" x="555" y="220">60</text>
+  <rect class="box" x="530" y="150" width="50" height="30" rx="6"/><text class="t-c" x="555" y="170">60</text>
+
+  <rect class="hit" x="630" y="200" width="50" height="30" rx="6"/><text class="t-c t-b" x="655" y="220">70</text>
+  <rect class="box" x="630" y="150" width="50" height="30" rx="6"/><text class="t-c" x="655" y="170">70</text>
+
+  <rect class="box" x="730" y="200" width="50" height="30" rx="6"/><text class="t-c" x="755" y="220">90</text>
+  <rect class="box" x="730" y="100" width="50" height="30" rx="6"/><text class="t-c" x="755" y="120">90</text>
+  <rect class="box" x="730" y="150" width="50" height="30" rx="6"/><text class="t-c" x="755" y="170">90</text>
+
+  <path class="arrow" d="M150 65 L226 65"/><path class="arrow" d="M280 65 L330 65" style="opacity:0.0"/>
+  <path class="arrow" d="M150 115 L226 115"/><path class="arrow" d="M280 115 L326 115"/><path class="arrow" d="M380 115 L726 115"/>
+  <path class="arrow" d="M150 165 L226 165"/><path class="arrow" d="M280 165 L326 165"/><path class="arrow" d="M380 165 L526 165"/><path class="arrow" d="M580 165 L626 165"/><path class="arrow" d="M680 165 L726 165"/>
+  <path class="arrow" d="M150 215 L226 215"/><path class="arrow" d="M280 215 L326 215"/><path class="arrow" d="M380 215 L426 215"/><path class="arrow" d="M480 215 L526 215"/><path class="arrow" d="M580 215 L626 215"/><path class="arrow" d="M680 215 L726 215"/>
+
+  <path class="arrow-g" d="M150 65 L226 65"/>
+  <path class="arrow-g" d="M255 80 L255 98"/>
+  <path class="arrow-g" d="M280 115 L326 115"/>
+  <path class="arrow-g" d="M355 130 L355 148"/>
+  <path class="arrow-g" d="M380 165 L526 165"/>
+  <path class="arrow-g" d="M580 165 L626 165"/>
+  <path class="arrow-g" d="M655 180 L655 198"/>
+  <text class="t-sm" x="90" y="270">Path: HEAD to 30 (level 3), down to level 2, right to 40, down to level 1, right past 60 to 70, down to level 0 and found.</text>
+  <text class="t-sm" x="90" y="292">Level 2 hop from 40 would reach 90, which is past 70, so we drop. About 7 hops instead of walking 7 nodes one by one at level 0.</text>
+</svg>
+<figcaption>Every element is on level 0. Roughly a half of them (with p = 1/2) reach level 1, a quarter reach level 2, and so on. A search moves right while the next key is not larger than the target, and drops a level when it would overshoot. The green arrows are the actual search path for key 70.</figcaption>
+</figure>
+
+<h3>3.2 Search, insert and delete walkthrough</h3>
+<p><b>Search for key 70.</b> Start at the head node on the highest level. Look at the next node on this level. If its key is less than or equal to 70, move to it; otherwise drop down one level while staying on the current node. In the figure, the head on level 3 points to 30, and 30 is below 70, so we move there. The next node on level 3 does not exist (or is beyond 70), so we drop to level 2 at node 30, move right to 40, then see that the next level-2 node is 90, which overshoots, so we drop to level 1. On level 1 we move from 40 through 60 to 70. We are at 70 and can stop (or drop to level 0 to read the node's data). The total work is the number of right moves plus the number of drops.</p>
+
+<p><b>Insert key 55.</b> First run a search for 55, but remember, on every level, the last node visited before dropping. These are the <i>predecessors</i> of the new node at each level. Then flip coins to choose the new node's height, say 2 (levels 0 and 1). Splice the new node into level 0 and level 1 by pointing the predecessors' next pointers at it and its own next pointers at what used to follow them. Nothing else in the structure moves. There are no rotations and no global rebalancing.</p>
+
+<p><b>Delete key 40.</b> Search for it, again recording predecessors on each level, then unlink the node from every level it appears in. Again only local pointers change.</p>
+
+<h3>3.3 Why it is O(log n) on average</h3>
+<p>The analysis is easiest to see backwards. Trace the search path in reverse, from the found node up to the head. At each step you either went "up" (the node you are on is also present at a higher level, which happens with probability p) or "left" (it is not). So the reversed path is a sequence of coin flips; you climb a level on each success. To climb all the way to the top level (about log<sub>1/p</sub> n levels) you expect about (log<sub>1/p</sub> n) / p steps in total. That is O(log n) expected, with a small constant. The worst case is O(n), but it requires an astronomically unlikely sequence of coin flips; with n of a million, the probability of significantly exceeding the expected time is negligible. This is a <b>probabilistic</b> guarantee, not a deterministic one, which is the one trade you make in exchange for simplicity.</p>
+<p>The expected space is n / (1 - p) pointers, so about 2n with p = 1/2 and about 1.33n with p = 1/4. A lower p means fewer pointers and slightly more steps per search; this is why Redis chose 1/4.</p>
+
+<h3>3.4 Rank queries in a skip list</h3>
+<p>To support rank, each forward pointer stores a <b>span</b>: the number of level-0 nodes it skips. While searching, add up the spans of every pointer you follow; the sum on arrival is the node's rank. To fetch the element at rank r, walk the same way but move right whenever accumulated span plus the next span does not exceed r. This gives O(log n) rank and O(log n) range-by-rank, exactly the same as an augmented balanced tree.</p>
+
+<h3>3.5 Why Redis uses a skip list for sorted sets</h3>
+<p>Redis sorted sets (ZSETs, see <a href="15-redis.html">Chapter 15</a>) pair a skip list with a hash table. The hash table maps member to score, giving O(1) <code>ZSCORE</code>. The skip list orders the (score, member) pairs, giving O(log n) <code>ZADD</code>, <code>ZREM</code>, <code>ZRANK</code> and range reads. Small ZSETs use a compact listpack encoding (a contiguous array) instead, switching to skip list plus hash when they grow. Redis's own author gave these reasons for choosing a skip list over a balanced tree:</p>
+<ul>
+  <li><b>Simplicity.</b> A skip list is easy to write, debug and modify; adding spans for rank took little code.</li>
+  <li><b>Range operations are natural.</b> Once the first element of a range is found, the rest is a plain walk along the level-0 list. Redis's level-0 list is also doubly linked, so <code>ZREVRANGE</code> walks backwards just as cheaply.</li>
+  <li><b>Memory flexibility.</b> The promotion probability is a tunable knob that trades memory for speed.</li>
+  <li><b>Performance comparable to balanced trees.</b> In practice, similar speed with less implementation risk.</li>
+</ul>
+<p>Redis is single-threaded for command execution, so concurrency is not the reason there. It matters for other systems, as described next.</p>
+
+<h3>3.6 Skip lists versus balanced trees for concurrency</h3>
+<p>The biggest practical advantage of skip lists in multi-threaded programs is that updates are <b>local</b>. Inserting or deleting touches only the few predecessor nodes at the levels where the element lives. There is no rotation near the root that invalidates other threads' work. This makes <b>lock-free or fine-grained-locking</b> implementations feasible. Java's <code>ConcurrentSkipListMap</code> is the well-known example; LevelDB and RocksDB use a skip list for their in-memory write buffer (the memtable), where many readers run alongside a writer. Concurrent balanced trees exist but are far harder to implement correctly.</p>
+
+<table>
+<tr><th>Aspect</th><th>Skip list</th><th>Balanced tree (red-black / AVL)</th></tr>
+<tr><td>Search / insert / delete</td><td>O(log n) expected</td><td>O(log n) worst case</td></tr>
+<tr><td>Guarantee type</td><td>Probabilistic (random coin flips)</td><td>Deterministic</td></tr>
+<tr><td>Rebalancing</td><td>None; local pointer splices</td><td>Rotations that may cascade to the root</td></tr>
+<tr><td>Concurrent updates</td><td>Fine-grained or lock-free, practical</td><td>Hard; usually coarse locks</td></tr>
+<tr><td>Range scan</td><td>Walk the bottom list; cache-unfriendly pointer chasing</td><td>In-order traversal; also pointer chasing</td></tr>
+<tr><td>Memory</td><td>About 1.33n to 2n pointers</td><td>2 pointers per node plus color/height</td></tr>
+<tr><td>Implementation effort</td><td>Low</td><td>High</td></tr>
+<tr><td>Disk friendliness</td><td>Poor (use B-trees)</td><td>Poor (use B-trees)</td></tr>
+</table>
+
+<div class="callout tip"><b>Interview tip</b> When asked to design a leaderboard, say the structure by name: "a sorted set, implemented in Redis as a skip list plus hash table, so add, remove and rank are O(log n) and top-K is O(log n + K)". Naming the structure and its costs signals real knowledge. Then immediately move on to the scaling question (sections 5 and 6), which is where the interesting design work is.</div>
+
+<h2 id="heap">4. Heaps and priority queues</h2>
+
+<p>A <b>priority queue</b> is an abstract data type: you can insert an item with a priority, and you can always extract the item with the highest (or lowest) priority. A <b>binary heap</b> is the standard implementation. It is a complete binary tree, stored compactly in an array, with the <b>heap property</b>: in a min-heap, every parent is smaller than or equal to its children, so the smallest element is always at the root.</p>
+
+<p>Array layout: for the node at index i (starting at 0), its children are at 2i+1 and 2i+2 and its parent is at (i-1)/2 rounded down. To <b>insert</b>, append the element at the end and <i>sift up</i>, swapping with its parent while it is smaller than the parent. To <b>extract the minimum</b>, take the root, move the last element to the root, and <i>sift down</i>, swapping with the smaller child until the property holds. Both operations cost O(log n); peeking at the minimum costs O(1); building a heap from n items in one pass (heapify) costs O(n).</p>
+
+<table>
+<tr><th>Operation</th><th>Binary heap</th><th>Sorted array</th><th>Balanced tree / skip list</th></tr>
+<tr><td>Peek min or max</td><td>O(1)</td><td>O(1)</td><td>O(log n) or O(1) with a cached pointer</td></tr>
+<tr><td>Insert</td><td>O(log n)</td><td>O(n)</td><td>O(log n)</td></tr>
+<tr><td>Extract min</td><td>O(log n)</td><td>O(1) or O(n)</td><td>O(log n)</td></tr>
+<tr><td>Find arbitrary element</td><td>O(n)</td><td>O(log n)</td><td>O(log n)</td></tr>
+<tr><td>Update priority of arbitrary element</td><td>O(n) to find, then O(log n); O(log n) with a position map</td><td>O(n)</td><td>O(log n)</td></tr>
+<tr><td>Rank / k-th element</td><td>Not supported</td><td>O(1)</td><td>O(log n) with augmentation</td></tr>
+</table>
+
+<p>The heap is the right tool when you only ever need the extreme element: schedulers picking the next job by deadline, Dijkstra's shortest path, merging K sorted lists, and the top-K algorithm in the next section. It is the wrong tool when you need rank, arbitrary range scans, or fast lookup by key, where the sorted set above wins. Heaps are also memory-compact and cache-friendly because they are plain arrays, which is why a heap of 1,000 items inside a streaming operator is cheap.</p>
+
+<p>The heap is also what powers timers and delay queues: a min-heap keyed on fire time lets a scheduler sleep until the earliest deadline. See <a href="38-scheduling-workflows.html">Chapter 38</a> for scheduling designs that build on this.</p>
+
+<h2 id="leaderboards">5. Leaderboards</h2>
+
+<p>A <b>leaderboard</b> ranks players (or users, products, posts) by a score and answers queries such as "who are the top 100?", "what is my rank?", "who is just above and below me?". It is the textbook use of a sorted set.</p>
+
+<h3>5.1 Redis ZSET operations</h3>
+<p>A single Redis sorted set key (for example <code>lb:global</code>) holds member to score. The operations that matter:</p>
+<table>
+<tr><th>Need</th><th>Command</th><th>Cost</th></tr>
+<tr><td>Add a player or set a score</td><td><code>ZADD lb:global 1500 alice</code></td><td>O(log n)</td></tr>
+<tr><td>Add points to a score</td><td><code>ZINCRBY lb:global 25 alice</code></td><td>O(log n)</td></tr>
+<tr><td>Top 10, highest first</td><td><code>ZREVRANGE lb:global 0 9 WITHSCORES</code></td><td>O(log n + 10)</td></tr>
+<tr><td>My rank (0-based, from highest)</td><td><code>ZREVRANK lb:global alice</code></td><td>O(log n)</td></tr>
+<tr><td>My score</td><td><code>ZSCORE lb:global alice</code></td><td>O(1)</td></tr>
+<tr><td>Players around me</td><td>get rank r, then <code>ZREVRANGE lb:global r-5 r+5</code></td><td>O(log n + 10)</td></tr>
+<tr><td>Players with score between a and b</td><td><code>ZRANGEBYSCORE</code> (or <code>ZRANGE ... BYSCORE</code>)</td><td>O(log n + m)</td></tr>
+<tr><td>Remove a player</td><td><code>ZREM lb:global alice</code></td><td>O(log n)</td></tr>
+<tr><td>Count of players</td><td><code>ZCARD</code></td><td>O(1)</td></tr>
+</table>
+<p>Ties need a rule. Redis orders equal scores lexicographically by member name. If you want "earlier achiever ranks higher", encode the tie-breaker into the score, for example score * 2<sup>k</sup> plus an inverted timestamp, as long as the result stays within the 53 bits of integer precision of a double.</p>
+
+<p>For a single board of 10 million players, one Redis node holds the structure in a few hundred megabytes (tens of bytes per member plus pointers), handles tens of thousands of updates per second, and answers any rank query in microseconds. That is why most leaderboard designs start, and often end, with one sorted set plus a replica for reads and persistence for durability (see <a href="15-redis.html">Chapter 15</a>).</p>
+
+<h3>5.2 Sharded leaderboards and merging</h3>
+<p>When one node is not enough, either because of write rate, memory or because the board is naturally partitioned, you shard. There are two ways, and they have very different consequences.</p>
+
+<p><b>Shard by player</b> (hash of player id decides the shard). Writes spread evenly. But the top 100 now lives in pieces across every shard, and a global rank requires knowing how many players on every shard have a higher score. The top-K query becomes <b>scatter-gather</b>: ask each shard for its own top 100, then merge the S sorted lists, taking the largest 100 overall (a K-way merge with a heap, O(S * K log S)). This is exact, because the global top 100 must be contained in the union of per-shard top 100s. Global rank of a player is computed as the sum over shards of the count of members with a higher score (<code>ZCOUNT shard (score +inf</code>), which is S parallel O(log n) calls.</p>
+
+<p><b>Shard by score range</b> (shard 1 holds scores 0-999, shard 2 holds 1000-1999, ...). The top K comes from the one or two highest shards, and a rank is "all players in higher shards plus rank within my shard", where the higher-shard counts are cheap cached numbers. But score distributions are skewed and shift over time, so ranges need rebalancing, and a hot score range (everyone clustered around the average) overloads one node. Moving a player when their score crosses a boundary is a cross-shard transaction. Range sharding suits scores that change slowly and distribution that is known; hash sharding is the safe default.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Sharded leaderboard: scatter gather per shard top K then merge">
+  <rect class="ext" x="20" y="130" width="120" height="50" rx="10"/><text class="t-c t-b" x="80" y="152">Client</text><text class="t-c t-sm" x="80" y="169">top 3 request</text>
+  <rect class="box" x="210" y="130" width="140" height="50" rx="10"/><text class="t-c t-b" x="280" y="152">Leaderboard</text><text class="t-c t-sm" x="280" y="169">service (merger)</text>
+  <rect class="cache" x="470" y="30" width="190" height="56" rx="10"/><text class="t-c t-b" x="565" y="52">Shard A (hash 0)</text><text class="t-c t-sm" x="565" y="72">ann 90, bob 70, cy 40</text>
+  <rect class="cache" x="470" y="140" width="190" height="56" rx="10"/><text class="t-c t-b" x="565" y="162">Shard B (hash 1)</text><text class="t-c t-sm" x="565" y="182">dee 95, eli 60, flo 55</text>
+  <rect class="cache" x="470" y="250" width="190" height="56" rx="10"/><text class="t-c t-b" x="565" y="272">Shard C (hash 2)</text><text class="t-c t-sm" x="565" y="292">gus 80, hal 75, ida 20</text>
+  <path class="arrow" d="M140 155 L206 155"/>
+  <path class="arrow" d="M350 145 L466 62"/><path class="arrow" d="M350 155 L466 168"/><path class="arrow" d="M350 165 L466 270"/>
+  <text class="t-sm" x="360" y="110">1. ZREVRANGE 0 2 on every shard</text>
+  <rect class="hit" x="710" y="120" width="170" height="70" rx="10"/><text class="t-c t-b" x="795" y="146">Merged top 3</text><text class="t-c t-sm" x="795" y="166">dee 95, ann 90, gus 80</text><text class="t-c t-sm" x="795" y="182">K-way merge with a heap</text>
+  <path class="arrow-g" d="M660 60 L760 118"/><path class="arrow-g" d="M660 168 L706 160"/><path class="arrow-g" d="M660 278 L760 192"/>
+  <text class="t-sm" x="660" y="320">2. Shards reply with local top 3; merger keeps the 3 largest overall.</text>
+</svg>
+<figcaption>With hash sharding, each shard returns its own top K. The global top K is guaranteed to be inside the union of those lists, so a K-way merge of S short lists is exact. Cost is S parallel calls plus a merge of S * K items.</figcaption>
+</figure>
+
+<h3>5.3 Approximate rank for huge boards</h3>
+<p>Consider a game with 500 million players. Showing the exact top 100 is easy. Showing every player their exact rank ("you are number 183,442,901") is expensive, and few players care about the exact digits. Options:</p>
+<ul>
+  <li><b>Score histogram.</b> Maintain bucket counts per score range (for example 10,000 buckets). A player's approximate rank is the sum of the counts of all higher buckets plus a fraction of their own bucket by linear interpolation. Updates are two counter changes (decrement old bucket, increment new). Error is bounded by one bucket's population. This gives "top 3%" style answers cheaply, and the histogram is tiny and trivially mergeable across shards by adding counts.</li>
+  <li><b>Sampling.</b> Keep a random sample (say 1 in 1,000 players) in the sorted set; rank is the sample rank times 1,000. Cheap and unbiased with a quantifiable error.</li>
+  <li><b>Quantile sketches</b> such as t-digest or the GK algorithm give a percentile of a score with a bounded error from very small memory and merge across shards. See <a href="57-hashing-probabilistic.html">Chapter 57</a> for the family of probabilistic structures.</li>
+  <li><b>Exact for the top, approximate for the rest.</b> Keep an exact sorted set for the top 10,000 (where players look at the exact position) and show percentile bands below that. This matches how people actually use leaderboards.</li>
+</ul>
+
+<h3>5.4 Time-windowed boards</h3>
+<p>"Daily", "weekly" and "all-time" leaderboards are common. The simplest approach is <b>one sorted set per window</b>, with the window in the key (<code>lb:2026-11-17</code>, <code>lb:2026-W47</code>). Every score event does a <code>ZINCRBY</code> on each active window key. Old keys are deleted with <code>EXPIRE</code> after the window ends (plus a grace period for display). To produce "last 7 days" from daily boards, use <code>ZUNIONSTORE</code> with sum aggregation across seven daily keys into a temporary key, cached for a minute. This is O(total members) so do it on a schedule, not per request. For a true rolling window with exact expiry, you would need to subtract old events; most products accept bucketed windows (hourly or daily buckets) because the cost and complexity are far lower.</p>
+
+<div class="callout watch"><b>Watch out</b> A leaderboard read must not become a hot key. If millions of clients refresh "top 100" every second, cache the result in application memory or a CDN for one to five seconds (<a href="13-caching-patterns.html">Chapter 13</a>). Only each player's own rank query needs to be fresh, and even that can lag a few seconds.</div>
+
+<h2 id="topk">6. Top-K</h2>
+
+<p>The <b>top-K problem</b> is: from a collection of items (or a stream of events) find the K items with the largest value, where the value is either given (scores) or is the <i>frequency</i> of occurrence (most-viewed, most-searched). Frequency-based top-K is the harder and more commonly asked variant.</p>
+
+<h3>6.1 Exact top-K with a heap</h3>
+<p>For a fixed collection of n scored items, keep a <b>min-heap of size K</b>. For each item: if the heap has fewer than K items, push it. Otherwise compare it to the heap's minimum (the root); if the new item is larger, pop the root and push the new one; if not, discard it. After one pass the heap holds exactly the K largest items. The cost is O(n log K) time and O(K) memory, much better than sorting everything (O(n log n)) when K is small. Using a <i>min</i>-heap for the <i>largest</i> items is the non-obvious part: the root is the weakest of the current winners, which is exactly the one a challenger must beat.</p>
+<p>An alternative is <b>quickselect</b> (partition-based selection), O(n) average, but it needs all the data in memory and is not streaming.</p>
+<p>For frequency top-K the situation is harder: you need a count per distinct item, via a hash map from item to count. With 100 million distinct search queries, the hash map itself is the memory problem. Keeping exact counts for an unbounded stream means O(distinct items) memory, which is why streaming approximations exist.</p>
+
+<h3>6.2 Streaming top-K and heavy hitters</h3>
+<p>A <b>heavy hitter</b> is an item whose frequency exceeds a threshold, such as more than 1% of all events. Finding the top K most frequent items in a stream, using memory far smaller than the number of distinct items and a single pass, is the heavy-hitters problem. Three classic approaches:</p>
+
+<h4>Count-Min Sketch plus a heap</h4>
+<p>A <b>Count-Min Sketch</b> (CMS, see <a href="57-hashing-probabilistic.html">Chapter 57</a>) is a table of d rows and w columns of counters with d independent hash functions. To count an event, hash the item with each of the d functions and increment one counter in each row. To estimate an item's count, take the <b>minimum</b> of its d counters. Collisions only ever inflate counters, so the estimate is never below the true count, and with width w about e/&epsilon; and depth d about ln(1/&delta;), the overestimate is at most &epsilon; times the total number of events with probability at least 1 - &delta;. The sketch uses fixed memory (for example 2,000 by 5 counters, about 40 KB) no matter how many distinct items appear.</p>
+<p>But the sketch alone cannot list the top items, because it does not store the items themselves. The standard pattern pairs it with a small <b>min-heap of size K</b> (plus a set of members). For each arriving event: update the sketch, get the new estimated count, and if the item is in the heap, update its entry; otherwise if the estimate exceeds the heap's smallest estimate, replace that entry. At any time the heap holds the current candidate top K with approximate counts. Memory is the sketch plus K entries.</p>
+
+<h4>Misra-Gries and Space-Saving (counter-based)</h4>
+<p><b>Misra-Gries</b> keeps at most k-1 counters. When an item arrives: if it already has a counter, increment it; else if there is a free counter, start it at 1; else decrement <i>all</i> counters by 1 (removing any that reach zero) and drop the new item. Every item whose true frequency exceeds n/k is guaranteed to still have a counter at the end, and each counter underestimates the truth by at most n/k. Intuitively, a decrement step cancels k distinct items at once, so an item that is truly frequent cannot be fully cancelled out.</p>
+<p><b>Space-Saving</b> (Metwally et al.) also keeps k counters but handles overflow differently: when a new item arrives and all counters are in use, it <i>replaces the item with the smallest count</i>, giving the newcomer that smallest count plus one (and remembering the old count as the possible error). Estimates are therefore overestimates, with a known error bound per item, and the algorithm is usually the best in practice for top-K because the counters always concentrate on the genuinely frequent items. Implementations store counters in a structure that finds the minimum in O(1), commonly a "stream-summary" linked list of count buckets.</p>
+
+<table>
+<tr><th>Approach</th><th>Memory</th><th>Error type</th><th>Stores item names?</th><th>Mergeable across shards?</th></tr>
+<tr><td>Exact hash map + heap</td><td>O(distinct items)</td><td>None</td><td>Yes</td><td>Yes (add counts)</td></tr>
+<tr><td>Count-Min Sketch + heap of K</td><td>Fixed (sketch) + K</td><td>Overestimate, bounded by &epsilon; N</td><td>Only the K in the heap</td><td>Sketches merge by adding tables</td></tr>
+<tr><td>Misra-Gries</td><td>k counters</td><td>Underestimate, at most N/k</td><td>Yes, k items</td><td>Yes, with a known procedure</td></tr>
+<tr><td>Space-Saving</td><td>k counters</td><td>Overestimate with per-item error</td><td>Yes, k items</td><td>Yes, with a known procedure</td></tr>
+</table>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Count-Min Sketch with heap pipeline for streaming top-K">
+  <rect class="ext" x="20" y="110" width="120" height="60" rx="10"/><text class="t-c t-b" x="80" y="136">Event stream</text><text class="t-c t-sm" x="80" y="154">item = "#cats"</text>
+  <path class="arrow" d="M140 140 L226 140"/>
+  <rect class="cache" x="230" y="40" width="300" height="200" rx="10"/><text class="t-c t-b" x="380" y="62">Count-Min Sketch (d = 3 rows)</text>
+  <rect class="box" x="250" y="80" width="260" height="34" rx="6"/><text class="t-sm" x="260" y="101">row 1: h1(item) = col 4  counter becomes 41</text>
+  <rect class="box" x="250" y="124" width="260" height="34" rx="6"/><text class="t-sm" x="260" y="145">row 2: h2(item) = col 9  counter becomes 37</text>
+  <rect class="box" x="250" y="168" width="260" height="34" rx="6"/><text class="t-sm" x="260" y="189">row 3: h3(item) = col 1  counter becomes 52</text>
+  <text class="t-c t-sm" x="380" y="226">estimate = min(41, 37, 52) = 37</text>
+  <path class="arrow" d="M530 140 L596 140"/>
+  <rect class="db" x="600" y="60" width="270" height="160" rx="10"/><text class="t-c t-b" x="735" y="82">Min-heap of size K = 3</text>
+  <text class="t-sm" x="620" y="110">root (weakest): #news  ~ 30</text>
+  <text class="t-sm" x="620" y="134">#sports ~ 58</text>
+  <text class="t-sm" x="620" y="158">#cats   ~ 37  (just replaced #tv ~ 28)</text>
+  <text class="t-sm" x="620" y="190">If estimate &gt; root, replace root.</text>
+  <text class="t-sm" x="620" y="208">If item already in heap, update it.</text>
+  <text class="t-c t-sm" x="450" y="280">The sketch holds counts for every item in fixed memory; the heap holds the names of only the current top K.</text>
+</svg>
+<figcaption>Each event updates the sketch in d counters, gets an estimated count (the minimum across rows), and is compared with the heap root. Only K names are ever stored, so memory stays constant however many distinct items occur.</figcaption>
+</figure>
+
+<h3>6.3 Distributed top-K: per-shard top-K then merge</h3>
+<p>When the stream is too large for one machine, partition it and compute locally, then combine. The approach depends on <i>how</i> the data is partitioned, and this is where correctness limits appear.</p>
+<ul>
+  <li><b>Partitioned by item (key).</b> All events for the same item go to the same shard (for example hash of the item). Every shard's counts are therefore complete for its items. Each shard computes its exact or sketch-based top K, and the merger takes the K largest from the union. This is <b>exactly correct</b> (up to sketch error), because the global top K must be in some shard's local top K.</li>
+  <li><b>Partitioned arbitrarily (round robin, by user).</b> Events for the same item are scattered, so the item's count is split across shards. Now a globally popular item might be only fifth on each shard and miss every shard's local top K. Merging local top-Ks then gives wrong results. An item with 1,000 events split 250/250/250/250 can lose to items with 300 events concentrated in one shard.</li>
+</ul>
+<p>Fixes for the arbitrary-partition case: (a) <b>re-partition by item</b> first (a shuffle, the standard first step in a MapReduce or Flink job, see <a href="37-batch-stream.html">Chapter 37</a>), then compute top-K per partition; (b) have each shard report <i>more</i> than K (top K times a safety factor), then fetch the missing counts for the candidates from all shards in a second round (the classic TPUT-style algorithm); (c) use <b>mergeable summaries</b> (Count-Min Sketches add cell by cell, Space-Saving and Misra-Gries summaries have defined merge procedures), so each shard sends a small summary and a coordinator merges them with a bounded error.</p>
+<p>A two-level aggregation also helps with <b>hot keys</b> (one item so popular that its shard is overloaded): pre-aggregate counts locally in a short window (for example one second) before sending to the item's owner, reducing messages by orders of magnitude.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 310" role="img" aria-label="Distributed top-K pipeline with local aggregation, shuffle by key, per-partition top-K and global merge">
+  <rect class="ext" x="20" y="40" width="130" height="46" rx="8"/><text class="t-c t-b" x="85" y="68">Ingest A</text>
+  <rect class="ext" x="20" y="130" width="130" height="46" rx="8"/><text class="t-c t-b" x="85" y="158">Ingest B</text>
+  <rect class="ext" x="20" y="220" width="130" height="46" rx="8"/><text class="t-c t-b" x="85" y="248">Ingest C</text>
+  <rect class="box" x="220" y="40" width="150" height="46" rx="8"/><text class="t-c t-b" x="295" y="60">Local pre-agg</text><text class="t-c t-sm" x="295" y="77">1 s counts</text>
+  <rect class="box" x="220" y="130" width="150" height="46" rx="8"/><text class="t-c t-b" x="295" y="150">Local pre-agg</text><text class="t-c t-sm" x="295" y="167">1 s counts</text>
+  <rect class="box" x="220" y="220" width="150" height="46" rx="8"/><text class="t-c t-b" x="295" y="240">Local pre-agg</text><text class="t-c t-sm" x="295" y="257">1 s counts</text>
+  <path class="arrow" d="M150 63 L216 63"/><path class="arrow" d="M150 153 L216 153"/><path class="arrow" d="M150 243 L216 243"/>
+  <rect class="cache" x="470" y="60" width="150" height="56" rx="8"/><text class="t-c t-b" x="545" y="84">Owner P1</text><text class="t-c t-sm" x="545" y="102">hash(item) mod 2 = 0</text>
+  <rect class="cache" x="470" y="190" width="150" height="56" rx="8"/><text class="t-c t-b" x="545" y="214">Owner P2</text><text class="t-c t-sm" x="545" y="232">hash(item) mod 2 = 1</text>
+  <path class="arrow" d="M370 63 L466 80"/><path class="arrow" d="M370 63 L466 210" style="opacity:0.5"/>
+  <path class="arrow" d="M370 153 L466 90"/><path class="arrow" d="M370 153 L466 215"/>
+  <path class="arrow" d="M370 243 L466 100" style="opacity:0.5"/><path class="arrow" d="M370 243 L466 225"/>
+  <text class="t-sm" x="372" y="290">shuffle by item so each item is counted in one place</text>
+  <rect class="hit" x="710" y="120" width="170" height="70" rx="10"/><text class="t-c t-b" x="795" y="146">Merge</text><text class="t-c t-sm" x="795" y="166">top K of the union</text><text class="t-c t-sm" x="795" y="182">of local top K lists</text>
+  <path class="arrow-g" d="M620 88 L706 140"/><path class="arrow-g" d="M620 218 L706 170"/>
+</svg>
+<figcaption>Pre-aggregate locally to cut traffic, shuffle by item so every count for an item lands in one owner, take each owner's top K, and merge. Because each item has one owner, the union of local top-K lists contains the true global top K.</figcaption>
+</figure>
+
+<h3>6.4 Time windows</h3>
+<p>Most real top-K questions are windowed: "top 10 searches in the last hour". The stream-processing vocabulary (<a href="37-batch-stream.html">Chapter 37</a>) applies directly:</p>
+<ul>
+  <li><b>Tumbling window:</b> fixed, non-overlapping slots (every hour on the hour). Compute top-K per slot; emit when the slot closes, using a watermark to decide when late events no longer arrive.</li>
+  <li><b>Sliding (hopping) window:</b> a window of length L that advances by a smaller step s (the last hour, updated every minute). Implement it by keeping per-step partial summaries (one sketch per minute) and combining the last L/s of them. Because sketches add, combining 60 one-minute sketches gives the hourly sketch; expiry is dropping the oldest minute. This beats re-reading the raw events.</li>
+  <li><b>Decay:</b> instead of a hard window, multiply old counts by a decay factor (for example half-life of an hour) so recent events weigh more. This needs only one set of counters and gives a smooth "recent popularity".</li>
+</ul>
+
+<h2 id="trending">7. Trending detection and sliding-window counters</h2>
+
+<p>"Most popular" and "trending" are different. A word like "the" or a permanently popular hashtag is always top-K by raw count, but it is not <i>trending</i>. Trending means <b>unusual growth compared with the item's own normal level</b>. Practical approaches:</p>
+<ul>
+  <li><b>Ratio of recent to baseline.</b> Compute the count in the current window (last 10 minutes) divided by the average count in the same slot over previous days or weeks. A topic with usual count 50 now at 500 scores 10; a permanently huge topic going from 1,000,000 to 1,100,000 scores 1.1. Add a minimum absolute count and smoothing (for example add a constant to both numerator and denominator) so tiny items with 1 event versus 0 do not produce infinite ratios.</li>
+  <li><b>Z-score or burst detection.</b> Compare the current count to the mean and standard deviation of history; flag items several deviations above.</li>
+  <li><b>Velocity and acceleration.</b> Compare consecutive windows: items whose rate of change is high are trending.</li>
+  <li><b>Diversity filter.</b> Require that the burst is spread over many distinct users, not one account posting a topic a million times, to resist spam and bots (a HyperLogLog distinct-user count per topic works well, see <a href="57-hashing-probabilistic.html">Chapter 57</a>).</li>
+</ul>
+
+<h3>7.1 Sliding-window counters</h3>
+<p>A frequent building block (also used in rate limiting, <a href="16-rate-limiting.html">Chapter 16</a>) is "how many events in the last N minutes?". Exact options and their costs:</p>
+<table>
+<tr><th>Technique</th><th>How it works</th><th>Memory</th><th>Accuracy</th></tr>
+<tr><td>Sliding log</td><td>Store a timestamp per event in a sorted set; remove those older than the window; count the rest</td><td>O(events in window)</td><td>Exact</td></tr>
+<tr><td>Fixed window</td><td>One counter per window key (minute 12:05); read the current key</td><td>O(1) per window</td><td>Boundary burst: up to 2x traffic across a window edge</td></tr>
+<tr><td>Bucketed sliding window</td><td>Divide the window into small buckets (for example 60 one-second buckets); sum the live ones; drop old buckets</td><td>O(buckets)</td><td>Error at most one bucket width</td></tr>
+<tr><td>Weighted two-window</td><td>count = current window count + previous window count * fraction of previous window still overlapped</td><td>O(1)</td><td>Approximate, assumes even spread</td></tr>
+<tr><td>Exponentially decayed counter</td><td>value = value * 2^(-dt / halfLife) + 1 on every event</td><td>O(1)</td><td>Smooth recency, not a hard window</td></tr>
+</table>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Bucketed sliding window counter over time with expiring bucket">
+  <text class="t-b" x="20" y="24">Window = last 6 minutes, bucket = 1 minute. Current time is inside minute 12:06.</text>
+  <rect class="miss" x="20"  y="50" width="110" height="60" rx="6"/><text class="t-c t-sm" x="75" y="76">12:00</text><text class="t-c t-b" x="75" y="98">40</text>
+  <rect class="box"  x="150" y="50" width="110" height="60" rx="6"/><text class="t-c t-sm" x="205" y="76">12:01</text><text class="t-c t-b" x="205" y="98">55</text>
+  <rect class="box"  x="280" y="50" width="110" height="60" rx="6"/><text class="t-c t-sm" x="335" y="76">12:02</text><text class="t-c t-b" x="335" y="98">48</text>
+  <rect class="box"  x="410" y="50" width="110" height="60" rx="6"/><text class="t-c t-sm" x="465" y="76">12:03</text><text class="t-c t-b" x="465" y="98">62</text>
+  <rect class="box"  x="540" y="50" width="110" height="60" rx="6"/><text class="t-c t-sm" x="595" y="76">12:04</text><text class="t-c t-b" x="595" y="98">51</text>
+  <rect class="box"  x="670" y="50" width="110" height="60" rx="6"/><text class="t-c t-sm" x="725" y="76">12:05</text><text class="t-c t-b" x="725" y="98">70</text>
+  <rect class="hit"  x="800" y="50" width="90" height="60" rx="6"/><text class="t-c t-sm" x="845" y="76">12:06 now</text><text class="t-c t-b" x="845" y="98">12</text>
+  <path class="arrow-r" d="M75 124 L75 150"/><text class="t-sm" x="20" y="170">12:00 bucket expired, dropped</text>
+  <text class="t-sm" x="20" y="205">Window sum = 55 + 48 + 62 + 51 + 70 + 12 = 298 events (the live buckets 12:01 to 12:06).</text>
+  <text class="t-sm" x="20" y="226">Each event increments one bucket. Reads sum a fixed handful of buckets, so cost is O(buckets), independent of event rate.</text>
+</svg>
+<figcaption>A ring of small counters turns an unbounded event stream into constant memory. Old buckets fall off the left end. The error is at most one bucket width because the oldest live bucket may contain events slightly older than the window.</figcaption>
+</figure>
+
+<p>In Redis the sliding log is natural with a sorted set whose score is the timestamp: <code>ZADD key now id</code>, <code>ZREMRANGEBYSCORE key 0 now-window</code>, then <code>ZCARD key</code>. It is exact but costs memory per event, so for high rates use the bucketed form (one hash with minute-bucket fields, or one key per bucket with a TTL slightly longer than the window).</p>
+
+<h2 id="merkle">8. Merkle tree recap</h2>
+
+<p>A <b>Merkle tree</b> is a hash tree: every leaf is the hash of a block of data, and every internal node is the hash of its children's hashes, so the root hash summarizes the whole data set. Two replicas holding the same data have the same root. If the roots differ, compare the children: descend only into subtrees whose hashes differ. After O(log n) comparisons you find exactly which blocks are different and transfer only those. This is why they appear in anti-entropy repair in Dynamo-style stores such as Cassandra and Riak (see <a href="33-gossip-merkle.html">Chapter 33</a> for the full treatment), in Git and blockchains (content integrity), and in file-sync tools.</p>
+<p>It belongs in this chapter for one reason: it is the <b>cheap way to prove two replicas converged</b>. CRDTs and OT promise that replicas end up in the same state; comparing a few root hashes is how a system verifies the promise cheaply instead of comparing whole documents, and how it finds a replica that has diverged because of a bug or lost update. Merkle trees do not resolve conflicts, only detect them; they pair naturally with the merge rules we cover next.</p>
+
+<h2 id="conflict">9. Why concurrent edits conflict</h2>
+
+<p>Switch topic to collaboration. Suppose a shared document contains the text <code>CAT</code>. Alice and Bob both have this version open. At the same moment, Alice inserts "H" at position 1 (making <code>CHAT</code>) and Bob deletes the character at position 2 (the "T", making <code>CA</code>). Each applies their own change instantly (collaborative tools must feel instant, so we cannot wait for a server round trip before showing the keystroke). Then each sends their change to the other.</p>
+
+<p>If Bob's replica naively applies "insert H at 1" to <code>CA</code>, it gets <code>CHA</code>, which is right. But if Alice's replica applies "delete at 2" to <code>CHAT</code>, it deletes the "A" (now at index 2) and ends with <code>CHT</code>. The replicas now disagree (<code>CHA</code> versus <code>CHT</code>) and neither is what Bob intended. The problem is that <b>positions are relative to a document version</b>, and when concurrent operations arrive, the version they were created against is no longer the current version.</p>
+
+<p>Approaches to avoid this:</p>
+<ul>
+  <li><b>Locking</b> (only one editor at a time, or per-paragraph locks). Simple but destroys the real-time experience and fails offline.</li>
+  <li><b>Last-writer-wins on the whole document.</b> One person's work is silently lost. Unacceptable for text.</li>
+  <li><b>Operational transformation (OT):</b> keep position-based operations, but <i>rewrite</i> an incoming operation to account for the concurrent operations already applied. Section 10.</li>
+  <li><b>CRDTs:</b> change the data model so that operations do not depend on positions at all: every character has a unique, stable identity, and operations refer to identities. Concurrent operations then commute by construction. Sections 11 to 14.</li>
+</ul>
+
+<p>The goal in all cases is a property usually called <b>convergence</b> (every replica ends up in the same state once it has seen the same set of operations), plus <b>intention preservation</b> (the result matches what each user meant, for example Bob's delete still deletes the "T" he saw, not whatever now sits at index 2).</p>
+
+<h2 id="ot">10. Operational transformation (OT)</h2>
+
+<p>OT is the technique behind Google Docs (and its ancestors Jupiter, Google Wave and EtherPad-style editors). Every edit is expressed as an <b>operation</b>, for example <code>insert(pos, char)</code> or <code>delete(pos)</code>. When two operations were generated concurrently against the same document state, one of them must be <b>transformed</b> against the other before being applied, so that its position is adjusted for the effect of the other.</p>
+
+<h3>10.1 The transform function</h3>
+<p>Define <code>transform(a, b)</code> as: given two operations a and b that were both created against the same document state, return a' which is a rewritten to apply <i>after</i> b has been applied, preserving a's intention. The desired property for convergence (called <b>TP1</b>) is:</p>
+<pre>apply(apply(S, a), transform(b, a))  ==  apply(apply(S, b), transform(a, b))</pre>
+<p>In words: applying a then the transformed b, ends in the same state as applying b then the transformed a. Think of a diamond: both paths from the starting state S reach the same final state.</p>
+
+<p>For the two text operations, the rules for transforming an insert (position p1, char c) against another insert (position p2) are:</p>
+<ul>
+  <li>If p1 &lt; p2, the other insert is to the right of mine and does not affect me: keep p1.</li>
+  <li>If p1 &gt; p2, the other insert shifted my target right by one: use p1 + 1.</li>
+  <li>If p1 == p2, both want the same slot. We need a deterministic tiebreak (for example by client or site id, lower id goes first) so both sites choose the same order, otherwise they diverge.</li>
+</ul>
+<p>Against a delete at position d: if p1 &lt;= d keep p1 (inserting before the deleted char is unaffected), else use p1 - 1. Transforming a delete against an insert or another delete follows the mirror-image logic, with the extra case that two concurrent deletes of the <i>same</i> character must collapse so that the second becomes a no-op (otherwise a neighboring character gets deleted by mistake).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Transformation diamond for two concurrent operations on the text CAT">
+  <rect class="ext" x="380" y="20" width="140" height="44" rx="8"/><text class="t-c t-b" x="450" y="40">S = "CAT"</text><text class="t-c t-sm" x="450" y="56">common state</text>
+  <rect class="box" x="130" y="130" width="220" height="50" rx="8"/><text class="t-c t-b" x="240" y="152">Alice: "CHAT"</text><text class="t-c t-sm" x="240" y="169">a = insert(1, H)</text>
+  <rect class="cache" x="550" y="130" width="220" height="50" rx="8"/><text class="t-c t-b" x="660" y="152">Bob: "CA"</text><text class="t-c t-sm" x="660" y="169">b = delete(2)</text>
+  <path class="arrow" d="M420 64 L300 126"/><path class="arrow" d="M480 64 L600 126"/>
+  <rect class="miss" x="60" y="250" width="270" height="56" rx="8"/><text class="t-c t-b" x="195" y="272">Naive: apply b as delete(2)</text><text class="t-c t-sm" x="195" y="292">"CHAT" becomes "CHT"  (wrong, lost the A)</text>
+  <rect class="hit" x="570" y="250" width="270" height="56" rx="8"/><text class="t-c t-b" x="705" y="272">Apply a as insert(1, H)</text><text class="t-c t-sm" x="705" y="292">"CA" becomes "CHA"  (right)</text>
+  <path class="arrow-r" d="M240 180 L195 246"/><path class="arrow-g" d="M660 180 L705 246"/>
+  <rect class="hit" x="330" y="300" width="240" height="50" rx="8"/><text class="t-c t-b" x="450" y="322">Transformed: b' = delete(3)</text><text class="t-c t-sm" x="450" y="340">"CHAT" becomes "CHA" on both</text>
+  <path class="arrow-g" d="M330 310 L260 308" />
+  <text class="t-sm" x="370" y="215">transform(b, a): a inserted before position 2, so shift b to 3</text>
+</svg>
+<figcaption>Both users start from "CAT". Alice's insert is at an index before Bob's delete, so Bob's delete must be shifted from index 2 to index 3 when applied after Alice's insert. With the transform both sites reach "CHA". Without it Alice's site ends in "CHT".</figcaption>
+</figure>
+
+<h3>10.2 Server-ordered OT (the practical design)</h3>
+<p>General peer-to-peer OT, where any client can talk to any other, requires transform functions satisfying a second property (<b>TP2</b>) about three-way concurrency, and TP2 is notoriously hard to get right; many published algorithms were later found to have counterexamples. The approach used in practice (Jupiter, Google Wave, Google Docs, ShareDB) avoids it by putting a <b>central server</b> in the loop that imposes a single total order on operations.</p>
+<p>Each client tracks the server revision number it is based on. The protocol:</p>
+<ol>
+  <li>The client applies its own edit locally at once and sends <code>(op, baseRevision)</code> to the server. It may have only one operation in flight at a time; further local edits are composed into a buffer and sent after the acknowledgment.</li>
+  <li>The server receives the op. If its <code>baseRevision</code> is older than the server's current revision, it transforms the incoming op against every operation the server has applied since that revision (in order), then applies it, appends it to the history and increments the revision.</li>
+  <li>The server broadcasts the (transformed) op to all other clients and acknowledges the sender.</li>
+  <li>Each client, on receiving a remote op, transforms it against its own pending (in-flight and buffered) operations before applying it to the local document, and transforms its pending operations against it as well.</li>
+</ol>
+<p>Because the server defines a single order and each client has just one linear history to reconcile with, only the two-party property TP1 is needed, which is far easier to guarantee. The cost is a central component: the server is a serialization point per document (one document lives on one server shard, which is fine, as documents are independent) and it needs a durable operation log.</p>
+
+<h3>10.3 Worked example: two concurrent inserts</h3>
+<p>The document is <code>ac</code> at server revision 5. Alice wants to insert "b" at index 1 (giving <code>abc</code>); Bob wants to insert "d" at index 2 (giving <code>acd</code>). Both ops are based on revision 5 and both are sent simultaneously.</p>
+<table>
+<tr><th>Step</th><th>Event</th><th>Server doc and revision</th><th>Alice's doc</th><th>Bob's doc</th></tr>
+<tr><td>0</td><td>Start</td><td><code>ac</code> r5</td><td><code>ac</code></td><td><code>ac</code></td></tr>
+<tr><td>1</td><td>Both type locally</td><td><code>ac</code> r5</td><td><code>abc</code> (pending a)</td><td><code>acd</code> (pending b)</td></tr>
+<tr><td>2</td><td>Alice's op arrives first: <code>ins(1,b)@r5</code></td><td>no concurrent ops; apply: <code>abc</code> r6</td><td>ack received, pending cleared</td><td>receives <code>ins(1,b)</code></td></tr>
+<tr><td>3</td><td>Bob's op arrives: <code>ins(2,d)@r5</code>, but server is at r6</td><td>transform against <code>ins(1,b)</code>: 2 &gt; 1 so shift to <code>ins(3,d)</code>; apply: <code>abcd</code> r7</td><td>receives <code>ins(3,d)</code>, applies: <code>abcd</code></td><td>transforms the incoming <code>ins(1,b)</code> against its pending <code>ins(2,d)</code>: 1 &lt; 2 so unchanged; applies: <code>abcd</code> (that is <code>ac</code> + b + d); ack for his own op</td></tr>
+<tr><td>4</td><td>End</td><td><code>abcd</code> r7</td><td><code>abcd</code></td><td><code>abcd</code></td></tr>
+</table>
+<p>Notice what happened to Bob's op: he meant "insert d after the c" (the end), and after Alice's insert the end is index 3, so the server rewrote 2 to 3, preserving his intention. Had the two inserts targeted exactly the same index, the tiebreak (for example the server's arrival order, or client id) would decide, but all participants would apply the same decision.</p>
+
+<h3>10.4 Inclusion transformation and exclusion transformation</h3>
+<p>In the OT literature, <b>inclusion transformation (IT)</b> is the forward transform used above: rewrite operation a so that it <i>includes</i> the effect of b, allowing it to apply after b. <b>Exclusion transformation (ET)</b> is the opposite: rewrite a so that it <i>excludes</i> b's effect, as if b had not happened. ET is needed in peer-to-peer designs (for example the GOT/GOTO family) to undo the effect of operations in the history before re-including them in the correct order; it is also what makes undo/redo in a collaborative editor work, since to undo your own operation you must transform its inverse over everything others have done since. Server-ordered designs rarely need ET for ordinary sync, but need an equivalent for undo.</p>
+
+<h3>10.5 Google Docs style, complexity and pitfalls</h3>
+<p>A Google Docs-style system carries richer operations than insert and delete: retain (skip N characters), insert string, delete N characters, and attribute changes (bold, link) over ranges, usually bundled as a list "retain 5, insert 'abc', retain 3, delete 2" covering the entire document length (the representation used in ShareDB's rich-text type and the Quill Delta format). Operations in this form can be <i>composed</i> (merge two sequential ops into one) and transformed against another list in a single linear walk, so transform cost is O(length of ops) rather than the document size. Structured content (tables, lists, comments) uses tree-shaped OT, which is substantially harder.</p>
+<p><b>Complexity.</b> The server transforms each incoming op against up to d concurrent ops (those committed since the client's base revision), so cost per op is O(d) transform calls, each linear in op length. With high latency or many editors, d grows. The number of distinct transform-function pairs grows as the square of operation types (every type must be transformed against every other), so adding an operation type is expensive in testing effort.</p>
+<p><b>Correctness pitfalls:</b></p>
+<ul>
+  <li>Failing TP1 or TP2 in rare operation combinations produces silent divergence; such bugs are found only through randomized testing and fuzzing (the standard defense is a fuzzer that runs thousands of random concurrent operation sequences and asserts all replicas converge).</li>
+  <li>Tiebreaking must be deterministic and symmetrical on all sites.</li>
+  <li>Concurrent delete of the same range needs the collapse rule; delete versus insert inside the deleted range needs a defined outcome (usually the insert survives, placed at the deletion point).</li>
+  <li>Client buffering bugs (more than one op in flight, or transforming against the wrong pending list) break the server's assumption about the base revision.</li>
+  <li>The server's operation history must be kept long enough that slow or offline clients can still be transformed against it; long offline sessions become expensive, which is one reason OT handles offline editing poorly.</li>
+  <li>Undo semantics: "undo my last change" must not undo someone else's text, which requires the transform of an inverse operation as noted above.</li>
+</ul>
+
+<h2 id="crdt">11. CRDTs: the idea</h2>
+
+<p>A <b>Conflict-free Replicated Data Type (CRDT)</b> is a data structure designed so that replicas can be updated independently and concurrently, without coordination, and are <b>guaranteed to converge</b> once they have exchanged their updates, whatever the order of delivery. There is no central transformer or server needed for correctness. Each replica applies its own updates locally and immediately (so reads and writes are always available, even offline) and merges what it receives from others.</p>
+
+<h3>11.1 State-based versus operation-based</h3>
+<table>
+<tr><th>Aspect</th><th>State-based (CvRDT, convergent)</th><th>Operation-based (CmRDT, commutative)</th></tr>
+<tr><td>What is sent</td><td>The entire local state (or a delta of it)</td><td>Each individual operation</td></tr>
+<tr><td>Merge rule</td><td>A <code>merge(s1, s2)</code> function that is commutative, associative and idempotent (a join on a semilattice: result is the least upper bound)</td><td>Operations must commute when concurrent; apply each one on receipt</td></tr>
+<tr><td>Delivery requirements</td><td>Weak: messages may be lost, duplicated, reordered, as long as state eventually propagates (gossip works)</td><td>Stronger: exactly-once delivery and causal order of operations (a reliable causal broadcast layer)</td></tr>
+<tr><td>Message size</td><td>Large for big states unless delta-CRDTs are used</td><td>Small</td></tr>
+<tr><td>Typical fit</td><td>Replicated key-value stores with anti-entropy (Riak, Redis Enterprise)</td><td>Editors with a reliable log/transport (Yjs and Automerge send operations or updates)</td></tr>
+</table>
+<p><b>Convergence conditions.</b> A state-based CRDT converges if its states form a <i>join-semilattice</i> (a set with a partial order in which any two elements have a least upper bound), updates only move a state upward in that order (monotonic), and merge computes the least upper bound. Merge is then automatically commutative (order of arrival does not matter), associative (grouping does not matter) and idempotent (receiving the same state twice does not matter): the three properties that let you survive reordering, batching and duplication. An operation-based CRDT converges if concurrent operations commute and the delivery layer provides causal, exactly-once delivery. <b>Delta-state CRDTs</b> are a hybrid: they ship only the part of the state that changed (the delta), which is itself a valid state and merged the same way, giving small messages with weak delivery requirements.</p>
+
+<h3>11.2 Counters: G-Counter and PN-Counter</h3>
+<p>A plain integer with "+1" cannot just be merged with max or sum: if two replicas both start at 5 and each add 1 independently, the answer should be 7, but max gives 6 and "sum the replicas' values" gives 12. The fix is to track contributions <b>per replica</b>.</p>
+<p>A <b>G-Counter</b> (grow-only counter) is a vector with one non-negative integer slot per replica. Replica i only ever increments slot i. The value is the sum of all slots. Merge takes the <b>element-wise maximum</b>. Because each slot is only changed by its owner and only grows, the max of two versions of a slot is always the newer one; merge is commutative, associative and idempotent. Example with replicas A, B, C: A holds [3,0,0], B holds [0,2,0]. After merge both hold [3,2,0] with value 5; a duplicate merge changes nothing.</p>
+<p>A <b>PN-Counter</b> (positive-negative counter) supports decrements by pairing two G-Counters: P for increments and N for decrements. Value = sum(P) - sum(N); merge merges each separately. It cannot enforce a lower bound (like "stock never below zero") without coordination, since two replicas can each decrement the last unit concurrently. That is a general limit of coordination-free designs, discussed under CALM below.</p>
+
+<h3>11.3 Sets: G-Set, 2P-Set and OR-Set</h3>
+<ul>
+  <li><b>G-Set (grow-only set).</b> Only additions are possible. Merge is set union. Simple and correct, but you cannot remove anything.</li>
+  <li><b>2P-Set (two-phase set).</b> Keep an add set A and a remove set R (a "tombstone set"), both grow-only. An element is present if it is in A and not in R. Merge is union of each. The flaw: once removed, an element can <b>never be re-added</b>, because it stays in R forever. This is an acceptable limit for some data (a unique id used once) but not for a shopping cart.</li>
+  <li><b>OR-Set (observed-remove set).</b> Each add attaches a <b>unique tag</b> (for example replica id plus counter) to the element. A remove deletes only the tags that the remover has <i>observed</i> for that element. Concurrent add and remove of the same element: the remove did not see the new add's tag, so the add survives ("add wins"). Re-adding after removal creates a fresh tag, so it works. State is a set of (element, tag) pairs; in the state-based form, removed tags are recorded (or tracked via causal context, as in the optimized OR-Set) so that merge does not resurrect them.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="OR-Set concurrent add and remove between two replicas, add wins">
+  <text class="t-b" x="20" y="22">OR-Set: Replica 1 removes "x" while Replica 2 concurrently re-adds "x". Result: x survives.</text>
+  <rect class="box" x="100" y="40" width="160" height="34" rx="8"/><text class="t-c t-b" x="180" y="62">Replica 1</text>
+  <rect class="cache" x="620" y="40" width="160" height="34" rx="8"/><text class="t-c t-b" x="700" y="62">Replica 2</text>
+  <line class="life" x1="180" y1="74" x2="180" y2="340"/><line class="life" x1="700" y1="74" x2="700" y2="340"/>
+  <rect class="hit" x="70" y="96" width="220" height="40" rx="6"/><text class="t-c t-sm" x="180" y="113">add x tag t1</text><text class="t-c t-sm" x="180" y="128">set = {(x, t1)}</text>
+  <path class="arrow dash" d="M290 116 L610 150"/><text class="t-sm" x="360" y="120">sync: both now hold {(x, t1)}</text>
+  <rect class="miss" x="70" y="170" width="220" height="40" rx="6"/><text class="t-c t-sm" x="180" y="187">remove x: drop observed tag t1</text><text class="t-c t-sm" x="180" y="202">set = {}  (tombstone t1)</text>
+  <rect class="hit" x="590" y="170" width="220" height="40" rx="6"/><text class="t-c t-sm" x="700" y="187">add x again, new tag t2 (concurrent)</text><text class="t-c t-sm" x="700" y="202">set = {(x, t1), (x, t2)}</text>
+  <path class="arrow" d="M290 195 L586 195"/><text class="t-sm" x="340" y="188">state exchange</text>
+  <path class="arrow" d="M586 205 L294 225"/>
+  <rect class="hit" x="70" y="250" width="220" height="56" rx="6"/><text class="t-c t-sm" x="180" y="270">merge: t1 removed, t2 unseen by remove</text><text class="t-c t-b" x="180" y="292">set = {(x, t2)}  x present</text>
+  <rect class="hit" x="590" y="250" width="220" height="56" rx="6"/><text class="t-c t-sm" x="700" y="270">merge: t1 removed, t2 kept</text><text class="t-c t-b" x="700" y="292">set = {(x, t2)}  x present</text>
+</svg>
+<figcaption>The remove only kills the tag it saw (t1). The concurrent add created a new tag (t2) that the remover never saw, so after merging both replicas agree that x is present. The "add wins" rule falls out of tagging; no coordination is needed.</figcaption>
+</figure>
+
+<h3>11.4 Registers: LWW and multi-value</h3>
+<p>A <b>register</b> holds a single value that can be overwritten. Two concurrent writes need a resolution rule.</p>
+<ul>
+  <li><b>LWW-Register (last-writer-wins).</b> Each write carries a timestamp (and replica id as a tiebreak). Merge keeps the value with the larger timestamp. It is trivially convergent and cheap, but it <b>silently discards</b> one of the concurrent writes, and with physical clocks that drift (see <a href="27-failure-time-ordering.html">Chapter 27</a>) the "last" write may not be the one the user made last. Hybrid logical clocks reduce, but do not eliminate, the data-loss nature of LWW. It is acceptable for data where the latest value truly wins (a user's profile picture, a "last seen" time) and dangerous otherwise.</li>
+  <li><b>Multi-value register (MV-Register).</b> Writes carry a version vector. If one write causally follows another, it overwrites. If two writes are concurrent, <b>both are kept</b> as siblings, and a read returns all of them so the application (or user) resolves the conflict, which a later write then supersedes. This is the Dynamo and Riak "siblings" behavior. No information is lost, at the price of pushing the merge decision to the reader.</li>
+</ul>
+<p>The version vectors used here, and the happens-before reasoning behind "causally follows" versus "concurrent", are those of <a href="27-failure-time-ordering.html">Chapter 27</a>. Replication context is in <a href="24-replication.html">Chapter 24</a> (leaderless replication, where this conflict handling originates).</p>
+
+<table>
+<tr><th>CRDT</th><th>State</th><th>Merge</th><th>Limitation</th></tr>
+<tr><td>G-Counter</td><td>Vector of per-replica counts</td><td>Element-wise max</td><td>Only increments</td></tr>
+<tr><td>PN-Counter</td><td>Two G-Counters (P and N)</td><td>Merge each</td><td>Cannot enforce bounds such as "never below zero"</td></tr>
+<tr><td>G-Set</td><td>Set of elements</td><td>Union</td><td>No removal</td></tr>
+<tr><td>2P-Set</td><td>Added set and removed set</td><td>Union of each</td><td>Removed element can never return</td></tr>
+<tr><td>OR-Set</td><td>Elements with unique tags</td><td>Union of tags, minus tombstoned tags</td><td>Metadata grows until garbage-collected</td></tr>
+<tr><td>LWW-Register</td><td>Value plus timestamp</td><td>Keep larger timestamp</td><td>Loses concurrent writes; clock-sensitive</td></tr>
+<tr><td>MV-Register</td><td>Values with version vectors</td><td>Keep non-dominated values</td><td>Application must resolve siblings</td></tr>
+</table>
+
+<h2 id="widget">12. Try it: G-Counter and OR-Set</h2>
+<p>The widget below simulates two replicas. Increment the counter on either replica, add or remove an element, then press Sync to exchange state and watch both converge. Try the concurrent add and remove case from the figure above.</p>
+<div class="widget"><h4>Try it: two replicas, state-based merge</h4>
+<div class="row">
+<button id="w-inc1">Replica 1: +1</button>
+<button id="w-inc2">Replica 2: +1</button>
+<button id="w-add1">R1: add "x"</button>
+<button id="w-rem1">R1: remove "x"</button>
+<button id="w-add2">R2: add "x"</button>
+<button id="w-rem2">R2: remove "x"</button>
+<button id="w-sync">Sync (merge both ways)</button>
+<button id="w-reset">Reset</button>
+</div>
+<div class="log" id="w-log"></div>
+</div>
+
+<h2 id="seq">13. Sequence CRDTs for text</h2>
+
+<p>A counter or set is easy; ordered text is the hard case. The core move is the one mentioned earlier: <b>give every character a unique identity that never changes</b>, and define operations in terms of identities instead of indexes. "Insert H after the character whose id is (alice, 7)" means the same thing regardless of what else has happened to the document. Different sequence CRDTs differ in how they generate ids and how they order concurrent inserts at the same spot.</p>
+
+<h3>13.1 RGA (Replicated Growable Array)</h3>
+<p>RGA stores the document as a linked list of elements; each element has a unique id, typically a pair <code>(logical timestamp, replica id)</code> built from a Lamport clock (see <a href="27-failure-time-ordering.html">Chapter 27</a>), so ids are totally ordered and respect causality. To insert, a replica creates a new element with a fresh id and names its <b>predecessor</b> (the element it goes right after). On receiving this remote insert, a replica finds the predecessor and places the new element after it. If other elements were already inserted after that same predecessor (a concurrent insert at the same location), the new element skips over any siblings with a <i>larger</i> id and goes in front of those with a smaller one, which gives every replica the same deterministic order (the newer insert ends up nearer to the predecessor). Delete does not remove the element; it marks it as a <b>tombstone</b> (hidden but still present), because other replicas may still have concurrent operations naming it as a predecessor.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="RGA sequence CRDT with unique ids, concurrent inserts and a tombstone">
+  <text class="t-b" x="20" y="22">Document "CAT". Alice and Bob concurrently edit; characters carry ids.</text>
+  <rect class="box" x="40" y="50" width="120" height="50" rx="8"/><text class="t-c t-b" x="100" y="72">C</text><text class="t-c t-sm" x="100" y="90">id 1@s</text>
+  <rect class="box" x="220" y="50" width="120" height="50" rx="8"/><text class="t-c t-b" x="280" y="72">A</text><text class="t-c t-sm" x="280" y="90">id 2@s</text>
+  <rect class="box" x="400" y="50" width="120" height="50" rx="8"/><text class="t-c t-b" x="460" y="72">T</text><text class="t-c t-sm" x="460" y="90">id 3@s</text>
+  <path class="arrow" d="M160 75 L216 75"/><path class="arrow" d="M340 75 L396 75"/>
+  <text class="t-sm" x="560" y="68">Start state, ids from the creating site s.</text>
+  <text class="t-sm" x="560" y="86">Each element keeps a pointer to its successor.</text>
+
+  <text class="t-b" x="20" y="140">Concurrent operations</text>
+  <rect class="cache" x="40" y="156" width="400" height="44" rx="8"/><text class="t-sm" x="52" y="183">Alice: insert H with id 4@alice after element 1@s (after C)</text>
+  <rect class="cache" x="460" y="156" width="400" height="44" rx="8"/><text class="t-sm" x="472" y="183">Bob: insert X with id 4@bob after element 1@s (also after C)</text>
+  <text class="t-sm" x="40" y="224">Both inserts name the same predecessor. Tie broken by id: (4,bob) is larger than (4,alice), so bob's goes first.</text>
+
+  <text class="t-b" x="20" y="262">Result on every replica after merge</text>
+  <rect class="box" x="40" y="276" width="90" height="44" rx="8"/><text class="t-c t-b" x="85" y="304">C</text>
+  <rect class="hit" x="150" y="276" width="90" height="44" rx="8"/><text class="t-c t-b" x="195" y="304">X</text>
+  <rect class="hit" x="260" y="276" width="90" height="44" rx="8"/><text class="t-c t-b" x="305" y="304">H</text>
+  <rect class="box" x="370" y="276" width="90" height="44" rx="8"/><text class="t-c t-b" x="415" y="304">A</text>
+  <rect class="miss" x="480" y="276" width="90" height="44" rx="8"/><text class="t-c t-sm" x="525" y="296">T</text><text class="t-c t-sm" x="525" y="312">tombstone</text>
+  <path class="arrow" d="M130 298 L146 298"/><path class="arrow" d="M240 298 L256 298"/><path class="arrow" d="M350 298 L366 298"/><path class="arrow" d="M460 298 L476 298"/>
+  <text class="t-sm" x="600" y="296">Visible text: "CXHA". T was deleted by a third</text>
+  <text class="t-sm" x="600" y="314">op but stays as a hidden tombstone.</text>
+</svg>
+<figcaption>Operations reference stable ids, not indexes. Concurrent inserts after the same element are ordered by their ids, so every replica produces the same sequence. A delete only marks the element hidden, because late-arriving operations might still refer to it.</figcaption>
+</figure>
+
+<h3>13.2 Logoot and LSEQ (dense identifiers)</h3>
+<p>Logoot takes a different route and avoids a linked structure. Each element gets a <b>position identifier</b> drawn from a dense, totally ordered space, such as a list of integers compared lexicographically (with a site id and counter to make them unique). To insert between elements with positions [3] and [4], generate a position between them, for example [3, 7]. Order is determined purely by comparing identifiers, so no predecessor pointers or tombstones are needed: delete really removes the element. The cost is that identifiers can grow long, for instance when many users keep inserting at the same spot (typing at the end of a document creates ever-deeper identifiers if the allocation strategy is naive). <b>LSEQ</b> improves this by choosing identifier allocation strategies adaptively (alternating whether new identifiers cluster near the left or right boundary at each depth) so that growth is sub-linear for common editing patterns, such as typing forward or typing backward.</p>
+
+<h3>13.3 Yjs and Automerge</h3>
+<p>The two most widely used libraries.</p>
+<ul>
+  <li><b>Yjs</b> implements a sequence CRDT variant (the YATA algorithm) in which each inserted item records its <i>left and right</i> origin neighbours at insertion time and a client id; these resolve the order of concurrent inserts. Its most important engineering trick is that runs of consecutive characters typed by the same client are stored as a <b>single block</b> with one id and a length, instead of one object per character, which cuts memory and encoding size dramatically. It supports shared text, arrays, maps and XML, exposes a compact binary update format, has pluggable network providers (WebSocket, WebRTC) and persistence, and is popular in editor integrations (ProseMirror, Quill, CodeMirror, Monaco).</li>
+  <li><b>Automerge</b> models a whole JSON-like document (maps, lists, text, counters) as a CRDT with a full operation history, giving the "git-like" capabilities of branching, merging and time travel. Its modern implementation is a Rust core with bindings for several languages, and a compact columnar binary format.</li>
+</ul>
+<p>Both give offline-first editing: a client edits with no network, accumulates updates, and merges on reconnect without a server needing to transform anything. A server is still useful, but only as a relay and persistence layer, not as an arbiter.</p>
+
+<h3>13.4 Tombstones, garbage collection and metadata growth</h3>
+<p>The price of CRDT convergence is <b>metadata</b>. A document of 100,000 visible characters may carry ids for all of them, plus tombstones for every character ever deleted. Without cleanup, a heavily edited document grows without bound: a document edited for years is far larger than the text it shows. Mitigations:</p>
+<ul>
+  <li><b>Run-length blocks</b> (Yjs): one block per contiguous run of characters, so overhead is per run, not per character. Typical documents stay within a small multiple of the text size.</li>
+  <li><b>Tombstone garbage collection.</b> A tombstone can be physically removed once <b>every replica has observed the delete</b>, since then no future operation can reference it as a predecessor. Knowing that requires tracking what each replica has seen (version vectors, see <a href="27-failure-time-ordering.html">Chapter 27</a>), which is hard when replicas can be offline indefinitely. Common compromises: Yjs drops the content of deleted items (keeping a tiny placeholder that preserves ordering information), which already removes most of the weight; systems with a known set of participants collect once all have acknowledged; others periodically <b>re-base</b> (snapshot the document into a fresh state and require clients to resync), accepting that very old offline copies cannot merge.</li>
+  <li><b>Compaction of history.</b> Automerge-style documents can be saved as a compressed snapshot plus recent changes; full history can be discarded if time travel is not needed.</li>
+  <li><b>Identifier length</b> (Logoot family): bounded by allocation strategy (LSEQ) and occasional renumbering coordinated across replicas.</li>
+</ul>
+
+<div class="callout watch"><b>Watch out</b> "CRDTs need no coordination" is true for convergence, but not for cleanup. Garbage collection, schema migration of the document model, and permission changes ("revoke Bob's edit access") do need agreement between replicas or a trusted server. Design the control plane separately from the data plane.</div>
+
+<h2 id="compare">14. OT versus CRDT</h2>
+
+<table>
+<tr><th>Dimension</th><th>Operational transformation</th><th>CRDT</th></tr>
+<tr><td>Core idea</td><td>Operations use positions; rewrite concurrent ones so they still apply correctly</td><td>Data carries unique identities; operations commute by design</td></tr>
+<tr><td>Central server</td><td>Practically required to order operations (server-ordered OT)</td><td>Optional; peer-to-peer and offline merge work</td></tr>
+<tr><td>Convergence proof</td><td>Per pair of operation types; subtle, history of faulty algorithms</td><td>Follows from the algebra (commutative, associative, idempotent merge)</td></tr>
+<tr><td>Offline and long-lived branches</td><td>Painful: many concurrent ops to transform against</td><td>Natural: merge when you reconnect</td></tr>
+<tr><td>Memory and metadata</td><td>Document is plain; server keeps an op log</td><td>Ids and tombstones on the document; needs GC</td></tr>
+<tr><td>Rich structures (tables, trees)</td><td>Hard; each new op type needs transform pairs</td><td>Composable (maps of lists of text), though tree moves are hard</td></tr>
+<tr><td>Intention preservation</td><td>Tuned per operation by the designer, can be very good</td><td>Determined by the CRDT rules; interleaving anomalies possible in some designs</td></tr>
+<tr><td>Undo</td><td>Requires inverse-op transformation</td><td>Also non-trivial; usually implemented per user as inverse operations</td></tr>
+<tr><td>Access control and validation</td><td>Easy: the server sees and checks every op</td><td>Harder: untrusted peers can send any op; typically a server still validates</td></tr>
+<tr><td>Typical products</td><td>Google Docs, Etherpad, ShareDB-based apps</td><td>Figma (CRDT-inspired), Notion-like and local-first apps, Yjs and Automerge-based tools, Apple Notes sync style designs</td></tr>
+</table>
+
+<p>Neither is strictly better. A server-centric product with strong access control and a short-lived online session fits OT well. A product that values offline work, peer-to-peer sync or multi-region active-active replication fits CRDTs. Many modern systems blend: a central server that relays and persists CRDT updates and enforces permissions. Figma, for instance, states that it uses a server as an authority and a CRDT-inspired model for properties (object id and property, last-writer-wins per property) rather than a full text sequence CRDT, because design objects are mostly independent property bags, not long text sequences. This shows a useful principle: <b>choose the weakest merge rule that preserves user intent</b>; per-property LWW is enough for shapes, while text needs a sequence CRDT or OT.</p>
+
+<h2 id="where">15. Where these are used</h2>
+<ul>
+  <li><b>Riak</b> offers CRDT data types (counters, sets, maps, registers, flags) on top of its Dynamo-style leaderless replication, where concurrent writes during partitions are the norm (<a href="24-replication.html">Chapter 24</a>).</li>
+  <li><b>Redis Enterprise Active-Active (CRDB)</b> replicates Redis data across geographically separate clusters using CRDT semantics for strings (with LWW), counters, sets, hashes and more, so each region can accept writes locally with low latency and merge asynchronously (<a href="15-redis.html">Chapter 15</a>).</li>
+  <li><b>Figma</b> for multiplayer design documents, with a server that orders updates and per-property conflict rules.</li>
+  <li><b>Collaborative notes and code editors</b> built on Yjs or Automerge, including local-first apps that work fully offline and sync later.</li>
+  <li><b>Offline-capable mobile apps</b> that queue edits and merge on reconnect (<a href="56-privacy-cost-mobile.html">Chapter 56</a> covers the client side: local storage, sync queues, push).</li>
+  <li><b>Distributed counters</b> for likes, views and inventory approximations across data centers (G-Counter and PN-Counter style).</li>
+  <li><b>Collaborative editing at large</b> by Google Docs, Etherpad and similar, with OT.</li>
+</ul>
+
+<h3>15.1 The CALM theorem</h3>
+<p>The <b>CALM theorem</b> (Consistency As Logical Monotonicity) states that a program has a coordination-free, consistent distributed implementation if and only if it is <b>monotonic</b>: its output only grows as more input arrives and never needs to retract something previously concluded. Set union, counting up, and "have we seen X" are monotonic. "Is the count exactly zero?", "is the set empty?" and "stock never negative" are non-monotonic: a later input can invalidate an earlier answer, so they need coordination (a quorum, a lock or consensus). CRDTs are the data-structure embodiment of monotonic computation, which explains both why they need no coordination and why they cannot enforce global invariants such as uniqueness or non-negative balances. For the larger picture of what you give up or keep under partitions, see <a href="28-cap-consistency.html">Chapter 28</a>.</p>
+
+<h3>15.2 Version vectors and causality, recap</h3>
+<p>A <b>version vector</b> (see <a href="27-failure-time-ordering.html">Chapter 27</a>) has one counter per replica. Comparing two vectors tells you whether one version happened before the other (all entries less than or equal, at least one strictly less), or whether they are <b>concurrent</b> (each has an entry the other lacks). Concurrency is exactly the situation that needs a conflict rule. Version vectors are used by multi-value registers to decide whether to overwrite or keep siblings, by CRDT delivery layers to enforce causal order ("I have not yet seen the operation this one depends on, so buffer it"), and by garbage collection to determine what every replica has observed. G-Counters are in effect version vectors whose entries are the value.</p>
+
+<h2 id="presence">16. Presence and cursors</h2>
+
+<p>Collaborative tools also show <b>who is here</b> and <b>where their cursor and selection are</b>. This is <i>ephemeral state</i>: it is only meaningful while the user is connected, it changes very frequently (every mouse move or keystroke), and losing an update does not matter because the next one replaces it. That makes it a poor fit for the durable operation log and a good fit for a separate, lightweight channel.</p>
+<ul>
+  <li><b>Separate channel.</b> Presence travels over the same WebSocket (<a href="06-realtime.html">Chapter 6</a>) but as a different message type, never stored in document history. In Yjs this is the "awareness" protocol.</li>
+  <li><b>Last value wins, with a time to live.</b> Each client broadcasts its state (name, color, cursor position, selection); recipients keep the latest per client and drop clients that have not sent a heartbeat for some seconds (for example every 5 s, expire after 15 to 30 s). Because it is LWW per client and each client is the only writer of its own record, there are no conflicts.</li>
+  <li><b>Cursor positions must be transformed too.</b> If Alice's cursor is at index 10 and Bob inserts 3 characters before it, her cursor should move to 13. In OT, cursor positions are transformed by the same functions as operations. In CRDTs, store a cursor as a <b>relative position</b>, an anchor to a character id (plus a side), which stays correct as the document changes and resolves back to an index on render.</li>
+  <li><b>Throttle and coalesce.</b> Send cursor updates at most every 50 to 100 ms and drop intermediate ones. With N users in a room, every update fans out to N-1 others, so total traffic grows as the square of users; large rooms show only nearby or most-recent participants, or reduce cursor update rates.</li>
+</ul>
+
+<h2 id="example">17. Worked example: a shared document with three clients</h2>
+
+<p>Design a note editor where three users (Ana, Ben, Cho) edit one document, one of them (Cho) on a phone that is briefly offline. We compare how the server-ordered OT design and the CRDT design behave, using the same scenario. The document starts as <code>Hi</code> (server revision 10).</p>
+<p>Events: Ana types " all" at the end, Ben concurrently inserts "!" at the end, and Cho, offline, inserts "Oh, " at the start. All three edits happen before any sync.</p>
+
+<h3>17.1 Server-ordered OT</h3>
+<table>
+<tr><th>Step</th><th>What happens</th><th>Result</th></tr>
+<tr><td>1</td><td>Ana's op <code>ins(2, " all")@r10</code> reaches the server first.</td><td>Applied. Doc <code>Hi all</code>, r11. Broadcast to Ben (Cho is offline).</td></tr>
+<tr><td>2</td><td>Ben's op <code>ins(2, "!")@r10</code> arrives, server is at r11. Transform against Ana's insert: same position 2, tie-break by arrival order (server's earlier op goes first), so Ben's index shifts to 6.</td><td>Applied as <code>ins(6, "!")</code>. Doc <code>Hi all!</code>, r12.</td></tr>
+<tr><td>3</td><td>Ben's client receives Ana's op, transforms it against its pending op, applies it, and gets the ack.</td><td>Ben shows <code>Hi all!</code>.</td></tr>
+<tr><td>4</td><td>Cho reconnects with <code>ins(0, "Oh, ")@r10</code>. Server is at r12, so the op must be transformed against two ops. Both are at positions after 0, so the position stays 0.</td><td>Applied. Doc <code>Oh, Hi all!</code>, r13.</td></tr>
+<tr><td>5</td><td>Server sends Cho the ops r11 and r12; Cho transforms them against her pending insert (shifting by 4) and applies. Ana and Ben receive r13.</td><td>All three show <code>Oh, Hi all!</code>.</td></tr>
+</table>
+<p>The server did the heavy lifting: it transformed Cho's op against the two missed revisions. If Cho had been offline for an hour with 5,000 ops by others, the server and the client would both have to transform long histories, which is why OT is poor for long offline sessions.</p>
+
+<h3>17.2 CRDT (RGA or YATA-style)</h3>
+<ul>
+  <li>Each character already has an id. "H" and "i" are (1,s) and (2,s). Ana's " all" is created as ids (3,ana) to (6,ana) after element (2,s). Ben's "!" is (3,ben) after (2,s) too. Cho's "Oh, " is created before "H" (anchored at the document start) with ids (1,cho) to (4,cho).</li>
+  <li>When updates merge in any order, Ana's and Ben's inserts both follow "i". The order between them is decided by ids: with the rule "larger id first", (3,ben) beats (3,ana), so Ben's "!" is placed directly after "i" and Ana's run follows it, giving <code>Hi! all</code>. Ana's run is a sequence whose characters stay attached to their left neighbours, so Ben's "!" lands before or after the whole run, never in the middle. With the opposite id rule the result would be <code>Hi all!</code>; either way every replica agrees. (This differs from the OT result above only because the tie-break rule differs.) (The interleaving of concurrent runs in the middle is the known anomaly that careful algorithms such as YATA and RGA avoid for contiguous runs.)</li>
+  <li>Cho's offline edits are sent as a batch of updates when she reconnects. No transforms occur; each replica just integrates the updates by id, and the server merely relays them. Cho's phone had applied her insert at once, and later receives Ana's and Ben's updates by the same mechanism.</li>
+  <li>Presence: each client has an awareness record (name, color, cursor as a relative position). When Cho reconnects, her cursor anchor (a character id) is still valid even though the text moved.</li>
+</ul>
+<p>Observe the difference in the failure case: if the server crashes in the OT design, the in-flight ops and revision numbers need the durable log to recover; in the CRDT design, any client holding the full state can reseed the server, since the state itself is the source of truth.</p>
+
+<h3>17.3 Sizing</h3>
+<p>Take a note with 20,000 characters and 30,000 total edits over its life. A CRDT with per-character ids and no run-length encoding might need about 16 to 32 bytes of metadata per element, so 50,000 elements (live plus tombstones) is roughly 1 to 1.6 MB; with run-length blocks (Yjs-style) it is typically tens to a couple hundred KB. The OT approach stores 20 KB of text plus an operation log of 30,000 ops at, say, 20 to 40 bytes each, about 600 KB to 1.2 MB, which can be compacted into periodic snapshots (for example every 100 revisions) and old ops discarded after all clients have moved past them. Both are modest for text; the difference matters more for very large, long-lived documents, and in that case you plan for GC or snapshot compaction up front. Network cost is small either way: a keystroke is tens of bytes. For the case study end to end (sharding documents, storage, fan-out) see <a href="../case-studies/c16-collaborative-editor.html">Design a Collaborative Editor</a>.</p>
+
+<h2 id="qa">18. Interview Q&amp;A</h2>
+
+<details><summary>Why does Redis use a skip list for sorted sets rather than a balanced tree?</summary>
+<p>A skip list gives the same expected O(log n) insert, delete, search and rank (using spans on each pointer) as a balanced tree, but with far simpler code: there are no rotations, and insertion only splices a few local pointers. Range queries are natural: find the start in O(log n) and then walk the bottom-level list, which is doubly linked in Redis for reverse ranges. The promotion probability is a tunable memory versus speed knob, and Redis uses 1/4 to save pointers. It is paired with a hash table so that score lookup by member is O(1). Redis does not need the concurrency advantages of skip lists because command execution is single-threaded, so the main reasons are simplicity and comparable performance.</p></details>
+
+<details><summary>How would you design a global leaderboard for 100 million players with real-time rank?</summary>
+<p>Start with the fact that one Redis sorted set can hold tens of millions of members and handles add, increment and rank in O(log n), so a single shard (with replicas for reads) may suffice for the top of the board. Beyond that, shard by player id hash, send each score update to its shard, and serve the global top K through scatter-gather: each shard returns its local top K and the service merges them, which is exact because the global top K is contained in the union. For "what is my rank", an exact answer costs S parallel ZCOUNT calls, which is acceptable for a player's own view; for huge boards use score histograms or quantile sketches and show percentile bands below the top few thousand. Cache the top 100 for a few seconds so refresh storms do not hammer Redis, and keep daily and weekly boards as separate keys with TTLs.</p></details>
+
+<details><summary>Explain how you find the top K most frequent items in a stream that does not fit in memory.</summary>
+<p>If the number of distinct items is small enough, a hash map of counts plus a min-heap of size K gives exact results in O(n log K). When distinct items are too many, use an approximate heavy-hitter structure. A Count-Min Sketch holds counters in fixed memory and overestimates counts by a bounded amount; pair it with a min-heap of K candidates, updating the heap each time an item's estimate is raised above the heap's minimum. Alternatively Space-Saving keeps K counters and replaces the smallest counter when a new item arrives, which tends to be the most accurate in practice. Both are mergeable, so you can run them per shard and combine summaries. State the guarantee: items above a frequency threshold are found, and the counts carry a small, known error.</p></details>
+
+<details><summary>Why can per-shard top-K then merge produce wrong answers, and how do you fix it?</summary>
+<p>It is exact only if each item's events all land on one shard (partition by item). If events for one item are spread across shards, an item that is globally the third most frequent could rank sixth on every shard and be absent from every local top K, so the merge misses it. Fixes include re-partitioning by item with a shuffle before counting, asking each shard for more than K and then querying exact counts for the candidate set in a second round, or using mergeable summaries such as Count-Min Sketches that add cell by cell. In stream engines, pre-aggregate locally in short windows to reduce shuffle volume and to defuse hot keys.</p></details>
+
+<details><summary>How is trending different from most popular, and how would you detect it?</summary>
+<p>Most popular is raw volume, which is dominated by permanently popular topics. Trending is unusual growth relative to a topic's own baseline. Compute the recent window's count (for example last ten minutes) and divide by a smoothed historical average for the same time of day, or compute a z-score against history, and require a minimum absolute volume so tiny topics do not spike on one event. Add a distinct-user check, using HyperLogLog, so one account or botnet cannot create a trend. Run this on tumbling or sliding windows in a stream processor and keep the highest scores in a small heap.</p></details>
+
+<details><summary>Walk through how operational transformation resolves two concurrent inserts.</summary>
+<p>Both clients start from revision r, apply their insert locally, and send the operation with the base revision to the server. The server applies the first arrival unchanged. For the second, it sees the base revision is behind, so it transforms the operation against every operation committed since: if the earlier insert was at an index less than or equal to this one, this one's index shifts right by the length inserted; for the same index a deterministic tie-break, such as arrival order, applies. The transformed operation is applied and broadcast. Each client, when it receives a remote operation, transforms it against its own unacknowledged operations before applying, and the transform diamond (TP1) guarantees that both orders reach the same text. The server's total order is what avoids the harder TP2 requirement.</p></details>
+
+<details><summary>What is the difference between state-based and operation-based CRDTs, and what makes merge safe?</summary>
+<p>A state-based CRDT ships its state (or deltas) and merges with a function that is commutative, associative and idempotent, so it tolerates lost, duplicated and reordered messages; this is the property you want for gossip and anti-entropy. An operation-based CRDT ships individual operations, which are small, but requires the delivery layer to give exactly-once and causal-order delivery, and the operations must commute when concurrent. The mathematical basis is a join-semilattice where updates only move state upward and merge is the least upper bound, which guarantees every replica that has seen the same updates holds the same state. Delta-state CRDTs combine the small messages of the operation-based approach with the weak delivery needs of the state-based one.</p></details>
+
+<details><summary>Describe how an OR-Set handles a concurrent add and remove of the same element.</summary>
+<p>Every add gives the element a fresh unique tag. A remove deletes only the tags that the removing replica had observed. If another replica concurrently adds the same element, that add has a new tag the remover never saw, so after merging, the new tag survives and the element is present: add wins over a concurrent remove. A later re-add after a remove also creates a new tag, so unlike a 2P-Set, elements can come back. The cost is metadata: tags and the record of removed tags accumulate and must be compacted using causal context once all replicas have observed them.</p></details>
+
+<details><summary>When would you choose OT, when CRDTs, and what are the main drawbacks of each?</summary>
+<p>Choose server-ordered OT for an always-online, server-centric product where a central server must enforce permissions and validation and where documents are mostly text with a few operation types; its drawbacks are the correctness difficulty of transform functions, the server as a serialization point, and poor behavior with long offline sessions. Choose CRDTs when you need offline-first behavior, peer-to-peer or multi-region active-active replication, or rich nested data, since merging is automatic and local; the drawbacks are metadata growth from ids and tombstones, the need for garbage collection with agreement between replicas, harder access control with untrusted peers, and some anomalies in intention preservation. A common modern hybrid is a server that relays CRDT updates, validates permissions and stores snapshots.</p></details>
+
+<details><summary>Why can't a CRDT enforce "inventory never goes below zero"? What do you do instead?</summary>
+<p>That invariant is non-monotonic: whether a decrement is allowed depends on the global total, and two replicas can each see one remaining unit and each decrement it, producing minus one after merge. The CALM theorem says such conditions need coordination. Practical options are to split the stock into per-replica allowances (escrow or reservation, in which each replica may sell only its own share and transfers shares with coordination), to route the scarce-resource decisions through a single leader or consensus group, or to accept overselling and compensate afterwards, as many retailers do. CRDTs remain useful for the parts that are monotonic, such as counting views or recording events.</p></details>
+
+<details><summary>How do you handle presence and cursors in a collaborative editor?</summary>
+<p>Treat them as ephemeral, per-client state on a separate lightweight channel, not as part of the durable document history. Each client broadcasts its own record (user, color, cursor and selection) at a throttled rate and others keep the latest record per client, expiring clients that miss heartbeats after some seconds. Cursor positions must follow document changes, so in OT they are transformed like operations and in CRDTs they are stored as relative positions anchored to a character id. Because fan-out grows with the square of participants in a room, large rooms limit update frequency or show only nearby participants.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">19. Recap</h2>
+<ul>
+<li>A sorted set needs fast insert, delete, score lookup, rank and range. A hash map plus an ordered structure gives it. Balanced trees do this deterministically but are hard to implement and to make concurrent; skip lists do it with random promotion, local pointer splices and O(log n) expected time, and are what Redis uses (with spans for rank).</li>
+<li>Heaps give O(1) peek and O(log n) insert and extract of the extreme element in a compact array. They are the right tool for schedulers and for exact top-K using a min-heap of size K (O(n log K)).</li>
+<li>Leaderboards use ZADD, ZINCRBY, ZREVRANGE and ZREVRANK. Shard by player and merge per-shard top K for exactness; use histograms or quantile sketches for approximate rank on enormous boards; use one key per time window with TTL.</li>
+<li>Streaming top-K uses Count-Min Sketch plus a heap, or Misra-Gries and Space-Saving counters. Distributed top-K is exact only when each item is owned by one shard; otherwise re-partition, over-fetch, or merge mergeable summaries. Windows use buckets, sliding combos of sketches, or decay.</li>
+<li>Trending is growth relative to baseline, filtered by minimum volume and distinct users. Sliding-window counters trade exactness for constant memory with bucket rings.</li>
+<li>Merkle trees detect divergence between replicas cheaply by comparing hashes top-down.</li>
+<li>Concurrent edits conflict because positions are relative to a version. OT rewrites operations (transform, TP1, server ordering to avoid TP2); CRDTs give elements permanent identities so operations commute.</li>
+<li>CRDT building blocks: G-Counter, PN-Counter, G-Set, 2P-Set, OR-Set, LWW and multi-value registers, then sequence CRDTs (RGA, Logoot/LSEQ, Yjs, Automerge). State-based CRDTs need an idempotent, commutative, associative merge; operation-based ones need causal exactly-once delivery.</li>
+<li>CRDT costs are metadata and tombstones, mitigated by run-length blocks, GC when all replicas have seen a delete, and snapshots. CALM explains why they cannot enforce non-monotonic invariants.</li>
+<li>Presence and cursors are ephemeral LWW state on a separate channel, with relative cursor anchors.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="15-redis.html">Chapter 15</a> (Redis sorted sets and data structures), <a href="24-replication.html">Chapter 24</a> (leaderless replication and conflicts), <a href="27-failure-time-ordering.html">Chapter 27</a> (version vectors and logical clocks), <a href="28-cap-consistency.html">Chapter 28</a> (consistency models and CALM context), <a href="33-gossip-merkle.html">Chapter 33</a> (Merkle trees and anti-entropy), <a href="37-batch-stream.html">Chapter 37</a> (windowing and stream aggregation) and <a href="57-hashing-probabilistic.html">Chapter 57</a> (Count-Min Sketch, HyperLogLog). Applied in <a href="../case-studies/c16-collaborative-editor.html">Design a Collaborative Editor</a>; client-side offline sync is covered in <a href="56-privacy-cost-mobile.html">Chapter 56</a>.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+<script>
+(function () {
+  function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+  var R = [ { g: [0, 0], tags: [] }, { g: [0, 0], tags: [] } ];
+  var removed = [ [], [] ];
+  var counter = 0;
+  var logEl = document.getElementById('w-log');
+  function val(r) { return r.g[0] + r.g[1]; }
+  function live(i) { return R[i].tags.filter(function (t) { return removed[i].indexOf(t) < 0; }); }
+  function render(msg) {
+    logEl.textContent = '';
+    if (msg) logEl.appendChild(el('div', null, msg));
+    for (var i = 0; i < 2; i++) {
+      var l = live(i);
+      logEl.appendChild(el('div', null, 'Replica ' + (i + 1) + ': G-Counter slots [' + R[i].g.join(', ') + '] value ' + val(R[i]) +
+        ' | OR-Set x present: ' + (l.length > 0 ? 'yes' : 'no') + ' tags {' + l.join(', ') + '} removed {' + removed[i].join(', ') + '}'));
+    }
+  }
+  function inc(i) { R[i].g[i] += 1; render('Replica ' + (i + 1) + ' incremented its own slot.'); }
+  function add(i) { counter += 1; R[i].tags.push('t' + counter); render('Replica ' + (i + 1) + ' added x with new tag t' + counter + '.'); }
+  function rem(i) {
+    var l = live(i);
+    if (!l.length) { render('Replica ' + (i + 1) + ' has no x to remove.'); return; }
+    l.forEach(function (t) { removed[i].push(t); });
+    render('Replica ' + (i + 1) + ' removed the tags it observed: ' + l.join(', ') + '.');
+  }
+  function union(a, b) { var out = a.slice(); b.forEach(function (x) { if (out.indexOf(x) < 0) out.push(x); }); return out; }
+  function sync() {
+    var g = [Math.max(R[0].g[0], R[1].g[0]), Math.max(R[0].g[1], R[1].g[1])];
+    var tags = union(R[0].tags, R[1].tags);
+    var rm = union(removed[0], removed[1]);
+    R[0].g = g.slice(); R[1].g = g.slice();
+    R[0].tags = tags.slice(); R[1].tags = tags.slice();
+    removed[0] = rm.slice(); removed[1] = rm.slice();
+    render('Synced: counters merged by element-wise max, tags and tombstones merged by union. Both replicas are identical.');
+  }
+  function reset() { R = [ { g: [0, 0], tags: [] }, { g: [0, 0], tags: [] } ]; removed = [[], []]; counter = 0; render('Reset.'); }
+  document.getElementById('w-inc1').addEventListener('click', function () { inc(0); });
+  document.getElementById('w-inc2').addEventListener('click', function () { inc(1); });
+  document.getElementById('w-add1').addEventListener('click', function () { add(0); });
+  document.getElementById('w-add2').addEventListener('click', function () { add(1); });
+  document.getElementById('w-rem1').addEventListener('click', function () { rem(0); });
+  document.getElementById('w-rem2').addEventListener('click', function () { rem(1); });
+  document.getElementById('w-sync').addEventListener('click', sync);
+  document.getElementById('w-reset').addEventListener('click', reset);
+  render('Replicas start empty.');
+})();
+</script>
+</body>
+</html>

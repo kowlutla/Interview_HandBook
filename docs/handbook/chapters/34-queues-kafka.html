@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 34: Message Queues, Logs and Kafka | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="34-queues-kafka">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Chapter 34 · Module 5 · Asynchronous Architecture</div>
+<h1>Message Queues, Logs and Kafka</h1>
+<p class="lead">A message broker lets one part of a system hand work or facts to another part without waiting for it. This chapter explains why that is useful, how queues, logs and publish/subscribe systems differ, how RabbitMQ and SQS behave, and then takes Apache Kafka apart: partitions, the write path, producers, consumer groups, replication, exactly-once, retention, sizing, failures and operations.</p>
+
+<h2 id="why">1. Why asynchronous messaging</h2>
+
+<p>In a <b>synchronous</b> call, service A sends a request to service B and waits for the answer. A's thread is blocked, A's latency includes B's latency, and if B is down or slow then A is down or slow too. In an <b>asynchronous</b> design, A writes a message to an intermediary called a <b>broker</b> and moves on. B reads the message later, at its own pace. The broker holds the message in between. A is the <b>producer</b> (publisher, sender); B is the <b>consumer</b> (subscriber, receiver).</p>
+
+<p>This one change, putting durable storage between two services, buys five distinct things. An interviewer expects you to name them separately, because each one justifies the extra moving part in a different situation.</p>
+
+<ul>
+  <li><b>Decoupling in time.</b> Producer and consumer do not need to be running at the same moment. If the consumer is being deployed or has crashed, messages wait in the broker. The producer is unaffected.</li>
+  <li><b>Decoupling in knowledge.</b> The producer does not need to know who consumes its messages, how many consumers exist, or what language they are written in. A new consumer can be added later without touching the producer.</li>
+  <li><b>Buffering and smoothing spikes (load leveling).</b> Traffic is bursty. Suppose a flash sale produces 50,000 orders per second for two minutes, but your fulfilment service can safely do 5,000 per second. Without a buffer you must either overprovision fulfilment tenfold for a two-minute event or drop requests. With a queue, the spike is absorbed into the backlog and drained over the next twenty minutes. You pay for average capacity instead of peak capacity, and the cost is that the work finishes later.</li>
+  <li><b>Fan-out.</b> One event ("order placed") must reach many independent systems: billing, inventory, email, analytics, fraud detection. The producer publishes once and each subscriber gets its own copy.</li>
+  <li><b>Reliability and retry.</b> If processing a message fails, the broker can hand it out again. Work is not lost because a worker died halfway. Combined with a dead-letter queue (section 3), failures can be isolated and inspected rather than blocking everything.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Synchronous call versus broker-buffered asynchronous call under a spike">
+  <text class="t-b" x="20" y="22">Synchronous: a spike hits the slow service directly</text>
+  <rect class="ext" x="30" y="40" width="140" height="50" rx="10"/><text class="t-c t-b" x="100" y="70">Order API</text>
+  <rect class="miss" x="400" y="40" width="170" height="50" rx="10"/><text class="t-c t-b" x="485" y="62">Fulfilment</text><text class="t-c t-sm" x="485" y="80">capacity 5k/s, receives 50k/s</text>
+  <path class="arrow-r" d="M170 65 L396 65"/><text class="t-c t-sm" x="283" y="58" style="fill:var(--bad)">timeouts, errors</text>
+  <text class="t-b" x="20" y="132">Asynchronous: the broker absorbs the spike</text>
+  <rect class="ext" x="30" y="150" width="140" height="50" rx="10"/><text class="t-c t-b" x="100" y="180">Order API</text>
+  <rect class="cache" x="300" y="150" width="200" height="50" rx="10"/><text class="t-c t-b" x="400" y="172">Broker</text><text class="t-c t-sm" x="400" y="190">backlog grows, then drains</text>
+  <rect class="hit" x="640" y="150" width="190" height="50" rx="10"/><text class="t-c t-b" x="735" y="172">Fulfilment</text><text class="t-c t-sm" x="735" y="190">steady 5k/s</text>
+  <path class="arrow-g" d="M170 175 L296 175"/><text class="t-c t-sm" x="233" y="168">50k/s in</text>
+  <path class="arrow-g" d="M500 175 L636 175"/><text class="t-c t-sm" x="568" y="168">5k/s out</text>
+</svg>
+<figcaption>The same burst is rejected in the synchronous design and simply waits in the asynchronous one. The price is added latency for the queued work and a new component to operate.</figcaption>
+</figure>
+
+<div class="callout watch"><b>Watch out</b>
+Asynchrony is not free. The caller no longer gets an immediate result, so the user interface must cope with "accepted, will be processed" instead of "done". You also gain duplicate messages, reordering, backlog monitoring and one more critical system. If the caller genuinely needs the answer right now (for example, "is this card valid?"), a synchronous call is the right tool. Section 16 covers when not to use a queue.
+</div>
+
+<h2 id="models">2. Three models: queue, log and publish/subscribe</h2>
+
+<p>The word "queue" is used loosely, but there are three genuinely different storage and delivery models. Most confusion in interviews comes from mixing them up, so learn the differences precisely.</p>
+
+<h3>2.1 The classic queue (competing consumers)</h3>
+<p>A traditional queue stores messages until a consumer takes one. Each message is delivered to <b>one</b> consumer, and once that consumer acknowledges it, the broker <b>deletes</b> it. If several consumers read from the same queue, they <b>compete</b> for messages: each message goes to exactly one of them, which spreads work across a pool of workers. The queue is a work list. Typical uses are job processing, email sending and image resizing. Ordering is first-in first-out in principle, but with several consumers and retries, the order in which messages are <i>finished</i> is not guaranteed. RabbitMQ and Amazon SQS are queues in this sense.</p>
+
+<h3>2.2 The log (retained, replayable)</h3>
+<p>A log is an append-only sequence of records, each with a sequential position called an <b>offset</b>. Records are <b>not deleted when read</b>. They are removed only by a retention policy (for example, after seven days, or when the log exceeds a size). A consumer keeps its own bookmark: "I have read up to offset 1,204,331." Reading is simply scanning forward from a position, so many independent consumers can read the same data at different speeds, and a consumer can <b>rewind</b> to reprocess history. Kafka, Apache Pulsar and Amazon Kinesis are log-based. The log is the model behind event sourcing and stream processing (<a href="36-event-driven.html">Chapter 36</a>, <a href="37-batch-stream.html">Chapter 37</a>).</p>
+
+<h3>2.3 Publish/subscribe (topic fan-out)</h3>
+<p>In pub/sub, a publisher sends a message to a named <b>topic</b>, and every subscriber of that topic receives a copy. The emphasis is on broadcasting to multiple independent interested parties. Classic pub/sub (for example Amazon SNS, Google Pub/Sub topics with several subscriptions, RabbitMQ fanout exchanges) usually gives each subscriber its own queue, so each subscriber consumes at its own pace. A log gives you pub/sub for free: each consumer group is an independent subscriber with its own offsets. A queue gives you pub/sub only if you create one queue per subscriber and have the broker copy messages into each.</p>
+
+<table>
+<tr><th>Property</th><th>Queue (RabbitMQ, SQS)</th><th>Log (Kafka, Pulsar, Kinesis)</th></tr>
+<tr><td>What happens on consume</td><td>Message is acknowledged and deleted</td><td>Nothing is deleted; the consumer's offset advances</td></tr>
+<tr><td>Replay old messages</td><td>Not possible once deleted</td><td>Yes, rewind the offset within retention</td></tr>
+<tr><td>Multiple independent readers</td><td>Need one queue per reader (copy)</td><td>Natural: each group has its own offsets</td></tr>
+<tr><td>Who tracks progress</td><td>Broker tracks per-message state</td><td>Consumer (or its group) tracks one number per partition</td></tr>
+<tr><td>Parallelism unit</td><td>Any number of competing consumers</td><td>One consumer per partition within a group</td></tr>
+<tr><td>Ordering</td><td>FIFO per queue, weakened by retries and concurrency</td><td>Strict within a partition</td></tr>
+<tr><td>Per-message features</td><td>Priorities, per-message TTL, delayed delivery, routing</td><td>Mostly none; filtering and delay are done by the consumer</td></tr>
+<tr><td>Best at</td><td>Task distribution, flexible routing</td><td>High-throughput event streams, replay, stream processing</td></tr>
+</table>
+
+<div class="callout key"><b>Key idea</b>
+A queue is a <i>to-do list</i>: when an item is done, it disappears. A log is a <i>ledger</i>: entries stay, and each reader keeps a bookmark. Queues optimize for distributing work; logs optimize for sharing a history of facts with many readers.
+</div>
+
+<h2 id="brokers">3. Broker-style queues: RabbitMQ, SQS and cloud pub/sub</h2>
+
+<h3>3.1 RabbitMQ: exchanges, bindings, queues</h3>
+<p>RabbitMQ implements the AMQP model. A producer never writes straight to a queue. It publishes to an <b>exchange</b> along with a <b>routing key</b> (a string label such as <code>order.created.eu</code>). The exchange applies a rule to decide which queues get a copy. The link between an exchange and a queue is called a <b>binding</b>, and it carries a pattern. Consumers read from queues.</p>
+<ul>
+  <li><b>Direct exchange:</b> delivers to queues whose binding key exactly equals the routing key. Good for routing a message to one named worker pool.</li>
+  <li><b>Fanout exchange:</b> ignores the key and copies the message to every bound queue. This is pub/sub broadcast.</li>
+  <li><b>Topic exchange:</b> binding patterns with wildcards (<code>order.*.eu</code>, <code>order.#</code>), so subscribers can express interest in categories.</li>
+  <li><b>Headers exchange:</b> routes on message header values instead of the key.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="RabbitMQ exchange, bindings and queues">
+  <rect class="ext" x="20" y="105" width="130" height="50" rx="10"/><text class="t-c t-b" x="85" y="128">Producer</text><text class="t-c t-sm" x="85" y="145">key order.created</text>
+  <rect class="cache" x="230" y="95" width="150" height="70" rx="10"/><text class="t-c t-b" x="305" y="122">Topic exchange</text><text class="t-c t-sm" x="305" y="142">matches key to bindings</text>
+  <rect class="box" x="520" y="20" width="170" height="52" rx="10"/><text class="t-c t-b" x="605" y="42">Queue: billing</text><text class="t-c t-sm" x="605" y="60">binding order.*</text>
+  <rect class="box" x="520" y="104" width="170" height="52" rx="10"/><text class="t-c t-b" x="605" y="126">Queue: email</text><text class="t-c t-sm" x="605" y="144">binding order.created</text>
+  <rect class="miss" x="520" y="188" width="170" height="52" rx="10"/><text class="t-c t-b" x="605" y="210">Queue: audit-eu</text><text class="t-c t-sm" x="605" y="228">binding *.deleted (no match)</text>
+  <rect class="hit" x="770" y="20" width="110" height="52" rx="10"/><text class="t-c t-b" x="825" y="52">Workers</text>
+  <rect class="hit" x="770" y="104" width="110" height="52" rx="10"/><text class="t-c t-b" x="825" y="136">Workers</text>
+  <path class="arrow" d="M150 130 L226 130"/>
+  <path class="arrow-g" d="M380 115 L516 52"/><path class="arrow-g" d="M380 130 L516 130"/><path class="arrow dash" d="M380 148 L516 205"/>
+  <path class="arrow" d="M690 46 L766 46"/><path class="arrow" d="M690 130 L766 130"/>
+  <text class="t-sm" x="230" y="270">Message with key order.created is copied to billing and email, not to audit-eu.</text>
+</svg>
+<figcaption>The producer knows only the exchange. Bindings decide which queues receive a copy, so routing changes need no producer change.</figcaption>
+</figure>
+
+<p><b>Acknowledgements.</b> When RabbitMQ delivers a message to a consumer, the message is marked "unacked" but stays in the broker. The consumer sends an <b>ack</b> when processing succeeds, and only then is the message deleted. If the consumer's connection drops before the ack, the broker re-queues the message for another consumer. This is <b>at-least-once</b> delivery. A consumer can also send a <b>nack</b> or <b>reject</b> to say "I cannot process this", optionally asking for requeue, or routing it to a dead-letter exchange.</p>
+
+<p><b>Prefetch (QoS).</b> The broker pushes messages to consumers instead of waiting to be polled. Prefetch count is the maximum number of unacknowledged messages a consumer may hold at once. Setting prefetch to 1 gives fair distribution (a slow worker gets one message at a time and a fast worker gets more) but wastes time on network round trips. Setting it to 1,000 maximizes throughput but one stuck consumer can hold 1,000 messages hostage while others sit idle. Typical values for tasks of uneven length are small (1 to 20); for tiny fast messages, in the hundreds.</p>
+
+<p><b>Durability.</b> A message survives a broker restart only if the queue is declared durable, the message is marked persistent, and the broker has written it to disk. Publisher confirms tell the producer when the broker has taken responsibility. Classic RabbitMQ queues live on one node; <b>quorum queues</b> replicate with Raft (<a href="29-consensus.html">Chapter 29</a>) across several nodes for availability. RabbitMQ is excellent at flexible routing, priorities, per-message TTL and request/reply, and handles tens of thousands of messages per second per node. It is not designed to retain huge histories or to be replayed.</p>
+
+<h3>3.2 Amazon SQS</h3>
+<p>SQS is a fully managed queue: no servers, effectively unlimited throughput for the <b>standard</b> type, and you pay per request. Its behaviours are worth knowing precisely.</p>
+<ul>
+  <li><b>Pull model with visibility timeout.</b> Consumers call <code>ReceiveMessage</code>. The message is not deleted; instead it becomes <b>invisible</b> to other consumers for the <b>visibility timeout</b> (default 30 seconds). If the consumer finishes, it calls <code>DeleteMessage</code>. If it crashes or is too slow, the timeout expires, the message becomes visible again and another consumer receives it. This is how SQS implements at-least-once and retry without a connection to track. Set the timeout longer than your worst-case processing time, or extend it while working; otherwise a slow job is processed twice at the same time.</li>
+  <li><b>Standard versus FIFO.</b> Standard queues offer very high throughput, at-least-once delivery and <b>best-effort ordering</b>, so duplicates and reordering happen. FIFO queues give ordering within a <b>message group ID</b> (messages with the same group ID are delivered in order and one at a time per group) and <b>deduplication</b> over a five-minute window using a deduplication ID. FIFO has lower throughput (hundreds to a few thousand messages per second per queue, higher with batching and high-throughput mode), so you spread load across many group IDs. This is the same idea as Kafka keys and partitions.</li>
+  <li><b>Long polling.</b> Short polling returns immediately even when empty, burning requests (and money) and sometimes missing messages on a subset of servers. Long polling (<code>WaitTimeSeconds</code> up to 20) holds the request open until a message arrives or time runs out, cutting empty responses and cost.</li>
+  <li><b>Dead-letter queue (DLQ) and redrive.</b> A queue can have a <b>redrive policy</b>: after a message has been received <code>maxReceiveCount</code> times without deletion, SQS moves it to a separate dead-letter queue. This isolates poison messages (section 13) so they stop being retried forever. Operators inspect the DLQ and can redrive messages back after fixing the bug.</li>
+  <li><b>Limits.</b> Messages are small (256 KB); retention is 1 minute to 14 days (default 4 days); delayed delivery up to 15 minutes. There is no replay and no cross-consumer fan-out inside one queue.</li>
+</ul>
+
+<h3>3.3 Cloud pub/sub services</h3>
+<p><b>SNS</b> (Amazon Simple Notification Service) is a topic: publishers send once and SNS pushes a copy to every subscription (SQS queues, Lambda functions, HTTP endpoints, email). The common AWS pattern is <b>SNS fan-out to SQS</b>: one topic, one SQS queue per consuming service, so each service gets durable buffering and its own DLQ. <b>Google Cloud Pub/Sub</b> has topics and subscriptions; each subscription is effectively an independent queue with acknowledgement deadlines, redelivery, optional ordering keys, dead lettering and, in some modes, seek-based replay of retained messages. Azure Service Bus and Event Hubs fill the same two roles (queue/topic broker, and log-style stream). The principle is the same everywhere: topic for fan-out plus a per-subscriber durable queue for pacing.</p>
+
+<h2 id="kafka-overview">4. Kafka architecture overview</h2>
+
+<p>Apache Kafka is a distributed, replicated, partitioned <b>commit log</b>. It was created at LinkedIn to move activity events and metrics between systems at very high volume, and is now the default backbone for event streaming. Its central design decision is to do very little per message at the broker: append to the end of a file, and let consumers read by position. This makes it fast, and it explains most of its behaviour.</p>
+
+<h3>4.1 The vocabulary</h3>
+<ul>
+  <li><b>Broker:</b> a Kafka server process. A cluster has several brokers (three to hundreds).</li>
+  <li><b>Topic:</b> a named stream of records, such as <code>orders</code>. A topic is a logical category.</li>
+  <li><b>Partition:</b> a topic is split into N partitions. Each partition is an independent, ordered, append-only log and is the unit of storage, replication and parallelism. Partitions of one topic are spread over brokers.</li>
+  <li><b>Record (message):</b> a key (optional), a value (bytes), a timestamp and optional headers. Kafka does not interpret the value; serialization is your choice (<a href="07-serialization.html">Chapter 7</a>), often Avro or Protobuf with a schema registry.</li>
+  <li><b>Offset:</b> the sequential number of a record within its partition (0, 1, 2, ...). It is unique only within one partition. A position in Kafka is the triple (topic, partition, offset).</li>
+  <li><b>Replica:</b> a copy of a partition on some broker. One replica is the <b>leader</b>, the others are <b>followers</b> (section 8).</li>
+  <li><b>Consumer group:</b> a set of consumers that share the work of reading a topic (section 7).</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Topic partitions on three brokers mapped to consumers in two consumer groups">
+  <text class="t-b" x="20" y="22">Topic orders: 6 partitions, replication factor 3 (only leaders shown)</text>
+  <rect class="cache" x="20" y="40" width="250" height="150" rx="10"/><text class="t-c t-b" x="145" y="62">Broker 1</text>
+  <rect class="box" x="40" y="76" width="95" height="36" rx="6"/><text class="t-c" x="87" y="99">P0 leader</text>
+  <rect class="box" x="155" y="76" width="95" height="36" rx="6"/><text class="t-c" x="202" y="99">P3 leader</text>
+  <rect class="miss" x="40" y="130" width="95" height="36" rx="6"/><text class="t-c t-sm" x="87" y="153">P1 follower</text>
+  <rect class="miss" x="155" y="130" width="95" height="36" rx="6"/><text class="t-c t-sm" x="202" y="153">P4 follower</text>
+  <rect class="cache" x="300" y="40" width="250" height="150" rx="10"/><text class="t-c t-b" x="425" y="62">Broker 2</text>
+  <rect class="box" x="320" y="76" width="95" height="36" rx="6"/><text class="t-c" x="367" y="99">P1 leader</text>
+  <rect class="box" x="435" y="76" width="95" height="36" rx="6"/><text class="t-c" x="482" y="99">P4 leader</text>
+  <rect class="miss" x="320" y="130" width="95" height="36" rx="6"/><text class="t-c t-sm" x="367" y="153">P2 follower</text>
+  <rect class="miss" x="435" y="130" width="95" height="36" rx="6"/><text class="t-c t-sm" x="482" y="153">P5 follower</text>
+  <rect class="cache" x="580" y="40" width="300" height="150" rx="10"/><text class="t-c t-b" x="730" y="62">Broker 3</text>
+  <rect class="box" x="600" y="76" width="110" height="36" rx="6"/><text class="t-c" x="655" y="99">P2 leader</text>
+  <rect class="box" x="740" y="76" width="110" height="36" rx="6"/><text class="t-c" x="795" y="99">P5 leader</text>
+  <rect class="miss" x="600" y="130" width="110" height="36" rx="6"/><text class="t-c t-sm" x="655" y="153">P0 follower</text>
+  <rect class="miss" x="740" y="130" width="110" height="36" rx="6"/><text class="t-c t-sm" x="795" y="153">P3 follower</text>
+
+  <text class="t-b" x="20" y="226">Consumer group A (3 consumers): each partition has exactly one owner</text>
+  <rect class="hit" x="20" y="240" width="130" height="40" rx="8"/><text class="t-c" x="85" y="264">A1: P0, P1</text>
+  <rect class="hit" x="170" y="240" width="130" height="40" rx="8"/><text class="t-c" x="235" y="264">A2: P2, P3</text>
+  <rect class="hit" x="320" y="240" width="130" height="40" rx="8"/><text class="t-c" x="385" y="264">A3: P4, P5</text>
+  <text class="t-b" x="480" y="226">Group B (analytics): independent offsets</text>
+  <rect class="hit" x="480" y="240" width="390" height="40" rx="8"/><text class="t-c" x="675" y="264">B1 reads all six partitions at its own pace</text>
+  <path class="arrow-g" d="M87 190 L85 236"/><path class="arrow-g" d="M367 190 L300 238"/><path class="arrow-g" d="M655 190 L600 238"/>
+  <text class="t-sm" x="20" y="310">Rule: within a group a partition goes to at most one consumer; across groups every group sees every record.</text>
+  <text class="t-sm" x="20" y="332">A 7th consumer in group A would sit idle: parallelism is capped by the partition count.</text>
+</svg>
+<figcaption>Partitions are spread over brokers (each also has follower copies elsewhere). Each consumer group divides the partitions among its members, and different groups read the same data independently.</figcaption>
+</figure>
+
+<h3>4.2 How a partition is stored on disk</h3>
+<p>A partition is a directory on a broker's disk. It is not one giant file but a series of <b>segments</b>. Each segment is a trio of files named after the offset of its first record, for example <code>00000000000012345678.log</code>:</p>
+<ul>
+  <li>The <b>.log</b> file holds the records themselves, appended in order, batch after batch.</li>
+  <li>The <b>.index</b> file is a sparse <b>offset index</b>: it maps a record offset to a byte position in the .log file, but only for some entries (one per few kilobytes of data), not every record. To find offset 12,345,999, Kafka picks the segment by file name (binary search on the base offsets), binary-searches the sparse index for the nearest earlier entry, then scans forward in the log a short way.</li>
+  <li>The <b>.timeindex</b> file maps timestamps to offsets, so "start reading from 09:00 yesterday" works.</li>
+</ul>
+<p>Only the newest <b>active segment</b> is written to. When it reaches a size limit (default 1 GB) or age limit, Kafka rolls to a new segment. Old segments are immutable. This matters for retention: deleting old data is just deleting whole files, which is cheap, instead of removing records one by one.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Partition made of segments with sparse index">
+  <text class="t-b" x="20" y="22">One partition directory (orders-3)</text>
+  <rect class="db" x="20" y="40" width="210" height="64" rx="8"/><text class="t-c t-b" x="125" y="64">Segment 0</text><text class="t-c t-sm" x="125" y="84">offsets 0 - 999,999</text>
+  <rect class="db" x="250" y="40" width="210" height="64" rx="8"/><text class="t-c t-b" x="355" y="64">Segment 1</text><text class="t-c t-sm" x="355" y="84">offsets 1,000,000 - 1,999,999</text>
+  <rect class="cache" x="480" y="40" width="250" height="64" rx="8"/><text class="t-c t-b" x="605" y="64">Active segment 2</text><text class="t-c t-sm" x="605" y="84">offsets 2,000,000 and growing</text>
+  <path class="arrow-g" d="M735 72 L800 72"/><text class="t-sm" x="740" y="62">append</text><text class="t-sm" x="806" y="76">new records</text>
+  <text class="t-sm" x="20" y="124">Old segments are immutable. Retention deletes whole files from the left.</text>
+  <text class="t-b" x="20" y="158">Inside a segment: sparse index points into the log</text>
+  <rect class="box" x="20" y="172" width="250" height="62" rx="8"/>
+  <text class="t-sm" x="34" y="192">.index (sparse)</text><text class="t-sm" x="34" y="210">offset 2,000,000 -> byte 0</text><text class="t-sm" x="34" y="226">offset 2,000,040 -> byte 65,536</text>
+  <rect class="db" x="340" y="172" width="540" height="62" rx="8"/>
+  <text class="t-sm" x="354" y="192">.log (records appended in order, in batches)</text><text class="t-sm" x="354" y="210">[2000000][2000001]...[2000040][2000041] ...</text><text class="t-sm" x="354" y="226">Lookup: jump to nearest index entry, scan forward</text>
+  <path class="arrow" d="M270 205 L336 205"/>
+</svg>
+<figcaption>Because the index is sparse and the log is sequential, a lookup is a binary search plus a short forward scan. Deleting data is deleting whole segment files.</figcaption>
+</figure>
+
+<h3>4.3 Why Kafka is fast: sequential I/O, page cache, zero-copy</h3>
+<p>Kafka reads and writes disks, yet reaches hundreds of megabytes per second per broker. Three design choices explain it.</p>
+<ol>
+  <li><b>Sequential I/O.</b> Appending to the end of a file and reading forward is the access pattern that disks (and even SSDs) do best. A spinning disk does sequential transfers at 100-200 MB/s but random access only at about a hundred operations per second. Kafka never updates records in place and never seeks randomly in the normal path.</li>
+  <li><b>The operating system page cache.</b> Kafka does not keep its own large in-process cache of messages. It writes through the OS, which holds recently written and read file pages in free RAM (the <b>page cache</b>). A write returns after the data is in the page cache; the OS flushes to disk in the background. Consumers that are keeping up read data that was written seconds ago, which is still in RAM, so they never touch the disk. Because the cache belongs to the OS and not the JVM heap, it survives a broker process restart and creates no garbage collection pressure. This is why Kafka brokers typically run with a modest heap (around 6 GB) and as much free RAM as possible for the page cache. Durability then comes from <b>replication</b> (section 8), not from fsync on every message; Kafka by default lets the OS decide when to flush.</li>
+  <li><b>Zero-copy transfer.</b> To serve a consumer, a naive server would read the file into memory, copy into the application, copy into a socket buffer and send. That is four copies and several context switches. Kafka stores records on disk in the <b>same binary format it sends over the network</b>, so the broker can use the <code>sendfile</code> system call to move bytes from the page cache directly to the network card, without passing through the application. This saves CPU and memory bandwidth. (When TLS encryption is enabled, the data must pass through user space for encryption and zero-copy no longer applies, so TLS costs throughput.)</li>
+</ol>
+<p>Add <b>batching</b> (producers send groups of records, brokers store and fetch groups, compression applies to a whole batch) and the result is a system where the per-record overhead is tiny.</p>
+
+<h2 id="write-path">5. The write path</h2>
+
+<p>Follow one record from a producer to durable storage. The steps below assume <code>acks=all</code> (section 6.3), the setting you want when data must not be lost.</p>
+<ol>
+  <li>The producer application calls <code>send(topic, key, value)</code>. The producer library serializes the key and value, asks its <b>partitioner</b> which partition to use, and places the record in an in-memory <b>batch</b> for that partition.</li>
+  <li>A background sender thread ships a batch when it is full (<code>batch.size</code>) or has waited long enough (<code>linger.ms</code>). The producer knows which broker leads each partition from cluster metadata it has fetched, so it sends the batch directly to the <b>leader broker</b> of that partition.</li>
+  <li>The leader appends the batch to the active segment of its log (in the page cache) and assigns offsets.</li>
+  <li>Followers continuously send <b>fetch</b> requests to the leader, the same request type consumers use, and append what they receive to their own logs.</li>
+  <li>The leader tracks how far each in-sync follower has caught up. When all replicas in the <b>in-sync replica set (ISR)</b> have the batch, the leader advances the <b>high watermark</b> past it. Only records below the high watermark are visible to consumers.</li>
+  <li>The leader responds to the producer with success and the assigned offset. If the producer does not get a response in time, it retries (which is where idempotence matters, section 6.4).</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="Kafka write path sequence with acks=all">
+  <rect class="ext"   x="20"  y="14" width="130" height="34" rx="8"/><text class="t-c t-b" x="85"  y="36">Producer</text>
+  <rect class="cache" x="270" y="14" width="150" height="34" rx="8"/><text class="t-c t-b" x="345" y="36">Leader broker</text>
+  <rect class="box"   x="540" y="14" width="140" height="34" rx="8"/><text class="t-c t-b" x="610" y="36">Follower 1</text>
+  <rect class="box"   x="740" y="14" width="140" height="34" rx="8"/><text class="t-c t-b" x="810" y="36">Follower 2</text>
+  <line class="life" x1="85" y1="48" x2="85" y2="370"/><line class="life" x1="345" y1="48" x2="345" y2="370"/><line class="life" x1="610" y1="48" x2="610" y2="370"/><line class="life" x1="810" y1="48" x2="810" y2="370"/>
+  <path class="arrow" d="M85 84 L341 84"/><text class="t-sm" x="100" y="76">1. produce batch (partition 3)</text>
+  <path class="arrow" d="M345 118 C385 118 385 138 349 138"/><text class="t-sm" x="395" y="132">2. append to local log</text>
+  <path class="arrow dash" d="M610 170 L349 170"/><text class="t-sm" x="400" y="162">3. fetch (offset N)</text>
+  <path class="arrow dash" d="M810 202 L349 202"/><text class="t-sm" x="560" y="194">3. fetch (offset N)</text>
+  <path class="arrow" d="M345 234 L606 234"/><text class="t-sm" x="400" y="226">4. batch returned</text>
+  <path class="arrow" d="M345 262 L806 262"/><text class="t-sm" x="640" y="254">4. batch returned</text>
+  <path class="arrow dash" d="M610 292 L349 292"/><text class="t-sm" x="400" y="284">5. next fetch confirms offset N+1</text>
+  <rect class="hit" x="250" y="304" width="190" height="26" rx="6"/><text class="t-c t-sm" x="345" y="322">6. high watermark advances</text>
+  <path class="arrow-g" d="M341 352 L89 352"/><text class="t-sm" x="110" y="344">7. ack success + offset</text>
+</svg>
+<figcaption>With acks=all the producer hears back only after every in-sync replica has the batch. Followers are not pushed to; they pull with ordinary fetch requests, and a fetch at the next offset tells the leader the previous batch is stored.</figcaption>
+</figure>
+
+<h2 id="producers">6. Producers in depth</h2>
+
+<h3>6.1 Keys and the partitioner</h3>
+<p>The partitioner decides which partition receives each record. The rules for the default partitioner are: if the record has a <b>key</b>, the partition is a hash of the key (Kafka uses murmur2) modulo the number of partitions, so <b>all records with the same key go to the same partition</b> and therefore stay in order. If the key is absent, modern clients use a <b>sticky</b> strategy: fill a batch for one partition, then move to another, which gives even spread while still producing large batches. You can also supply a custom partitioner or name a partition explicitly.</p>
+<p>Choosing the key is a design decision. Use the entity whose events must stay ordered: <code>orderId</code> for order lifecycle events, <code>userId</code> for per-user state, <code>accountId</code> for a ledger. The key must have high cardinality and an even distribution, or you get hot partitions (section 13). Note the hash is taken modulo the partition count, so <b>adding partitions to a topic changes where keys map</b>: a key that lived on partition 4 may move to partition 9 for new records, breaking per-key ordering across the change. Plan partition counts up front.</p>
+
+<h3>6.2 Batching, linger and compression</h3>
+<p>A producer that sent each record in its own network request would be limited by per-request overhead. Instead it accumulates records per partition into batches. Two settings control the trade-off between throughput and latency. <code>batch.size</code> (default 16 KB) is the maximum bytes in a batch; <code>linger.ms</code> is how long the sender waits for more records before sending a not-yet-full batch (default 0 in older clients, meaning send immediately if the sender is free; newer clients default to a small positive value). Raising linger to 5-20 ms with a larger batch size sharply improves throughput and compression ratios at the cost of a few milliseconds of latency. For a latency-critical low-volume topic, keep linger at zero.</p>
+<p><b>Compression</b> is applied per batch by the producer (<code>gzip</code>, <code>snappy</code>, <code>lz4</code>, <code>zstd</code>) and the batch stays compressed on the broker and on the wire until the consumer decompresses it. Larger batches compress better because repeated field names in similar JSON records are found. Typical ratios are 2x to 5x for JSON text. zstd and lz4 give a good balance of ratio and CPU. Since the broker stores and replicates compressed batches without recompressing them (when the topic's compression type is left as "producer"), compression saves network, disk and page cache all at once.</p>
+
+<h3>6.3 Acknowledgements: acks 0, 1, all</h3>
+<table>
+<tr><th>acks</th><th>Producer waits for</th><th>Latency</th><th>Data loss risk</th></tr>
+<tr><td><code>0</code></td><td>Nothing; fire and forget</td><td>Lowest</td><td>High: lost if the leader is down or the network drops the batch, and the producer never knows</td></tr>
+<tr><td><code>1</code></td><td>The leader has written to its own log</td><td>Low</td><td>Medium: if the leader crashes before followers copy the record, and a follower becomes the new leader, the acknowledged record is gone</td></tr>
+<tr><td><code>all</code> (or -1)</td><td>All replicas currently in the ISR have the record</td><td>Higher (one follower round trip)</td><td>Lowest, provided <code>min.insync.replicas</code> is set to 2 or more</td></tr>
+</table>
+<p><code>acks=all</code> is only as strong as the ISR. If the ISR shrinks to the leader alone, "all in-sync replicas" means just the leader, which is the same as acks=1. The setting <code>min.insync.replicas</code> (section 8.3) forces the broker to <b>reject</b> writes when the ISR is smaller than the minimum, trading availability for safety. The usual production recipe is replication factor 3, <code>min.insync.replicas=2</code>, <code>acks=all</code>: you survive one broker failure with no loss and no downtime.</p>
+
+<h3>6.4 The idempotent producer</h3>
+<p>Retries create duplicates. Imagine the leader writes a batch and the acknowledgement is lost on the network. The producer times out and resends; the leader appends the same records a second time. Retrying can also reorder: if batch 1 fails and batch 2 succeeds, then batch 1's retry lands after batch 2.</p>
+<p>The <b>idempotent producer</b> (<code>enable.idempotence=true</code>, the default in recent clients) fixes this. On start, the producer receives a unique <b>producer ID</b> from the broker. Each record batch to a partition carries a monotonically increasing <b>sequence number</b>. The broker remembers the last sequence numbers per (producer ID, partition) and discards a batch whose sequence it has already seen, and rejects out-of-order ones so the producer retries in order. The result is exactly-once <i>per partition within one producer session</i>: no duplicates and no reordering from retries. It does not protect against the application itself sending the same business event twice, nor does it survive a producer restart (new producer ID); that is what transactions and application-level idempotency keys address (section 9, and <a href="32-idempotency-ids.html">Chapter 32</a>).</p>
+
+<div class="callout tip"><b>Interview tip</b>
+When asked "how do you avoid losing messages in Kafka", give the full chain on the producer side: replication factor 3, <code>min.insync.replicas=2</code>, <code>acks=all</code>, idempotence on, and handle send failures by checking the callback or future. On the consumer side add: commit offsets only after processing. Candidates who mention only "use acks=all" miss half the answer.
+</div>
+
+<h2 id="consumers">7. Consumers, groups, offsets and rebalancing</h2>
+
+<h3>7.1 Pull model and consumer groups</h3>
+<p>Kafka consumers <b>pull</b>: they issue fetch requests with a starting offset and receive the next batch of records, optionally waiting up to <code>fetch.max.wait.ms</code> until <code>fetch.min.bytes</code> are available. Pull lets each consumer control its own pace, so a slow consumer does not need back-pressure signalling; it just falls behind.</p>
+<p>To scale reading, consumers join a <b>consumer group</b> by sharing a <code>group.id</code>. The topic's partitions are divided among the group's members so that <b>each partition is read by exactly one consumer in the group at a time</b>. With 12 partitions and 4 consumers, each consumer gets 3. With 12 partitions and 12 consumers, one each. With 15 consumers, three are idle. So the <b>partition count is the ceiling on consumer parallelism</b> for a group. Different groups are completely independent, each receiving the full stream, which is how one topic serves billing, search indexing and analytics simultaneously.</p>
+
+<h3>7.2 Offsets and commits</h3>
+<p>The group's progress is stored as one number per partition: the offset of the <b>next record to read</b>. Committing an offset means writing it to a special internal Kafka topic named <code>__consumer_offsets</code>. After a crash or reassignment, the new owner of the partition resumes from the last committed offset. The commit strategy determines the delivery guarantee:</p>
+<ul>
+  <li><b>Auto commit</b> (<code>enable.auto.commit=true</code>): the client commits periodically in the background (every 5 seconds by default). Convenient, but it can commit offsets of records the application has fetched but not finished processing. A crash then <b>loses</b> those records (at-most-once for that window). Or, after processing but before the next auto-commit, a crash causes <b>reprocessing</b> (duplicates).</li>
+  <li><b>Manual commit after processing</b> (<code>commitSync</code> / <code>commitAsync</code>): process the batch, then commit. A crash between processing and commit means the batch is processed again: <b>at-least-once</b>. This is the standard safe choice, combined with idempotent processing.</li>
+  <li><b>Commit before processing:</b> at-most-once; a crash after commit and before finishing loses the record. Occasionally acceptable for metrics.</li>
+  <li><b>Store offsets with the results</b> in the same database transaction as the side effect, then seek to them on startup. This gives effectively-once for a database sink without Kafka transactions.</li>
+</ul>
+<p>The setting <code>auto.offset.reset</code> decides where a group with no committed offset begins: <code>earliest</code> (start of retained data) or <code>latest</code> (only new records). Choosing <code>latest</code> by accident in a new group means silently skipping history; choosing <code>earliest</code> on a huge topic means a long catch-up.</p>
+
+<h3>7.3 Rebalancing</h3>
+<p>Whenever the membership of a group changes (a consumer joins, leaves cleanly, crashes, or stops sending heartbeats) or the topic's partition count changes, partitions must be reassigned. This process is the <b>rebalance</b>. A <b>group coordinator</b> (one of the brokers) tracks membership. Consumers send periodic <b>heartbeats</b> (<code>heartbeat.interval.ms</code>, around 3 s) from a background thread; if the coordinator hears nothing for <code>session.timeout.ms</code> (often 10-45 s), the consumer is declared dead. Separately, if the application does not call <code>poll()</code> within <code>max.poll.interval.ms</code> (default 5 minutes), the consumer is considered stuck and removed. This second timer is the usual cause of surprise rebalances: a batch of slow records exceeds the poll interval.</p>
+
+<p>In the classic <b>eager</b> protocol, a rebalance is a stop-the-world event. Every consumer in the group <b>revokes all its partitions</b>, rejoins the group, a group leader runs the assignor, and everybody receives new assignments. During this window nobody in the group consumes. For a group with hundreds of members and large state, this pause can last tens of seconds or minutes.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Eager rebalance versus cooperative incremental rebalance timelines">
+  <text class="t-b" x="20" y="22">Eager rebalance: consumer C3 joins a group of C1 and C2</text>
+  <text class="t-sm" x="20" y="52">C1</text><rect class="hit" x="60" y="38" width="200" height="22" rx="4"/><text class="t-sm" x="70" y="53">owns P0 P1 P2</text>
+  <rect class="miss" x="260" y="38" width="200" height="22" rx="4"/><text class="t-sm" x="270" y="53">revoked: paused</text>
+  <rect class="hit" x="460" y="38" width="260" height="22" rx="4"/><text class="t-sm" x="470" y="53">new: P0 P1</text>
+  <text class="t-sm" x="20" y="86">C2</text><rect class="hit" x="60" y="72" width="200" height="22" rx="4"/><text class="t-sm" x="70" y="87">owns P3 P4 P5</text>
+  <rect class="miss" x="260" y="72" width="200" height="22" rx="4"/><text class="t-sm" x="270" y="87">revoked: paused</text>
+  <rect class="hit" x="460" y="72" width="260" height="22" rx="4"/><text class="t-sm" x="470" y="87">new: P2 P3</text>
+  <text class="t-sm" x="20" y="120">C3</text><rect class="miss" x="60" y="106" width="400" height="22" rx="4"/><text class="t-sm" x="70" y="121">not yet a member, joins at the start of the pause</text>
+  <rect class="hit" x="460" y="106" width="260" height="22" rx="4"/><text class="t-sm" x="470" y="121">new: P4 P5</text>
+  <text class="t-sm" x="262" y="150">all consumption stops here (stop-the-world)</text>
+
+  <text class="t-b" x="20" y="200">Cooperative (incremental) rebalance: same event</text>
+  <text class="t-sm" x="20" y="230">C1</text><rect class="hit" x="60" y="216" width="300" height="22" rx="4"/><text class="t-sm" x="70" y="231">owns P0 P1 P2, keeps reading P0 P1</text>
+  <rect class="hit" x="360" y="216" width="360" height="22" rx="4"/><text class="t-sm" x="370" y="231">P0 P1 only (P2 handed over)</text>
+  <text class="t-sm" x="20" y="264">C2</text><rect class="hit" x="60" y="250" width="300" height="22" rx="4"/><text class="t-sm" x="70" y="265">owns P3 P4 P5, keeps reading P3 P4</text>
+  <rect class="hit" x="360" y="250" width="360" height="22" rx="4"/><text class="t-sm" x="370" y="265">P3 P4 only (P5 handed over)</text>
+  <text class="t-sm" x="20" y="298">C3</text><rect class="miss" x="60" y="284" width="300" height="22" rx="4"/><text class="t-sm" x="70" y="299">joins; waits for P2 and P5 to be released</text>
+  <rect class="hit" x="360" y="284" width="360" height="22" rx="4"/><text class="t-sm" x="370" y="299">P2 P5 after two short rounds</text>
+  <text class="t-sm" x="20" y="340">Only the partitions that must move are paused, and only briefly.</text>
+  <text class="t-sm" x="20" y="362">Static membership (group.instance.id) avoids a rebalance when a pod restarts quickly.</text>
+</svg>
+<figcaption>In the eager protocol every consumer drops everything and consumption halts for the whole group. In the cooperative protocol the rebalance happens over two rounds and only the partitions that actually change owner are interrupted.</figcaption>
+</figure>
+
+<p><b>Why rebalances hurt.</b> (1) Lost throughput during the pause, and lag accumulates. (2) Consumers that hold in-memory state (aggregations, caches, open DB cursors) must flush or rebuild it, which is costly for stream processors. (3) Records that were processed but not yet committed are processed again by the new owner, producing duplicates. (4) A <b>rebalance storm</b> can start when the pause itself makes other consumers miss their heartbeat or poll deadline, triggering another rebalance, repeatedly (section 13).</p>
+<p><b>Mitigations.</b> Use the <b>cooperative sticky assignor</b> (<code>CooperativeStickyAssignor</code>), which keeps partitions where they are and moves only what is needed, in two incremental steps. Use <b>static membership</b> (<code>group.instance.id</code> plus a longer session timeout) so a pod that restarts within the timeout gets its old partitions back with no rebalance at all. Keep per-poll work short (lower <code>max.poll.records</code>) so you never exceed <code>max.poll.interval.ms</code>. Roll deployments gradually instead of restarting all consumers at once. Newer Kafka versions also offer a server-driven group protocol (KIP-848) that moves assignment logic to the broker and removes the global synchronization barrier.</p>
+
+<h3>7.4 Consumer lag</h3>
+<p><b>Lag</b> for a partition is the log end offset (the newest record) minus the group's committed offset. It counts how many records the consumers are behind, and, divided by the consumption rate, estimates how long until they catch up. Lag is <i>the</i> health metric of a consumer group. A steady small lag is normal. Lag that grows without bound means consumption is slower than production: scale out consumers (up to the partition count), speed up processing, or fix a stuck consumer. Lag that is high on a single partition points to a hot key or a poison message stuck on that partition. Alert on <b>lag growth over time</b> and on <b>time lag</b> (age of the oldest unprocessed record), not just a fixed count, because 10,000 records of lag is a blip on a 50k/s topic and a disaster on a 10/s topic.</p>
+
+<h2 id="replication">8. Replication, ISR and the controller</h2>
+<p>Replication in general is covered in <a href="24-replication.html">Chapter 24</a>; here is how Kafka specialises it. Replication is per partition. Each partition has a <b>replication factor</b> (typically 3): one replica is the <b>leader</b> and handles all reads and writes for that partition by default, and the others are <b>followers</b> that only copy the leader's log by fetching. Because leadership is per partition and partitions are spread out, every broker is a leader for some partitions and a follower for others, so load is balanced.</p>
+
+<h3>8.1 In-sync replicas and the high watermark</h3>
+<p>Waiting for every replica would make a slow or dead follower block all writes. Kafka instead tracks the <b>in-sync replica set (ISR)</b>: the leader plus every follower that has fetched up to the leader's log end recently (within <code>replica.lag.time.max.ms</code>, default 30 s in modern versions). A follower that falls behind or stops fetching is removed from the ISR; when it catches up, it rejoins. The ISR is dynamic, and it is recorded in cluster metadata.</p>
+<p>The <b>high watermark (HW)</b> is the highest offset that has been replicated to <i>all</i> ISR members. Consumers can read only up to the HW. This guarantees that a consumer never sees a record that could disappear if the leader fails, because any record below the HW exists on every in-sync replica and any of them could become leader. Records between the HW and the leader's log end offset are "uncommitted".</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Leader and followers with log end offsets, high watermark and ISR shrinking">
+  <text class="t-b" x="20" y="22">Partition with replication factor 3 (offsets shown as cells)</text>
+  <text class="t-sm" x="20" y="62">Leader B1</text>
+  <rect class="hit" x="110" y="44" width="400" height="28" rx="4"/><text class="t-sm" x="120" y="63">0 1 2 3 4 5 6 7 8 9 (committed: up to 7)</text>
+  <rect class="cache" x="510" y="44" width="130" height="28" rx="4"/><text class="t-sm" x="518" y="63">8 9 uncommitted</text>
+  <text class="t-sm" x="20" y="108">Follower B2</text>
+  <rect class="hit" x="110" y="90" width="400" height="28" rx="4"/><text class="t-sm" x="120" y="109">0 1 2 3 4 5 6 7 8 (in sync, one behind)</text>
+  <text class="t-sm" x="20" y="154">Follower B3</text>
+  <rect class="miss" x="110" y="136" width="300" height="28" rx="4"/><text class="t-sm" x="120" y="155">0 1 2 3 4 5 6 (slow, 3 behind)</text>
+  <path class="arrow-r" d="M660 30 L660 176"/><text class="t-sm" x="520" y="190">high watermark = smallest log end in the ISR</text>
+  <text class="t-b" x="20" y="226">What happens as the ISR changes (replication factor 3, min.insync.replicas = 2)</text>
+  <rect class="hit" x="20" y="240" width="260" height="70" rx="8"/><text class="t-c t-b" x="150" y="262">ISR = B1, B2, B3</text><text class="t-c t-sm" x="150" y="282">acks=all needs 3 copies</text><text class="t-c t-sm" x="150" y="298">normal operation</text>
+  <rect class="cache" x="320" y="240" width="260" height="70" rx="8"/><text class="t-c t-b" x="450" y="262">ISR = B1, B2 (B3 lags)</text><text class="t-c t-sm" x="450" y="282">acks=all needs 2 copies</text><text class="t-c t-sm" x="450" y="298">writes still succeed</text>
+  <rect class="miss" x="620" y="240" width="260" height="70" rx="8"/><text class="t-c t-b" x="750" y="262">ISR = B1 only</text><text class="t-c t-sm" x="750" y="282">below min.insync.replicas</text><text class="t-c t-sm" x="750" y="298">writes rejected (safe, unavailable)</text>
+  <path class="arrow" d="M280 275 L316 275"/><path class="arrow" d="M580 275 L616 275"/>
+</svg>
+<figcaption>The high watermark is the lowest log end offset among ISR members. As followers fall out of the ISR, acks=all needs fewer copies, until min.insync.replicas forces the broker to refuse writes rather than accept data that exists on only one machine.</figcaption>
+</figure>
+
+<h3>8.2 Leader failure and election</h3>
+<p>When a leader broker dies, the cluster elects a new leader for each of its partitions <b>from the ISR</b>. Every ISR member has all committed records, so nothing acknowledged under acks=all is lost. Producers and consumers receive a metadata error, refresh metadata, and continue with the new leader, typically within seconds. A rejoining old leader must <b>truncate</b> any uncommitted tail of its log that does not match the new leader's history, then follow it. (Kafka uses a <b>leader epoch</b>, a counter incremented per election, to make truncation precise and to avoid divergent logs.)</p>
+
+<h3>8.3 min.insync.replicas and unclean leader election</h3>
+<p><code>min.insync.replicas</code> is the minimum ISR size for which a write with acks=all is accepted. With replication factor 3 and min ISR 2, the system tolerates one failure with both durability and availability, but if two brokers are lost the partition becomes read-only for producers (writes fail with <code>NotEnoughReplicas</code>). That is the CAP trade-off made visible: you choose consistency over availability for this partition.</p>
+<p>What if all ISR members are down and only an out-of-sync replica is alive? <b>Unclean leader election</b> (<code>unclean.leader.election.enable</code>, default false) decides. If false, the partition stays offline until an ISR member returns: no data loss, but downtime. If true, an out-of-sync replica becomes leader immediately: the partition is available, but it is missing the records the old leader had acknowledged, and those are <b>permanently lost</b> (and offsets may later be reused with different content). Enable it only for data you can regenerate (metrics, logs), never for financial or order events.</p>
+
+<h3>8.4 The controller, ZooKeeper and KRaft</h3>
+<p>One broker acts as the <b>controller</b>. It watches broker liveness, performs leader elections when brokers fail, and records metadata changes (topics, partitions, ISR, configuration). Historically the controller kept this metadata in <b>ZooKeeper</b> (<a href="30-coordination-locks.html">Chapter 30</a>), a separate cluster, and the controller was elected through it. A new controller had to reload all metadata from ZooKeeper, which scaled badly past roughly 100,000 partitions and made failover slow.</p>
+<p><b>KRaft</b> mode (Kafka Raft, the default in current releases and the only option from Kafka 4.0) removes ZooKeeper. A small set of <b>controller nodes</b> (usually three or five) runs the Raft consensus protocol (<a href="29-consensus.html">Chapter 29</a>) over an internal metadata log called <code>__cluster_metadata</code>. One is the active controller (the Raft leader); the others hold a hot copy and can take over quickly. Brokers fetch metadata updates from this log just as followers fetch data. Benefits: one system to operate instead of two, much faster controller failover, and support for far more partitions per cluster. Note that this Raft group is only for <i>metadata</i>; the replication of record data still uses the ISR mechanism described above.</p>
+
+<h2 id="semantics">9. Delivery semantics and exactly-once</h2>
+<p>The general theory of at-most-once, at-least-once and exactly-once delivery is in <a href="32-idempotency-ids.html">Chapter 32</a>. Applied to Kafka:</p>
+<ul>
+  <li><b>At-most-once:</b> producer acks=0 or no retries, and/or the consumer commits before processing. Messages may be lost, never duplicated.</li>
+  <li><b>At-least-once:</b> producer retries with acks=all, and the consumer commits after processing. Nothing is lost, but duplicates occur after retries or consumer crashes. This is the default realistic choice, paired with idempotent consumers (for example, an upsert keyed on a business ID, or a processed-ID table).</li>
+  <li><b>Exactly-once:</b> each input record affects the output exactly once, even across failures. Kafka offers this inside the Kafka ecosystem through <b>transactions</b>.</li>
+</ul>
+
+<h3>9.1 How Kafka transactions work</h3>
+<p>The classic exactly-once case is <b>consume, transform, produce</b>: read records from topic A, compute, write results to topic B, and record progress. If the process crashes after writing to B but before committing its offset on A, a restart reprocesses the input and writes duplicates to B. A transaction makes "write outputs" and "commit input offsets" a single atomic unit.</p>
+<ol>
+  <li>The producer sets a stable <code>transactional.id</code> and calls <code>initTransactions()</code>. A <b>transaction coordinator</b> broker maps this id to a producer ID and an <b>epoch</b>. If an old instance with the same id is still alive (a zombie), the new instance bumps the epoch and the broker <b>fences</b> the old one, rejecting its writes.</li>
+  <li>The producer calls <code>beginTransaction()</code>, sends records to any number of partitions and topics, and calls <code>sendOffsetsToTransaction()</code> to include the consumed offsets of the input topic as part of the transaction.</li>
+  <li>The producer calls <code>commitTransaction()</code>. The coordinator writes a commit decision to its transaction log, then writes <b>commit markers</b> into every partition involved. (An abort writes abort markers instead.)</li>
+  <li>Consumers configured with <code>isolation.level=read_committed</code> read only up to the <b>last stable offset</b> and skip records of aborted transactions. Consumers with the default <code>read_uncommitted</code> see everything, including aborted data.</li>
+</ol>
+<p>Kafka Streams enables this with a single setting (<code>processing.guarantee=exactly_once_v2</code>). Costs: extra latency (the commit requires marker writes), slightly lower throughput, and read_committed consumers are held back by any long-open transaction. <b>Limits matter in interviews:</b> exactly-once applies to the Kafka-to-Kafka loop. The moment you call a payment API, send an email or update an external database, that side effect is outside the transaction and you are back to at-least-once, so the side effect itself must be idempotent (idempotency keys, <a href="32-idempotency-ids.html">Chapter 32</a>) or you use the outbox pattern (<a href="31-distributed-transactions.html">Chapter 31</a>).</p>
+
+<div class="callout key"><b>Key idea</b>
+"Exactly-once" is really <b>at-least-once delivery plus deduplication or atomic commit of effects</b>. Kafka gives you that inside its own log (idempotent producer, transactions, fencing). For anything outside Kafka, you provide the idempotency.
+</div>
+
+<h2 id="retention">10. Retention and log compaction</h2>
+<p>Since consuming does not delete data, Kafka needs an explicit rule for discarding it. Each topic has a <b>cleanup policy</b>.</p>
+<h3>10.1 Time and size retention (delete policy)</h3>
+<p>With <code>cleanup.policy=delete</code>, whole segments are removed once they are older than <code>retention.ms</code> (default 7 days) or when the partition exceeds <code>retention.bytes</code>. Only closed segments are deleted, judged by the newest timestamp in the segment, so actual retention is a little longer than configured. Retention is independent of consumption: a record is deleted on schedule even if no one has read it, so a consumer that is down for longer than retention loses data (it will find its committed offset no longer exists and fall back to <code>auto.offset.reset</code>). Alert on lag measured against retention. Long retention is cheap compared with other systems because storage is sequential files; some deployments retain for months, and <b>tiered storage</b> moves older segments to object storage (<a href="21-object-storage.html">Chapter 21</a>) while keeping recent data on local disks.</p>
+
+<h3>10.2 Log compaction</h3>
+<p>With <code>cleanup.policy=compact</code>, Kafka keeps <b>at least the latest record for every key</b> and discards older records with the same key. The topic becomes a changelog of a table: reading it from the start reconstructs the latest state of every entity. A background <b>cleaner</b> thread rewrites older segments, dropping records whose key has a newer value. A record with a key and a <b>null value</b> is a <b>tombstone</b>, meaning "delete this key"; it is retained for <code>delete.retention.ms</code> so that consumers can see the deletion, then removed. The active segment is never compacted, so recent duplicates are visible, and compaction does not change offsets: offsets of surviving records stay the same and simply have gaps.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Log compaction before and after">
+  <text class="t-b" x="20" y="22">Before compaction (offset: key=value)</text>
+  <rect class="db" x="20" y="34" width="70" height="40" rx="4"/><text class="t-c t-sm" x="55" y="58">0: A=1</text>
+  <rect class="db" x="95" y="34" width="70" height="40" rx="4"/><text class="t-c t-sm" x="130" y="58">1: B=1</text>
+  <rect class="db" x="170" y="34" width="70" height="40" rx="4"/><text class="t-c t-sm" x="205" y="58">2: A=2</text>
+  <rect class="db" x="245" y="34" width="70" height="40" rx="4"/><text class="t-c t-sm" x="280" y="58">3: C=1</text>
+  <rect class="db" x="320" y="34" width="70" height="40" rx="4"/><text class="t-c t-sm" x="355" y="58">4: B=2</text>
+  <rect class="db" x="395" y="34" width="70" height="40" rx="4"/><text class="t-c t-sm" x="430" y="58">5: A=3</text>
+  <rect class="db" x="470" y="34" width="84" height="40" rx="4"/><text class="t-c t-sm" x="512" y="58">6: C=null</text>
+  <rect class="cache" x="559" y="34" width="70" height="40" rx="4"/><text class="t-c t-sm" x="594" y="58">7: D=1</text>
+  <text class="t-sm" x="640" y="58">(7 is in the active segment)</text>
+  <path class="arrow" d="M300 90 L300 128"/><text class="t-sm" x="312" y="114">cleaner keeps the newest record per key</text>
+  <text class="t-b" x="20" y="152">After compaction: offsets keep their numbers, with gaps</text>
+  <rect class="hit" x="320" y="164" width="70" height="40" rx="4"/><text class="t-c t-sm" x="355" y="188">4: B=2</text>
+  <rect class="hit" x="395" y="164" width="70" height="40" rx="4"/><text class="t-c t-sm" x="430" y="188">5: A=3</text>
+  <rect class="miss" x="470" y="164" width="84" height="40" rx="4"/><text class="t-c t-sm" x="512" y="188">6: C=null</text>
+  <rect class="cache" x="559" y="164" width="70" height="40" rx="4"/><text class="t-c t-sm" x="594" y="188">7: D=1</text>
+  <text class="t-sm" x="20" y="188">offsets 0-3 removed</text>
+  <text class="t-sm" x="20" y="232">Tombstone C=null is kept for a while, then removed too. Result: latest state per key.</text>
+</svg>
+<figcaption>Compaction turns a log of updates into a snapshot of the latest value per key, without ever renumbering offsets. A null value marks deletion.</figcaption>
+</figure>
+<p>Compaction powers the internal <code>__consumer_offsets</code> topic, Kafka Streams state-store changelogs, and "table" topics like a user profile feed that new services replay to bootstrap a local cache. It is also how you can honour a deletion request for personal data in a log (write a tombstone for that key). You can combine policies (<code>compact,delete</code>) to compact and also drop data older than a limit.</p>
+
+<h2 id="ordering">11. Ordering and choosing the partition count</h2>
+<p><b>Kafka guarantees order only within one partition.</b> Records with the same key go to the same partition and therefore are read in the order they were written. Across partitions there is no ordering at all: if events for order 7 are on partition 2 and events for order 8 are on partition 5, a consumer may see 8's events before 7's even though 7 happened first. Global ordering of a topic requires a single partition, which limits throughput to one consumer and is rarely worth it. The design rule: <b>choose a key such that only events that must be ordered relative to each other share a key</b>.</p>
+<p>A producer with retries and several in-flight requests can reorder records within a partition unless idempotence is enabled (it preserves order with up to five in-flight requests per connection). Consumers that process records of one partition concurrently with a thread pool destroy order again, so parallelize across partitions or keys, not within one partition's stream.</p>
+
+<h3>11.1 How many partitions?</h3>
+<p>Partitions set the maximum parallelism of consumption and the aggregate write throughput, but each has a cost. Reason from both sides.</p>
+<ul>
+  <li><b>Lower bound from throughput.</b> Let T be the target throughput, p the throughput one producer can push to a single partition, and c the throughput one consumer can process from one partition. You need at least max(T/p, T/c) partitions. In practice consumer processing speed is the bottleneck.</li>
+  <li><b>Lower bound from consumer parallelism.</b> If you want to run up to N consumers in a group, you need at least N partitions, and you should plan for future growth.</li>
+  <li><b>Upper bound costs.</b> Each partition is a set of open files and memory buffers on every replica, adds leader-election and recovery time after a broker failure (more partitions to elect), increases replication work, and enlarges the metadata. Do not create thousands of partitions for a small topic.</li>
+  <li><b>You can add partitions later, never remove them,</b> and adding changes key-to-partition mapping (section 6.1), breaking per-key ordering for existing keys. So choose a count with headroom from the start (for example 2-3x current need), prefer numbers with many divisors (12, 24, 60) so consumers divide them evenly, and treat a repartition as a migration (create a new topic, dual-write or copy, switch consumers).</li>
+</ul>
+
+<h2 id="sizing">12. Worked example: capacity sizing</h2>
+<p>Scenario: an event pipeline for an e-commerce platform. Average 20,000 events per second, peak 50,000 per second, average record size 1 KB (uncompressed), keyed by <code>orderId</code>. Three independent consumer groups read the topic (fulfilment, search indexing, analytics). Retention 7 days, replication factor 3, compression about 3x for the JSON payloads. Each consumer thread can process about 500 records per second.</p>
+
+<h3>12.1 Ingress and egress bandwidth</h3>
+<table>
+<tr><th>Quantity</th><th>Calculation</th><th>Result</th></tr>
+<tr><td>Producer ingress, peak</td><td>50,000 x 1 KB</td><td>50 MB/s raw, about 17 MB/s on the wire after 3x compression</td></tr>
+<tr><td>Replication traffic</td><td>17 MB/s x 2 followers (RF 3)</td><td>about 34 MB/s extra inter-broker</td></tr>
+<tr><td>Consumer egress, peak</td><td>17 MB/s x 3 groups (if all caught up)</td><td>about 51 MB/s</td></tr>
+<tr><td>Total cluster network, peak</td><td>17 in + 34 replication + 51 out</td><td>about 100 MB/s spread over brokers: modest</td></tr>
+</table>
+
+<h3>12.2 Storage</h3>
+<p>Average ingress is 20,000 x 1 KB = 20 MB/s raw. Per day: 20 MB/s x 86,400 s = 1.73 TB raw. Seven days: 12.1 TB raw. After 3x compression: about 4.0 TB for one copy. With replication factor 3: about 12.1 TB across the cluster. Keep disks under about 60% full, leaving room for segment rolling, rebalancing and growth, so provision 12.1 / 0.6 = about 20 TB of disk. On 6 brokers, that is about 3.4 TB each, so give each broker 4 TB of SSD.</p>
+
+<h3>12.3 Partitions</h3>
+<p>Consumer parallelism is the limit. At peak, 50,000 / 500 = 100 consumer threads are needed to keep up, so at least 100 partitions. Add headroom for growth and for catching up after a backlog (to drain a backlog you need spare capacity above the arrival rate), so choose <b>120 partitions</b> (divisible by 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 24, 30, 40, 60). Per-partition write rate at peak is 50 MB/s / 120 = about 0.4 MB/s raw, far below what a partition can take, so partitions are not constrained on the write side. Replicas: 120 x 3 = 360 partition replicas over 6 brokers = 60 per broker, which is comfortable.</p>
+
+<h3>12.4 Broker count and the failure check</h3>
+<p>Throughput alone would need only two or three brokers; 100 MB/s is small for modern hardware. The binding constraints are storage (about 12 TB across brokers at 60% fill) and fault tolerance. Six brokers across three availability zones with rack awareness (<code>broker.rack</code>) place each partition's three replicas in three different zones. If one broker fails, its 60 replicas (about 20 of them leaders) move to the survivors, each absorbing about a fifth more load, and a replacement broker must re-replicate about 2 TB (12.1 TB / 6): at a throttled 100 MB/s that takes roughly 5.5 hours; at 300 MB/s about 2 hours. During that time the ISR for affected partitions is 2 of 3, which still meets min.insync.replicas=2, so writes continue. A second simultaneous failure in another zone would block writes for partitions that lost two replicas, which is why you leave headroom and watch under-replicated partitions.</p>
+
+<h3>12.5 Time to drain a backlog</h3>
+<p>If the fulfilment consumers are down for 30 minutes during an average load, the backlog is 20,000 x 1,800 = 36 million records. With 100 consumers at 500 records per second each (50,000 per second) and new records still arriving at 20,000 per second, the net drain rate is 30,000 per second, so recovery takes 36,000,000 / 30,000 = 1,200 s = 20 minutes. This is the load-leveling effect of section 1 in numbers, and it shows why you leave consumer capacity above the average rate.</p>
+
+<h2 id="failures">13. Failure modes and mitigations</h2>
+<table>
+<tr><th>Failure</th><th>What happens</th><th>Mitigation</th></tr>
+<tr><td>Broker loss</td><td>Leaders on that broker are re-elected from ISR; clients retry after metadata refresh; brief errors for those partitions. If replicas share a rack or zone, a zone loss can take several at once.</td><td>RF 3, rack awareness, min ISR 2, acks=all, retries with idempotence, spare capacity. Controlled shutdown moves leaders first during planned restarts.</td></tr>
+<tr><td>Consumer lag growth</td><td>Consumers slower than producers; downstream effects get later, and if lag exceeds retention, data is lost to the consumer.</td><td>Scale consumers (up to partitions), batch downstream writes, find the slow dependency, alert on lag trend and time lag, size retention to exceed the worst outage.</td></tr>
+<tr><td>Rebalance storm</td><td>Consumers repeatedly leave and rejoin; the group spends its time rebalancing rather than processing, for instance because a batch exceeds max.poll.interval.ms, or a rolling deploy restarts all pods quickly.</td><td>Cooperative sticky assignor, static membership, smaller max.poll.records, longer session timeout, offload slow work, staged rollouts with pauses.</td></tr>
+<tr><td>Hot partition</td><td>One key (a very large customer, for example) takes a large share of traffic; one broker and one consumer saturate while the others idle.</td><td>Better key choice (a compound key such as customer plus a shard number), salting keys when per-key order is not required, a custom partitioner, dedicated topics for heavy tenants.</td></tr>
+<tr><td>Poison message</td><td>A record the consumer cannot process (corrupt, unexpected schema, triggers a bug) fails every time. Because the partition is ordered and the offset cannot advance, the consumer is stuck retrying and lag on that partition grows without limit.</td><td>Catch deserialization and processing errors; retry a bounded number of times, then publish the record with error metadata to a dead-letter topic and commit past it; validate schemas at the producer; alert on DLQ rate. See <a href="35-messaging-patterns.html">Chapter 35</a>.</td></tr>
+<tr><td>Duplicate processing</td><td>Rebalance or crash after processing and before commit; producer retry without idempotence.</td><td>Idempotent consumers, idempotent producer, transactions for Kafka-to-Kafka.</td></tr>
+<tr><td>Unclean election data loss</td><td>All ISR dead; an out-of-sync replica promoted; acknowledged records vanish.</td><td>Keep unclean.leader.election.enable=false for important data; monitor ISR shrink rate.</td></tr>
+<tr><td>Disk full</td><td>A broker whose log directory fills stops accepting writes and may crash.</td><td>Retention sized to disk, alerts at 70 percent, client quotas, tiered storage, move partitions away.</td></tr>
+<tr><td>Slow follower or network partition</td><td>Follower drops out of ISR; if too many do, the partition becomes unwritable under min ISR.</td><td>Monitor under-replicated partitions and ISR shrink and expand rates; find the slow disk or noisy neighbour.</td></tr>
+</table>
+
+<h2 id="ops">14. Operations</h2>
+<h3>14.1 What to monitor</h3>
+<ul>
+  <li><b>Under-replicated partitions:</b> partitions where the ISR is smaller than the replica set. Should be zero in steady state. The single most important broker alert.</li>
+  <li><b>Offline partitions and active controller count:</b> offline partitions must be zero; exactly one active controller.</li>
+  <li><b>ISR shrink and expand rate:</b> frequent flapping signals slow disks or network.</li>
+  <li><b>Consumer lag and time lag</b> per group and partition, plus the group's state (stable, rebalancing).</li>
+  <li><b>Request latency</b> (produce, fetch) at p99 and the request-queue and network-processor idle ratios, which show broker saturation.</li>
+  <li><b>Disk usage, disk I/O wait, page cache hit, network throughput</b> per broker, and JVM garbage collection pauses.</li>
+  <li><b>Skew:</b> bytes in per partition, to catch hot keys.</li>
+</ul>
+<h3>14.2 Partition reassignment</h3>
+<p>When you add brokers, Kafka does not automatically move existing partitions to them; new brokers sit empty until you run a <b>partition reassignment</b> (the <code>kafka-reassign-partitions</code> tool, or automation such as Cruise Control). The plan lists, for each partition, the new replica set. The new replicas are added as followers, copy the whole log from the leader, join the ISR, and the old replicas are then removed. Because this copies terabytes, you <b>throttle</b> the replication bandwidth so that production traffic is not starved, run it off-peak, and move in small batches. Reassignment is also how you drain a broker before decommissioning it, fix skew, or change the replication factor. A related operation is <b>preferred leader election</b>: after a failure, leaders concentrate on the survivors; once the original broker recovers, leadership is moved back to the preferred replica (first in the replica list) to restore balance.</p>
+<h3>14.3 Other operational practices</h3>
+<p>Use rolling restarts (one broker at a time, waiting until under-replicated partitions return to zero before the next). Set client <b>quotas</b> so one noisy producer or consumer cannot take the cluster's bandwidth. Use a <b>schema registry</b> with compatibility rules so a producer cannot publish a format that breaks consumers. Mirror clusters across regions with MirrorMaker or similar for disaster recovery (<a href="26-multi-region-migrations.html">Chapter 26</a>); offsets differ between clusters and need translation. Managed offerings (Confluent Cloud, Amazon MSK, Redpanda, Aiven) remove much of this toil at a price.</p>
+
+<h2 id="decision">15. Choosing a system: Kafka, RabbitMQ, SQS, Pulsar, Kinesis</h2>
+<table>
+<tr><th>System</th><th>Model</th><th>Strengths</th><th>Weaknesses</th><th>Pick it when</th></tr>
+<tr><td>Kafka</td><td>Partitioned replicated log</td><td>Very high throughput, replay, many consumer groups, ordering per key, stream processing ecosystem, durable retention</td><td>Operational weight, partition count is a hard planning decision, no per-message ack or priorities, rebalances, poor for tiny low-volume work queues</td><td>Event streaming, data pipelines, event sourcing, CDC, fan-out to many consumers, replay needed</td></tr>
+<tr><td>RabbitMQ</td><td>Broker queue with exchanges</td><td>Rich routing, priorities, per-message TTL, delayed messages, request/reply, push delivery, low latency</td><td>Lower throughput ceiling, no replay by default, very deep queues hurt performance, scaling out is harder</td><td>Task queues with complex routing, moderate volume, per-message control</td></tr>
+<tr><td>Amazon SQS</td><td>Managed queue (standard or FIFO)</td><td>No operations, very high scaling, simple, built-in DLQ, pay per use</td><td>No replay, no fan-out alone (add SNS), 256 KB limit, FIFO throughput limits, at-least-once on standard</td><td>Decoupling microservices on AWS, background jobs, buffering with minimal operations</td></tr>
+<tr><td>Apache Pulsar</td><td>Log with separate serving (brokers) and storage (BookKeeper)</td><td>Multi-tenancy, built-in geo-replication, both queue-like and stream subscriptions, independent scaling and tiered storage</td><td>Two systems to run, smaller ecosystem and community than Kafka</td><td>Many tenants, mixed queue and stream workloads, need to scale storage and serving separately</td></tr>
+<tr><td>Amazon Kinesis Data Streams</td><td>Managed log with shards</td><td>Managed, tight AWS integration (Lambda, Firehose), ordered per shard key</td><td>Per-shard throughput limits (on the order of 1 MB/s write per shard in provisioned mode), shorter default retention (24 hours, extendable), smaller ecosystem</td><td>AWS-native streaming without wanting to operate Kafka; moderate volume</td></tr>
+</table>
+<p>A good interview answer chooses by the workload: "this is job distribution to a worker fleet on AWS, so SQS with a DLQ; this is a firehose of clickstream events consumed by several teams and needing replay, so Kafka."</p>
+
+<h2 id="when-not">16. When not to use a queue</h2>
+<ul>
+  <li><b>The caller needs the result now.</b> A user waiting for a search result or a card authorization wants a synchronous answer. Request/reply over a queue adds latency and complexity.</li>
+  <li><b>Low volume, simple needs.</b> A job table in your existing database, polled with <code>SELECT ... FOR UPDATE SKIP LOCKED</code>, can serve a few hundred jobs per second with no new infrastructure. Do not introduce a Kafka cluster for ten events per minute.</li>
+  <li><b>Strong cross-entity consistency.</b> If two updates must be atomic and visible together, use a transaction, not two messages with eventual consistency. Where a workflow spans services, see <a href="31-distributed-transactions.html">Chapter 31</a>.</li>
+  <li><b>Hiding an overloaded downstream.</b> A queue turns overload into a growing backlog. Without back-pressure, rate limits or autoscaling, the backlog becomes hours of delay or exhausts retention. A queue is a buffer, not extra capacity.</li>
+  <li><b>You need strict global ordering</b> and high throughput at the same time; the two conflict.</li>
+  <li><b>You cannot make consumers idempotent</b> and cannot tolerate duplicates; at-least-once delivery will hurt.</li>
+</ul>
+
+<h2 id="widget">17. Try it: partition assignment</h2>
+<p>This small simulator assigns partitions to consumers round-robin, and shows what changes when the number of consumers changes. Change the numbers and observe idle consumers and how many partitions change owner.</p>
+<div class="widget">
+<h4>Partition assignment simulator</h4>
+<div class="row">
+<label>Partitions <input type="number" id="pa-parts" value="8" min="1" max="24"></label>
+<label>Consumers <input type="number" id="pa-cons" value="3" min="1" max="30"></label>
+<label>Then change to <input type="number" id="pa-cons2" value="4" min="1" max="30"></label>
+<button id="pa-run">Assign</button>
+</div>
+<div class="log" id="pa-out">Press Assign.</div>
+</div>
+
+<h2 id="qa">18. Interview Q&amp;A</h2>
+
+<details><summary>Why use a message queue instead of calling the other service directly?</summary>
+<p>A direct call couples the caller to the callee's availability and speed, so a slow or failed callee degrades the caller, and spikes pass straight through. A queue decouples them in time (the consumer can be down), absorbs bursts by buffering so you provision for average load, lets you add consumers without changing the producer, and adds retry for transient failures. The price is eventual processing, duplicate and out-of-order handling, and another critical system to run, so I would use it when the caller does not need the result immediately.</p>
+</details>
+
+<details><summary>What is the difference between a queue and a log like Kafka?</summary>
+<p>In a queue, a message is handed to one consumer and deleted after acknowledgement; the broker tracks per-message state and the goal is distributing work. In a log, records stay until retention expires, each consumer group keeps its own offset per partition, and reading is non-destructive, so many groups can read the same data and any group can rewind to replay history. Consequently logs fit event streaming, stream processing and event sourcing, while queues fit job distribution with per-message routing, priorities and TTLs.</p>
+</details>
+
+<details><summary>How does Kafka achieve such high throughput?</summary>
+<p>It turns all disk activity into sequential appends and sequential reads, which disks handle at full bandwidth. It leans on the OS page cache, so recently written data is served from memory to consumers that keep up. It stores records in the same format as the wire format and uses sendfile for zero-copy transfer from cache to socket. Producers batch records and compress whole batches, which reduces network, disk and cache use at once. The broker itself does little work per message: no per-message acknowledgement bookkeeping, since consumers track a single offset.</p>
+</details>
+
+<details><summary>How do you guarantee no message loss in Kafka?</summary>
+<p>On the producer: replication factor 3, <code>min.insync.replicas=2</code>, <code>acks=all</code>, idempotence enabled, and check callbacks so failures are retried or surfaced. On the broker: disable unclean leader election, and spread replicas across racks. On the consumer: disable auto commit and commit the offset only after the record is processed, accepting at-least-once and making processing idempotent. Also keep retention longer than the worst consumer outage so unread data is not deleted. This gives you durability against a single broker failure; it cannot protect against losing a whole cluster without cross-cluster replication.</p>
+</details>
+
+<details><summary>Explain consumer groups and what limits parallelism.</summary>
+<p>A consumer group is a set of consumers sharing a group id. Kafka assigns each partition to exactly one consumer in the group, so the group collectively reads the topic once and each record is handled by one member. The number of partitions is therefore the maximum useful number of consumers: extra consumers sit idle. Separate groups are independent and each read all records, which provides publish/subscribe. To scale beyond the limit you must have more partitions (planned in advance) or make each consumer faster, for instance by handing records to a worker pool keyed so that per-key order is preserved.</p>
+</details>
+
+<details><summary>What is a rebalance and why is it a problem?</summary>
+<p>A rebalance redistributes a group's partitions when members join, leave, crash, or the partition count changes. In the eager protocol all consumers give up all partitions and wait for new assignments, so the whole group stops processing, lag builds, in-memory state is lost and uncommitted work is reprocessed. A slow consumer exceeding the poll interval can trigger repeated rebalances, a storm. I would use the cooperative sticky assignor so only moved partitions pause, static membership so quick restarts do not trigger rebalances, smaller poll batches, and staged deployments.</p>
+</details>
+
+<details><summary>Explain ISR, high watermark and min.insync.replicas.</summary>
+<p>Each partition has a leader and followers; the ISR is the leader plus followers that are caught up within a time limit. The high watermark is the highest offset replicated to every ISR member, and consumers can only read below it, so they never see data that might vanish on a leader change. With acks=all, a write is acknowledged when all ISR members have it, and <code>min.insync.replicas</code> sets the smallest ISR allowed for such writes to succeed. With RF 3 and min ISR 2 you survive one broker loss with no data loss and no downtime, and if two are lost writes are rejected rather than accepted on a single copy, which chooses consistency over availability.</p>
+</details>
+
+<details><summary>How does Kafka achieve exactly-once, and what are the limits?</summary>
+<p>Within Kafka it combines the idempotent producer (producer id plus sequence numbers to dedupe retries), transactions (atomic writes to multiple partitions together with the consumer offsets of the input, coordinated through a transaction coordinator with commit markers), and epoch-based fencing of zombie producers. Consumers using read_committed skip aborted data. The limit is that it covers the read-process-write loop within Kafka. Once a side effect leaves Kafka (a database write, an API call, an email) you are at-least-once again, so that effect must be idempotent or done via an outbox, because no broker can make an external system transactional with itself.</p>
+</details>
+
+<details><summary>How do you choose the number of partitions and the key?</summary>
+<p>Estimate required throughput divided by the per-partition producer and consumer throughput, and make sure the count covers the maximum number of consumers you want, then add headroom since you can add partitions later but not remove them, and adding them remaps keys. Avoid overshooting, because each partition costs file handles, replication traffic and failover time. Choose a key that groups only the events needing relative order (like orderId), with many distinct values and even spread, so no single key becomes hot. If one key is genuinely huge, I would salt it or split it, giving up strict order for that entity or ordering within sub-keys.</p>
+</details>
+
+<details><summary>A consumer is stuck on one partition and lag is growing only there. What do you do?</summary>
+<p>Single-partition lag points to a poison message or a hot key, not general under-capacity. Look at the consumer logs for repeated exceptions at the same offset, and check whether the committed offset is advancing. If it is a poison record, route it to a dead-letter topic after bounded retries, commit past it, and fix the producer or deserializer; for a hot key, check bytes per partition, then change the key or partitioning. As a short-term step I can reset the group offset past the bad record, accepting that it is skipped, after saving it for later analysis.</p>
+</details>
+
+<details><summary>Kafka or SQS for a background job system on AWS?</summary>
+<p>For job distribution to a worker pool, SQS is usually better: fully managed, per-message visibility timeout and retry, built-in DLQ, easy scaling by adding workers, and no partition planning. Kafka fits when I need many independent consumers of the same stream, replay, strict per-key ordering at very high throughput, or stream processing. If events must also feed analytics and search, I might publish to Kafka as the system of record and use SQS for specific task execution, but I would avoid the operational cost of Kafka for a simple job queue.</p>
+</details>
+
+<h2 id="recap-sec">19. Recap</h2>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2>
+<ul>
+  <li>Asynchronous messaging decouples producers and consumers in time and knowledge, buffers spikes, fans out events and enables retry, at the cost of eventual processing, duplicates and one more system.</li>
+  <li>A queue deletes messages after acknowledgement and distributes work (RabbitMQ, SQS). A log keeps records, lets each reader hold an offset and allows replay (Kafka, Pulsar, Kinesis). Pub/sub broadcasts one message to many subscribers.</li>
+  <li>RabbitMQ routes through exchanges and bindings, with acks and prefetch. SQS uses a visibility timeout, long polling, FIFO groups for ordering and a redrive DLQ.</li>
+  <li>Kafka topics are split into partitions, each a replicated append-only log stored as segments with sparse indexes. Speed comes from sequential I/O, the page cache, batching, compression and zero-copy.</li>
+  <li>Producers choose a partition by key hash; batching and linger trade latency for throughput; acks=all with min.insync.replicas=2 and idempotence prevent loss and duplicates from retries.</li>
+  <li>Consumers in a group each own distinct partitions; partition count caps parallelism. Commit after processing for at-least-once. Rebalances pause consumption; use cooperative assignors and static membership. Watch lag.</li>
+  <li>Replication: leader and followers per partition, ISR, high watermark, leader election from the ISR, unclean election trades data for availability, KRaft replaces ZooKeeper for metadata.</li>
+  <li>Exactly-once inside Kafka uses transactions and fencing; outside Kafka you need idempotent effects.</li>
+  <li>Retention deletes old segments by time or size; compaction keeps the latest value per key. Ordering exists only within a partition; choose keys and partition counts carefully because they are hard to change.</li>
+  <li>Size with throughput, storage with retention and replication, and consumer parallelism; plan failures: broker loss, lag, rebalance storms, hot partitions and poison messages.</li>
+</ul></div>
+<p class="connects"><b>Connects to:</b> builds on <a href="24-replication.html">Chapter 24</a> (replication), <a href="29-consensus.html">Chapter 29</a> (Raft and KRaft) and <a href="32-idempotency-ids.html">Chapter 32</a> (delivery semantics and idempotency). Leads to <a href="35-messaging-patterns.html">Chapter 35</a> (messaging patterns, retries and DLQ), <a href="36-event-driven.html">Chapter 36</a> (event-driven design) and <a href="37-batch-stream.html">Chapter 37</a> (stream processing).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+<script>
+(function () {
+  function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+  function assign(parts, cons) {
+    const res = [];
+    for (let c = 0; c < cons; c++) res.push([]);
+    for (let p = 0; p < parts; p++) res[p % cons].push(p);
+    return res;
+  }
+  function fmt(a) { return a.length ? 'P' + a.join(' P') : '(idle)'; }
+  document.getElementById('pa-run').addEventListener('click', function () {
+    const parts = Math.max(1, parseInt(document.getElementById('pa-parts').value, 10) || 1);
+    const c1 = Math.max(1, parseInt(document.getElementById('pa-cons').value, 10) || 1);
+    const c2 = Math.max(1, parseInt(document.getElementById('pa-cons2').value, 10) || 1);
+    const out = document.getElementById('pa-out');
+    out.textContent = '';
+    const a = assign(parts, c1), b = assign(parts, c2);
+    const owner = function (arr) { const o = {}; arr.forEach(function (list, i) { list.forEach(function (p) { o[p] = i; }); }); return o; };
+    const oa = owner(a), ob = owner(b);
+    out.appendChild(el('div', null, 'Before: ' + parts + ' partitions, ' + c1 + ' consumers'));
+    a.forEach(function (l, i) { out.appendChild(el('div', null, '  C' + (i + 1) + ': ' + fmt(l))); });
+    out.appendChild(el('div', null, 'After: ' + c2 + ' consumers'));
+    b.forEach(function (l, i) { out.appendChild(el('div', null, '  C' + (i + 1) + ': ' + fmt(l))); });
+    let moved = 0;
+    for (let p = 0; p < parts; p++) if (oa[p] !== ob[p]) moved++;
+    const idle = b.filter(function (l) { return l.length === 0; }).length;
+    out.appendChild(el('div', null, 'Eager protocol: all ' + parts + ' partitions pause during the rebalance.'));
+    out.appendChild(el('div', null, 'Cooperative protocol (upper bound): at most ' + moved + ' partition(s) change owner with this simple assignment; a sticky assignor usually moves fewer.'));
+    out.appendChild(el('div', null, idle > 0 ? 'Idle consumers: ' + idle + ' (more consumers than partitions).' : 'No idle consumers.'));
+  });
+})();
+</script>
+</body>
+</html>

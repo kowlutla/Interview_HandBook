@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 25: Design a Digital Wallet and Ledger | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="c25-digital-wallet-ledger">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 25 · Worked solutions</div>
+<h1>Design a Digital Wallet and Ledger</h1>
+<p class="lead">A digital wallet holds money on behalf of users and moves it between them in milliseconds. Behind the simple "balance" number sits the hardest data-integrity problem in everyday systems: every cent must be accounted for, every transfer must happen exactly once, and the whole history must be provable years later. This worked solution designs a wallet backed by a double-entry, append-only ledger, with idempotent transfers, cross-shard sagas, an event-sourced history, and reconciliation against the outside world.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+
+<p>The prompt is usually "Design a digital wallet like PayPal balance, Venmo, Cash App or a mobile-money service." The word <b>wallet</b> hides a lot, so the first minutes go to narrowing it, following the framework in <a href="../chapters/01-interview-framework.html">Chapter 1</a>. A wallet differs from a card payment system (see <a href="c14-payment-system.html">Case study 14</a>) in one important way: the money lives <i>inside our system</i> as a stored balance. In a card flow the money stays at the bank and we only coordinate. Here we are the bookkeeper, so the correctness burden is ours alone.</p>
+
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>What does the wallet do?</td><td>Users hold a balance in one or more currencies; they can <b>top up</b> (add money from a bank account or card), <b>transfer</b> to another user (peer to peer), <b>pay a merchant</b>, and <b>withdraw</b> to a bank account. Balance and history are visible instantly.</td></tr>
+<tr><td>Is it real money or points?</td><td>Real money. A wallet balance is a <b>liability</b>: money we owe the user, backed by cash held in bank accounts. Regulators typically require such funds to be kept safe (segregated or "safeguarded"), so we must always be able to prove that total wallet balances do not exceed the cash we hold.</td></tr>
+<tr><td>Scale?</td><td>50 million registered wallets, 20 million daily active users, 30 million transfers per day, with peaks of 5 times the average on paydays and holidays.</td></tr>
+<tr><td>Can a balance go negative?</td><td>Never for a user wallet. Internal system accounts (the bank clearing account, fee revenue) may be negative or positive by their nature.</td></tr>
+<tr><td>Currencies?</td><td>Multi-currency, but each wallet account holds exactly one currency. Conversion is a separate, explicit operation (section 7.5).</td></tr>
+<tr><td>Consistency requirement?</td><td>Strong for money: a sender is debited exactly once and the receiver credited exactly once, never one without the other. Derived views (search, analytics, statements) may lag by seconds.</td></tr>
+<tr><td>What must be provable?</td><td>For any account at any past time, the balance and the exact list of movements that produced it. An auditor, a regulator or a support agent must be able to replay it.</td></tr>
+<tr><td>Fees, holds and limits?</td><td>Yes: some transfers carry a fee, card-like <b>holds</b> reserve funds before final payment, and per-user limits (daily total, KYC tier) apply.</td></tr>
+<tr><td>Availability versus correctness?</td><td>Correctness wins. A brief "try again" is acceptable; a lost, duplicated or invented cent is not.</td></tr>
+</table>
+
+<div class="callout tip"><b>Interview tip</b>
+Say early: "A balance is not a number we store and edit; it is a <i>summary of immutable ledger entries</i>. Everything else in the design follows from protecting that ledger." It signals you know the central idea of financial systems, and it gives you a spine to hang idempotency, sagas, event sourcing and reconciliation on.
+</div>
+
+<h2 id="requirements">2. Requirements</h2>
+
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li><b>Create wallet accounts</b> per user and currency, and system accounts for the platform itself (bank clearing, fees, in-transit funds).</li>
+<li><b>Top up</b> from an external source and <b>withdraw</b> to an external destination, both of which involve outside parties that are slow and unreliable.</li>
+<li><b>Transfer</b> between two wallets (peer to peer or customer to merchant), optionally with a fee.</li>
+<li><b>Hold and release</b>: reserve an amount on a wallet (for a pending order or a pre-authorization) so it cannot be spent twice, then capture or release it later.</li>
+<li><b>Read the balance</b> (current and available) and <b>paginated history</b> of movements, with downloadable statements.</li>
+<li><b>Reconcile</b> internal books against bank and processor records, and detect internal inconsistencies automatically.</li>
+<li><b>Reverse or correct</b> a mistaken movement through a new, balanced transaction, never by editing history.</li>
+</ul>
+
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Exactly-once effect.</b> A transfer submitted once, or retried many times, moves money once. This is the headline requirement.</li>
+<li><b>Atomicity.</b> Debit and credit of one transfer succeed together or neither is visible as final. No money appears or disappears.</li>
+<li><b>Non-negative balances.</b> Concurrent spends can never overdraw a user wallet.</li>
+<li><b>Durability:</b> an acknowledged transfer is never lost, even if a node or a whole zone fails (zero recovery point objective for the ledger).</li>
+<li><b>Latency:</b> a same-shard transfer returns in under 150 ms at p99; a cross-shard transfer in under 400 ms at p99. Balance reads under 50 ms at p99.</li>
+<li><b>Availability:</b> 99.95% for money-moving writes, 99.99% for balance reads. When uncertain, refuse or delay; never guess.</li>
+<li><b>Auditability:</b> immutable history retained for years (often 7 or more, depending on jurisdiction), with who, what and why on every entry.</li>
+</ul>
+
+<h3>2.3 Out of scope</h3>
+<p>The card network and bank integrations themselves (we treat them as external parties behind an adapter), identity verification and sanctions screening beyond a hook, fraud-model training, tax reporting, interest accrual and lending, and the general ledger of the company's own accounting. We mention each only where it touches the design.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+
+<p>A wallet is a modest-throughput system with extreme correctness needs. The estimate mainly decides how many database shards we need and how large the ledger grows.</p>
+
+<h3>3.1 Traffic</h3>
+<ul>
+<li>30,000,000 transfers per day. A day has 86,400 seconds, so average is 30,000,000 ÷ 86,400 ≈ <b>347 transfers per second</b>.</li>
+<li>Peak factor 5 (payday, holiday evening): about <b>1,750 transfers per second</b>.</li>
+<li>Top-ups and withdrawals: assume another 6 million per day (about 70 per second average, 350 at peak). They are slower because they involve a bank or processor, but they are a small share of load.</li>
+<li>Balance reads: 20 million daily active users open the app about 10 times a day, so 200 million reads per day, which is 200,000,000 ÷ 86,400 ≈ <b>2,315 per second</b> average and about <b>11,600 per second</b> at peak. Reads outnumber writes about 6 to 1 on average and dominate the traffic, but they are cheap if served from a derived balance.</li>
+<li>History reads: 3 history page loads per active user per day is 60 million per day, about 700 per second. These come from a read-optimized view, not the primary ledger.</li>
+</ul>
+
+<h3>3.2 Storage</h3>
+<table>
+<tr><th>Data</th><th>Per unit</th><th>Per day</th><th>Per year</th></tr>
+<tr><td>Ledger entries (a transfer writes about 3 entries: sender, receiver, fee; top-ups and withdrawals write 2)</td><td>about 150 B each, 3 per transfer on average</td><td>30M × 3 × 150 B ≈ 13.5 GB (90M rows)</td><td>about 4.9 TB (33 billion rows)</td></tr>
+<tr><td>Transfer records (state, legs, references)</td><td>about 300 B</td><td>30M × 300 B = 9 GB</td><td>about 3.3 TB</td></tr>
+<tr><td>Event log and outbox (about 2 events per transfer)</td><td>about 400 B</td><td>30M × 2 × 400 B = 24 GB</td><td>about 8.8 TB (moves to object storage after 90 days)</td></tr>
+<tr><td>Idempotency records (kept 7 days online)</td><td>about 400 B</td><td>12 GB</td><td>84 GB rolling window</td></tr>
+<tr><td>Account rows with cached balances (50M accounts)</td><td>about 200 B</td><td>stable</td><td>10 GB total</td></tr>
+</table>
+<p>The hot relational ledger therefore grows about 8 to 9 TB per year with transfers and entries combined, and about 25 TB over three years before replication. A single database machine cannot comfortably hold that with the write rate, so we shard (section 8). Old entries remain in the ledger but live on cheaper storage tiers, and the raw event log archives to object storage (<a href="../chapters/21-object-storage.html">Chapter 21</a>).</p>
+
+<h3>3.3 Memory, shards and bandwidth</h3>
+<ul>
+<li><b>Balance cache:</b> 50 million accounts × about 100 B (id, balance, version, held amount) is about 5 GB, which fits in a small Redis cluster (<a href="../chapters/15-redis.html">Chapter 15</a>). Even caching all accounts is cheap.</li>
+<li><b>Write capacity per shard:</b> one transfer is about 6 to 8 SQL statements in one transaction (read idempotency key, insert key, update two balances with checks, insert 3 entries, insert transfer, insert outbox). A well-tuned relational primary with synchronous replication typically sustains somewhere on the order of a few hundred such transactions per second, depending on hardware and replica latency. Plan on 500 transfers per second per shard as a safe working figure.</li>
+<li><b>Shards:</b> 1,750 peak ÷ 500 ≈ 3.5, so 4 shards is the bare minimum; for headroom, hot spots and growth we choose <b>16 shards</b> (about 110 peak transfers per second each, and 25 TB ÷ 16 ≈ 1.6 TB each after three years, both comfortable).</li>
+<li><b>Cross-shard share:</b> if accounts are hashed across 16 shards, the chance that sender and receiver share a shard is 1 in 16, so about <b>94% of transfers are cross-shard</b> (15 of 16). That single number is why the cross-shard design in section 7.3 is the heart of the solution rather than an edge case.</li>
+<li><b>Bandwidth:</b> 1,750 requests per second × about 1 KB is under 2 MB per second at peak. Network is irrelevant here; correctness and disk write latency matter.</li>
+</ul>
+
+<h3>3.4 Money in flight</h3>
+<p>Assume an average transfer of 25 dollars. 30 million per day is 750 million dollars moved daily, and the wallet might hold about 2 billion dollars of customer balances. A one-in-a-million error rate would misplace about 750 dollars every day, which is why we design for provable invariants and run automated checks (section 7.6) instead of relying on "usually right".</p>
+
+<h2 id="api">4. API design</h2>
+
+<p>Every money-moving call carries a client-generated <b>idempotency key</b> (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>). General REST conventions are in <a href="../chapters/05-api-design.html">Chapter 5</a>. Amounts are integers in minor units (4999 means 49.99), never floating point, because binary floating point cannot represent 0.10 exactly.</p>
+
+<pre><code>POST /v1/transfers
+  Headers: Idempotency-Key: 5b2f...        (required)
+  Body:    { "from_account": "acc_A1", "to_account": "acc_B7",
+             "amount": 2500, "currency": "USD",
+             "reference": "dinner", "fee_policy": "sender_pays" }
+  Reply:   201 { "transfer_id": "tr_01J...", "status": "completed" | "pending",
+                 "from_balance_after": 7400 }
+           409 { "error": "request_in_progress" }
+           422 { "error": "idempotency_key_reused_with_different_body" }
+           402 { "error": "insufficient_funds" }
+
+POST /v1/topups        Idempotency-Key  { "account": "acc_A1", "source_token": "bank_tok_9", "amount": 10000 }
+POST /v1/withdrawals   Idempotency-Key  { "account": "acc_A1", "destination_token": "bank_tok_3", "amount": 5000 }
+POST /v1/holds         Idempotency-Key  { "account": "acc_A1", "amount": 3000, "expires_in": 600 }
+POST /v1/holds/{id}/capture   { "amount": 2800, "to_account": "acc_M5" }   // partial allowed
+POST /v1/holds/{id}/release
+
+GET  /v1/accounts/{id}/balance      -> { "posted": 7400, "held": 3000, "available": 4400, "as_of": "..." }
+GET  /v1/accounts/{id}/entries?cursor=...&amp;limit=50   -> immutable entries, newest first
+GET  /v1/transfers/{id}             -> state + legs + events
+
+Internal / events: transfer.completed, transfer.failed, hold.captured, account.balance_low</code></pre>
+
+<p>Design notes. <b>Status is honest.</b> A transfer may legitimately return <code>pending</code> when it is mid-saga (cross-shard) or waiting on an external bank; the caller learns the final outcome by event or by reading the transfer, never by assuming. <b>Balance has three numbers.</b> <i>Posted</i> is the sum of completed entries, <i>held</i> is reserved by active holds, and <i>available</i> is posted minus held; spending checks <i>available</i>. <b>History uses cursors,</b> not page numbers, because new entries keep arriving at the head and offsets would shift (<a href="../chapters/05-api-design.html">Chapter 5</a>). <b>The server issues ids</b> as time-sortable unique ids so they index well and cannot be guessed.</p>
+
+<h2 id="data-model">5. Data model and storage choice</h2>
+
+<h3>5.1 Why a relational database for the ledger</h3>
+<p>A ledger needs multi-row atomic transactions (debit and credit together), unique constraints (the idempotency guarantee is literally a unique index), check constraints (<code>balance &gt;= 0</code>), strong consistency and ad hoc audit queries. That is the textbook case for a relational database with ACID transactions (<a href="../chapters/18-relational-internals.html">Chapter 18</a>), replicated synchronously (<a href="../chapters/24-replication.html">Chapter 24</a>) and sharded when one primary is not enough (<a href="../chapters/25-sharding.html">Chapter 25</a>). A key-value or document store would force us to rebuild uniqueness and atomicity in application code, which is exactly where money bugs hide. We use eventually consistent stores only for derived, rebuildable views: search indexes, analytics, and the history read model (<a href="../chapters/20-nosql.html">Chapter 20</a>).</p>
+
+<h3>5.2 Core tables</h3>
+<table>
+<tr><th>Table</th><th>Key columns</th><th>Notes</th></tr>
+<tr><td><code>accounts</code></td><td>account_id (PK), owner_id, currency, kind (user, system, transit, fee, bank), status, posted_balance, held_amount, version, allow_negative</td><td>The balance columns are a <b>cache of the ledger</b>, updated in the same transaction as the entries. A check constraint rejects negative <code>posted_balance - held_amount</code> unless <code>allow_negative</code>.</td></tr>
+<tr><td><code>ledger_transactions</code></td><td>txn_id (PK), transfer_id, kind, created_at, idempotency_ref</td><td>One balanced money event on one shard.</td></tr>
+<tr><td><code>ledger_entries</code></td><td>entry_id (PK), txn_id, account_id, amount (signed integer), currency, seq_in_account, created_at</td><td><b>Immutable, insert-only.</b> Entries of one txn_id sum to zero. Unique (account_id, seq_in_account) gives a gap-free per-account ordering.</td></tr>
+<tr><td><code>transfers</code></td><td>transfer_id (PK), from_account, to_account, amount, currency, state, leg1_txn, leg2_txn, created_at, version</td><td>The saga record for a transfer; its state machine is in section 7.3.</td></tr>
+<tr><td><code>holds</code></td><td>hold_id, account_id, amount, state (active, captured, released, expired), expires_at</td><td>Reserved funds. The sum of active holds equals <code>accounts.held_amount</code>.</td></tr>
+<tr><td><code>idempotency_keys</code></td><td>(client_id, key) unique, request_hash, status, response_code, response_body, transfer_id, locked_until</td><td>Dedupe table, written in the same transaction as the money movement where possible.</td></tr>
+<tr><td><code>outbox</code></td><td>id, topic, payload, created_at, published_at</td><td>Transactional outbox for events (<a href="../chapters/36-event-driven.html">Chapter 36</a>).</td></tr>
+<tr><td><code>external_movements</code></td><td>movement_id, kind (topup, withdrawal), provider, provider_ref, state, amount</td><td>Tracks calls to banks and processors, written before the call.</td></tr>
+<tr><td><code>recon_items</code></td><td>file_id, line_no, provider_ref, amount, matched_transfer, status</td><td>Reconciliation workspace (section 7.6).</td></tr>
+</table>
+
+<h3>5.3 Signed amounts and account kinds</h3>
+<p>To avoid confusion between accounting's "debit" and "credit" (which flip meaning between asset and liability accounts), this page uses <b>signed entries</b>: an entry carries a positive or negative integer, and the entries of one transaction sum to zero. For a user wallet, which is a liability account from our point of view, a positive entry means "we owe the user more". The system accounts are the other side of every movement: a <b>bank clearing</b> account representing the real cash we hold, <b>fee revenue</b>, and <b>transit</b> accounts for money in flight between shards. Money never enters or leaves the ledger without a balancing entry on one of these.</p>
+
+<h3>5.4 Sharding key</h3>
+<p>Shard by <b>account_id</b> (hash). An account's entries, balance, holds and sequence numbers live together on one shard so that "debit this account if funds suffice" is a local, single-row, strongly consistent operation. The cost, computed in section 3.3, is that most transfers touch two shards. We do not try to avoid that by clever placement; we design the protocol for it (section 7.3). Idempotency keys and the transfer record live on the sender's shard.</p>
+
+<h2 id="first-design">6. First design, then the scaled architecture</h2>
+
+<h3>6.1 The simple version</h3>
+<p>Start with one service and one relational database. A transfer is a single database transaction:</p>
+<pre><code>BEGIN;
+  SELECT balance FROM accounts WHERE id = :from FOR UPDATE;   -- lock sender
+  -- fail if balance &lt; amount
+  UPDATE accounts SET balance = balance - :amt WHERE id = :from;
+  UPDATE accounts SET balance = balance + :amt WHERE id = :to;
+  INSERT INTO ledger_entries ... (two rows);
+COMMIT;</code></pre>
+<p>This is correct for a small system, because one transaction gives atomicity, isolation and durability for free. It has four limits that the rest of the page repairs:</p>
+<ol>
+<li><b>Retries.</b> If the client times out and resends, the transfer happens twice. (Idempotency, section 7.1.)</li>
+<li><b>Deadlocks and hot rows.</b> Two transfers in opposite directions between the same pair lock rows in opposite orders and deadlock; a popular merchant's row becomes a serial bottleneck. (Lock ordering and sub-accounts, sections 7.1 and 8.)</li>
+<li><b>One machine.</b> 25 TB and 1,750 writes per second do not fit one primary. Sharding makes most transfers cross-shard, and a plain transaction no longer spans both accounts. (Sagas, section 7.3.)</li>
+<li><b>Mutable balance as truth.</b> Overwriting a balance loses history; a bug leaves no trace. (Append-only ledger, section 7.2, event sourcing, section 7.4.)</li>
+</ol>
+
+<h3>6.2 The scaled architecture</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 440" role="img" aria-label="Wallet and ledger architecture">
+  <rect class="ext" x="20" y="40" width="120" height="46" rx="10"/><text class="t-c t-b" x="80" y="68">Mobile / web</text>
+  <rect class="box" x="190" y="40" width="150" height="46" rx="10"/><text class="t-c t-b" x="265" y="60">Wallet API</text><text class="t-c t-sm" x="265" y="77">auth, limits, idem-key</text>
+  <rect class="box" x="400" y="40" width="170" height="60" rx="10"/><text class="t-c t-b" x="485" y="62">Transfer coordinator</text><text class="t-c t-sm" x="485" y="80">saga state machine</text>
+  <rect class="box" x="190" y="150" width="150" height="46" rx="10"/><text class="t-c t-b" x="265" y="170">Risk / limits</text><text class="t-c t-sm" x="265" y="187">velocity, KYC tier</text>
+  <rect class="db" x="400" y="150" width="80" height="60" rx="10"/><text class="t-c t-b" x="440" y="176">Shard 1</text><text class="t-c t-sm" x="440" y="194">ledger</text>
+  <rect class="db" x="490" y="150" width="80" height="60" rx="10"/><text class="t-c t-b" x="530" y="176">Shard 2</text><text class="t-c t-sm" x="530" y="194">ledger</text>
+  <rect class="db" x="400" y="225" width="170" height="40" rx="10"/><text class="t-c t-b" x="485" y="250">... Shard 16 (sync replicas)</text>
+  <rect class="cache" x="190" y="260" width="150" height="46" rx="10"/><text class="t-c t-b" x="265" y="280">Balance cache</text><text class="t-c t-sm" x="265" y="297">Redis, derived</text>
+  <rect class="cache" x="640" y="40" width="120" height="46" rx="10"/><text class="t-c t-b" x="700" y="60">Event bus</text><text class="t-c t-sm" x="700" y="77">outbox relay</text>
+  <rect class="box" x="640" y="130" width="120" height="46" rx="10"/><text class="t-c t-b" x="700" y="150">Projectors</text><text class="t-c t-sm" x="700" y="167">history, balances</text>
+  <rect class="db" x="640" y="220" width="120" height="46" rx="10"/><text class="t-c t-b" x="700" y="240">Read store</text><text class="t-c t-sm" x="700" y="257">statements, search</text>
+  <rect class="box" x="400" y="340" width="170" height="46" rx="10"/><text class="t-c t-b" x="485" y="360">Bank / PSP adapter</text><text class="t-c t-sm" x="485" y="377">top-up, withdrawal</text>
+  <rect class="ext" x="640" y="340" width="120" height="46" rx="10"/><text class="t-c t-b" x="700" y="360">Banks, PSPs</text><text class="t-c t-sm" x="700" y="377">external, slow</text>
+  <rect class="box" x="190" y="340" width="150" height="46" rx="10"/><text class="t-c t-b" x="265" y="360">Reconciler</text><text class="t-c t-sm" x="265" y="377">checks + file match</text>
+  <rect class="db" x="790" y="130" width="90" height="60" rx="10"/><text class="t-c t-b" x="835" y="156">Archive</text><text class="t-c t-sm" x="835" y="174">object store</text>
+  <path class="arrow" d="M140 63 L186 63"/>
+  <path class="arrow" d="M340 63 L396 63"/>
+  <path class="arrow dash" d="M265 86 L265 146"/>
+  <path class="arrow" d="M485 100 L485 146"/>
+  <path class="arrow dash" d="M400 180 L344 270"/>
+  <path class="arrow" d="M570 70 L636 63"/>
+  <path class="arrow" d="M700 86 L700 126"/>
+  <path class="arrow" d="M700 176 L700 216"/>
+  <path class="arrow dash" d="M760 150 L786 160"/>
+  <path class="arrow" d="M485 265 L485 336"/>
+  <path class="arrow dash" d="M570 363 L636 363"/>
+  <path class="arrow dash" d="M340 363 L396 363"/>
+  <path class="arrow dash" d="M265 340 L265 310"/>
+</svg>
+<figcaption>The Wallet API enforces idempotency and limits. The coordinator drives each transfer as a small saga over ledger shards. Shards own the truth; the balance cache, read store and archive are derived. An outbox relay feeds projectors. The adapter isolates slow external banks, and the reconciler checks everything from outside.</figcaption>
+</figure>
+
+<p>Walk the boxes once. The <b>Wallet API</b> is stateless and validates the request, authenticates the user, and checks limits through the risk hook before any money moves. The <b>transfer coordinator</b> is the only component that decides a transfer's progress; it can be a library running inside the API process or a separate workflow service (<a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>), but it always persists state before acting. The <b>ledger shards</b> are the system of record: each is a relational primary with synchronous replicas in two other zones. The <b>balance cache</b> accelerates reads but is never consulted for a spending decision. The <b>outbox relay</b> publishes events in order per account to the bus, <b>projectors</b> build history and statement views, and the <b>reconciler</b> compares our books with the world. The <b>adapter</b> holds all bank-specific code, so slow or failing banks never touch the ledger path.</p>
+
+<h3>6.3 Request flow: a same-shard transfer</h3>
+<p>When sender and receiver happen to share a shard (6% of transfers), the whole transfer is one local ACID transaction, the fast path.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Sequence diagram of a same-shard transfer">
+  <rect class="ext" x="20" y="10" width="110" height="30" rx="8"/><text class="t-c t-b" x="75" y="30">Client</text>
+  <rect class="box" x="210" y="10" width="120" height="30" rx="8"/><text class="t-c t-b" x="270" y="30">Wallet API</text>
+  <rect class="db" x="440" y="10" width="140" height="30" rx="8"/><text class="t-c t-b" x="510" y="30">Ledger shard</text>
+  <rect class="cache" x="700" y="10" width="140" height="30" rx="8"/><text class="t-c t-b" x="770" y="30">Event bus</text>
+  <line class="life" x1="75" y1="40" x2="75" y2="390"/><line class="life" x1="270" y1="40" x2="270" y2="390"/><line class="life" x1="510" y1="40" x2="510" y2="390"/><line class="life" x1="770" y1="40" x2="770" y2="390"/>
+  <path class="arrow" d="M75 70 L266 70"/><text class="t-sm" x="85" y="64">1. POST /transfers + key</text>
+  <path class="arrow" d="M270 100 L506 100"/><text class="t-sm" x="280" y="94">2. begin txn: insert idem-key row</text>
+  <path class="arrow" d="M270 135 L506 135"/><text class="t-sm" x="280" y="129">3. lock both accounts in id order</text>
+  <path class="arrow" d="M506 170 L510 170 L510 190"/><text class="t-sm" x="520" y="168">4. check available &gt;= amount + fee</text>
+  <text class="t-sm" x="520" y="190">5. insert 3 entries (sum = 0), update balances</text>
+  <text class="t-sm" x="520" y="210">6. insert transfer(completed) + outbox row</text>
+  <path class="arrow dash" d="M506 245 L274 245"/><text class="t-sm" x="300" y="239">7. COMMIT ok (sync replicas acked)</text>
+  <path class="arrow dash" d="M266 280 L79 280"/><text class="t-sm" x="95" y="274">8. 201 completed + balance</text>
+  <path class="arrow dash" d="M514 320 L766 320"/><text class="t-sm" x="560" y="314">9. relay publishes transfer.completed</text>
+  <text class="t-sm" x="85" y="368">A duplicate of step 1 hits the unique key in step 2 and returns the stored reply from step 8.</text>
+</svg>
+<figcaption>Steps 2 to 7 are one database transaction. If anything fails before the commit, nothing is visible. The event in step 9 is published after commit from the outbox, so a crash cannot lose it.</figcaption>
+</figure>
+
+<ol>
+<li>The client sends the request with an idempotency key. The API inserts the key row in the same transaction that will move money, so the key exists if and only if the effect happened (or is in progress).</li>
+<li>Both accounts are locked in a deterministic order (lower account id first). Fixed lock order is the standard cure for the opposite-direction deadlock described in section 6.1.</li>
+<li>The check <code>posted - held &gt;= amount + fee</code> runs while holding the lock, so two concurrent spends cannot both pass on stale data.</li>
+<li>Balanced entries are inserted, cached balances updated, the transfer recorded, and an outbox row written, all in one commit. The commit returns only after a synchronous replica has the data, so an acknowledged transfer survives losing the primary.</li>
+</ol>
+
+<h2 id="deep-dives">7. Deep dives</h2>
+
+<h3 id="idempotency">7.1 Idempotency and concurrency control</h3>
+
+<p>An idempotent operation has the same effect whether it runs once or many times. Networks cannot promise exactly-once delivery: a timeout tells the sender nothing about whether the receiver acted. So the client must be free to retry, and the server must make retries harmless. The mechanism is a unique key per business intent, repeated on every retry (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>).</p>
+
+<table>
+<tr><th>Situation</th><th>Behaviour</th></tr>
+<tr><td>Key never seen</td><td>Insert key row as <code>in_progress</code> in the transfer's own transaction. Do the work. Store response and mark <code>done</code> in the same commit.</td></tr>
+<tr><td>Key seen, <code>done</code>, same request hash</td><td>Return the stored status and body byte for byte. No new effect.</td></tr>
+<tr><td>Key seen, <code>in_progress</code></td><td>Concurrent duplicate. Return 409 with a retry hint. Never start a second execution.</td></tr>
+<tr><td>Key seen, different request hash</td><td>Reject with 422. The client reused a key for a different intent, which is a client bug worth surfacing.</td></tr>
+<tr><td>Key seen, saga <code>pending</code>, process died</td><td>The recovery worker resumes the saga from its persisted state (section 7.3); the retry just reads the current state.</td></tr>
+</table>
+
+<p>Uniqueness must come from a database unique index, never from "check, then insert" in code, because two concurrent retries would both pass the check. The loser of the insert race receives a constraint violation and takes the "in progress" path. Keys are scoped per client or per user, and kept for a window (for example 7 days); past that the transfer record itself, with a business-level reference, is the backstop.</p>
+
+<h4>Preventing overdraft under concurrency</h4>
+<p>The balance check and the debit must be one atomic step, otherwise two simultaneous spends of 80 dollars from a 100 dollar wallet both succeed. Three options exist, compared here:</p>
+<table>
+<tr><th>Approach</th><th>How it works</th><th>Tradeoff</th></tr>
+<tr><td>Pessimistic row lock</td><td><code>SELECT ... FOR UPDATE</code> on the account row, check, then update</td><td>Simple and correct. Serializes spends per account, which is fine because one user rarely spends concurrently. Needs fixed lock order to avoid deadlock.</td></tr>
+<tr><td>Conditional update</td><td><code>UPDATE accounts SET posted = posted - :amt WHERE id = :id AND posted - held &gt;= :amt</code>; zero rows updated means insufficient funds</td><td>One statement, no explicit lock round trip; the database takes the row lock internally for the update. Best default.</td></tr>
+<tr><td>Optimistic version check</td><td>Read balance and version, update <code>WHERE version = :v</code>, retry on conflict</td><td>Cheap when conflicts are rare, wasteful on hot accounts where retries pile up.</td></tr>
+</table>
+<p>We choose the <b>conditional update</b> for user accounts: the check and debit are one statement, and a database check constraint on <code>posted - held &gt;= 0</code> is a second line of defence that makes a negative balance impossible even if application code is wrong. Locks are always taken in account-id order when a transaction touches two rows.</p>
+
+<div class="callout key"><b>Key idea</b>
+"Exactly once" does not exist across a network. What we build is <b>at-least-once delivery plus idempotent effects</b>, which together give exactly-once <i>effects</i>: the money moves once even if requests, messages and recovery attempts repeat.
+</div>
+
+<h3 id="ledger">7.2 The double-entry, append-only ledger</h3>
+
+<p>The account row says what the balance is; the <b>ledger</b> says <i>why</i>. In double-entry bookkeeping every money event is recorded as two or more entries that sum to zero, so money is never created or destroyed in the books, only moved between accounts. If the sum over the whole system is ever nonzero, there is a bug, and one query finds it.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Ledger entries for a transfer with fee and for a later reversal">
+  <text class="t-b" x="20" y="24">Transfer: Alice sends 100.00 to Bob, sender pays a 1.00 fee</text>
+  <rect class="ext" x="20" y="40" width="190" height="36" rx="6"/><text class="t-c t-sm" x="115" y="63">Account</text>
+  <rect class="ext" x="210" y="40" width="110" height="36" rx="6"/><text class="t-c t-sm" x="265" y="63">Amount</text>
+  <rect class="box" x="20" y="76" width="190" height="36"/><text class="t-c t-sm" x="115" y="99">Alice wallet</text>
+  <rect class="box" x="210" y="76" width="110" height="36"/><text class="t-c t-sm" x="265" y="99">-101.00</text>
+  <rect class="box" x="20" y="112" width="190" height="36"/><text class="t-c t-sm" x="115" y="135">Bob wallet</text>
+  <rect class="box" x="210" y="112" width="110" height="36"/><text class="t-c t-sm" x="265" y="135">+100.00</text>
+  <rect class="box" x="20" y="148" width="190" height="36"/><text class="t-c t-sm" x="115" y="171">Fee revenue</text>
+  <rect class="box" x="210" y="148" width="110" height="36"/><text class="t-c t-sm" x="265" y="171">+1.00</text>
+  <text class="t-sm" x="20" y="208">Sum: -101.00 + 100.00 + 1.00 = 0. Balanced.</text>
+  <text class="t-sm" x="20" y="228">Wallets are liabilities: + means we owe the user more.</text>
+  <text class="t-sm" x="20" y="248">Top-up: bank clearing -100 (cash we hold), wallet +100.</text>
+  <text class="t-sm" x="20" y="268">(Signed convention; accountants say debit and credit.)</text>
+  <rect class="hit" x="380" y="40" width="500" height="140" rx="8"/>
+  <text class="t-b" x="396" y="64">Rules the ledger enforces</text>
+  <text class="t-sm" x="396" y="88">1. Per transaction, entries sum to zero (code check + DB constraint trigger).</text>
+  <text class="t-sm" x="396" y="108">2. Insert-only: the app role has no UPDATE or DELETE on entries.</text>
+  <text class="t-sm" x="396" y="128">3. Mistakes are fixed by a new reversing transaction, never by edits.</text>
+  <text class="t-sm" x="396" y="148">4. Unique (transfer_id, leg) makes a replayed step inert.</text>
+  <text class="t-sm" x="396" y="168">5. Entries per account carry a gap-free sequence number.</text>
+  <rect class="cache" x="380" y="200" width="500" height="120" rx="8"/>
+  <text class="t-b" x="396" y="224">Reversal of the fee later is a new transaction</text>
+  <text class="t-sm" x="396" y="248">Fee revenue -1.00, Alice wallet +1.00, reason: support refund.</text>
+  <text class="t-sm" x="396" y="268">Original three entries stay exactly as written.</text>
+  <text class="t-sm" x="396" y="288">Balance = last snapshot + sum of later entries.</text>
+</svg>
+<figcaption>A transfer with a fee writes three balanced entries. A correction is a second balanced transaction that references the first, so history shows both the original and the fix.</figcaption>
+</figure>
+
+<h4>Why immutability</h4>
+<ul>
+<li><b>Audit.</b> An auditor can replay the ledger from the first row and arrive at every balance on every date. If rows could be edited, "what was the balance on March 3rd" would be unknowable.</li>
+<li><b>Concurrency.</b> Inserts to a table do not conflict with each other the way repeated updates to one row do. The only contention point is the cached balance row, which we keep deliberately thin.</li>
+<li><b>Tamper evidence.</b> A buggy job or an attacker with write access cannot quietly rewrite history; at most it adds visible entries. Each entry can also carry a hash of the previous entry of that account (a hash chain), and daily account digests can be stored somewhere write-once, so tampering is detectable.</li>
+<li><b>Replication and replay.</b> An append-only log ships cleanly to a warehouse, and any derived state can be rebuilt from it.</li>
+</ul>
+
+<h4>Balance as derived data</h4>
+<p>The cached <code>posted_balance</code> on the account row is updated in the same transaction as the entries, so it is exact at commit time. It is still <i>derived</i>: a nightly job recomputes each account's balance from its entries (or from the last verified snapshot plus later entries) and any mismatch pages an engineer. Without the cache every spend would sum millions of rows; without the nightly check a bug in the cache update would go unnoticed. We keep both.</p>
+
+<h4>Holds</h4>
+<p>A hold reserves money without moving it. Creating a hold increases <code>held_amount</code> (and a <code>holds</code> row) inside one transaction that checks <code>available &gt;= amount</code>. Capturing it converts the reserved amount into a real transfer (partial capture releases the remainder); releasing or expiring it decrements <code>held_amount</code>. No ledger entries are written for a hold itself, because no money moved, but the hold row and its state changes are audited. Expiry is driven by a scheduler (<a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>), and capture after expiry must fail, so the capture transaction checks hold state under lock.</p>
+
+<h3 id="cross-shard">7.3 Cross-shard transfers: saga with transit accounts</h3>
+
+<p>With 16 shards, about 94% of transfers cross shards, and a relational transaction cannot span two independent databases without a distributed commit protocol. This is the question an interviewer most wants you to reason about, so compare the options first.</p>
+
+<table>
+<tr><th>Option</th><th>How</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>A. One big database</td><td>No sharding; scale up the primary</td><td>Simplest; local ACID for every transfer</td><td>Hits a ceiling (25 TB, write throughput); one failure domain; very costly last 20%. Fine as the phase 1 design.</td></tr>
+<tr><td>B. Two-phase commit (XA) across shards</td><td>Coordinator asks both shards to prepare, then commit</td><td>Atomic on paper</td><td>Locks held across network round trips; coordinator crash can leave in-doubt transactions blocking rows; throughput and availability both drop as shards multiply (<a href="../chapters/31-distributed-transactions.html">Chapter 31</a>).</td></tr>
+<tr><td>C. Saga with per-shard transit accounts</td><td>Two local transactions, linked by a persisted transfer state, with a compensating reversal</td><td>Each step is a cheap local ACID transaction; no cross-shard locks; resumable after crashes; scales linearly</td><td>An intermediate state is visible (money in transit); needs careful idempotency and compensation (<a href="../chapters/48-sagas.html">Chapter 48</a>).</td></tr>
+<tr><td>D. Dedicated ledger engine</td><td>A purpose-built, replicated state machine for balances and two-phase transfers (TigerBeetle is one such open-source ledger database)</td><td>Very high throughput; transfer semantics built in</td><td>Newer technology, another system to operate; worth evaluating at large scale rather than as the first answer.</td></tr>
+</table>
+
+<p>We choose <b>C</b>. The key trick is the <b>transit account</b>. Every shard holds a system account representing "money that has left a wallet on this shard and not yet arrived". Each leg of the transfer is then <i>balanced by itself on its own shard</i>, so every shard's ledger sums to zero at all times, even mid-saga.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 480" role="img" aria-label="Sequence diagram of a cross-shard transfer saga with a compensation path">
+  <rect class="box" x="20" y="10" width="140" height="30" rx="8"/><text class="t-c t-b" x="90" y="30">Coordinator</text>
+  <rect class="db" x="300" y="10" width="170" height="30" rx="8"/><text class="t-c t-b" x="385" y="30">Shard A (Alice)</text>
+  <rect class="db" x="580" y="10" width="170" height="30" rx="8"/><text class="t-c t-b" x="665" y="30">Shard B (Bob)</text>
+  <line class="life" x1="90" y1="40" x2="90" y2="470"/><line class="life" x1="385" y1="40" x2="385" y2="470"/><line class="life" x1="665" y1="40" x2="665" y2="470"/>
+  <path class="arrow" d="M90 70 L90 78 L94 78"/><text class="t-sm" x="104" y="76">1. persist transfer T: state=initiated (sender shard)</text>
+  <path class="arrow" d="M90 110 L381 110"/><text class="t-sm" x="100" y="104">2. leg 1 (key T:1)</text>
+  <text class="t-sm" x="400" y="128">Alice -101, TransitOut +100, Fee +1; state=debited</text>
+  <path class="arrow dash" d="M381 150 L94 150"/><text class="t-sm" x="150" y="144">3. leg 1 done</text>
+  <path class="arrow" d="M90 190 L661 190"/><text class="t-sm" x="100" y="184">4. leg 2 (key T:2): credit Bob</text>
+  <text class="t-sm" x="684" y="208">TransitIn -100, Bob +100</text>
+  <path class="arrow dash" d="M661 230 L94 230"/><text class="t-sm" x="150" y="224">5. leg 2 done</text>
+  <path class="arrow" d="M90 270 L381 270"/><text class="t-sm" x="100" y="264">6. mark T completed; outbox event</text>
+  <rect class="miss" x="20" y="300" width="860" height="170" rx="8"/>
+  <text class="t-b" x="36" y="324">Failure path: step 4 is rejected for good (Bob's account closed or limit exceeded)</text>
+  <path class="arrow-r" d="M661 350 L94 350"/><text class="t-sm" x="150" y="344" style="fill:var(--bad)">4b. leg 2 rejected, permanent</text>
+  <path class="arrow-r" d="M90 390 L381 390"/><text class="t-sm" x="100" y="384" style="fill:var(--bad)">4c. compensate (key T:C)</text>
+  <text class="t-sm" x="400" y="408">TransitOut -100, Alice +101 (fee refunded); state=reversed</text>
+  <text class="t-sm" x="36" y="440">If step 4 merely times out, the coordinator retries the same key T:2 and never compensates until it knows.</text>
+  <text class="t-sm" x="36" y="460">Crash anywhere: a recovery worker reloads T from its shard and resumes at the recorded state.</text>
+</svg>
+<figcaption>Each leg is a balanced local transaction guarded by its own idempotency key. The saga record on the sender's shard tells recovery where to resume. A permanent rejection of leg 2 triggers a compensating transaction that returns the money.</figcaption>
+</figure>
+
+<p>Step by step, with the reasoning:</p>
+<ol>
+<li><b>Persist intent first.</b> The transfer record is written (state <code>initiated</code>) before anything moves, so a crash at any later point leaves a durable record that recovery can find.</li>
+<li><b>Leg 1, on the sender's shard,</b> is one local transaction: check and debit Alice (conditional update), credit the shard's <i>TransitOut</i> account, credit the fee account, advance the state to <code>debited</code>. Money has now left Alice and is parked in a system account. It cannot be spent twice because it is no longer in her balance.</li>
+<li><b>Leg 2, on the receiver's shard,</b> is one local transaction: debit that shard's <i>TransitIn</i> account, credit Bob. It is keyed <code>T:2</code>, so a retry after a timeout is inert and returns the original outcome.</li>
+<li><b>Completion:</b> mark the transfer <code>completed</code> and emit an event.</li>
+<li><b>Compensation:</b> if leg 2 is rejected permanently (a real "no", not a timeout), run a reversing leg on shard A that undoes leg 1. Compensation is a <i>new</i> balanced transaction, not an undo; the ledger shows the original debit and the reversal.</li>
+</ol>
+
+<p>The invariant that makes this auditable: <b>summed across all shards, TransitOut accounts plus TransitIn accounts equal the total amount of transfers currently in flight</b>, and equal zero when none are. A reconciler (section 7.6) checks this every few minutes; a transfer stuck in <code>debited</code> for longer than a threshold is pushed forward or compensated and alerts a human if neither is possible.</p>
+
+<h4>The transfer state machine</h4>
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Transfer state machine">
+  <rect class="box" x="20" y="40" width="120" height="44" rx="22"/><text class="t-c t-b" x="80" y="67">initiated</text>
+  <rect class="box" x="210" y="40" width="120" height="44" rx="22"/><text class="t-c t-b" x="270" y="67">debited</text>
+  <rect class="hit" x="400" y="40" width="130" height="44" rx="22"/><text class="t-c t-b" x="465" y="67">completed</text>
+  <rect class="miss" x="20" y="170" width="120" height="44" rx="22"/><text class="t-c t-b" x="80" y="197">failed</text>
+  <rect class="cache" x="210" y="170" width="120" height="44" rx="22"/><text class="t-c t-b" x="270" y="197">reversing</text>
+  <rect class="miss" x="400" y="170" width="130" height="44" rx="22"/><text class="t-c t-b" x="465" y="197">reversed</text>
+  <path class="arrow" d="M140 62 L206 62"/>
+  <path class="arrow" d="M330 62 L396 62"/>
+  <path class="arrow-r" d="M80 84 L80 166"/>
+  <path class="arrow-r" d="M270 84 L270 166"/>
+  <path class="arrow" d="M330 192 L396 192"/>
+  <text class="t-sm" x="560" y="52">initiated to debited: leg 1 committed.</text>
+  <text class="t-sm" x="560" y="72">debited to completed: leg 2 committed.</text>
+  <text class="t-sm" x="560" y="92">initiated to failed: leg 1 refused</text>
+  <text class="t-sm" x="560" y="108">(insufficient funds, limits). Nothing moved.</text>
+  <text class="t-sm" x="560" y="128">debited to reversing: leg 2 refused for good.</text>
+  <text class="t-sm" x="560" y="148">reversing to reversed: compensation committed.</text>
+  <text class="t-sm" x="560" y="178">Terminal: completed, failed, reversed.</text>
+  <text class="t-sm" x="560" y="198">No path from completed except a new refund transfer.</text>
+  <text class="t-sm" x="20" y="250">Every transition is a compare-and-set on the transfer version, and appends an audit event.</text>
+</svg>
+<figcaption>The saga's persisted state. There is deliberately no automatic path out of <code>completed</code>; undoing a finished transfer is a new, separate transfer, so the history is never rewritten.</figcaption>
+</figure>
+
+<div class="callout watch"><b>Watch out</b>
+Never treat a timeout on leg 2 as a rejection. If leg 2 actually committed and you compensate leg 1, Alice gets her money back <i>and</i> Bob keeps his: you have created money. Only a definite answer from the receiver's shard (a stored rejection) justifies compensation; otherwise retry with the same key, and escalate to a human if the shard is down for long.
+</div>
+
+<h3 id="event-sourcing">7.4 Event sourcing and derived views</h3>
+
+<p><b>Event sourcing</b> means the durable truth is an append-only sequence of facts ("account A credited 100 by transfer T"), and current state is computed by replaying them. A double-entry ledger is already close to this: entries are the facts, balances are the replayed state. The design question is how far to push it, and how to serve reads that a replay-only model serves badly.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Command side writes entries, projectors build read views, snapshots shorten replay">
+  <rect class="box" x="20" y="100" width="130" height="60" rx="10"/><text class="t-c t-b" x="85" y="126">Command</text><text class="t-c t-sm" x="85" y="144">validate, decide</text>
+  <rect class="db" x="210" y="80" width="200" height="100" rx="10"/><text class="t-c t-b" x="310" y="106">Ledger shard</text><text class="t-c t-sm" x="310" y="126">entries (append-only)</text><text class="t-c t-sm" x="310" y="144">+ cached balance row</text><text class="t-c t-sm" x="310" y="162">+ outbox, one txn</text>
+  <rect class="cache" x="470" y="100" width="120" height="60" rx="10"/><text class="t-c t-b" x="530" y="126">Event stream</text><text class="t-c t-sm" x="530" y="144">ordered per account</text>
+  <rect class="box" x="650" y="20" width="230" height="56" rx="10"/><text class="t-c t-b" x="765" y="44">Balance cache projector</text><text class="t-c t-sm" x="765" y="62">fast reads, rebuildable</text>
+  <rect class="box" x="650" y="100" width="230" height="56" rx="10"/><text class="t-c t-b" x="765" y="124">History / statement view</text><text class="t-c t-sm" x="765" y="142">paged, searchable</text>
+  <rect class="box" x="650" y="180" width="230" height="56" rx="10"/><text class="t-c t-b" x="765" y="204">Analytics / fraud features</text><text class="t-c t-sm" x="765" y="222">warehouse, streaming</text>
+  <rect class="hit" x="210" y="220" width="200" height="56" rx="10"/><text class="t-c t-b" x="310" y="244">Snapshots</text><text class="t-c t-sm" x="310" y="262">balance at seq N, verified</text>
+  <path class="arrow" d="M150 130 L206 130"/>
+  <path class="arrow" d="M410 130 L466 130"/>
+  <path class="arrow" d="M590 120 L646 56"/><path class="arrow" d="M590 130 L646 128"/><path class="arrow" d="M590 140 L646 204"/>
+  <path class="arrow dash" d="M310 180 L310 216"/>
+</svg>
+<figcaption>Writes go through one transactional path. Everything the user reads is a projection of the ordered event stream and can be rebuilt by replay. Snapshots bound how many entries a replay must read.</figcaption>
+</figure>
+
+<table>
+<tr><th>Option</th><th>Description</th><th>Tradeoff</th></tr>
+<tr><td>State plus entries (chosen)</td><td>A mutable balance row updated atomically with immutable entries; the entries are the audit truth, and events go out via outbox</td><td>Fast, simple spends with strong checks; two representations to keep consistent, which the nightly recompute guards.</td></tr>
+<tr><td>Pure event sourcing</td><td>Only the event log is stored; balance is a replay (plus snapshot) every time</td><td>Single source of truth and elegant replay, but every spend must read and fold events under concurrency control, and read models are always eventually consistent, which complicates "check funds now".</td></tr>
+<tr><td>Mutable balance only</td><td>Update the number, keep no history</td><td>Fastest to build. Unauditable; rejected.</td></tr>
+</table>
+
+<p>We take the hybrid on purpose: the spend decision reads the transactional balance row (strong, local, one statement), while history, statements, notifications, analytics and search are <b>projections</b> built by consumers of the event stream. Consequences to state: projections lag by a second or two, so the app overlays "pending" items from the write path right after a transfer (read-your-writes, <a href="../chapters/28-cap-consistency.html">Chapter 28</a>); projectors are idempotent (they store the last applied sequence number per account and skip repeats); and any projection can be dropped and rebuilt from entries or the archived stream (<a href="../chapters/37-batch-stream.html">Chapter 37</a>, <a href="../chapters/36-event-driven.html">Chapter 36</a>). <b>Snapshots</b> store a verified balance at a given per-account sequence number, so recomputing a balance reads only entries after the snapshot rather than the account's whole life.</p>
+
+<p>The gap-free per-account sequence number deserves a sentence: it lets a projector detect a missing event (it sees sequence 41 after 39) and refetch rather than silently skip, and it lets reconciliation prove completeness. Ordering is guaranteed per account (events of one account are in one partition keyed by account id, <a href="../chapters/34-queues-kafka.html">Chapter 34</a>), not globally, and that is enough, because nobody needs a global order of unrelated accounts (<a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>).</p>
+
+<h3 id="external">7.5 Top-ups, withdrawals and currencies</h3>
+
+<p>Everything above is internal and fully under our control. Top-ups and withdrawals touch banks and processors, which are slow, asynchronous and sometimes wrong, so they get a pending state and a two-step ledger pattern.</p>
+
+<ul>
+<li><b>Top-up from a card or bank debit.</b> Create an <code>external_movements</code> row (written before the call), call the provider with an idempotency key derived from our movement id, and wait for a result or webhook. On confirmation, one balanced ledger transaction credits the wallet and debits the bank clearing account. Until confirmed, the user sees a pending item and cannot spend it. Bank debits can be returned days later (insufficient funds at the source), so for risky users we credit only after settlement, or credit early up to a limit and accept the risk, claw back via a reversing entry if the debit fails.</li>
+<li><b>Withdrawal.</b> The reverse, with the order of operations reversed for safety: first <i>reserve</i> the money (a hold, or a debit into a "withdrawals in flight" system account), then instruct the bank, then finalize on confirmation. If the bank rejects, release or reverse. Debiting before sending prevents spending the same funds twice. Never send the bank instruction first and debit afterwards, because a crash between them gives away money.</li>
+<li><b>Unknown outcome.</b> A bank API timeout is unknown, not failed. We retry with the same provider key or query by our reference, with exponential backoff and jitter (<a href="../chapters/40-resilience.html">Chapter 40</a>), and bound the uncertainty with a "needs review" state, exactly the discipline of <a href="c14-payment-system.html">Case study 14</a>. Withdrawals, being irreversible once the bank has paid, additionally have a second-approval rule above a threshold.</li>
+</ul>
+
+<h4>Currencies</h4>
+<p>Each account holds one currency, and a ledger transaction balances <b>per currency</b>. A conversion is an explicit transaction pair through FX clearing accounts: the USD side debits the user's USD wallet and credits FX clearing USD; the EUR side debits FX clearing EUR and credits the user's EUR wallet, with the rate, its source and timestamp recorded. The FX clearing balances are the platform's currency position, visible as gain or loss. Amounts use each currency's exponent from a currency table (JPY has 0 decimal places, most have 2, some have 3), never an assumed two. Rounding follows a documented rule (typically half-even on the converted amount).</p>
+
+<h3 id="recon">7.6 Reconciliation and invariant checking</h3>
+
+<p>Even with all of the above, reality disagrees with the books sometimes: a bank file shows a return we never heard of, a deploy had a bug, an operator fixed something by hand. <b>Reconciliation</b> is the independent process that proves, rather than assumes, that the books are right. It has two halves: internal invariants and external matching.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="Reconciliation: internal invariants and external matching">
+  <rect class="db" x="20" y="40" width="190" height="70" rx="10"/><text class="t-c t-b" x="115" y="68">Ledger shards</text><text class="t-c t-sm" x="115" y="88">entries, balances, transit</text>
+  <rect class="ext" x="20" y="150" width="190" height="60" rx="10"/><text class="t-c t-b" x="115" y="176">Bank statements</text><text class="t-c t-sm" x="115" y="194">cash, safeguarding</text>
+  <rect class="ext" x="20" y="250" width="190" height="60" rx="10"/><text class="t-c t-b" x="115" y="276">Processor reports</text><text class="t-c t-sm" x="115" y="294">top-up and payout files</text>
+  <rect class="box" x="280" y="30" width="200" height="130" rx="10"/><text class="t-c t-b" x="380" y="54">Internal invariants</text><text class="t-c t-sm" x="380" y="76">sum of all entries = 0</text><text class="t-c t-sm" x="380" y="94">balance = sum(entries)</text><text class="t-c t-sm" x="380" y="112">transit total = in-flight</text><text class="t-c t-sm" x="380" y="130">no user balance &lt; 0</text><text class="t-c t-sm" x="380" y="148">gap-free sequences</text>
+  <rect class="box" x="280" y="190" width="200" height="120" rx="10"/><text class="t-c t-b" x="380" y="214">External matcher</text><text class="t-c t-sm" x="380" y="236">key: provider_ref, then</text><text class="t-c t-sm" x="380" y="254">amount + date + account</text><text class="t-c t-sm" x="380" y="272">wallet liabilities vs</text><text class="t-c t-sm" x="380" y="290">cash held</text>
+  <rect class="hit" x="580" y="40" width="300" height="60" rx="10"/><text class="t-c t-b" x="730" y="66">Clean: close the period</text><text class="t-c t-sm" x="730" y="86">store signed digest</text>
+  <rect class="miss" x="580" y="130" width="300" height="80" rx="10"/><text class="t-c t-b" x="730" y="156">Exceptions</text><text class="t-c t-sm" x="730" y="176">missing, extra, amount differs,</text><text class="t-c t-sm" x="730" y="194">duplicate, stuck in transit</text>
+  <rect class="cache" x="580" y="240" width="300" height="70" rx="10"/><text class="t-c t-b" x="730" y="266">Fix = new ledger transaction</text><text class="t-c t-sm" x="730" y="286">auto rule or ticket + approval</text>
+  <path class="arrow" d="M210 75 L276 90"/><path class="arrow" d="M210 180 L276 230"/><path class="arrow" d="M210 280 L276 270"/><path class="arrow dash" d="M115 110 L115 146"/>
+  <path class="arrow-g" d="M480 80 L576 70"/><path class="arrow-r" d="M480 250 L576 180"/>
+  <path class="arrow" d="M730 210 L730 236"/>
+  <text class="t-sm" x="280" y="345">Fast checks run every few minutes; the full recompute and file match run nightly. Match rate is an SLO.</text>
+</svg>
+<figcaption>Internal invariants prove the ledger is self-consistent; the external matcher proves it agrees with banks and processors. Disagreements become exceptions, resolved by new balanced transactions.</figcaption>
+</figure>
+
+<p><b>Internal invariants</b> are cheap and powerful. The sum of every entry in the ledger is zero. Each account's cached balance equals the sum of its entries. The sum of transit accounts equals the value of in-flight transfers. No user balance is negative. Sequence numbers have no gaps. A violated invariant is not a ticket; it is an incident, because it means money is being created or destroyed.</p>
+<p><b>External matching</b> normalizes bank and processor files into one format and matches each line to our records by provider reference, then by amount, date and account for the leftovers. The most important wallet-specific check is <b>liabilities versus cash</b>: the sum of all user wallet balances must not exceed the cash we hold in the safeguarded bank accounts (plus funds in transit). The exception types name the bug: <i>in the bank file, not in ours</i> means a missed webhook or a crash after calling the bank; <i>in ours, not in the file</i> means a movement we recorded that did not happen (or has not settled yet); <i>amount mismatch</i> points to fees or currency; <i>duplicate in the file</i> is a real double movement that slipped past every earlier defence. Fixes are always new ledger transactions that reference the exception, so reconciliation leaves its own audit trail.</p>
+
+<h2 id="scaling">8. Scaling, bottlenecks and hot spots</h2>
+
+<table>
+<tr><th>Concern</th><th>Choice</th><th>Reason</th></tr>
+<tr><td>Stateless tier</td><td>API and coordinator instances scale horizontally behind a load balancer (<a href="../chapters/09-load-balancing.html">Chapter 9</a>)</td><td>All state is in the shards, so any instance serves any request.</td></tr>
+<tr><td>Ledger sharding</td><td>Hash of account_id across 16 shards, each a primary with two synchronous replicas in separate zones (<a href="../chapters/24-replication.html">Chapter 24</a>, <a href="../chapters/25-sharding.html">Chapter 25</a>)</td><td>Account-local operations stay on one shard; capacity is 16 × about 500 = 8,000 transfers per second, far above the 1,750 peak.</td></tr>
+<tr><td>Resharding</td><td>Use a fixed number of virtual buckets (for example 1,024) mapped to physical shards through a directory; move buckets when adding shards</td><td>Account placement never changes, only the bucket-to-shard map, so growth is a data move, not a rehash of everything.</td></tr>
+<tr><td>Hot accounts</td><td>Split into N sub-accounts (for example 16); a transfer touching the logical account picks one sub-account at random, balance reads sum them</td><td>A popular merchant, or the fee revenue account that every transfer credits, would otherwise serialize on one row.</td></tr>
+<tr><td>Fee account contention</td><td>Do not credit the fee account in the user's transaction at all: write the fee to a per-shard "fees pending" sub-account, and sweep it to the global fee account in batch</td><td>Removes the single most contended row in the system from the critical path.</td></tr>
+<tr><td>Balance reads</td><td>Cache derived balances in Redis (about 5 GB total), refreshed by projectors and invalidated or overwritten on each commit (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>); the app shows pending overlays</td><td>11,600 reads per second at peak need not touch the primaries. The cache is never used for an authorize decision.</td></tr>
+<tr><td>History reads</td><td>Read store (wide-column or search-backed) keyed by account and time, built by projectors</td><td>Cursor pagination over a derived view; the ledger primaries are not queried for browsing.</td></tr>
+<tr><td>Event publishing</td><td>Bus partitioned by account_id (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>)</td><td>Ordering per account for projectors without global ordering cost.</td></tr>
+<tr><td>Rate limiting</td><td>Per user, per device and per IP at the gateway (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>)</td><td>Throttles abuse, brute-force and card-testing style probing.</td></tr>
+</table>
+
+<h3>8.1 Consistency choices</h3>
+<p>Within a shard we have strong, serializable-enough behaviour for the balance check, entries, transfer record and outbox. Across shards we accept <b>eventual consistency with explicit states</b>: for a short time (typically tens of milliseconds) money sits in a transit account and the transfer says <code>pending</code>. Toward the outside world we give <b>read-your-writes</b> for the user who made a change and bounded staleness elsewhere. In the language of <a href="../chapters/28-cap-consistency.html">Chapter 28</a>, the money path is CP: if a shard's primary is unreachable we refuse to guess and return an error, rather than let an unverifiable balance be spent. Only the derived views are AP-ish.</p>
+
+<h3>8.2 Multi-region</h3>
+<p>Wallets are normally <b>active-passive per shard with a home region per account</b>: concurrent writes to one balance from two regions would permit "both regions spent the last 10 dollars", and a ledger cannot merge such conflicts (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>, <a href="../chapters/41-ha-dr.html">Chapter 41</a>). Shoppers and read views can be served locally; the money write routes to the account's home region. A standby region replicates synchronously (or near-synchronously with a documented loss window, which finance must accept) and failover is rehearsed. Data-residency law may pin an account's data to a country. Cross-region transfers use the same saga, with legs on the two home regions and the same transit-account discipline.</p>
+
+<h2 id="failures">9. Failure modes</h2>
+
+<table>
+<tr><th>What fails</th><th>What happens</th><th>Mitigation</th></tr>
+<tr><td>Client times out and retries</td><td>Same idempotency key arrives again</td><td>Unique key returns the stored reply or "in progress"; no second transfer.</td></tr>
+<tr><td>API instance dies mid-request</td><td>Key row may be in progress, transfer may be mid-saga</td><td>Transaction rolls back if before commit; otherwise the persisted saga state is resumed by recovery workers.</td></tr>
+<tr><td>Coordinator crashes between leg 1 and leg 2</td><td>Money sits in transit; the transfer is <code>debited</code></td><td>Recovery sweeper finds transfers older than a few seconds in non-terminal states and re-drives them with the same leg keys.</td></tr>
+<tr><td>Receiver's shard slow or down</td><td>Leg 2 cannot commit</td><td>Retry with backoff and jitter; the transfer stays <code>pending</code> and the sender sees pending. After a long outage, compensate only if a definite rejection or operator decision exists; alert on stuck-in-transit age.</td></tr>
+<tr><td>Leg 2 commits but its reply is lost</td><td>Coordinator is unsure</td><td>Retry with key <code>T:2</code>; the shard returns the original result. This is why leg keys are derived from the transfer id.</td></tr>
+<tr><td>Shard primary fails</td><td>Writes to its accounts stop</td><td>Promote a synchronous replica (no acknowledged commit lost); clients get 503 or pending meanwhile and retry with the same keys. Other shards are unaffected, which bounds the blast radius to about 1/16 of users.</td></tr>
+<tr><td>Replica lag</td><td>Reads from a replica show an old balance</td><td>Spend decisions use the primary only; replica or cache reads are display-only and labelled with an as-of time.</td></tr>
+<tr><td>Balance cache wrong or lost</td><td>Wrong number shown</td><td>Cache is derived: refill from the shard; nightly recompute compares cache, row and entries.</td></tr>
+<tr><td>Bank API timeout on withdrawal</td><td>Unknown whether money left</td><td>Funds were already reserved; retry with the same provider key or query by reference; bounded retries, then review; reconciliation settles the rest.</td></tr>
+<tr><td>Duplicate or late bank webhook</td><td>Possible double-credit</td><td>Inbox table unique on provider event id; state machine accepts only forward transitions; ledger unique per (movement, step).</td></tr>
+<tr><td>Outbox relay or bus down</td><td>History and notifications lag</td><td>Outbox rows accumulate durably; money still moves; relay catches up; alert on outbox age.</td></tr>
+<tr><td>Projector bug</td><td>Wrong statement shown</td><td>Fix and rebuild the projection by replay; the ledger was never wrong.</td></tr>
+<tr><td>Ledger invariant violated</td><td>Money created or destroyed in the books</td><td>DB constraints block it at write time; invariant monitors page immediately; freeze affected accounts; fix only through reversing transactions with approval.</td></tr>
+<tr><td>Risk service down</td><td>No fraud score</td><td>Policy fixed in advance: fail closed above a configured amount, fail open with tight local velocity limits below it; record that the check was skipped.</td></tr>
+<tr><td>Clock skew</td><td>Misordered events across machines</td><td>Order by per-account sequence numbers and database sequences, not wall clocks (<a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>).</td></tr>
+<tr><td>Operator mistake or insider fraud</td><td>Manual adjustment is wrong or malicious</td><td>Adjustments are ledger transactions requiring two-person approval, tagged with the actor and reason; alerts on unusual manual entries.</td></tr>
+</table>
+
+<h2 id="security">10. Security, abuse, monitoring and cost</h2>
+
+<h3>10.1 Security and abuse</h3>
+<ul>
+<li><b>Authentication and authorization:</b> strong user authentication with step-up (one-time code or biometric) for risky actions such as adding a bank account, large transfers, or a new device. A caller may only debit accounts they own; the check is in the service, not just the UI (<a href="../chapters/55-security.html">Chapter 55</a>).</li>
+<li><b>Fraud and limits:</b> per-user daily and monthly limits by KYC tier, velocity rules (many small transfers to new payees), device and IP signals, and a synchronous risk hook that returns allow, deny or review within a budget of about 100 ms. Account-takeover patterns (new device, then immediate withdrawal) trigger holds.</li>
+<li><b>Least privilege at the database:</b> the application role can insert entries and update the balance row but cannot update or delete entries; separate roles for support (masked, read-only) and for migrations. Ledger-affecting configuration changes need two-person approval.</li>
+<li><b>Encryption and secrets:</b> TLS everywhere (<a href="../chapters/03-networking-essentials.html">Chapter 3</a>), encryption at rest, bank credentials in a secrets vault with rotation. Bank account numbers and tokens are stored encrypted or tokenized; the wallet never stores raw card numbers (the card processor does, keeping us out of the heaviest card-data compliance scope).</li>
+<li><b>Privacy:</b> personal data is separated from ledger entries (entries reference an opaque account id), so a deletion request can erase personal fields while the financial record, which has a legal retention requirement, stays (<a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>).</li>
+<li><b>Replay and tampering:</b> request signing and short timestamp windows on sensitive endpoints, nonce checks on withdrawals, and signature plus timestamp verification on inbound bank webhooks, with a re-fetch of critical state from the provider rather than trusting the body.</li>
+</ul>
+
+<h3>10.2 Monitoring and SLOs</h3>
+<p>Per <a href="../chapters/54-observability-slos.html">Chapter 54</a>, pick indicators tied to money:</p>
+<ul>
+<li><b>Transfer success rate</b> excluding legitimate refusals (insufficient funds, limits): 99.95%.</li>
+<li><b>Latency:</b> same-shard transfer p99 under 150 ms; cross-shard p99 under 400 ms; balance read p99 under 50 ms.</li>
+<li><b>Stuck transfers:</b> count and maximum age of transfers in <code>debited</code> or <code>reversing</code> (target: none older than 1 minute; alert at 5 minutes).</li>
+<li><b>Ledger invariant violations:</b> must be zero always; any occurrence pages immediately.</li>
+<li><b>Outbox lag</b> under 5 seconds; <b>projection lag</b> p99 under 5 seconds.</li>
+<li><b>Reconciliation auto-match rate</b> above 99.9%; <b>liabilities-to-cash coverage</b> at or above 100% at every check.</li>
+<li><b>Business alerts:</b> sudden drop in top-up success per bank, spike in idempotency conflicts with differing bodies, spike in insufficient-funds refusals on one shard. Traces carry the transfer id and idempotency key through every hop (<a href="../chapters/52-microservice-observability.html">Chapter 52</a>).</li>
+</ul>
+
+<h3>10.3 Cost</h3>
+<p>Infrastructure is modest. Sixteen shards, each with a primary and two replicas on modest memory-heavy machines, plus a Redis cluster and an event bus, is a few hundred thousand dollars per year in cloud spend at this scale, depending on provider and hardware. The dominant costs are elsewhere: bank and processor fees per top-up and withdrawal (often a fixed amount plus a percentage, so a few cents to a couple of percent), fraud losses, compliance and audit work, and engineering time. Practical levers: batch withdrawals to cut per-payout fees, push users toward cheaper rails (bank transfer over card), archive cold entries and events to object storage, and avoid over-sharding, because every extra shard raises cross-shard saga cost.</p>
+
+<h2 id="evolution">11. Evolution, phasing and alternatives</h2>
+
+<h3>11.1 What to build first</h3>
+<ol>
+<li><b>Phase 1:</b> one database, local ACID transfers as in section 6.1 plus idempotency keys, the double-entry append-only ledger with constraints, the nightly invariant check, and a single bank integration with a webhook inbox. Retrofitting idempotency and double entry later is painful, so these are day-one features. A single well-provisioned primary handles this scale of product for a long time.</li>
+<li><b>Phase 2:</b> outbox and event bus, projections for history and statements, balance cache, holds, automated daily reconciliation, risk hook.</li>
+<li><b>Phase 3:</b> sharding by account with the transit-account saga, virtual buckets, hot-account sub-accounts, multi-currency and FX, second bank, multi-region standby with failover drills.</li>
+<li><b>At 10x scale (300 million transfers per day, about 17,500 per second at peak):</b> go from 16 to about 128 shards (the virtual-bucket map makes this a data move), push per-shard throughput with batching (group many transfers into one commit, which dramatically raises throughput when disk sync dominates), evaluate a dedicated ledger engine (option D in section 7.3), build streaming reconciliation instead of nightly batch (<a href="../chapters/37-batch-stream.html">Chapter 37</a>), and adopt cell-based isolation so a failure hits a fraction of users (<a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>).</li>
+</ol>
+
+<h3>11.2 Alternatives not chosen</h3>
+<table>
+<tr><th>Alternative</th><th>Why not</th></tr>
+<tr><td>Two-phase commit across shards</td><td>Holds locks over network round trips, blocks on coordinator failure, and scales poorly; sagas with transit accounts get the atomicity we need from local transactions.</td></tr>
+<tr><td>Mutable balance as the only source of truth</td><td>No history, hidden bugs, lost updates; unauditable.</td></tr>
+<tr><td>Pure event sourcing for the spend path</td><td>Elegant but makes "check funds now" depend on folding events under concurrency; we keep a transactional balance row and use events for derived views.</td></tr>
+<tr><td>Eventually consistent NoSQL for the ledger</td><td>No multi-row atomicity or unique constraints, our core safety tools (<a href="../chapters/20-nosql.html">Chapter 20</a>).</td></tr>
+<tr><td>Sharding by transfer id</td><td>Spreads writes but scatters one account's entries across all shards, making balance checks distributed; sharding by account keeps the critical check local.</td></tr>
+<tr><td>Blockchain or distributed-ledger technology</td><td>A permissioned database with an append-only table and hash chain gives the audit properties we need without consensus overhead among parties who already trust a single operator; the regulator and the bank are the counterparties, not peers on a chain.</td></tr>
+</table>
+
+<h2 id="qa">12. Interview Q&amp;A</h2>
+
+<details><summary>How do you guarantee a transfer is applied exactly once?</summary>
+<p>We cannot get exactly-once delivery from a network, so we build at-least-once with idempotent effects. The client sends a unique idempotency key, and the API inserts it into a table with a unique index in the same transaction that moves money. A retry hits the constraint and gets the stored response instead of a second movement. Internally, each saga leg has a key derived from the transfer id (for example T:1 and T:2) with a unique constraint, so recovery re-driving a leg is inert. Consumers of events keep a last-applied sequence number, so duplicate deliveries change nothing.</p>
+</details>
+
+<details><summary>Why a double-entry ledger instead of just updating two balance columns?</summary>
+<p>Double entry makes every transaction self-checking: entries sum to zero, so money cannot appear or vanish without a visible imbalance. Because entries are append-only, we can reconstruct any balance at any past moment, which auditors and regulators require, and inserts do not suffer the lost-update problem of repeatedly overwriting one row. Corrections are reversing transactions, so history shows both the mistake and the fix. We still keep a cached balance column for fast spend checks, but it is derived and verified nightly against the entries.</p>
+</details>
+
+<details><summary>Most transfers cross shards. How do you keep them atomic without two-phase commit?</summary>
+<p>We split the transfer into two local transactions linked by a persisted saga record. Leg 1 on the sender's shard debits the sender and credits a transit account on that shard, balanced by itself. Leg 2 on the receiver's shard debits that shard's transit account and credits the receiver. Each leg has its own idempotency key and survives crashes via a recovery worker that resumes from the stored state. If leg 2 is rejected for good, a compensating transaction returns the money. Intermediate "pending" is visible briefly, but no money is lost or created, and a global invariant on transit accounts proves it.</p>
+</details>
+
+<details><summary>Leg 2 times out. Do you compensate?</summary>
+<p>No. A timeout means the outcome is unknown, and compensating while leg 2 may have committed would pay the money out twice, once to the receiver and once back to the sender. We retry leg 2 with the same key, which either returns the original committed result or performs it once. We compensate only on a definite, stored rejection or an explicit operator decision, and meanwhile alert on the age of transfers stuck in transit. The same rule applies to external bank calls: unknown is a state, not a failure.</p>
+</details>
+
+<details><summary>How do you prevent two concurrent spends from overdrawing a wallet?</summary>
+<p>The balance check and the debit must be one atomic step. We use a conditional update, <code>UPDATE ... SET posted = posted - amt WHERE id = ? AND posted - held &gt;= amt</code>, and treat zero updated rows as insufficient funds. The database serializes concurrent updates on the same row, so the second spend sees the reduced balance. A check constraint that the available balance is non-negative is a backstop even if application code is wrong. When a transaction touches two accounts we lock in a fixed order to avoid deadlocks. Cached balances are never used for this decision.</p>
+</details>
+
+<details><summary>How would you handle a very hot account, such as a platform fee account or a huge merchant?</summary>
+<p>The ledger inserts are cheap; the contention comes from the single cached balance row every transaction must update. We split a hot logical account into N sub-accounts (say 16), pick one at random per transaction, and sum them on read, using snapshots to keep that cheap. For the fee account we go further: the fee goes to a per-shard pending sub-account and a batch job sweeps it to the main account, so the user transaction never touches the global hot row. User wallets need overdraft protection and stay as single rows, which is fine because one person rarely spends concurrently.</p>
+</details>
+
+<details><summary>What does reconciliation check, and why do you need it if the system is idempotent and transactional?</summary>
+<p>Idempotency and transactions defend against failures we anticipated. Reconciliation catches the ones we did not: a bank return we never received, a bug in a deploy, a manual fix gone wrong. Internally it verifies invariants: all entries sum to zero, each cached balance equals the sum of its entries, transit totals equal in-flight transfers, and no user is negative. Externally it matches our records with bank and processor files by provider reference, and checks that total wallet liabilities do not exceed the safeguarded cash. Differences become exceptions fixed by new balanced entries, which also leaves an audit trail. The match rate is itself a health metric.</p>
+</details>
+
+<details><summary>Where does event sourcing fit, and what are its costs?</summary>
+<p>The ledger entries are already an event log, and we emit events through a transactional outbox so that history, statements, notifications and analytics are projections that can be rebuilt by replay. We deliberately do not make the spend decision a pure replay. It reads a transactional balance row so the check is strong and local, while read models are eventually consistent. The costs are projection lag (mitigated by showing pending overlays right after a write), the need for idempotent projectors using per-account sequence numbers, and snapshots to bound replay time. In return we get cheap new views and the ability to repair a bad projection without touching the ledger.</p>
+</details>
+
+<details><summary>How do you add or remove shards without downtime?</summary>
+<p>Accounts hash into a fixed number of virtual buckets, say 1,024, and a directory maps buckets to physical shards. Adding capacity moves some buckets to a new shard: copy the bucket's rows, stream changes until caught up, briefly pause writes for just that bucket, flip the directory entry, and resume. Account placement by bucket never changes, so nothing is rehashed. In-flight sagas keep their leg keys, and routing looks up the current owner at each retry, so a leg retried after a move simply goes to the new shard.</p>
+</details>
+
+<details><summary>How do you design a withdrawal so money is never lost or paid twice?</summary>
+<p>Order matters. First reserve the funds with a hold or a debit into a withdrawals-in-flight system account, all in a local transaction, so the user cannot spend them again. Then write an external-movement row, then call the bank with an idempotency key derived from that row. If the call times out we retry with the same key or query by our reference, never assume failure. On confirmation we finalize the ledger, moving the money from in-flight to the bank clearing account. If the bank rejects, we release the hold or reverse the debit. Reconciliation against the bank statement is the last check, and large amounts need a second approval.</p>
+</details>
+
+<details><summary>What would you do differently if wallets were not backed by real money, for example loyalty points?</summary>
+<p>The architecture stays the same because the failure modes (double spend, lost update, audit) are the same, but several requirements loosen. There is no bank reconciliation and no safeguarding rule, so the external half of reconciliation shrinks to internal invariants. Multi-currency and FX mostly vanish. Latency and availability targets can lean toward availability, and regional active-active with conflict policies becomes more conceivable for low-value balances, though many programs still require exact accounting for liability and breakage reporting. I would still keep the append-only ledger and idempotency, since they are cheap and prevent expensive disputes.</p>
+</details>
+
+<h2 id="recap-sec">13. Connects to and recap</h2>
+
+<p class="connects"><b>Connects to:</b> the interview approach in <a href="../chapters/01-interview-framework.html">Chapter 1</a> and estimation in <a href="../chapters/02-estimation.html">Chapter 2</a>; API conventions in <a href="../chapters/05-api-design.html">Chapter 5</a>; relational transactions in <a href="../chapters/18-relational-internals.html">Chapter 18</a>, replication in <a href="../chapters/24-replication.html">Chapter 24</a>, sharding in <a href="../chapters/25-sharding.html">Chapter 25</a> and multi-region in <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>; time and ordering in <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a> and consistency in <a href="../chapters/28-cap-consistency.html">Chapter 28</a>; distributed transactions in <a href="../chapters/31-distributed-transactions.html">Chapter 31</a>; idempotency and ids in <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>; queues in <a href="../chapters/34-queues-kafka.html">Chapter 34</a>, event-driven patterns in <a href="../chapters/36-event-driven.html">Chapter 36</a> and batch and stream processing in <a href="../chapters/37-batch-stream.html">Chapter 37</a>; resilience in <a href="../chapters/40-resilience.html">Chapter 40</a>; sagas in <a href="../chapters/48-sagas.html">Chapter 48</a>; observability in <a href="../chapters/54-observability-slos.html">Chapter 54</a> and security in <a href="../chapters/55-security.html">Chapter 55</a>. Related worked solutions: <a href="c14-payment-system.html">Payment system</a> (PSP integration, unknown outcomes) and <a href="c15-ticket-booking.html">Ticket booking</a> (holds and double-booking).</p>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>A wallet balance is a liability and a <b>summary of immutable ledger entries</b>, not a number we edit. The ledger is double-entry: each transaction's signed entries sum to zero, entries are insert-only, and mistakes are fixed by reversing transactions.</li>
+<li>Scale is moderate (about 347 transfers per second average, 1,750 at peak, about 9 TB per year); correctness is the hard part. 16 shards by account give headroom, but about 94% of transfers then cross shards.</li>
+<li>Idempotency keys with a unique index, scoped per client and written in the money transaction, make retries harmless; leg keys derived from the transfer id do the same inside sagas. At-least-once delivery plus idempotent effects gives exactly-once effects.</li>
+<li>Prevent overdraft with an atomic conditional update plus a check constraint, fixed lock order for two-account transactions, and holds that reserve funds without moving them.</li>
+<li>Cross-shard transfers are sagas: persist the transfer first, run balanced local legs through per-shard transit accounts, resume after crashes, and compensate only on a definite rejection. A timeout is unknown, never failure.</li>
+<li>Spend decisions read the transactional balance on the primary; history, statements and analytics are event-sourced projections that can lag and be rebuilt. Snapshots and gap-free per-account sequences make replay and verification cheap.</li>
+<li>Top-ups and withdrawals touch slow external banks: reserve before sending, record before calling, retry with provider keys, and let webhooks and reconciliation settle unknowns.</li>
+<li>Reconciliation proves the books: internal invariants (sum zero, balance equals entries, transit equals in-flight, no negatives) plus matching with bank files and liabilities-versus-cash coverage. Fixes are new ledger transactions.</li>
+<li>Hot accounts get sub-accounts and batched sweeps; growth uses virtual buckets; failures are contained to a shard; the money path is CP and refuses to guess.</li>
+</ul></div>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

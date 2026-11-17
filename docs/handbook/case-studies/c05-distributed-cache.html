@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 05: Design a Distributed Cache | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c05-distributed-cache">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 05 · Worked solutions</div>
+<h1>Design a Distributed Cache</h1>
+<p class="lead">We design a shared in-memory cache service in the style of Memcached or a Redis cluster: many servers that together hold hundreds of millions of hot objects, so that the databases behind them see only a small fraction of the traffic. The hard parts are not "put and get". They are spreading keys without reshuffling everything, surviving node failures, stopping stampedes and hot keys, and keeping cached data close enough to the truth.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is "design a distributed cache". That is broad on purpose. A strong candidate does not start drawing boxes; they first narrow it down by asking questions, as laid out in <a href="../chapters/01-interview-framework.html">Chapter 1</a>. A cache sits in front of a slower, more durable store (a database, a service) and keeps copies of recently or frequently used data in memory. "Distributed" means one machine is not enough, either because the data does not fit in the memory of one machine, or because one machine cannot serve the request rate.</p>
+
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>Who are the clients?</td><td>Internal backend services (a few hundred services, thousands of application instances). Not browsers.</td></tr>
+<tr><td>Is it a cache or a database?</td><td>A cache. Losing any entry must be safe, because the source of truth is a database. We never promise durability.</td></tr>
+<tr><td>Which data model?</td><td>Key to value, with an optional time to live (TTL). Values are opaque bytes up to 1 MB. A few simple server-side structures (counters) are nice to have, not required.</td></tr>
+<tr><td>Who populates it?</td><td>The application (cache-aside, see <a href="../chapters/13-caching-patterns.html">Chapter 13</a>). The cache itself does not talk to databases, except for an optional invalidation feed.</td></tr>
+<tr><td>Scale?</td><td>About 1.5 million operations per second at peak, one billion live keys, average value around 1 KB.</td></tr>
+<tr><td>Latency target?</td><td>Server-side p99 under 2 ms; client-observed p99 under 5 ms within a data center.</td></tr>
+<tr><td>Availability?</td><td>99.99%. But "available" has a special meaning here: a cache outage must degrade the system, not take it down (section 14).</td></tr>
+<tr><td>Consistency?</td><td>Eventual with a bounded staleness. Reads may be stale by at most a few seconds in the normal case; we avoid stale data being stuck forever.</td></tr>
+<tr><td>Multi-tenant?</td><td>Yes. Many teams share the service, so we need isolation of memory and request rate (section 12).</td></tr>
+<tr><td>Multi-region?</td><td>Each region runs its own independent cluster. Cross-region invalidation is a stretch topic (section 15).</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements</h2>
+<h3>2.1 Functional</h3>
+<ul>
+<li><b>get / multi-get:</b> fetch one or many keys. Multi-get matters because a single web request often needs 20 to 100 objects.</li>
+<li><b>set / add / delete:</b> store with a TTL, store only if absent (<code>add</code>, useful for locks and leases), remove.</li>
+<li><b>compare-and-set:</b> store only if the entry has not changed since I read it (a version token). This is how we avoid some write races.</li>
+<li><b>increment/decrement:</b> atomic counters (rate counters, view counts).</li>
+<li><b>TTL and eviction:</b> expired entries disappear; when memory is full the least valuable entries are dropped automatically.</li>
+<li><b>Namespaces per tenant</b> with quotas.</li>
+</ul>
+<h3>2.2 Non-functional</h3>
+<ul>
+<li><b>Low latency:</b> sub-millisecond in the server, one network hop on the read path.</li>
+<li><b>High hit rate:</b> 97 to 99% of reads should be answered from memory. The hit rate is the product's real quality metric, because every miss costs a database read.</li>
+<li><b>Horizontal scalability:</b> add nodes to add capacity, with only a small fraction of keys moving.</li>
+<li><b>Fault tolerance:</b> a node can die without a visible error burst and without crushing the database.</li>
+<li><b>Operability:</b> clear metrics, safe resizing, rolling upgrades.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Durable storage (that is a database, see <a href="../chapters/20-nosql.html">Chapter 20</a> and the key-value store in <a href="c04-key-value-store.html">case study 4</a>), strong consistency across cache and database, cross-key transactions, secondary indexes, and query languages. Where a feature would pull us toward being a database, we say no, because a cache that tries to be a database is worse at both jobs.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>We do the arithmetic from <a href="../chapters/02-estimation.html">Chapter 2</a> and let it drive decisions. The numbers below are used consistently for the rest of the page.</p>
+<h3>3.1 Traffic</h3>
+<ul>
+<li>Peak: 1.5 million ops/s. Average over the day is about 40% of peak, so roughly 600,000 ops/s.</li>
+<li>Read to write ratio of 20:1. Peak reads = 1.5M × 20/21 ≈ 1.43M reads/s. Peak writes (sets and deletes) ≈ 71,000/s.</li>
+<li>Target hit rate 98%. Misses = 2% × 1.43M ≈ 28,600 reads/s reach the databases, plus each miss triggers one cache fill, so fills ≈ 28,600 sets/s of the 71,000 total writes. The rest (about 42,000/s) are update-driven deletes and sets.</li>
+<li>If the hit rate fell to 90%, misses would be 143,000/s, five times more. A database sized for 40,000 reads/s would fall over. This is why the hit rate is a first-class SLO and why a cold cluster is dangerous (section 11).</li>
+</ul>
+<h3>3.2 Memory</h3>
+<ul>
+<li>Average entry: key 50 bytes + value 1,000 bytes + per-item metadata (hash chain pointer, LRU pointers, expiry, flags, CAS id; memcached uses about 48 to 56 bytes) ≈ 1,100 bytes.</li>
+<li>One billion keys × 1,100 B = 1.1 TB of raw data.</li>
+<li>Slab allocator internal waste and hash table overhead add about 15% (section 8.1): 1.1 TB × 1.15 ≈ 1.27 TB. Round to 1.3 TB, and plan to run at about 85% full so there is room for growth, giving about 1.5 TB of memory in total.</li>
+<li>Node choice: 64 GB machines, 52 GB given to the cache (the remainder for OS, network buffers, fork copy-on-write headroom and the process itself). 1.5 TB ÷ 52 GB ≈ 29 primaries. We use <b>32 shards</b> (a power of two, tidy for operations). Each primary holds about 1.3 TB ÷ 32 ≈ 41 GB of data, which is 79% of its 52 GB: some headroom.</li>
+<li>Each shard has one replica, so there are 64 nodes. Memory is not the cost driver for the replica question: replicas double the bill but halve the risk (section 9).</li>
+</ul>
+<h3>3.3 Per-node load and bandwidth</h3>
+<ul>
+<li>1.5M ops/s ÷ 32 ≈ 47,000 ops/s per primary on average. A single-threaded Redis process handles on the order of 100,000 simple ops/s; a multi-threaded Memcached handles several hundred thousand. So the request rate is comfortable; <b>hot keys, not average load, are the risk</b> (section 7).</li>
+<li>Bandwidth: 1.5M × 1.1 KB ≈ 1.65 GB/s in total, about 13 Gbit/s across the whole cluster and about 52 MB/s (0.4 Gbit/s) per primary. Fine for 10 Gbit NICs. Multi-gets of big batches can produce bursts, but the average is small.</li>
+<li>Connections: 4,000 application instances × 32 shards × 4 connections each = 512,000 connections in total, or 16,000 per node. That is manageable for an event-driven server but a good reason for client-side pooling or a proxy tier (section 13).</li>
+</ul>
+<h3>3.4 What the numbers tell us</h3>
+<ul>
+<li>Capacity is dominated by memory, so the key design question is memory efficiency: the allocator, the eviction policy and the item overhead.</li>
+<li>Request rate per node is modest, so we can afford an extra hop (proxy) if it buys us operability.</li>
+<li>The database is sized for the miss traffic, about 29,000 reads/s. Anything that multiplies misses (node loss, resize, cold start, stampede) is the main threat.</li>
+</ul>
+
+<h2 id="api">4. API design</h2>
+<p>We offer a small binary or text protocol, in the spirit of the Memcached protocol or the Redis RESP protocol (see <a href="../chapters/15-redis.html">Chapter 15</a>). The logical API, which a client library wraps:</p>
+<pre>get(ns, key)                           -> { value, flags, cas, ttl_remaining } | MISS | LEASE(token) | STALE(value, token)
+get_multi(ns, [key...])                -> map key -> same result as get
+set(ns, key, value, ttl, flags)        -> STORED
+add(ns, key, value, ttl)               -> STORED | EXISTS      (only if absent)
+cas(ns, key, value, ttl, cas_token)    -> STORED | EXISTS | NOT_FOUND
+lease_set(ns, key, value, ttl, token)  -> STORED | REJECTED   (token must still be valid)
+delete(ns, key)                        -> DELETED | NOT_FOUND
+touch(ns, key, ttl)                    -> TOUCHED              (extend TTL without moving the value)
+incr(ns, key, delta)                   -> new value
+stats / admin: slots, migrate, drain, flush(ns)</pre>
+<p>Notes on the choices. The <code>ns</code> (namespace) is the tenant or keyspace; it is part of the stored key so two tenants can use the same key text. <code>get</code> can return a <b>lease</b> or a <b>stale</b> value; these two outcomes implement stampede protection and are explained in section 7. <code>touch</code> exists because rewriting a 500 KB value just to extend its life wastes bandwidth. Every response includes the remaining TTL so a client can decide whether to refresh early. There is no "list all keys" or "scan by pattern" in the public API: it would hold up a node and encourage using the cache as a database.</p>
+
+<h2 id="data-model">5. Data model and storage choice</h2>
+<p>Each shard is a hash table in memory. A table entry points to an item; an item holds the key, the value bytes, expiry time, flags, a version number (the CAS id) and the pointers the eviction algorithm needs. There is no disk on the hot path. We choose memory because the latency target (sub-millisecond) and the request rate are far beyond what a disk-based store gives at this cost; a cache is explicitly a place where the price per read operation matters more than the price per gigabyte. Options for the server software:</p>
+<table>
+<tr><th>Option</th><th>Strengths</th><th>Weaknesses</th><th>Use here?</th></tr>
+<tr><td>Memcached</td><td>Simple, multi-threaded, very predictable memory (slab allocator), tiny per-item overhead, huge operational record</td><td>No replication or persistence built in, only strings, clustering is entirely client or proxy side</td><td>Good fit for pure caching at scale</td></tr>
+<tr><td>Redis (cluster mode)</td><td>Rich structures, built-in replication, failover and slot-based sharding, optional persistence</td><td>Single-threaded command execution per process (I/O threads help), larger per-item overhead, fork-based snapshots need memory headroom</td><td>Good when you want replication and failover out of the box</td></tr>
+<tr><td>Build our own</td><td>Tailored to the workload</td><td>Years of engineering for allocator, networking and bugs</td><td>No. In an interview, build on one of the above and explain its internals</td></tr>
+</table>
+<p>We design the service as a <b>cluster of Redis-or-Memcached-like shard processes</b> plus a thin control plane, and where the two products differ we say so. The sharding and routing logic can be written once for both. The data lives only in RAM; the source of truth is always the database, which is why we can tolerate losing a node. Tools for the database side are in <a href="../chapters/17-data-modeling.html">Chapter 17</a> and <a href="../chapters/24-replication.html">Chapter 24</a>.</p>
+
+<h2 id="simple">6. A first simple design, then the scaled architecture</h2>
+<h3>6.1 One box</h3>
+<p>Start with one cache server (say a 64 GB machine running Redis or Memcached). Application servers use cache-aside: read the cache; on a miss read the database and fill the cache. This already gives 100,000 or more ops/s and one hop. What breaks as we grow:</p>
+<ol>
+<li><b>Memory:</b> 1.3 TB does not fit on one machine.</li>
+<li><b>Request rate:</b> 1.5M ops/s exceeds one process, and one NIC.</li>
+<li><b>Single point of failure:</b> if the one box dies, 100% of reads go to the database and it collapses.</li>
+<li><b>Blast radius:</b> a restart empties the cache.</li>
+</ol>
+<p>So we shard (spread keys over many nodes), replicate (a second copy for failover), and add a control plane to know who owns what.</p>
+<h3>6.2 The scaled architecture</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Distributed cache high level architecture">
+  <rect class="ext" x="20" y="40" width="170" height="60" rx="10"/><text class="t-c t-b" x="105" y="66">App instances</text><text class="t-c t-sm" x="105" y="84">with cache client library</text>
+  <rect class="ext" x="20" y="150" width="170" height="60" rx="10"/><text class="t-c t-b" x="105" y="176">Near-cache</text><text class="t-c t-sm" x="105" y="194">in-process, tiny, 1 s TTL</text>
+  <path class="arrow dash" d="M105 100 L105 148"/>
+
+  <rect class="box" x="270" y="60" width="150" height="70" rx="10"/><text class="t-c t-b" x="345" y="88">Proxy tier</text><text class="t-c t-sm" x="345" y="106">optional, stateless</text><text class="t-c t-sm" x="345" y="120">pools and routes</text>
+  <path class="arrow" d="M190 70 L266 85"/>
+  <path class="arrow dash" d="M190 180 L230 180 L230 120 L266 110"/>
+
+  <rect class="cache" x="520" y="30" width="150" height="46" rx="8"/><text class="t-c t-b" x="595" y="58">Shard 1 primary</text>
+  <rect class="cache" x="520" y="90" width="150" height="46" rx="8"/><text class="t-c t-b" x="595" y="118">Shard 2 primary</text>
+  <rect class="cache" x="520" y="150" width="150" height="46" rx="8"/><text class="t-c t-b" x="595" y="178">... Shard 32</text>
+  <rect class="hit" x="710" y="30" width="150" height="46" rx="8"/><text class="t-c t-b" x="785" y="58">Shard 1 replica</text>
+  <rect class="hit" x="710" y="90" width="150" height="46" rx="8"/><text class="t-c t-b" x="785" y="118">Shard 2 replica</text>
+  <rect class="hit" x="710" y="150" width="150" height="46" rx="8"/><text class="t-c t-b" x="785" y="178">... replica 32</text>
+  <path class="arrow-g" d="M670 53 L706 53"/><path class="arrow-g" d="M670 113 L706 113"/><path class="arrow-g" d="M670 173 L706 173"/>
+  <text class="t-sm" x="640" y="214">async replication</text>
+  <path class="arrow" d="M420 85 L516 53"/><path class="arrow" d="M420 95 L516 113"/><path class="arrow" d="M420 105 L516 173"/>
+
+  <rect class="ext" x="270" y="270" width="190" height="60" rx="10"/><text class="t-c t-b" x="365" y="296">Config / control plane</text><text class="t-c t-sm" x="365" y="314">slot map, health, resize</text>
+  <path class="arrow dash" d="M300 270 L330 134"/><path class="arrow dash" d="M460 290 L610 200"/>
+  <rect class="db" x="560" y="290" width="150" height="60" rx="10"/><text class="t-c t-b" x="635" y="316">Databases</text><text class="t-c t-sm" x="635" y="334">source of truth</text>
+  <rect class="ext" x="740" y="290" width="130" height="60" rx="10"/><text class="t-c t-b" x="805" y="316">Change feed</text><text class="t-c t-sm" x="805" y="334">binlog / CDC</text>
+  <path class="arrow dash" d="M740 320 L714 320"/>
+  <path class="arrow dash" d="M105 210 L105 355 L556 325"/><text class="t-sm" x="150" y="372">miss: app reads the DB, then fills the cache</text>
+  <path class="arrow dash" d="M805 290 L805 200"/><text class="t-sm" x="815" y="250">invalidate</text>
+</svg>
+<figcaption>Clients (through an optional proxy tier) route each key to one of 32 shards. Each shard has an asynchronous replica. A control plane owns the slot map. Databases remain the source of truth, and a change feed deletes stale entries.</figcaption>
+</figure>
+<p>The pieces: a <b>client library</b> that knows how to find the right shard; an optional <b>proxy tier</b> (in the style of mcrouter or Twemproxy for memcached, or Envoy's Redis proxy) that pools connections and hides topology; <b>shard processes</b> in primary and replica pairs; a <b>control plane</b> (a small consensus-backed service or the gossip inside Redis Cluster, see <a href="../chapters/29-consensus.html">Chapter 29</a> and <a href="../chapters/33-gossip-merkle.html">Chapter 33</a>) that publishes the slot map and promotes replicas; and a <b>change feed</b> from the databases for invalidation (section 10).</p>
+
+<h3>6.3 Request flow: read</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="Read path sequence: near-cache, proxy, shard, database">
+  <rect class="ext" x="30" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="85" y="32">App</text>
+  <rect class="box" x="230" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="285" y="32">Client lib</text>
+  <rect class="cache" x="460" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="515" y="32">Shard</text>
+  <rect class="db" x="720" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="775" y="32">Database</text>
+  <line class="life" x1="85" y1="44" x2="85" y2="370"/><line class="life" x1="285" y1="44" x2="285" y2="370"/><line class="life" x1="515" y1="44" x2="515" y2="370"/><line class="life" x1="775" y1="44" x2="775" y2="370"/>
+  <path class="arrow" d="M85 70 L281 70"/><text class="t-sm" x="100" y="64">1 get(user:42)</text>
+  <text class="t-sm" x="295" y="92">2 near-cache check, then hash key to slot to shard</text>
+  <path class="arrow" d="M285 108 L511 108"/><text class="t-sm" x="330" y="102">3 GET over pooled connection</text>
+  <path class="arrow-g" d="M511 140 L289 140"/><text class="t-sm" x="330" y="134" style="fill:var(--good)">4a HIT: value (done, about 1 ms)</text>
+  <path class="arrow-r" d="M511 180 L289 180"/><text class="t-sm" x="320" y="174" style="fill:var(--bad)">4b MISS: LEASE(token) (first caller only)</text>
+  <path class="arrow" d="M285 220 L771 220"/><text class="t-sm" x="420" y="214">5 SELECT ... (only the lease holder)</text>
+  <path class="arrow" d="M771 252 L289 252"/><text class="t-sm" x="520" y="246">6 row</text>
+  <path class="arrow" d="M285 290 L511 290"/><text class="t-sm" x="330" y="284">7 lease_set(key, value, ttl, token)</text>
+  <path class="arrow" d="M281 330 L89 330"/><text class="t-sm" x="110" y="324">8 return value to app</text>
+  <text class="t-sm" x="520" y="360">Other callers during step 5 receive a short wait-and-retry or a stale value.</text>
+</svg>
+<figcaption>Read path. A hit returns after one network hop. A miss hands exactly one caller a lease to fetch from the database and fill the cache; other callers do not pile onto the database.</figcaption>
+</figure>
+<h3>6.4 Request flow: write</h3>
+<ol>
+<li>The application writes the new value to the <b>database first</b> (the database is the source of truth).</li>
+<li>After the database commit, the application issues <code>delete(key)</code> to the cache (not "set the new value"; section 10 explains why delete is safer).</li>
+<li>Independently, the change feed from the database also emits a delete for the key, which repairs the case where the application crashed between steps 1 and 2 or where another system wrote to the database.</li>
+<li>The next reader misses, takes a lease, loads the fresh row and refills the cache.</li>
+</ol>
+<h2 id="stampede-hot">7. Deep dive: stampedes and hot keys</h2>
+<p>Two problems turn a healthy cache into an outage. Both are covered in general terms in <a href="../chapters/14-caching-failures.html">Chapter 14</a>; here we decide exactly what our service does about them.</p>
+
+<h3>7.1 The stampede (thundering herd)</h3>
+<p>A <b>stampede</b> happens when a popular entry disappears (its TTL expires, it is evicted, or it is deleted by an invalidation) and many clients ask for it in the same instant. Every one of them sees a miss, and every one of them runs the same expensive database query. Suppose one key is read 50,000 times per second and the query takes 40 ms. In the 40 ms before the first refill lands, about 50,000 × 0.04 = 2,000 requests all miss and all hit the database for the same row. If the query is heavy, the database slows down, the refill takes even longer, more requests pile up, and the slowdown feeds itself.</p>
+<p>We use four layered defenses.</p>
+<ol>
+<li><b>Leases (server side).</b> On a miss, the shard does not just say "miss". It hands the first caller a <i>lease</i>: a unique token meaning "you are the one allowed to fill this key". It remembers the token. Later callers for the same key within a short window (say 10 seconds) get either a "wait and retry in a few milliseconds" answer or, if we kept one, a stale value. Only the holder may call <code>lease_set</code> with the token. This is the mechanism described in Facebook's Memcache paper, and it also solves a second problem: if a <code>delete</code> arrives while the lease is out, the shard invalidates the token, so a slow filler cannot write an old value after a newer delete (section 10).</li>
+<li><b>Single-flight (client side).</b> Inside one application process, concurrent requests for the same missing key share one in-flight load. The first thread runs the loader; the others wait on its result. This cuts duplicate work by the number of threads per instance, and it does not need any server support.</li>
+<li><b>Stale-while-revalidate.</b> We store each value with a soft expiry earlier than its hard expiry. For example the hard TTL is 10 minutes, the soft TTL is 9 minutes. Between 9 and 10 minutes the shard returns the old value flagged as stale and gives one caller a lease to refresh it in the background. Users see no latency spike, and the database sees one query.</li>
+<li><b>TTL jitter.</b> If a million keys are all loaded at 09:00 with a 1-hour TTL, they all expire at 10:00 together. Adding a random +/-10% to every TTL spreads expiry over six minutes.</li>
+</ol>
+<div class="callout key"><b>Key idea</b> A lease turns "N callers all do the work" into "one caller does the work, N-1 wait a few milliseconds or accept slightly old data". The shard is the right place to decide who is first, because it is the only place that sees every caller.</div>
+<p>Sometimes the database is the thing in trouble, so we also add a global cap: each tenant has a ceiling on lease grants per second, and clients apply <a href="../chapters/40-resilience.html">circuit breaking and load shedding</a> to loaders, so a stampede across many different keys (a "dogpile" rather than a single hot key) is bounded too.</p>
+
+<h3>7.2 Hot keys</h3>
+<p>Consistent hashing spreads <i>keys</i> evenly, not <i>load</i>. A single celebrity profile, a feature flag read on every request, or a viral product can receive 200,000 reads per second. All of them hash to the same shard, and that shard's CPU (or single thread, in Redis) and NIC saturate while 31 other shards are idle. Adding shards does not help, because the key still lives on exactly one of them.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Hot key handling: near-cache and key replicas">
+  <text class="t-b" x="20" y="22">Without protection</text>
+  <rect class="ext" x="20" y="40" width="140" height="44" rx="8"/><text class="t-c t-b" x="90" y="67">4,000 app instances</text>
+  <rect class="miss" x="330" y="34" width="170" height="56" rx="8"/><text class="t-c t-b" x="415" y="58">Shard 7</text><text class="t-c t-sm" x="415" y="76">hot key: 200k reads/s</text>
+  <path class="arrow-r" d="M160 62 L326 62"/>
+  <text class="t-sm" x="530" y="66">saturated, tail latency rises for every key on this shard</text>
+
+  <text class="t-b" x="20" y="130">With a near-cache (in each client)</text>
+  <rect class="ext" x="20" y="148" width="140" height="44" rx="8"/><text class="t-c t-b" x="90" y="175">App instance</text>
+  <rect class="hit" x="190" y="148" width="130" height="44" rx="8"/><text class="t-c t-b" x="255" y="168">Near-cache</text><text class="t-c t-sm" x="255" y="184">TTL 1 s, 5k keys</text>
+  <rect class="cache" x="410" y="148" width="170" height="44" rx="8"/><text class="t-c t-b" x="495" y="175">Shard 7</text>
+  <path class="arrow" d="M160 170 L186 170"/><path class="arrow dash" d="M320 170 L406 170"/>
+  <text class="t-sm" x="600" y="168">1 read per instance per second</text>
+  <text class="t-sm" x="600" y="186">= 4,000 reads/s instead of 200,000</text>
+
+  <text class="t-b" x="20" y="232">With replicated copies (key#0 ... key#3)</text>
+  <rect class="ext" x="20" y="250" width="140" height="44" rx="8"/><text class="t-c t-b" x="90" y="277">App picks i at random</text>
+  <rect class="cache" x="330" y="244" width="110" height="30" rx="6"/><text class="t-c t-sm" x="385" y="264">shard 3: key#0</text>
+  <rect class="cache" x="330" y="278" width="110" height="30" rx="6"/><text class="t-c t-sm" x="385" y="298">shard 12: key#1</text>
+  <rect class="cache" x="460" y="244" width="110" height="30" rx="6"/><text class="t-c t-sm" x="515" y="264">shard 21: key#2</text>
+  <rect class="cache" x="460" y="278" width="110" height="30" rx="6"/><text class="t-c t-sm" x="515" y="298">shard 28: key#3</text>
+  <path class="arrow" d="M160 272 L326 262"/><path class="arrow" d="M160 276 L326 292"/>
+  <text class="t-sm" x="600" y="266">load splits four ways, writes must update or</text>
+  <text class="t-sm" x="600" y="284">delete all four copies</text>
+</svg>
+<figcaption>Top: all reads of a hot key land on one shard. Middle: a tiny in-process near-cache absorbs repeats. Bottom: the hot key is stored under several suffixed names that hash to different shards.</figcaption>
+</figure>
+<p>Remedies, in the order we would reach for them:</p>
+<ol>
+<li><b>Near-cache (local cache) in the client.</b> Each application instance keeps a small in-process map (a few thousand entries, bounded, with an admission policy such as TinyLFU so one-off keys do not pollute it) with a very short TTL, typically 0.5 to 2 seconds. With 4,000 instances, even a 1-second TTL turns 200,000 reads/s into at most 4,000 reads/s at the shard. The cost is staleness of up to the TTL, which is why we only enable it for keys that tolerate it, and why the near-cache is never used for data that must reflect a write immediately.</li>
+<li><b>Detect, then promote.</b> Shards keep a cheap approximate counter of the top keys (a count-min sketch, see <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>, or sampling one request in a hundred). When a key crosses a threshold such as 20,000 reads/s, the control plane marks it hot and pushes the flag to clients, which switch on near-caching for it automatically. Developers do not need to know in advance.</li>
+<li><b>Replicate the hot key under several names.</b> Store <code>profile:42#0</code> through <code>#3</code>, each hashing to a different shard; readers pick a random suffix. Reads divide by four. Writes must update or delete all four, so this suits read-mostly keys. Redis replicas serving reads (<code>READONLY</code>) give a similar effect without suffixes, at the price of replication lag.</li>
+<li><b>Split a hot aggregate.</b> A shared counter that is written a lot (a global view count) is best sharded into N sub-counters that are summed on read, or buffered in the client and flushed periodically.</li>
+<li><b>Rate-limit as a last resort.</b> If one key is abusive, the proxy sheds the excess for that key rather than letting it harm its neighbours (see <a href="../chapters/16-rate-limiting.html">Chapter 16</a>).</li>
+</ol>
+
+<h2 id="memory">8. Deep dive: memory management</h2>
+<h3 id="slab">8.1 Slab allocator</h3>
+<p>The obvious way to store variable-size values is to call the system allocator (<code>malloc</code>) for each item and <code>free</code> it on eviction. Over days of operation with items of random sizes coming and going, this leaves memory full of small unusable gaps. That is <b>external fragmentation</b>: the process holds 52 GB but cannot place a new 3 KB item. Memcached avoids it with a <b>slab allocator</b>.</p>
+<p>Memory is cut into fixed 1 MB <i>pages</i>. Each page is assigned to one <i>slab class</i>, and a class has a fixed <i>chunk size</i>. Chunk sizes grow geometrically by a growth factor (the memcached default is 1.25): for example 96, 120, 152, 192, 240 ... bytes, up to the page size. A page for the 240-byte class is split into 1 MB ÷ 240 B ≈ 4,369 chunks. An item is stored in the smallest chunk that fits it, so a 200-byte item sits in a 240-byte chunk and wastes 40 bytes. That wasted tail is <b>internal fragmentation</b>; with a factor of 1.25 the average waste is roughly 10 to 12%, which is where our 15% overhead estimate in section 3 comes from (it also covers the hash table).</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="Slab classes, pages and chunks">
+  <text class="t-b" x="20" y="22">52 GB of memory, cut into 1 MB pages, handed to slab classes on demand</text>
+  <rect class="cache" x="20" y="40" width="260" height="44" rx="6"/><text class="t-c t-b" x="150" y="62">Class 3: 152 B chunks</text><text class="t-c t-sm" x="150" y="77">6,898 chunks per page, 14 pages</text>
+  <rect class="cache" x="300" y="40" width="260" height="44" rx="6"/><text class="t-c t-b" x="430" y="62">Class 9: 1,184 B chunks</text><text class="t-c t-sm" x="430" y="77">885 chunks per page, 31,000 pages</text>
+  <rect class="cache" x="580" y="40" width="300" height="44" rx="6"/><text class="t-c t-b" x="730" y="62">Class 20: 12 KB chunks</text><text class="t-c t-sm" x="730" y="77">85 chunks per page, 900 pages</text>
+  <text class="t-b" x="20" y="124">One 1,184-byte-chunk page, zoomed in</text>
+  <rect class="hit" x="20" y="140" width="140" height="44" rx="4"/><text class="t-c t-sm" x="90" y="160">item 1,100 B</text><text class="t-c t-sm" x="90" y="174">waste 84 B</text>
+  <rect class="hit" x="170" y="140" width="140" height="44" rx="4"/><text class="t-c t-sm" x="240" y="160">item 1,010 B</text><text class="t-c t-sm" x="240" y="174">waste 174 B</text>
+  <rect class="miss" x="320" y="140" width="140" height="44" rx="4"/><text class="t-c t-sm" x="390" y="160">free chunk</text><text class="t-c t-sm" x="390" y="174">on free list</text>
+  <rect class="hit" x="470" y="140" width="140" height="44" rx="4"/><text class="t-c t-sm" x="540" y="160">item 1,180 B</text><text class="t-c t-sm" x="540" y="174">waste 4 B</text>
+  <text class="t-sm" x="630" y="166">... 885 chunks, all the same size</text>
+  <text class="t-b" x="20" y="226">Rules</text>
+  <text class="t-sm" x="20" y="246">Eviction is per class: a full class evicts its own least recently used item, never an item of another class.</text>
+  <text class="t-sm" x="20" y="264">A slab rebalancer can move a page from an idle class to a starved one when the item size mix drifts.</text>
+</svg>
+<figcaption>The allocator never fragments: every chunk in a class is the same size, so a freed chunk always fits the next item of that class. The price is wasted bytes inside chunks, and the risk that pages are stuck in the wrong class.</figcaption>
+</figure>
+<p>The famous failure of slabs is <b>slab calcification</b>. Pages are assigned to classes as traffic arrives; if the workload's size distribution later shifts (for instance values grow from 200 B to 2 KB), the old class keeps all its pages while the new class has too few, and it starts evicting aggressively although plenty of memory exists in total. Mitigations: an automatic slab rebalancer that reclaims pages from classes with low eviction pressure (built into modern memcached), tuning the growth factor, and separate pools for very different size profiles. Redis, in contrast, relies on <code>jemalloc</code> and can suffer from <b>memory fragmentation</b> instead; it reports a fragmentation ratio (resident memory divided by used memory) and supports active defragmentation. A ratio persistently above about 1.5 is a sign to investigate.</p>
+
+<h3 id="eviction">8.2 Eviction: LRU and LFU approximations</h3>
+<p>When a shard is full and a new item arrives, something must go. A perfect <b>LRU</b> (least recently used) keeps a linked list of all items ordered by last access and evicts from the tail. Every read must move the item to the head, which means taking a lock on shared list pointers on every hit. At 100,000 reads/s per node this lock is the bottleneck, and the two pointers per item cost 16 bytes of the item's overhead. Real caches therefore <b>approximate</b>.</p>
+<table>
+<tr><th>Approach</th><th>How it works</th><th>Tradeoff</th></tr>
+<tr><td>Exact LRU list</td><td>Doubly linked list, move to head on each hit</td><td>Accurate, but lock contention and pointer memory</td></tr>
+<tr><td>Segmented LRU (memcached)</td><td>Items live in HOT, WARM and COLD segments per class; a background thread moves items between them; a hit only sets a bit, and the item is moved lazily</td><td>Hits are almost lock free; scan resistant, because a one-time item never reaches WARM</td></tr>
+<tr><td>Sampled LRU (Redis)</td><td>No list. Each item stores a coarse last-access clock (24 bits). To evict, sample a handful of random keys (<code>maxmemory-samples</code>, default 5) and evict the oldest of them, with a small eviction pool carried between rounds</td><td>No per-hit cost beyond writing the clock; with 5 to 10 samples it comes close to true LRU</td></tr>
+<tr><td>LFU (least frequently used)</td><td>Store an approximate access count (Redis uses an 8-bit logarithmic counter with decay over time) and evict the lowest</td><td>Protects stable popular keys from being flushed by a scan; needs decay so old favourites eventually leave</td></tr>
+<tr><td>TinyLFU / W-TinyLFU</td><td>Admit a new item only if its estimated frequency (count-min sketch) beats the victim's</td><td>Best hit rates in studies; used by libraries such as Caffeine, a good fit for the near-cache</td></tr>
+</table>
+<p>Which one for us? A general-purpose service with mixed tenants should default to an LRU approximation (segmented or sampled), because recency adapts fast to changing workloads. A tenant whose traffic is a stable Zipf distribution (a few very popular keys) with periodic batch scans of the whole data set should choose LFU, because a scan would otherwise evict every popular key. Redis exposes both as policies (<code>allkeys-lru</code>, <code>allkeys-lfu</code>, and <code>volatile-*</code> variants that only evict keys that have a TTL); for a cache we want an <code>allkeys-*</code> policy so that memory pressure never produces "out of memory" write errors. See <a href="../chapters/15-redis.html">Chapter 15</a>.</p>
+<div class="callout watch"><b>Watch out</b> Do not fill memory to 100%. Eviction, replication buffers, client output buffers and (in Redis) fork copy-on-write during snapshots all need headroom. We run primaries at about 80 to 85% of the configured memory and alert at 90%.</div>
+
+<h3 id="ttl">8.3 TTL and expiry</h3>
+<p>A TTL says when an entry stops being valid. Removing expired entries has two parts. <b>Lazy expiry</b>: when a key is read, the shard checks its expiry time and discards it if it is past. This is free but never reclaims a key nobody reads again. <b>Active expiry</b>: a background task samples keys that have a TTL and deletes the expired ones. Redis samples 20 keys per round, ten times per second, and repeats at once if more than a quarter were expired, so a burst of expiry does not leave memory full of dead data. Memcached uses a crawler thread that walks the LRU. Expired items also take priority as eviction victims because freeing them costs nothing in hit rate.</p>
+<p>TTL choice is a business decision, not just a technical one: it bounds staleness (section 10), controls how long cold data occupies memory, and, if every key gets the same TTL, creates synchronized expiry (hence jitter, section 7.1). Typical guidance: short (seconds to minutes) for data that can change without us noticing, longer (hours) for data protected by explicit invalidation, and never "no TTL" for derived data, because a missed invalidation would then be permanent.</p>
+
+<h2 id="replication">9. Replication and failover</h2>
+<p>Losing a primary loses 1/32 of the cache (about 41 GB). The misses from that loss are 1/32 of 1.43M reads/s ≈ 45,000 reads/s of extra traffic aimed at the database, on top of the normal 28,600 reads/s: a 1.6x increase. A database sized with roughly 2x headroom survives it, but it is an expensive moment, and refilling 41 GB over the database path takes a long time (section 11). A replica avoids this.</p>
+<h3>9.1 Replication design</h3>
+<ul>
+<li><b>Asynchronous primary to replica copy.</b> Writes are acknowledged by the primary immediately and streamed to the replica afterwards. We choose async because a cache write should cost sub-millisecond. The consequence: if the primary crashes, the last few milliseconds of writes may be missing on the replica. For a cache that is acceptable: a missing entry is only a miss; a missing <i>delete</i> is the dangerous case, because the replica then keeps a stale value (see section 10, and mitigation by TTL and the change feed).</li>
+<li><b>One replica per shard</b> in a different failure domain (another rack, ideally another availability zone). Zone placement is the main thing that makes a replica useful. Memcached has no built-in replication, so the same effect comes from the proxy writing to two pools (mcrouter's replicated pools), at the cost of two writes per set.</li>
+<li><b>Replica reads:</b> normally off. Serving reads from replicas adds capacity but exposes replication lag, so we enable it only for hot keys and tolerant tenants.</li>
+</ul>
+<h3>9.2 Failure detection and promotion</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Failover timeline">
+  <line x1="40" y1="130" x2="870" y2="130" class="arrow"/>
+  <circle cx="110" cy="130" r="7" class="miss"/><text class="t-c t-b" x="110" y="108">t = 0</text><text class="t-c t-sm" x="110" y="160">primary dies</text>
+  <circle cx="300" cy="130" r="7" class="cache"/><text class="t-c t-b" x="300" y="108">t = 1 to 5 s</text><text class="t-c t-sm" x="300" y="160">peers miss heartbeats,</text><text class="t-c t-sm" x="300" y="176">mark PFAIL (suspect)</text>
+  <circle cx="500" cy="130" r="7" class="cache"/><text class="t-c t-b" x="500" y="108">t = 5 to 15 s</text><text class="t-c t-sm" x="500" y="160">majority of primaries agree:</text><text class="t-c t-sm" x="500" y="176">FAIL, replica elected</text>
+  <circle cx="680" cy="130" r="7" class="hit"/><text class="t-c t-b" x="680" y="108">t = about 15 s</text><text class="t-c t-sm" x="680" y="160">replica promoted,</text><text class="t-c t-sm" x="680" y="176">new slot map published</text>
+  <circle cx="840" cy="130" r="7" class="hit"/><text class="t-c t-b" x="840" y="108">+ seconds</text><text class="t-c t-sm" x="840" y="160">clients refresh,</text><text class="t-c t-sm" x="840" y="176">traffic recovers</text>
+  <rect class="miss" x="60" y="210" width="620" height="34" rx="6"/><text class="t-c t-sm" x="370" y="232">window of errors/misses for 1/32 of keys: clients time out fast and go to the database</text>
+  <text class="t-sm" x="60" y="276">Detection time is a tunable tradeoff: shorter timeouts recover faster but cause false failovers on a slow network or a long pause.</text>
+</svg>
+<figcaption>Timeline of a failover. The exact durations depend on configuration (Redis Cluster's node timeout is typically set to a few seconds up to 15 s), but the phases are the same: suspect, agree, elect, publish, refresh.</figcaption>
+</figure>
+<p>In Redis Cluster the nodes themselves gossip heartbeats (<a href="../chapters/33-gossip-merkle.html">Chapter 33</a>). A node is flagged as suspect by a peer that misses replies for the node timeout, and declared failed when a majority of primaries agree. The replica with the most up-to-date replication offset requests votes, and wins with a majority, incrementing a <i>config epoch</i> that makes the newest map win (the same ideas as in <a href="../chapters/29-consensus.html">Chapter 29</a>). For a memcached-based deployment, an external controller (health checker plus a small consensus-backed store) plays the same role and the proxy tier swaps the endpoint.</p>
+<p>Two hazards deserve explicit mention. <b>Split brain:</b> a partitioned old primary may keep accepting writes. In a cache the damage is bounded because those writes will be dropped when it rejoins as a replica and resyncs, but clients on the minority side can read stale data; the old primary stops serving when it cannot reach a majority of primaries for its node timeout. <b>Flapping:</b> a node that fails and recovers repeatedly causes constant map changes; we add hysteresis (a minimum time before a failed node may rejoin as primary).</p>
+
+<h2 id="consistency">10. Deep dive: consistency with the source database</h2>
+<p>The cache and the database are two copies of the same fact, and no protocol between them is both cheap and perfectly consistent. The patterns are in <a href="../chapters/13-caching-patterns.html">Chapter 13</a> and the theory in <a href="../chapters/28-cap-consistency.html">Chapter 28</a>. This section decides which write policy this service recommends and how it closes the known races.</p>
+<table>
+<tr><th>Write policy</th><th>How</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Cache-aside, delete on write (default)</td><td>App writes DB, then deletes the cache key; reader refills on miss</td><td>Simple, safe, only the data actually read is cached, cache outage does not block writes</td><td>A miss after every write; races described below</td></tr>
+<tr><td>Cache-aside, update on write</td><td>App writes DB, then sets the new value in the cache</td><td>No miss after write</td><td>Two concurrent writers can leave the older value in the cache; wasted work for never-read keys</td></tr>
+<tr><td>Write-through</td><td>A cache layer writes to the DB and its own memory in one operation</td><td>Cache always matches what was written through it</td><td>Needs the cache to understand the database; slower writes; bypass writes still go unseen</td></tr>
+<tr><td>Write-behind (write-back)</td><td>Write to cache, flush to DB later</td><td>Very fast writes, coalescing</td><td>Data loss if the cache node dies before the flush; this is database territory, not a pure cache</td></tr>
+<tr><td>Read-through</td><td>The cache loads from the DB itself on a miss</td><td>Loader logic in one place, built-in single-flight</td><td>Needs a pluggable loader inside the cache tier</td></tr>
+</table>
+<p>We recommend <b>cache-aside with delete on write</b> and, for the fill path, leases. We offer read-through only as a library feature (the client runs the loader), keeping the server free of database knowledge.</p>
+<h3>10.1 The classic races</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="Race: stale fill after delete, and how a lease prevents it">
+  <rect class="ext" x="60" y="10" width="140" height="34" rx="8"/><text class="t-c t-b" x="130" y="32">Reader A</text>
+  <rect class="cache" x="380" y="10" width="140" height="34" rx="8"/><text class="t-c t-b" x="450" y="32">Cache shard</text>
+  <rect class="ext" x="700" y="10" width="140" height="34" rx="8"/><text class="t-c t-b" x="770" y="32">Writer B + DB</text>
+  <line class="life" x1="130" y1="44" x2="130" y2="370"/><line class="life" x1="450" y1="44" x2="450" y2="370"/><line class="life" x1="770" y1="44" x2="770" y2="370"/>
+  <path class="arrow" d="M130 70 L446 70"/><text class="t-sm" x="150" y="64">1 get(k): MISS, lease token L1</text>
+  <path class="arrow" d="M130 105 L766 105"/><text class="t-sm" x="160" y="99">2 read DB: value v1 (old)</text>
+  <path class="arrow" d="M766 145 L134 145"/><text class="t-sm" x="500" y="139">... A is slow, B updates DB to v2 meanwhile</text>
+  <path class="arrow" d="M770 180 L770 200"/><text class="t-sm" x="560" y="196">3 B commits v2 to DB</text>
+  <path class="arrow" d="M766 225 L454 225"/><text class="t-sm" x="520" y="219">4 B: delete(k), invalidates lease L1</text>
+  <path class="arrow-r" d="M130 270 L446 270"/><text class="t-sm" x="150" y="264" style="fill:var(--bad)">5 A: set(k, v1) with no lease: STALE FOREVER</text>
+  <path class="arrow-g" d="M130 320 L446 320"/><text class="t-sm" x="150" y="314" style="fill:var(--good)">5 with leases: lease_set(L1) is REJECTED, v1 dropped</text>
+  <text class="t-sm" x="150" y="355">Next reader misses and loads v2. Staleness is bounded to the miss window.</text>
+</svg>
+<figcaption>The race that corrupts cache-aside: a slow reader fills the cache with an old value after the writer has already deleted the key. Without protection the old value stays until the TTL. A lease that the delete invalidates closes the race.</figcaption>
+</figure>
+<ol>
+<li><b>Stale fill after delete</b> (figure above). Fixed by leases, or by <code>add</code> plus versions: store a version number from the database row with the value and refuse to overwrite a higher version (a compare-and-set on version).</li>
+<li><b>Delete before commit.</b> If the writer deletes the key and only then commits to the database, a reader can miss in between, read the old row, and refill with the old value. The rule is: always <b>commit first, delete after</b>.</li>
+<li><b>Lost delete.</b> The cache node is unreachable at delete time, or the app crashes after the commit. Mitigations: retry the delete from a durable queue, a change feed that emits deletes from the database log (so even writes by other systems are covered), and a TTL as the final backstop. A short-lived "tombstone" approach (set the key to a delete marker for a few seconds) protects against replication-lag reordering.</li>
+<li><b>Replica lag on reads.</b> If the cache fill reads the database from a read replica that is behind, the cache gets an old value. Fill from the primary database or from a replica known to have caught up past the write (a database version or timestamp comparison; see <a href="../chapters/24-replication.html">Chapter 24</a>).</li>
+</ol>
+<h3>10.2 Invalidation feed</h3>
+<p>Application-side deletes cover only the writes the application knows about. A <b>change data capture</b> pipeline tails the database's replication log (the binlog or write-ahead log) and publishes row changes to a queue (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>). A fleet of invalidators consumes it and issues <code>delete</code>s, routing each by key to the right shard. This catches writes from scripts, other services and manual fixes. It is eventually consistent (typically sub-second to a few seconds behind), idempotent (deleting twice is harmless), and it is how large deployments make cached data converge. The invalidator carries the row version so that a delete never races ahead of a fill that is itself newer.</p>
+<p>Finally, state the guarantee honestly: after a database write commits, the cache may serve the old value for the time it takes the delete or CDC event to arrive (milliseconds to seconds), and never longer than the TTL. Readers that need read-your-writes (the user who just saved a setting) bypass the cache or use a session-scoped flag to read from the database for a few seconds.</p>
+
+<h2 id="rebalance">11. Cold start, warm-up and rebalancing</h2>
+<h3>11.1 Why an empty cache is dangerous</h3>
+<p>A freshly started cluster has a hit rate of zero. All 1.43M reads/s would flow to databases that are sized for 28,600 reads/s, which is 50 times too much. The databases would fail, loaders would time out, nothing would get cached, and the system would not recover on its own: a classic <b>metastable failure</b> in which the cure (a warm cache) can never form because the sickness (database overload) prevents the fills. The same thing happens in miniature when a shard restarts empty.</p>
+<p>Defences, from cheapest to most involved:</p>
+<ol>
+<li><b>Never lose the cache by accident.</b> Rolling restarts one shard at a time, replicas promoted before the primary is restarted, and persisted snapshots (Redis RDB or a memcached warm-restart file in shared memory) so that a process restart reloads memory in seconds.</li>
+<li><b>Admission control during warm-up.</b> A new or empty cluster is brought into service by gradually shifting traffic: 1%, then 5%, 25%, 100% of keys (or tenants), with the percentage raised only when the database load and hit rate stay inside limits. A feature flag in the client decides, per key hash, whether to consult the new cluster.</li>
+<li><b>Warm-up by replay.</b> Replay recent reads: a log of the last hour of key accesses, sampled, can be played against the databases at a controlled rate to prefill the hottest keys first (the long tail can fill itself). Or copy from an existing warm cluster (a second region, or the cluster being replaced) at a rate limit.</li>
+<li><b>Priority and shedding.</b> While cold, the loaders favour critical tenants and shed optional work, so the database serves the traffic that matters (<a href="../chapters/40-resilience.html">Chapter 40</a>).</li>
+<li><b>Lease-limited fills.</b> Leases (section 7) ensure that at most one load per key runs at a time, so the cold database sees the number of <i>distinct</i> hot keys, not the number of requests.</li>
+</ol>
+<p>A rough warm-up estimate: if the database can give us 15,000 spare reads/s on top of normal load, loading 41 GB (about 37 million entries at 1.1 KB) for a single shard would take 37M ÷ 15,000 ≈ 2,500 s, about 41 minutes, even with perfect efficiency. This is why we replicate and why we do not casually restart whole shards.</p>
+
+<h3>11.2 Scaling out with few extra misses</h3>
+<p>Suppose traffic grows and we add a 33rd shard. If routing is <code>hash(key) mod N</code>, going from 32 to 33 changes the shard for about 97% of the keys: nearly the whole cache becomes unreachable at once, a catastrophe equal to a cold start. This is the reason for <b>consistent hashing</b> (section 13): when a node is added, only about 1/33, roughly 3%, of the keys move, and all of them move to the new node.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Slot migration during scale-out">
+  <text class="t-b" x="20" y="22">16,384 slots; each key maps to one slot with CRC16(key) mod 16384; shards own ranges of slots</text>
+  <rect class="cache" x="20" y="44" width="230" height="56" rx="8"/><text class="t-c t-b" x="135" y="68">Shard A: slots 0-511</text><text class="t-c t-sm" x="135" y="88">512 slots, 41 GB</text>
+  <rect class="cache" x="20" y="116" width="230" height="56" rx="8"/><text class="t-c t-b" x="135" y="140">Shard B: slots 512-1023</text><text class="t-c t-sm" x="135" y="160">512 slots, 41 GB</text>
+  <rect class="cache" x="20" y="188" width="230" height="56" rx="8"/><text class="t-c t-b" x="135" y="212">... 30 more shards</text><text class="t-c t-sm" x="135" y="232">each about 512 slots</text>
+  <rect class="hit" x="620" y="116" width="250" height="56" rx="8"/><text class="t-c t-b" x="745" y="140">New shard 33: 0 slots</text><text class="t-c t-sm" x="745" y="160">receives about 496 slots</text>
+  <path class="arrow-g" d="M250 72 L616 130"/><path class="arrow-g" d="M250 144 L616 144"/><path class="arrow-g" d="M250 216 L616 158"/>
+  <text class="t-sm" x="330" y="110">each old shard gives up 15 or 16 slots</text>
+  <text class="t-b" x="20" y="282">Per-slot migration protocol</text>
+  <text class="t-sm" x="20" y="302">1 mark slot MIGRATING on source, IMPORTING on target   2 copy keys in small batches, with their remaining TTL</text>
+  <text class="t-sm" x="20" y="320">3 reads for a key not yet moved are served by the source; a key already moved gets an ASK redirect to the target</text>
+  <text class="t-sm" x="20" y="338">4 when the slot is empty, publish the new owner (higher epoch); clients learn it from a MOVED redirect or a map refresh</text>
+</svg>
+<figcaption>Scale-out by moving slots. Keys are grouped into a fixed number of slots; adding a node means reassigning some slots, copied live so that most reads never miss.</figcaption>
+</figure>
+<p>Two ways to rebalance. <b>Without data movement:</b> the new shard simply starts empty and takes its slots. The 3% of keys that moved miss once each; reads rise from 2% misses to about 2% + 3% × 98% ≈ 4.9%, so database reads rise from 28,600/s to about 70,000/s (2.45x) and decay as the new shard fills. That is survivable if the database has headroom, but we avoid it by <b>live slot migration</b> as in the figure: copy the slot's keys with their remaining TTL from the old owner to the new one, in small batches and at a limited rate (for example 100 MB/s per shard) so the source stays responsive. Moving 39 GB at an aggregate of about 2 GB/s (32 sources in parallel at roughly 60 MB/s each) takes under a minute of wall-clock bandwidth, though we pace it to be gentle: 20 to 30 minutes is typical in practice. During the move, a request for a slot that is mid-migration may need one extra hop (the ASK redirect), the only added latency. Leaving the old copy in place until the new owner is confirmed also means that if the migration is abandoned, nothing is lost.</p>
+<p>The reverse operation (scale in, or replacing a node) is a drain: move slots away first, then remove the node. For memcached with ketama-style consistent hashing (no slots), the proxy can run both the old and new rings for a transition window: <b>read from the new owner, fall back to the old owner on a miss, and populate the new owner</b>. This makes the rebalance invisible at the cost of a second lookup on misses during the window. Capacity planning rule: add nodes before utilisation exceeds 80% of memory, because migration itself needs headroom, and never resize and deploy at the same time.</p>
+
+<h2 id="tenants">12. Multi-tenant quotas and isolation</h2>
+<p>Many teams share the cluster. One careless tenant, with a scan that touches millions of keys, can flush everyone else's working set and double the database's miss traffic. Isolation applies to three resources; the cell and noisy-neighbour ideas are in <a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>.</p>
+<ul>
+<li><b>Memory.</b> Each tenant receives a byte quota within a shared shard. Items carry a tenant id (the namespace). When the shard must evict, it picks a victim from the tenant that is furthest over its quota, falling back to global LRU among tenants under quota; a tenant under its quota cannot be evicted by a neighbour's growth. Unused quota is borrowed freely (this is what makes sharing cheaper than separate clusters) and reclaimed on demand. Very large or very sensitive tenants get a <b>dedicated pool</b> (own shards), which is the strongest isolation and costs the most.</li>
+<li><b>Request rate.</b> A token bucket per tenant at the proxy tier (see <a href="../chapters/16-rate-limiting.html">Chapter 16</a>), for example 200,000 ops/s with a burst of 400,000. Excess requests get a fast "throttled" reply that the client treats as a miss, so the application degrades instead of queueing at the shard.</li>
+<li><b>Connections and value size.</b> Maximum connections per client host, a maximum value size (1 MB) and a maximum key length (250 bytes), so that nobody ties up buffers or blows up the slab classes.</li>
+</ul>
+<p>Operationally, each tenant gets a dashboard of its own hit rate, memory use and throttle count, plus a cost showback (bytes held times price). Quotas change through the control plane, not by redeploying clients. Security (section 15) also uses the namespace: a credential grants access to specific namespaces only.</p>
+
+<h2 id="sharding">13. Deep dive: sharding, routing and the client library</h2>
+<h3>13.1 Consistent hashing and slots</h3>
+<p>We need a function from key to shard that (a) spreads keys evenly, (b) is computed by clients without asking anyone, and (c) changes for only a small fraction of keys when shards are added or removed. Plain modulo fails (c) as shown. <b>Consistent hashing</b> (see <a href="../chapters/25-sharding.html">Chapter 25</a> and <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>) places both nodes and keys on a circle of hash values; a key belongs to the first node clockwise from its hash. Removing a node hands its range to the next node; adding one takes a slice from its neighbour. Because a physical node placed at a single point would get uneven ranges, each node is placed at many points, called <b>virtual nodes</b> (ketama uses about 100 to 200 per server), which evens the load to within a few percent and spreads a failed node's keys across all survivors rather than dumping them on one neighbour.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Hash ring with virtual nodes and an added node">
+  <circle cx="230" cy="185" r="130" fill="none" stroke="var(--line)" stroke-width="3"/>
+  <circle cx="230" cy="55" r="9" class="cache"/><text class="t-sm" x="246" y="50">A1</text>
+  <circle cx="343" cy="120" r="9" class="box"/><text class="t-sm" x="356" y="118">B1</text>
+  <circle cx="343" cy="250" r="9" class="db"/><text class="t-sm" x="356" y="262">C1</text>
+  <circle cx="230" cy="315" r="9" class="cache"/><text class="t-sm" x="246" y="332">A2</text>
+  <circle cx="117" cy="250" r="9" class="box"/><text class="t-sm" x="88" y="262">B2</text>
+  <circle cx="117" cy="120" r="9" class="db"/><text class="t-sm" x="88" y="118">C2</text>
+  <circle cx="300" cy="75" r="7" class="hit"/><text class="t-sm" x="306" y="68">key k1</text>
+  <circle cx="165" cy="290" r="7" class="miss"/><text class="t-sm" x="96" y="306">D1 new</text>
+  <text class="t-c t-sm" x="230" y="180">each server appears</text><text class="t-c t-sm" x="230" y="196">many times on the ring</text>
+  <text class="t-b" x="460" y="60">How to read it</text>
+  <text class="t-sm" x="460" y="84">Key k1 hashes to a point; walk clockwise; the first node point owns it (B1).</text>
+  <text class="t-sm" x="460" y="106">A server owns many small arcs (A1, A2), so load evens out.</text>
+  <text class="t-sm" x="460" y="128">If server A dies, the keys of A1 go to B1 and of A2 to B2: spread, not dumped.</text>
+  <text class="t-sm" x="460" y="150">Adding D1 takes only the arc between B2 and D1 from A2's range.</text>
+  <text class="t-b" x="460" y="200">Numbers for 32 servers</text>
+  <text class="t-sm" x="460" y="224">160 points each = 5,120 points; standard deviation of load ~ 1/sqrt(160) = 8%</text>
+  <text class="t-sm" x="460" y="246">Adding the 33rd server moves 1/33 = 3% of keys</text>
+  <text class="t-sm" x="460" y="268">Slots (Redis style): 16,384 fixed buckets, exact control, no ring math</text>
+  <text class="t-sm" x="460" y="290">Slot map is 16,384 entries: tiny enough to cache in every client</text>
+</svg>
+<figcaption>A consistent hash ring with virtual nodes. Compare with slot-based sharding, which Redis Cluster uses: keys map to one of 16,384 slots and the control plane assigns slots to shards, which makes migration a matter of moving whole slots.</figcaption>
+</figure>
+<p>Two refinements matter in practice. <b>Slots instead of a ring:</b> hash the key to one of a fixed number of slots (16,384 in Redis Cluster), then keep an explicit table slot to shard. The table is small, balanced exactly (not statistically), and rebalancing is the movement of named slots. <b>Hash tags:</b> if two keys must live together (for a multi-key operation), the client hashes only a marked part of the key. Use sparingly, because it creates skew. There is also <b>rendezvous (highest-random-weight) hashing</b>, which needs no virtual nodes: score each node against the key and pick the highest. It has the same minimal-movement property and costs O(N) per lookup, fine for 32 nodes.</p>
+
+<h3>13.2 Where does routing live?</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 320" role="img" aria-label="Three routing models: client-side, proxy, server-side redirect">
+  <text class="t-c t-b" x="150" y="22">Client-side</text>
+  <rect class="ext" x="60" y="40" width="180" height="50" rx="8"/><text class="t-c t-b" x="150" y="62">App + smart client</text><text class="t-c t-sm" x="150" y="80">holds slot map</text>
+  <rect class="cache" x="20" y="170" width="80" height="40" rx="8"/><text class="t-c t-sm" x="60" y="195">shard 1</text>
+  <rect class="cache" x="110" y="170" width="80" height="40" rx="8"/><text class="t-c t-sm" x="150" y="195">shard 2</text>
+  <rect class="cache" x="200" y="170" width="80" height="40" rx="8"/><text class="t-c t-sm" x="240" y="195">shard 3</text>
+  <path class="arrow" d="M110 90 L65 166"/><path class="arrow" d="M150 90 L150 166"/><path class="arrow" d="M190 90 L235 166"/>
+  <text class="t-c t-sm" x="150" y="240">1 hop, fastest</text><text class="t-c t-sm" x="150" y="258">logic in every language</text><text class="t-c t-sm" x="150" y="276">many connections</text>
+
+  <text class="t-c t-b" x="450" y="22">Proxy tier</text>
+  <rect class="ext" x="360" y="40" width="180" height="50" rx="8"/><text class="t-c t-b" x="450" y="62">App + thin client</text><text class="t-c t-sm" x="450" y="80">knows only the proxy</text>
+  <rect class="box" x="380" y="110" width="140" height="36" rx="8"/><text class="t-c t-b" x="450" y="133">Proxy</text>
+  <rect class="cache" x="320" y="170" width="80" height="40" rx="8"/><text class="t-c t-sm" x="360" y="195">shard 1</text>
+  <rect class="cache" x="410" y="170" width="80" height="40" rx="8"/><text class="t-c t-sm" x="450" y="195">shard 2</text>
+  <rect class="cache" x="500" y="170" width="80" height="40" rx="8"/><text class="t-c t-sm" x="540" y="195">shard 3</text>
+  <path class="arrow" d="M450 90 L450 108"/><path class="arrow" d="M420 146 L365 166"/><path class="arrow" d="M450 146 L450 166"/><path class="arrow" d="M480 146 L535 166"/>
+  <text class="t-c t-sm" x="450" y="240">+1 hop (about 0.2 ms)</text><text class="t-c t-sm" x="450" y="258">pooling, failover, quotas</text><text class="t-c t-sm" x="450" y="276">central policy, easy upgrades</text>
+
+  <text class="t-c t-b" x="750" y="22">Server-side redirect</text>
+  <rect class="ext" x="660" y="40" width="180" height="50" rx="8"/><text class="t-c t-b" x="750" y="62">App + thin client</text><text class="t-c t-sm" x="750" y="80">talks to any node</text>
+  <rect class="cache" x="620" y="170" width="80" height="40" rx="8"/><text class="t-c t-sm" x="660" y="195">shard 1</text>
+  <rect class="cache" x="710" y="170" width="80" height="40" rx="8"/><text class="t-c t-sm" x="750" y="195">shard 2</text>
+  <rect class="cache" x="800" y="170" width="80" height="40" rx="8"/><text class="t-c t-sm" x="840" y="195">shard 3</text>
+  <path class="arrow" d="M730 90 L670 166"/><path class="arrow-r dash" d="M650 166 L720 120 L760 166"/>
+  <text class="t-c t-sm" x="750" y="240">wrong node replies MOVED</text><text class="t-c t-sm" x="750" y="258">client caches the answer</text><text class="t-c t-sm" x="750" y="276">Redis Cluster default</text>
+</svg>
+<figcaption>Three places to put the key-to-shard decision. Most large systems end up with a smart client for latency-critical paths and a proxy for everything else.</figcaption>
+</figure>
+<table>
+<tr><th>Model</th><th>Pros</th><th>Cons</th><th>Choose when</th></tr>
+<tr><td>Client-side (smart client, slot map or ring in the library)</td><td>Fewest hops and lowest latency; no extra fleet to run</td><td>Routing logic must be implemented and kept consistent in every language and version; thousands of clients each open connections to every shard; topology change needs client refresh</td><td>One or two languages, latency critical</td></tr>
+<tr><td>Proxy tier (mcrouter, Twemproxy, Envoy)</td><td>Clients stay thin; connection pooling cuts 512,000 connections to a few thousand; failover, replication to a second pool, shadowing for tests, quotas and metrics in one place</td><td>Extra hop and extra fleet to scale and keep available; a bug in the proxy is a global bug</td><td>Many languages, many tenants, need central policy</td></tr>
+<tr><td>Server-side redirect (Redis Cluster MOVED/ASK)</td><td>No external routing component; nodes know the map</td><td>Clients still need cluster-aware libraries; one wasted round trip on a stale map</td><td>You already run Redis Cluster</td></tr>
+</table>
+<p>Our choice: <b>a proxy tier for the default path</b> (tenants get quotas, pooling and safe resizing for free, and the 0.2 ms extra hop fits inside our 5 ms budget) and <b>a smart-client option</b> with the same slot map for the few services that need the last 0.2 ms. The proxy tier is stateless and scaled horizontally behind <a href="../chapters/09-load-balancing.html">a load balancer</a> or, better, per-host sidecars (see <a href="../chapters/10-proxies.html">Chapter 10</a>).</p>
+
+<h3>13.3 Client library behaviour</h3>
+<p>A cache is only as good as its worst client. A good library does the following.</p>
+<ul>
+<li><b>Short timeouts.</b> A cache call that takes 50 ms is worse than a miss. Typical timeouts are 5 to 20 ms for gets. A timeout is treated as a miss, not an error that fails the user's request.</li>
+<li><b>Bounded retries with a budget.</b> At most one retry, and only while retries stay under about 10% of requests, otherwise retries amplify an overload (<a href="../chapters/51-microservice-resilience.html">Chapter 51</a>). Sets and deletes are idempotent, so retrying them is safe.</li>
+<li><b>Circuit breaker per shard.</b> After repeated failures to one shard, stop calling it for a few seconds and treat its keys as misses (while the lease and database caps protect the database).</li>
+<li><b>Batching and pipelining.</b> Group multi-gets by shard and issue them in parallel, so 100 keys cost about the slowest of 32 parallel calls, not 100 sequential ones. Cap batch sizes so one response does not fill a connection for long.</li>
+<li><b>Connection pooling</b> with a small fixed number of connections per shard and keep-alive, avoiding the connect cost and the connection storms after a restart.</li>
+<li><b>Topology refresh.</b> Refresh the slot map on a redirect, on connection errors and periodically (every 30 to 60 s), with jitter so thousands of clients do not refresh together.</li>
+<li><b>Hedged requests.</b> For tail latency, if a get is not answered within the p95 time (say 3 ms), send the same read to the replica and take the first reply, at a cost of about 5% extra reads.</li>
+<li><b>Serialization and compression.</b> A compact, versioned format (see <a href="../chapters/07-serialization.html">Chapter 7</a>); compress only values above a size threshold (for example 1 KB), because compression trades CPU for memory and bandwidth. Include a schema version in the value so deploys that change the format can read or ignore old entries.</li>
+<li><b>Metrics from the client.</b> Hit, miss, timeout, latency per namespace, because the client sees what the server cannot (the full request time).</li>
+</ul>
+
+<h2 id="failures">14. Failure modes and degraded mode</h2>
+<p>The principle: <b>the cache is an optimization, so its failure must never be a correctness failure</b>, but it often is a capacity failure, because the database was sized assuming a 98% hit rate. We plan for both. Resilience patterns are in <a href="../chapters/40-resilience.html">Chapter 40</a> and <a href="../chapters/41-ha-dr.html">Chapter 41</a>.</p>
+<table>
+<tr><th>What fails</th><th>What users and systems see</th><th>Mitigation</th></tr>
+<tr><td>One shard primary dies</td><td>Misses and timeouts for 1/32 of keys until promotion (seconds); about 45,000 extra reads/s to the database</td><td>Replica promotion, fast client timeouts, circuit breaker, database headroom of at least 2x, leases to collapse duplicate loads</td></tr>
+<tr><td>Primary and replica both die (same zone event)</td><td>1/32 of the cache gone; effectively a cold shard</td><td>Replicas in different zones; a spare empty node is added and warmed by gradual traffic ramp; gutter pool (below)</td></tr>
+<tr><td>A shard is slow (GC pause, noisy neighbour, swap, a huge key being deleted, slow command)</td><td>Tail latency for that shard; callers pile up</td><td>Timeouts, hedged reads to the replica, unlinking big keys in a background thread, forbidding slow commands, circuit breaker</td></tr>
+<tr><td>Network partition between clients and a zone</td><td>That zone's clients see timeouts for remote shards</td><td>Zone-aware placement so a request uses local shards; tolerate misses; do not fail over on client-side evidence alone</td></tr>
+<tr><td>Wrong data returned (stale replica, lost delete, bad serialization after a deploy)</td><td>Users see old or garbled data</td><td>TTL backstop, CDC invalidation, version tags in values, checksum of values, ability to flush a namespace and a per-namespace key prefix version for emergencies</td></tr>
+<tr><td>Proxy tier fails or is overloaded</td><td>All cache calls fail or slow</td><td>Stateless, many instances, autoscaling, clients fall back to direct connections or to the database with rate limits</td></tr>
+<tr><td>Control plane unavailable</td><td>No failover or resize; existing traffic continues</td><td>Data path does not depend on the control plane; clients keep the last known map; control plane itself runs as a consensus group of 3 or 5</td></tr>
+<tr><td>Memory exhausted</td><td>Heavy eviction, hit rate collapse, or write errors if misconfigured</td><td>An allkeys eviction policy, alerts at 80 to 90%, quotas per tenant, scale-out before saturation</td></tr>
+<tr><td>Invalidation pipeline lags</td><td>Stale reads for minutes</td><td>Monitor lag, shorten TTL for sensitive namespaces, alert on lag over a few seconds</td></tr>
+</table>
+<h3>14.1 Degraded mode</h3>
+<p>If the cache is unavailable or the hit rate collapses, the service enters a defined degraded mode instead of improvising:</p>
+<ol>
+<li>Clients stop waiting: calls time out quickly and are treated as misses.</li>
+<li>A global concurrency limit on database loaders keeps the database inside its capacity (for example at most 60,000 concurrent-rate reads per second). Excess loads either wait briefly, or return a default or stale value from the near-cache, or an error for non-critical features.</li>
+<li>Non-critical tenants are shed first; critical read paths (login, checkout) keep priority.</li>
+<li>Where a feature allows it, serve slightly stale data longer ("serve stale on error"): the stale-while-revalidate copy and the near-cache extend lifetime while the backend is struggling.</li>
+</ol>
+<p>The <b>gutter pool</b> from Facebook's design is a small separate set of cache servers (on the order of 1% of capacity). When a client cannot reach a primary shard, it asks the gutter pool instead and stores the value there with a short TTL (a few seconds). The gutter absorbs the traffic of the failed shard's hottest keys and caps database load at the cost of brief staleness; no resharding is needed during the failure.</p>
+
+<h2 id="ops">15. Security, monitoring, multi-region and cost</h2>
+<h3>15.1 Security and abuse</h3>
+<ul>
+<li><b>Network isolation:</b> shards in private subnets, never exposed to the internet (several well-known data breaches came from open Redis ports); only proxies and approved clients can connect.</li>
+<li><b>Authentication and TLS:</b> mutual TLS or per-tenant credentials with namespace scoping (see <a href="../chapters/55-security.html">Chapter 55</a>). TLS costs CPU (often 10 to 30% on small-value workloads), which is a reason to terminate it in the proxy tier on a trusted network if policy allows.</li>
+<li><b>Sensitive data:</b> cache only what you would accept being exposed to a mis-scoped read; encrypt or avoid personal data, and honour deletion requests (a delete in the database must also reach the cache, within the TTL at worst). See <a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>.</li>
+<li><b>Abuse:</b> cache penetration (a flood of requests for keys that do not exist, so every call misses) is countered with negative caching (store "not found" for a short TTL such as 30 s) or a Bloom filter of existing ids, per <a href="../chapters/14-caching-failures.html">Chapter 14</a>. Key flooding by one tenant is caught by quotas.</li>
+</ul>
+<h3>15.2 Monitoring and SLOs</h3>
+<p>The signals, following <a href="../chapters/54-observability-slos.html">Chapter 54</a>:</p>
+<ul>
+<li><b>Hit rate</b> per tenant and per namespace: hits ÷ (hits + misses). The SLO is a floor, for example 97% over 5 minutes for the production tenants. Watch the miss <i>rate</i> too, because a stable percentage can hide a doubling of absolute database load when traffic doubles.</li>
+<li><b>Latency:</b> p50, p99, p99.9 at the shard and at the client; the gap between them is network and queueing.</li>
+<li><b>Evictions per second and eviction age</b> (how old the evicted items were): evicting items younger than their TTL means the cache is too small for its workload; this is the most useful capacity signal.</li>
+<li><b>Memory:</b> used versus max, fragmentation ratio, per-slab-class pages, per-tenant bytes.</li>
+<li><b>Replication lag and failover count</b>, slot-map version skew across clients, connection counts, rejected or throttled requests.</li>
+<li><b>Hot key reports:</b> top-N keys per shard from sampling.</li>
+<li><b>Backend load:</b> database reads per second caused by misses, correlated with the cache's miss rate. An alert that fires when misses rise beyond what the database can take is the single most protective alert.</li>
+</ul>
+<p>SLOs: 99.99% of requests answered (hit, miss or fast timeout) within 5 ms at the client; hit rate at or above 97%; staleness bound: 99.9% of invalidations applied within 5 seconds of the database commit.</p>
+<h3>15.3 Multi-region</h3>
+<p>Each region runs its own cluster in front of its local database replicas; cross-region reads for cache misses are slow and fragile. The hard part is invalidation: a write in region A must delete the key in region B. Facebook solved this by having the database's replication stream carry the invalidations, so the delete arrives in order with the data (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>). A second tool is a short TTL on keys that may be written from other regions. We do not replicate cache contents across regions, because the data is cheap to rebuild and replication traffic would exceed the benefit.</p>
+<h3>15.4 Cost</h3>
+<p>The cluster is 64 nodes of 64 GB, memory-heavy instances. At a placeholder price of $0.50 per hour per 64 GB node (check actual provider pricing), that is 64 × 0.50 × 730 ≈ $23,000 per month. The replicas are half of this, which is the price of the failover guarantee. Compare with the value: without the cache, the databases would need to serve 1.43M reads/s instead of 28,600, about 50 times more, which would cost far more than $23,000 per month. Savings levers: compress large values (often 2 to 3x), shorten TTLs on cold data, drop the replica for tenants who can tolerate a cold shard, right-size using the eviction-age signal, and move rarely-read big values to cheaper tiers (SSD-backed cache extensions exist in both products).</p>
+
+<h2 id="evolution">16. Evolution and alternatives</h2>
+<h3>16.1 What to build first</h3>
+<ol>
+<li><b>Phase 1 (weeks):</b> a replicated Redis or Memcached pair per tenant, cache-aside in a shared client library with timeouts, TTL jitter and single-flight. Dashboards for hit rate.</li>
+<li><b>Phase 2:</b> sharding with a slot map, a proxy tier, leases and stale-while-revalidate, quotas.</li>
+<li><b>Phase 3:</b> CDC-driven invalidation, hot key detection with near-cache promotion, gutter pool, automated resizing and warm-up tooling.</li>
+<li><b>Phase 4:</b> multi-region invalidation, SSD tiers, chargeback.</li>
+</ol>
+<h3>16.2 At 10x scale</h3>
+<ul>
+<li>10x traffic (15M ops/s) and 10x data (13 TB): about 320 shards. Memory stays the driver, so SSD-backed tiers (flash for the long tail, RAM for the head) become attractive, as 13 TB of RAM is costly.</li>
+<li>A single proxy fleet and a single slot map become operational risks. Split the service into <b>cells</b> (<a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>): each cell serves a group of tenants with its own proxies, shards and control plane, bounding the blast radius of any bug or overload.</li>
+<li>With 320 shards, gossip-based failure detection costs grow; hierarchical or externally coordinated membership is preferred.</li>
+<li>Network becomes a bottleneck for large values (13 times the bandwidth); local near-caches and compression carry more weight.</li>
+</ul>
+<h3>16.3 Alternatives not chosen</h3>
+<ul>
+<li><b>A purely local in-process cache:</b> the lowest latency, but each of 4,000 instances caches independently, the combined hit rate is poor for a big key space and invalidation is hard. We use it only as a near-cache for the hottest keys.</li>
+<li><b>Write-behind or a durable cache:</b> turns the service into a database with weaker guarantees. Not chosen.</li>
+<li><b>CDN or HTTP caching instead:</b> right for public static content (<a href="../chapters/12-cdn.html">Chapter 12</a>), but it does not serve internal service-to-service object lookups with fine-grained invalidation.</li>
+<li><b>Strong consistency between cache and database (distributed transactions):</b> would add latency and fragility to every write. TTL plus invalidation gives bounded staleness at a fraction of the cost.</li>
+</ul>
+
+<h2 id="qa">17. Interview Q&amp;A</h2>
+<details><summary>Why not just use hash(key) mod N to pick the shard?</summary><p>Modulo is perfectly even and trivial to compute, but it ties every key's location to N. When you go from 32 to 33 shards, a key stays put only if its hash gives the same remainder under both, which happens for about 1 key in 33; roughly 97% of the cache moves. Because moved keys are simply unreachable (the new owner is empty), the hit rate drops to a few percent and the database suddenly sees nearly the full read load, an outage disguised as a routine resize. Consistent hashing or fixed slots change only the keys that must move, about 1/33 here, and slots let us copy those keys live so even they rarely miss.</p></details>
+<details><summary>Memcached or Redis for this service?</summary><p>If the workload is plain strings with simple get and set, a very high request rate and huge memory, Memcached gives predictable memory use, multi-threading and low per-item overhead, and gets its replication and failover from a proxy such as mcrouter. If you want built-in replication, automatic failover, slot-based clustering, data structures like counters and sorted sets, and optional persistence for fast restarts, Redis Cluster provides them in one product, at the price of higher per-item memory and a mostly single-threaded engine per shard. At our 47,000 ops/s per shard either works; I would pick Redis Cluster when the team is small and wants fewer moving parts, and Memcached plus a proxy tier when the fleet is huge and uniform.</p></details>
+<details><summary>A key is requested 200,000 times per second. What do you do?</summary><p>First note that adding shards cannot help, since one key lives on one shard. Put a near-cache of about one second in each client, which reduces the load at the shard to roughly one request per client instance per second, about 4,000 per second here. If the key can tolerate no staleness, store it under several suffixed names that hash to different shards and read a random one, updating all copies on write; or allow reads from the replica. Detect hot keys automatically with sampled counters and promote them without developer action, and protect neighbours with a per-key rate limit at the proxy.</p></details>
+<details><summary>How do you stop a cache stampede?</summary><p>Layer several defences. The shard issues a lease to the first missing caller and makes the others wait briefly or take a stale value, so only one database query runs per key. Inside each process, single-flight collapses concurrent loads. Stale-while-revalidate with a soft TTL lets users keep getting the old value while one caller refreshes it. TTL jitter prevents mass simultaneous expiry. Finally a global limit on database loaders caps total pressure even when many different keys miss at once.</p></details>
+<details><summary>The database row changes. How do you keep the cache from serving stale data forever?</summary><p>Commit to the database first, then delete the key (not set it), so a later reader reloads fresh data. The classic race is a slow reader that loaded the old row before the write and fills the cache after the delete; leases close it because the delete invalidates the outstanding lease token, or you can carry a row version and refuse older versions. Back this up with a change data capture feed that emits deletes for any write, including ones the application did not make, and with a TTL as the ultimate bound. The honest guarantee is bounded staleness: typically under a few seconds, never more than the TTL.</p></details>
+<details><summary>What happens when a cache node dies, and how do you avoid overloading the database?</summary><p>With async replicas, a failure detector flags the node after missing heartbeats, a majority agrees, and the most up-to-date replica is promoted; clients learn the new map from a redirect or refresh. For the several seconds that takes, 1/32 of keys miss, adding about 45,000 reads per second at the database, so clients use short timeouts, a circuit breaker and leases to collapse duplicate work, and the database is provisioned with roughly 2x headroom. A gutter pool can hold the hottest keys of the dead shard for a few seconds. Afterwards, warm the replacement gradually rather than all at once.</p></details>
+<details><summary>How do you add a node without a spike of misses?</summary><p>Use consistent hashing or slots so only about 3% of the keys change owner when going from 32 to 33 shards. Then migrate those slots live: copy keys in small batches with their remaining TTL from the old owner to the new one, serve reads from the source until a key has moved, redirect afterwards, and publish the new owner when the slot is empty. If you cannot copy, run both rings for a window, read from the new owner and fall back to the old one on a miss. Pace the migration to protect the source, and only resize when memory is below about 80% so the move has headroom.</p></details>
+<details><summary>Explain LRU, and why a real cache does not implement it exactly.</summary><p>LRU evicts the item whose last access is oldest, based on the idea that recent use predicts future use. Exact LRU keeps all items in a linked list and moves the item to the head on every read, which needs a lock around shared pointers and 16 bytes of extra memory per item, so it becomes a bottleneck at high read rates. Memcached therefore uses segmented LRU with lazy bumping so hits are almost lock free, and Redis stores a coarse timestamp and, to evict, samples a few random keys and removes the oldest, which closely approximates LRU at no per-hit cost. If the workload has scans, an LFU policy protects popular keys better.</p></details>
+<details><summary>How do you share the cache fairly among many teams?</summary><p>Namespace the keys per tenant and enforce three quotas: memory (evict preferentially from the tenant furthest over its allotment, so a growing neighbour cannot push a tenant under quota out), request rate (a token bucket at the proxy, with excess answered as fast misses), and limits on connections and value size. Unused quota may be borrowed, which is what makes a shared cluster cheaper than separate ones. Tenants with extreme or sensitive needs get dedicated shards. Per-tenant dashboards of hit rate, memory and throttling make quotas something teams can reason about, and credentials are scoped to namespaces.</p></details>
+<details><summary>Why is a cold cache so dangerous, and what do you do about it?</summary><p>The databases are sized for the miss traffic (about 2% of reads), so a hit rate of zero sends 50 times more load than they were built for. They slow down, requests time out, the loaders never finish filling the cache, and the system stays broken even when the original cause is gone. So we avoid emptiness (rolling restarts, replicas, snapshots), bring new capacity in gradually by shifting a growing percentage of keys, prefill the hottest keys by replaying recent access logs at a controlled rate, and use leases and a global loader cap so the database sees each key's load once. During recovery we shed low-priority traffic.</p></details>
+<details><summary>Should the cache write to the database (write-through or write-behind)?</summary><p>For a general-purpose shared cache I would not. Write-through needs the cache tier to know each database's schema and failure behaviour, slows every write and still misses writes that bypass it. Write-behind makes the cache the holder of the only copy of recent writes, so a node loss means data loss, which turns a cache into an under-engineered database. Cache-aside with delete on write keeps the cache stateless with respect to correctness: it can be wiped at any time and the system remains right, only slower. The exceptions are specific, tolerant use cases such as counters where losing a few seconds of increments is acceptable.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">18. Recap</h2>
+<ul>
+<li>Sizing: 1.5M ops/s, 1 billion keys at about 1.1 KB gives roughly 1.3 TB of data, 32 shards of about 41 GB each on 52 GB of usable RAM, plus a replica for each. Memory is the cost driver, request rate per node is modest, and the database is sized for the 2% of reads that miss.</li>
+<li>Sharding: consistent hashing with virtual nodes, or 16,384 slots, so a resize moves about 1/N of the keys; route through a proxy tier by default, with a smart-client option.</li>
+<li>Memory: slab allocation avoids fragmentation at the price of about 10 to 15% internal waste; eviction uses approximate LRU (segmented or sampled) or LFU; TTLs are jittered and expire lazily plus actively.</li>
+<li>Protection: leases, single-flight, stale-while-revalidate and TTL jitter defend against stampedes; near-cache, key replicas and sampling-based detection defend against hot keys.</li>
+<li>Consistency: cache-aside, commit then delete, leases or versions against stale fills, a CDC feed for invalidation, and TTL as the backstop. The guarantee is bounded staleness.</li>
+<li>Availability: asynchronous replicas with majority-agreed promotion; fast client timeouts, circuit breakers, database headroom, a gutter pool and a defined degraded mode, because the cache failing must never be a correctness failure.</li>
+<li>Operations: slot migration for live scale-out, gradual warm-up, per-tenant quotas, and metrics led by hit rate, eviction age and database load from misses.</li>
+</ul></div>
+<p class="connects"><b>Connects to:</b> builds on <a href="../chapters/13-caching-patterns.html">Chapter 13</a> (write policies), <a href="../chapters/14-caching-failures.html">Chapter 14</a> (stampede, penetration, avalanche), <a href="../chapters/15-redis.html">Chapter 15</a> (Redis internals), <a href="../chapters/25-sharding.html">Chapter 25</a> and <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a> (consistent hashing, sketches), <a href="../chapters/24-replication.html">Chapter 24</a> and <a href="../chapters/29-consensus.html">Chapter 29</a> (replication, failover), <a href="../chapters/28-cap-consistency.html">Chapter 28</a> (consistency), <a href="../chapters/42-multitenancy-cells.html">Chapter 42</a> (quotas, cells) and <a href="../chapters/54-observability-slos.html">Chapter 54</a> (SLOs). Related case studies: <a href="c04-key-value-store.html">case study 4</a> (the durable store behind a cache), <a href="c03-rate-limiter.html">case study 3</a> (counters and token buckets), and <a href="c01-url-shortener.html">case study 1</a> (a read-heavy system that depends on a cache).</p>
+<!--END-->
+
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

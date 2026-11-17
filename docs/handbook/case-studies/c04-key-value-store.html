@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 4: Design a Key-Value Store | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c04-key-value-store">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+  </defs>
+</svg>
+
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+
+<main>
+<div class="kicker">Case study 4 · Worked solutions</div>
+<h1>Design a Key-Value Store</h1>
+<p class="lead">We design a Dynamo-style, always-writable, horizontally scalable key-value store: how keys are spread over machines, how copies are kept, how conflicting writes are detected and merged, how the system heals itself after failures, and how each node stores data on disk. We finish by contrasting it with a strongly consistent store built on Raft.</p>
+
+<!-- ======================= 1 ======================= -->
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+
+<p>The prompt is short: "Design a distributed key-value store." A key-value store is the simplest database interface there is. You give it a key (a short identifier such as <code>cart:u8231</code>) and it stores or returns an opaque value (a blob of bytes, typically a few kilobytes). There are no joins, no secondary indexes, no SQL. Because the interface is so small, the interesting part is entirely inside: how to make it hold more data than one machine can, answer in a few milliseconds, and keep working when machines die. Real examples include Amazon's Dynamo (the design this page follows), Apache Cassandra, Riak, and Voldemort. Redis and etcd are also key-value stores but make very different choices, which we compare in section 15.</p>
+
+<p>In an interview the first move is to ask questions that pin down the trade-offs (the framework is in <a href="../chapters/01-interview-framework.html">Chapter 1</a>). The table lists the questions and the answers we will assume for the rest of the page.</p>
+
+<table>
+<tr><th>Question</th><th>Assumed answer</th><th>Why it matters</th></tr>
+<tr><td>Single machine or distributed?</td><td>Distributed. Data far exceeds one machine.</td><td>Forces partitioning and replication.</td></tr>
+<tr><td>What are keys and values?</td><td>Keys up to 256 bytes, values up to 1 MB, average value 2 KB. Values are opaque.</td><td>Sets storage, bandwidth, and whether we can merge values.</td></tr>
+<tr><td>Read:write ratio?</td><td>About 4:1 reads to writes, with bursts.</td><td>Drives replica placement and cache design.</td></tr>
+<tr><td>Consistency requirement?</td><td>Availability first. Writes must succeed even during failures. Eventual consistency is acceptable; applications can resolve conflicts.</td><td>Chooses the AP side of <a href="../chapters/28-cap-consistency.html">CAP</a>.</td></tr>
+<tr><td>Latency target?</td><td>p99 under 10 ms for reads and writes inside a region.</td><td>Rules out synchronous cross-region coordination on the hot path.</td></tr>
+<tr><td>Multi-region?</td><td>Yes, 2 to 3 data centers, each with a full copy.</td><td>Needs a replication policy aware of data centers.</td></tr>
+<tr><td>Scale?</td><td>Tens of billions of keys, hundreds of thousands of operations per second.</td><td>Sets node count in the estimation.</td></tr>
+<tr><td>Do we need transactions or range scans?</td><td>No multi-key transactions. Point operations only (range scans out of scope).</td><td>Allows hash partitioning, which scatters adjacent keys.</td></tr>
+<tr><td>Is it a cache or a database?</td><td>A durable database. Data must survive restarts.</td><td>Requires a write-ahead log and disk storage.</td></tr>
+</table>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="requirements">2. Requirements and scope</h2>
+
+<h3>2.1 Functional requirements</h3>
+<ul>
+  <li><b>put(key, value, context):</b> store a value under a key. The optional <code>context</code> is version metadata returned by an earlier read; it tells the store which version this write is based on (section 9).</li>
+  <li><b>get(key):</b> return the value or, if concurrent writes conflicted, all the conflicting values plus a context.</li>
+  <li><b>delete(key, context):</b> remove a key. Internally this is a write of a special marker called a tombstone (section 11).</li>
+  <li>Tunable consistency per request: the caller chooses how many replicas must answer.</li>
+  <li>Optional time-to-live (TTL) per key, after which the key disappears.</li>
+</ul>
+
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+  <li><b>High availability for writes:</b> a write is accepted as long as a configurable minimum number of replicas are reachable, even if some nodes or a whole rack is down. Target 99.99% request availability.</li>
+  <li><b>Low latency:</b> p99 under 10 ms in-region.</li>
+  <li><b>Horizontal scalability:</b> add nodes to add capacity, with only a small fraction of data moving.</li>
+  <li><b>Durability:</b> once a write is acknowledged, it survives the loss of any single node (and with a write quorum of 2 out of 3, any single node simultaneously).</li>
+  <li><b>Partition tolerance and eventual convergence:</b> after a network partition heals, replicas converge to the same data without operator action.</li>
+  <li><b>Decentralized:</b> no single master node whose failure stops the cluster. Every node can accept any request.</li>
+</ul>
+
+<h3>2.3 Explicitly out of scope</h3>
+<ul>
+  <li>Multi-key transactions, secondary indexes, and range queries.</li>
+  <li>Strong (linearizable) consistency. We contrast with it, but our design does not provide it by default.</li>
+  <li>Fine-grained access control and encryption key management beyond a brief mention in section 14.</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b>
+The requirements say "always writable" and "eventually consistent". That one decision shapes everything: it forces replicas to accept writes independently, which creates conflicts, which in turn needs versioning, conflict resolution, and background repair. A design that required strong consistency would be built from different parts (section 15).
+</div>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="estimation">3. Capacity estimation</h2>
+
+<p>Estimation techniques are in <a href="../chapters/02-estimation.html">Chapter 2</a>. We use round numbers and show every step.</p>
+
+<h3>3.1 Traffic</h3>
+<ul>
+  <li>Average load: 200,000 operations per second (ops/s).</li>
+  <li>Read:write 4:1, so 160,000 reads/s and 40,000 writes/s on average.</li>
+  <li>Peak is 3 times average: 600,000 ops/s, which is 480,000 reads/s and 120,000 writes/s.</li>
+</ul>
+
+<h3>3.2 Data size</h3>
+<ul>
+  <li>10 billion distinct keys. Average key 50 bytes, average value 2 KB, plus about 100 bytes of metadata per record (version vector, timestamp, checksum). Record size is about 2,150 bytes, which we round to 2.2 KB.</li>
+  <li>Logical data: 10 billion × 2.2 KB = 22 TB.</li>
+  <li>Replication factor N = 3: 22 TB × 3 = 66 TB of stored data (before compression; real systems typically see 1.5 to 2 times compression for JSON-like values, which we treat as extra headroom).</li>
+  <li>New data per day: 40,000 writes/s average × 86,400 s = 3.46 billion writes a day. Most are overwrites of existing keys, so net growth is much smaller than 3.46 billion × 2.2 KB = 7.6 TB. Assume 5% of writes are new keys: about 0.38 TB of logical growth per day, 140 TB a year of logical data if sustained. We therefore plan capacity in steps and budget to add nodes continuously.</li>
+</ul>
+
+<h3>3.3 Node count</h3>
+<ul>
+  <li>Each node has 4 TB of NVMe storage. An LSM store needs free space for compaction (section 11), so we aim for at most 50% fill, around 2 TB of data per node. The 66 TB needs at least 66 / 2 = 33 nodes. We choose <b>40 nodes</b> (about 1.65 TB each, 41% full).</li>
+  <li>Replica operations at peak. Each write goes to 3 replicas: 120,000 × 3 = 360,000 replica writes/s. Each read with R = 2 contacts 2 replicas (one full read plus one cheaper digest read): 480,000 × 2 = 960,000 replica reads/s. Total 1.32 million replica operations/s.</li>
+  <li>Per node: 1,320,000 / 40 = 33,000 operations/s. A modern NVMe-backed LSM node handles this comfortably (tens of thousands of operations/s, with the memtable and OS page cache absorbing much of the read load).</li>
+</ul>
+
+<h3>3.4 Bandwidth and memory</h3>
+<ul>
+  <li>Client writes at peak: 120,000 × 2.2 KB = 264 MB/s into the cluster. The coordinator forwards to two further replicas: 528 MB/s of internal traffic.</li>
+  <li>Client reads at peak: 480,000 × 2.2 KB = 1.06 GB/s out to clients. Digest reads add little because they carry only a hash.</li>
+  <li>Spread over 40 nodes this is well under 100 MB/s per node, far below a 10 Gbit/s (about 1.25 GB/s) network card.</li>
+  <li>Bloom filters (section 11): at about 10 bits per key, a node holding 10 billion × 3 / 40 = 750 million replica keys needs 750 million × 10 bits = 7.5 billion bits, about 0.94 GB of memory.</li>
+  <li>Memtable: 256 MB per node before flush. Page cache: whatever remains of, say, 64 GB RAM, which holds the hottest few percent of the 1.65 TB.</li>
+  <li>Tokens: with 256 virtual nodes per machine, the ring has 40 × 256 = 10,240 tokens, a tiny table that every node can hold in memory.</li>
+</ul>
+
+<div class="callout tip"><b>Interview tip</b>
+State the replication multiplier explicitly. Candidates often size storage for 22 TB and forget that three copies means 66 TB, and that compaction headroom roughly doubles the raw disk you must buy.
+</div>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="api">4. API design</h2>
+
+<p>The client-facing API is small. Design details of APIs in general are in <a href="../chapters/05-api-design.html">Chapter 5</a>; here the unusual part is the <b>context</b> object that carries version information.</p>
+
+<pre><code>GET  /v1/kv/{key}?r=2
+  200 OK
+  { "values": [ {"value": "base64...", "ts": 1731800000123} ],
+    "context": "opaque-token-encoding-the-version-vector" }
+  // If concurrent versions exist, "values" holds several entries (siblings).
+  // 404 if the key does not exist (or was deleted and the tombstone is current).
+
+PUT  /v1/kv/{key}?w=2
+  { "value": "base64...", "context": "opaque-token-or-empty", "ttl_seconds": 86400 }
+  200 OK   { "context": "new-opaque-token" }
+  // context from an earlier get tells the store which version(s) this write supersedes.
+  // 503 if fewer than w replicas acknowledged in time (the write may still land later).
+
+DELETE /v1/kv/{key}?w=2
+  { "context": "opaque-token" }
+  204 No Content</code></pre>
+
+<p>Three details deserve attention:</p>
+<ul>
+  <li><b>Opaque context.</b> The client treats the context as a black box: read it from a <code>get</code>, send it back unchanged on the next <code>put</code>. Inside it is a version vector (section 9). Hiding it lets the server change the representation without breaking clients.</li>
+  <li><b>Per-request consistency knobs.</b> <code>r</code> and <code>w</code> are the number of replicas that must respond. Defaults are r = 2, w = 2 with N = 3 (section 5.3).</li>
+  <li><b>Idempotency.</b> A retry of the same <code>put</code> with the same context writes the same version and is safe. The details of idempotent design are in <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>.</li>
+</ul>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="data-model">5. Data model and storage choice</h2>
+
+<p>Each stored record has this logical shape:</p>
+<pre><code>key        : bytes (up to 256 B)
+value      : bytes (up to 1 MB), or a tombstone marker
+version    : version vector, e.g. {nodeA:3, nodeC:1}
+timestamp  : wall-clock time at the coordinator (used for last-write-wins and tombstone expiry)
+ttl        : optional expiry time</code></pre>
+
+<h3>5.1 Why not use an existing database per node?</h3>
+<p>Each node needs a fast, local, embedded storage engine for its share of the keys. The workload is point reads and writes with heavy write volume, and the data can be many times larger than RAM. A B-tree engine updates pages in place, which causes random writes. A <b>log-structured merge tree (LSM tree)</b> turns every write into a sequential append and organizes data into sorted immutable files, which suits write-heavy workloads and SSDs. <a href="../chapters/19-storage-engines.html">Chapter 19</a> explains both families in depth; we pick an LSM tree and detail it in section 9. Many real Dynamo-style systems (Cassandra, Riak with LevelDB or Bitcask, ScyllaDB) do exactly this.</p>
+
+<h3>5.2 The three placement questions</h3>
+<p>The distributed part answers three questions for every key:</p>
+<ol>
+  <li><b>Which nodes own this key?</b> Answered by consistent hashing with virtual nodes (section 7).</li>
+  <li><b>How many of them must agree for an operation to succeed?</b> Answered by quorums (section 5.3).</li>
+  <li><b>What happens when replicas disagree?</b> Answered by versioning and repair (sections 6, 10, 12).</li>
+</ol>
+
+<h3>5.3 Replication and quorums in one paragraph</h3>
+<p>Every key is stored on <b>N = 3</b> nodes, called its <b>replicas</b> (general replication theory is in <a href="../chapters/24-replication.html">Chapter 24</a>). A write is sent to all N replicas but reported successful once <b>W</b> of them acknowledge. A read is sent to the replicas and returns once <b>R</b> reply. The rule <b>R + W &gt; N</b> guarantees that every read set overlaps every write set in at least one node, so a read sees the most recent acknowledged write, provided the system is not using sloppy quorum (section 8) and no conflicting concurrent writes exist. With N = 3, W = 2, R = 2 we get 2 + 2 = 4 &gt; 3. This tolerates one replica being down for both reads and writes.</p>
+
+<table>
+<tr><th>N, R, W</th><th>Behaviour</th><th>Use when</th></tr>
+<tr><td>3, 2, 2</td><td>Balanced. R + W = 4 &gt; 3. Survives one node down for reads and writes.</td><td>Default.</td></tr>
+<tr><td>3, 1, 3</td><td>Fast reads, writes need all replicas. One node down blocks writes.</td><td>Read-heavy, rare writes.</td></tr>
+<tr><td>3, 3, 1</td><td>Fast, highly available writes; reads need all replicas and may be slow.</td><td>Write-heavy logging where reads are rare.</td></tr>
+<tr><td>3, 1, 1</td><td>R + W = 2, not greater than 3. Fastest and most available, but a read may miss the latest write.</td><td>Cache-like, staleness acceptable.</td></tr>
+</table>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="first-design">6. A first simple design, then the scaled architecture</h2>
+
+<h3>6.1 Version zero: one box</h3>
+<p>The simplest key-value store is a hash map in memory with an append-only file for durability. A write appends a line to the log and updates the map; a restart replays the log. This gives microsecond reads, but fails three ways: capacity is limited to one machine's RAM, throughput to one machine's cores, and one failure loses availability. The next step is to copy the box (replication) and then split the data over many boxes (partitioning). Doing only replication does not add capacity; doing only partitioning loses data when a box dies. We need both.</p>
+
+<h3>6.2 The scaled architecture</h3>
+<p>The final design has no master. All 40 nodes run the same software. A client can send a request to any node, which then acts as that request's <b>coordinator</b>: the node that finds the replicas, forwards the work, collects replies, and answers the client. Nodes learn who is alive and who owns which token ranges through <b>gossip</b> (section 10.4). Clients can either send to any node through a load balancer, or use a smart client library that holds the ring map and sends straight to a replica of the key (saving one hop).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="High level architecture of the key-value store: clients, coordinators, ring of nodes, data centers">
+  <rect class="ext" x="20" y="30" width="130" height="46" rx="10"/><text class="t-c t-b" x="85" y="58">Clients</text>
+  <rect class="ext" x="20" y="120" width="130" height="46" rx="10"/><text class="t-c t-b" x="85" y="141">Smart client</text><text class="t-c t-sm" x="85" y="157">(holds ring map)</text>
+  <rect class="box" x="210" y="30" width="130" height="46" rx="10"/><text class="t-c t-b" x="275" y="58">Load balancer</text>
+  <path class="arrow" d="M150 53 L206 53"/>
+  <path class="arrow dash" d="M150 143 L300 143 L300 205"/>
+
+  <rect class="box" x="400" y="20" width="470" height="340" rx="14" style="fill:none;stroke:var(--fg);stroke-dasharray:6 4"/>
+  <text class="t-b" x="416" y="42">Data center A: ring of 40 nodes (same software on each)</text>
+
+  <rect class="cache" x="430" y="70" width="130" height="60" rx="10"/><text class="t-c t-b" x="495" y="94">Node 1</text><text class="t-c t-sm" x="495" y="112">coordinator for</text><text class="t-c t-sm" x="495" y="124">this request</text>
+  <rect class="db" x="620" y="70" width="110" height="60" rx="10"/><text class="t-c t-b" x="675" y="96">Node 7</text><text class="t-c t-sm" x="675" y="114">replica 1</text>
+  <rect class="db" x="760" y="70" width="100" height="60" rx="10"/><text class="t-c t-b" x="810" y="96">Node 12</text><text class="t-c t-sm" x="810" y="114">replica 2</text>
+  <rect class="db" x="620" y="170" width="110" height="60" rx="10"/><text class="t-c t-b" x="675" y="196">Node 23</text><text class="t-c t-sm" x="675" y="214">replica 3</text>
+  <rect class="box" x="430" y="170" width="130" height="60" rx="10"/><text class="t-c t-b" x="495" y="196">Node 2 ... 40</text><text class="t-c t-sm" x="495" y="214">other tokens</text>
+  <path class="arrow" d="M340 53 L426 90"/>
+  <path class="arrow" d="M560 90 L616 90"/>
+  <path class="arrow" d="M560 105 L616 190"/>
+  <path class="arrow" d="M700 70 C720 50 780 50 800 66"/>
+  <text class="t-sm" x="450" y="262">All nodes exchange membership by gossip.</text>
+  <text class="t-sm" x="450" y="280">Each node: commit log, memtable, SSTables, bloom filters.</text>
+  <text class="t-sm" x="450" y="298">Hinted handoff and read repair run in the background.</text>
+  <text class="t-sm" x="450" y="316">Merkle-tree anti-entropy compares replicas on a schedule.</text>
+  <text class="t-sm" x="450" y="338">Data centers B and C hold their own replicas (section 13).</text>
+</svg>
+<figcaption>Any node can coordinate. The coordinator hashes the key to find its three replicas on the ring, sends the operation to them, and replies once enough have answered.</figcaption>
+</figure>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="partitioning">7. Deep dive 1: partitioning with consistent hashing and virtual nodes</h2>
+
+<h3>7.1 Why not hash modulo the node count?</h3>
+<p>The first idea is <code>node = hash(key) mod 40</code>. It spreads keys evenly, but when you add a 41st node, <code>mod 41</code> changes the answer for almost every key: roughly 40/41 of all data would have to move. For a 66 TB cluster that is a catastrophe. We need a scheme where adding or removing one node moves only about 1/N of the data. That scheme is <b>consistent hashing</b>, explained fully in <a href="../chapters/25-sharding.html">Chapter 25</a> and <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>.</p>
+
+<h3>7.2 The ring</h3>
+<p>Imagine the output space of a hash function (say 128 bits) bent into a circle. Each node is given one or more positions on the circle, called <b>tokens</b>. To find where a key lives, hash the key to get a position, then walk clockwise until you meet a token; that node is the key's <b>primary</b> owner. For replication factor N = 3, the key is also stored on the next two <em>distinct</em> physical nodes clockwise. This list of N nodes is the key's <b>preference list</b>.</p>
+
+<h3>7.3 Why virtual nodes</h3>
+<p>With one token per node, the segments between tokens differ wildly in length, so some nodes get much more data than others. Worse, when a node dies, its entire load falls onto its single clockwise neighbour. <b>Virtual nodes (vnodes)</b> fix both: each physical machine owns many tokens, say 256, scattered at random around the ring. Each node then owns many small ranges, the sum of which is close to 1/40 of the ring (the statistical spread shrinks as the number of tokens grows). When a node leaves, its many small ranges go to many different neighbours, so the load is shared. When a node joins, it takes a few small ranges from many existing nodes, so streaming happens in parallel from many sources and finishes fast. Machines with more disk can simply be given more tokens, which handles heterogeneous hardware.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Consistent hashing ring with virtual nodes and a preference list for a key">
+  <circle cx="260" cy="200" r="150" fill="none" stroke="var(--fg)" stroke-width="2"/>
+  <circle cx="260" cy="50" r="14" class="box"/><text class="t-c t-b" x="260" y="55">A1</text>
+  <circle cx="390" cy="125" r="14" class="db"/><text class="t-c t-b" x="390" y="130">B1</text>
+  <circle cx="390" cy="275" r="14" class="cache"/><text class="t-c t-b" x="390" y="280">C1</text>
+  <circle cx="260" cy="350" r="14" class="box"/><text class="t-c t-b" x="260" y="355">A2</text>
+  <circle cx="130" cy="275" r="14" class="db"/><text class="t-c t-b" x="130" y="280">B2</text>
+  <circle cx="130" cy="125" r="14" class="cache"/><text class="t-c t-b" x="130" y="130">C2</text>
+  <circle cx="330" cy="68" r="7" fill="var(--fg)"/><text class="t-sm" x="342" y="64">hash(key)</text>
+  <path class="arrow" d="M338 76 C360 90 370 100 378 112"/>
+  <text class="t-c t-b" x="260" y="195">Ring</text>
+  <text class="t-c t-sm" x="260" y="214">physical nodes A, B, C</text>
+  <text class="t-c t-sm" x="260" y="230">each with 2 vnodes shown</text>
+
+  <rect class="hit" x="540" y="40" width="330" height="150" rx="10"/>
+  <text class="t-b" x="556" y="64">Preference list for this key (N = 3)</text>
+  <text x="556" y="90">1. Walk clockwise from hash(key): B1, node B</text>
+  <text x="556" y="112">2. Next token C1, node C (distinct)</text>
+  <text x="556" y="134">3. Next token A2, node A (distinct)</text>
+  <text class="t-sm" x="556" y="158">If the next token belonged to a node already chosen,</text>
+  <text class="t-sm" x="556" y="174">skip it, so replicas sit on different machines.</text>
+
+  <rect class="miss" x="540" y="210" width="330" height="150" rx="10"/>
+  <text class="t-b" x="556" y="234">Node D joins</text>
+  <text x="556" y="258">D takes a few tokens, each cutting a small range</text>
+  <text x="556" y="278">from a different existing node. About 1/(N+1) of</text>
+  <text x="556" y="298">the data moves in total, streamed in parallel from</text>
+  <text x="556" y="318">many sources. A node leaving spreads its ranges</text>
+  <text x="556" y="338">over many neighbours.</text>
+</svg>
+<figcaption>Each machine owns several scattered tokens. A key is stored on the first node clockwise and the next two distinct nodes. Skipping repeated physical nodes keeps replicas on different machines (and, with rack-aware placement, in different racks).</figcaption>
+</figure>
+
+<h3>7.4 How many vnodes?</h3>
+<p>Too few tokens give imbalance; too many make the ring metadata large, slow repair, and increase the number of range-level sessions (every Merkle comparison is per range). Typical systems used 256 tokens per node historically; newer ones use 16 or fewer with smarter token allocation. For our 40-node cluster, 256 tokens means 10,240 ranges. With 66 TB total data, each range holds about 6.4 GB across replicas (66 TB / 10,240), a convenient unit for streaming and repair.</p>
+
+<h3>7.5 Alternatives compared</h3>
+<table>
+<tr><th>Strategy</th><th>Pros</th><th>Cons</th><th>Verdict</th></tr>
+<tr><td>Hash mod N</td><td>Trivial, even.</td><td>Reshuffles nearly all keys when N changes.</td><td>Rejected.</td></tr>
+<tr><td>Consistent hashing, 1 token/node</td><td>Minimal movement.</td><td>Uneven load, hotspot on neighbour at failure.</td><td>Rejected.</td></tr>
+<tr><td>Consistent hashing with vnodes</td><td>Even load, parallel rebalance, weighting.</td><td>More metadata, more repair units.</td><td><b>Chosen.</b></td></tr>
+<tr><td>Fixed partitions (e.g. 4,096 slots) assigned to nodes</td><td>Simple, easy to move whole partitions, used by Couchbase and Redis Cluster.</td><td>Needs a central or consensus-managed assignment table.</td><td>Valid alternative if you want a coordinator.</td></tr>
+<tr><td>Range partitioning on key</td><td>Supports scans.</td><td>Hot ranges, needs splitting.</td><td>Not needed here (no scans).</td></tr>
+</table>
+
+<h3>7.6 Request routing: where does the coordinator run?</h3>
+<p>There are two designs. In the <b>server-side coordinator</b> design, the client sends to any node (through a load balancer); that node forwards to the true replicas. This keeps clients simple but adds a hop. In the <b>smart client</b> design, the client library downloads the ring map, computes the preference list itself, and talks directly to a replica, which acts as coordinator; this saves one network round trip and shifts load off the balancer. The client refreshes its map periodically and when a node answers "not my range". The Dynamo paper used both: a generic load balancer for simplicity and a partition-aware client for the lowest latency. Our default is the smart client with fall-back to any node, because at 10 ms p99 one hop (about 0.5 ms in a data center) is cheap but not free.</p>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="write-read-flow">8. Request flows: put and get with quorums</h2>
+
+<h3>8.1 The write path (put)</h3>
+<ol>
+  <li>The client sends <code>put(key, value, context, w=2)</code> to a coordinator, ideally one of the key's three replicas.</li>
+  <li>The coordinator hashes the key, consults its ring map, and finds the preference list (nodes B, C, A in the figure).</li>
+  <li>It builds the new version: it increments its own counter in the version vector from the supplied context (section 9.2) and stamps the record with its wall-clock time.</li>
+  <li>It writes the record locally (commit log, then memtable) and sends the same record in parallel to the other two replicas.</li>
+  <li>Each replica appends to its own commit log, updates its memtable, and acknowledges.</li>
+  <li>As soon as W = 2 acknowledgements (counting the coordinator's own) arrive, the coordinator answers the client "success". The third replica's reply is not waited for; if it is slow or down, the system repairs it later (section 10).</li>
+  <li>If fewer than W acknowledgements arrive before the timeout (say 50 ms), the coordinator returns an error. The write may still have reached one replica; the client may retry, and repair will reconcile.</li>
+</ol>
+
+<h3>8.2 The read path (get)</h3>
+<ol>
+  <li>The client sends <code>get(key, r=2)</code> to a coordinator.</li>
+  <li>The coordinator asks the closest replica for the full value and the other replicas for a <b>digest</b> (a hash of their stored version), to save bandwidth.</li>
+  <li>When R = 2 replies are in, it compares them. If the digests match, it returns the value.</li>
+  <li>If the digests differ, the coordinator fetches full versions from both and compares version vectors: if one dominates the other (it is a strict descendant), the newer wins; if they are concurrent, both are returned as siblings to the client.</li>
+  <li>The coordinator then issues <b>read repair</b>: it writes the winning version to any replica that returned a stale one, in the background (section 10.2).</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 420" role="img" aria-label="Sequence diagram of a put with quorum W=2 and a get with R=2">
+  <rect class="ext" x="30" y="14" width="110" height="32" rx="8"/><text class="t-c t-b" x="85" y="35">Client</text>
+  <rect class="cache" x="230" y="14" width="130" height="32" rx="8"/><text class="t-c t-b" x="295" y="35">Coordinator</text>
+  <rect class="db" x="470" y="14" width="110" height="32" rx="8"/><text class="t-c t-b" x="525" y="35">Replica 2</text>
+  <rect class="db" x="620" y="14" width="110" height="32" rx="8"/><text class="t-c t-b" x="675" y="35">Replica 3</text>
+  <rect class="miss" x="770" y="14" width="110" height="32" rx="8"/><text class="t-c t-b" x="825" y="35">Replica 1 (down)</text>
+  <line class="life" x1="85" y1="46" x2="85" y2="410"/><line class="life" x1="295" y1="46" x2="295" y2="410"/><line class="life" x1="525" y1="46" x2="525" y2="410"/><line class="life" x1="675" y1="46" x2="675" y2="410"/><line class="life" x1="825" y1="46" x2="825" y2="410"/>
+
+  <text class="t-b" x="95" y="74">PUT, W = 2 (one replica down)</text>
+  <path class="arrow" d="M85 94 L291 94"/><text class="t-sm" x="100" y="88">1. put(k, v, ctx)</text>
+  <path class="arrow" d="M295 120 L521 120"/><text class="t-sm" x="340" y="114">2. replicate</text>
+  <path class="arrow" d="M295 134 L671 134"/>
+  <path class="arrow-r dash" d="M295 148 L821 148"/><text class="t-sm" x="700" y="164" style="fill:var(--bad)">no reply (timeout)</text>
+  <path class="arrow-g dash" d="M521 176 L299 176"/><text class="t-sm" x="360" y="170">3. ack</text>
+  <path class="arrow-g dash" d="M671 190 L299 190"/><text class="t-sm" x="560" y="186">3. ack</text>
+  <path class="arrow-g dash" d="M291 214 L89 214"/><text class="t-sm" x="100" y="208">4. success after 2 acks</text>
+
+  <text class="t-b" x="95" y="252">GET, R = 2 and read repair</text>
+  <path class="arrow" d="M85 272 L291 272"/><text class="t-sm" x="100" y="266">5. get(k)</text>
+  <path class="arrow" d="M295 290 L521 290"/><text class="t-sm" x="340" y="284">6. full read</text>
+  <path class="arrow" d="M295 304 L671 304"/><text class="t-sm" x="560" y="300">digest read</text>
+  <path class="arrow-g dash" d="M521 326 L299 326"/><path class="arrow-g dash" d="M671 340 L299 340"/><text class="t-sm" x="360" y="320">7. data + digest differ</text>
+  <path class="arrow-g dash" d="M291 362 L89 362"/><text class="t-sm" x="100" y="356">8. newest value + context</text>
+  <path class="arrow dash" d="M295 388 L671 388"/><text class="t-sm" x="360" y="382">9. repair stale replica (async)</text>
+</svg>
+<figcaption>The coordinator answers as soon as W (or R) replicas respond. A dead replica does not block the operation. If replies disagree, the coordinator reconciles and pushes the newest version to the stale replica after replying.</figcaption>
+</figure>
+
+<h3>8.3 What the quorum rule really promises</h3>
+<p>If R + W &gt; N and the quorums are <b>strict</b> (always the real preference-list nodes), then a read quorum contains at least one node that saw the latest acknowledged write. The coordinator picks the newest by version. This is "read-your-writes" in the common case, but it is <em>not</em> linearizability: concurrent writes, a write that failed midway but landed on one node, and clock effects can all show surprising results (see <a href="../chapters/28-cap-consistency.html">Chapter 28</a>). With <b>sloppy quorums</b> (next section) even this overlap guarantee is lost for the period of the failure.</p>
+
+<div class="callout watch"><b>Watch out</b>
+A common wrong claim is "R + W &gt; N gives strong consistency". It gives overlap, not an ordering guarantee. A write that is acknowledged by only one node and then reported as failed can still be read later; two concurrent writes can both succeed. True linearizability needs a single ordered log per key range, as in Raft (section 15).
+</div>
+
+<h3>8.4 Sloppy quorum and hinted handoff</h3>
+<p>Suppose replica 1 for a key is down. A strict quorum with W = 2 still succeeds (2 of the 3 respond), but if two replicas are down it fails and the store stops accepting writes for that key, which violates "always writable". A <b>sloppy quorum</b> relaxes this: the write goes to the first N <em>healthy</em> nodes on the ring walking clockwise from the key, even if they are not the key's usual replicas. Say node D, the next node after the three owners, is healthy. The coordinator sends the replica meant for the down node to D along with a <b>hint</b>: a note saying "this record belongs to node A; hand it over when A comes back". D stores the hinted data in a separate local area. When gossip reports that A is alive again, D streams the hinted records to A and then deletes them. This is <b>hinted handoff</b>.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Hinted handoff timeline when a replica is down and recovers">
+  <rect class="db" x="30" y="50" width="120" height="44" rx="8"/><text class="t-c t-b" x="90" y="76">Replica B</text>
+  <rect class="db" x="190" y="50" width="120" height="44" rx="8"/><text class="t-c t-b" x="250" y="76">Replica C</text>
+  <rect class="miss" x="350" y="50" width="140" height="44" rx="8"/><text class="t-c t-b" x="420" y="70">Replica A</text><text class="t-c t-sm" x="420" y="86">down</text>
+  <rect class="cache" x="540" y="50" width="150" height="44" rx="8"/><text class="t-c t-b" x="615" y="70">Node D</text><text class="t-c t-sm" x="615" y="86">next healthy on ring</text>
+  <rect class="box" x="730" y="50" width="140" height="44" rx="8"/><text class="t-c t-b" x="800" y="70">Coordinator</text><text class="t-c t-sm" x="800" y="86">sees A is down</text>
+
+  <text class="t-b" x="30" y="136">Phase 1: A is down</text>
+  <path class="arrow" d="M760 94 L150 130"/>
+  <text class="t-sm" x="300" y="150">normal write to B and C</text>
+  <path class="arrow dash" d="M790 94 L650 130"/>
+  <text class="t-sm" x="600" y="150">write for A goes to D with hint "owner = A"</text>
+
+  <text class="t-b" x="30" y="190">Phase 2: A recovers</text>
+  <path class="arrow-g" d="M590 200 L480 230"/>
+  <text class="t-sm" x="420" y="256">D hears via gossip that A is back, streams hinted records to A, then deletes them</text>
+  <text class="t-sm" x="30" y="282">Hints are kept for a limited time (for example 3 hours). Beyond that, anti-entropy (section 10) must repair A instead.</text>
+</svg>
+<figcaption>While A is down, its share of writes is parked on D. This keeps writes succeeding, at the cost that reads of that key may not see the parked data until it is handed back, because D is not in the usual read set.</figcaption>
+</figure>
+
+<p>Hinted handoff gives high write availability and speeds up recovery after short outages. It does not replace repair: hints can be lost if D itself dies, are capped by time and size, and do not help a node that was down for days. That is why Merkle-tree anti-entropy exists (section 10.3).</p>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="versioning">9. Deep dive 2: versioning, vector clocks and conflict resolution</h2>
+
+<h3>9.1 Why conflicts happen</h3>
+<p>Because any W of N replicas can accept a write, and sloppy quorums let others accept it too, two clients can update the same key at the same time on different replicas, or one client can update a key while another replica is cut off. After the partition heals the replicas hold different values with no obvious "latest". We need a way to tell "version B came after version A" (so A can be dropped) from "A and B happened independently" (so both must be kept and merged). Background on time and ordering is in <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>.</p>
+
+<h3>9.2 Vector clocks</h3>
+<p>A <b>vector clock</b> (also called a version vector in this context) is a list of (node, counter) pairs attached to each value. When a node coordinates a write, it takes the vector from the context the client supplied, increments its own counter (adding an entry if absent), and stores the result with the new value. Comparison rules:</p>
+<ul>
+  <li>Vector X <b>descends from</b> Y if every counter in Y is less than or equal to the matching counter in X. Then X is a newer version and Y can be discarded.</li>
+  <li>If neither descends from the other, the versions are <b>concurrent</b> (a conflict). Both are kept as <b>siblings</b> and returned to the reader.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Vector clock example with a conflict created by concurrent writes and then merged">
+  <text class="t-b" x="20" y="24">Shopping cart key, coordinators are nodes A and B</text>
+  <rect class="box" x="20" y="44" width="200" height="56" rx="8"/><text class="t-c t-b" x="120" y="68">D1: [milk]</text><text class="t-c t-sm" x="120" y="88">vector {A:1}</text>
+  <path class="arrow" d="M220 72 L300 72"/>
+  <rect class="box" x="300" y="44" width="220" height="56" rx="8"/><text class="t-c t-b" x="410" y="68">D2: [milk, eggs]</text><text class="t-c t-sm" x="410" y="88">vector {A:2} (A coordinated)</text>
+
+  <path class="arrow" d="M410 100 L250 168"/><path class="arrow" d="M410 100 L570 168"/>
+  <text class="t-sm" x="300" y="136">client 1 reads D2,</text><text class="t-sm" x="300" y="150">writes via A</text>
+  <text class="t-sm" x="560" y="136">client 2 reads D2, writes via B</text>
+  <text class="t-sm" x="560" y="150">(replicas cut off from each other)</text>
+
+  <rect class="cache" x="100" y="168" width="300" height="56" rx="8"/><text class="t-c t-b" x="250" y="192">D3: [milk, eggs, bread]</text><text class="t-c t-sm" x="250" y="212">vector {A:3}</text>
+  <rect class="cache" x="450" y="168" width="330" height="56" rx="8"/><text class="t-c t-b" x="615" y="192">D4: [milk, eggs, juice]</text><text class="t-c t-sm" x="615" y="212">vector {A:2, B:1}</text>
+
+  <path class="arrow-r" d="M250 224 L400 280"/><path class="arrow-r" d="M615 224 L500 280"/>
+  <rect class="miss" x="270" y="280" width="360" height="56" rx="8"/><text class="t-c t-b" x="450" y="304">Next get returns siblings D3 and D4</text><text class="t-c t-sm" x="450" y="324">{A:3} and {A:2,B:1} are concurrent</text>
+  <rect class="hit" x="660" y="280" width="220" height="56" rx="8"/><text class="t-c t-b" x="770" y="304">Client merges</text><text class="t-c t-sm" x="770" y="324">[milk, eggs, bread, juice]</text>
+  <path class="arrow-g" d="M630 308 L656 308"/>
+</svg>
+<figcaption>D3 and D4 both descend from D2 but neither descends from the other: {A:3} has A=3 &gt; 2 while {A:2,B:1} has B=1 &gt; 0. The store keeps both. The client merges them and writes back with a context covering both, with new vector {A:3, B:1}, which dominates both.</figcaption>
+</figure>
+
+<h3>9.3 Conflict resolution strategies</h3>
+<table>
+<tr><th>Strategy</th><th>How it works</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Last-write-wins (LWW)</td><td>Keep the version with the highest wall-clock timestamp.</td><td>Simple, no siblings, small metadata. Used by Cassandra.</td><td>Clock skew can pick the wrong write; concurrent updates are silently lost.</td></tr>
+<tr><td>Client-side merge (application reconciliation)</td><td>Return siblings; the application merges (for example union of cart items).</td><td>No lost updates; business logic decides.</td><td>Pushes complexity to every client; deletes can resurrect items.</td></tr>
+<tr><td>CRDTs</td><td>Store data types (sets, counters, registers) whose merge is mathematically automatic and commutative.</td><td>Convergence without app code.</td><td>Limited data types, metadata growth; see <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>.</td></tr>
+<tr><td>Strong consistency (no conflicts)</td><td>A leader orders all writes.</td><td>No siblings.</td><td>Not available during partitions (section 15).</td></tr>
+</table>
+
+<p>We choose vector clocks with client-side merge as the default, with a per-key-space option to use LWW for data where losing a concurrent update is harmless (session data, last-seen timestamps). We expose this as a bucket-level setting.</p>
+
+<h3>9.4 Practical issues</h3>
+<ul>
+  <li><b>Vector growth.</b> Every new coordinator adds an entry. Dynamo bounded this by storing a timestamp per entry and truncating the oldest entries once the vector exceeds, say, 10 entries. Truncation can create false conflicts (never lost data, but extra siblings), which is safe. Another approach is to restrict coordinators to the key's top replicas, so only three node ids ever appear.</li>
+  <li><b>Sibling explosion.</b> A client that repeatedly writes without a context creates a new sibling each time. Mitigate by requiring context on updates and by capping siblings with an alert.</li>
+  <li><b>Clock dependence.</b> Vector clocks do not use wall clocks to order, which is exactly why they are safe under skew. LWW does, which is its weakness. Even our timestamp for tombstone expiry only needs rough accuracy.</li>
+  <li><b>Dotted version vectors</b> are a refinement that avoids false siblings when the same client updates through different coordinators; mention it if asked for improvements.</li>
+</ul>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="repair">10. Deep dive 3: how replicas heal (read repair, hints, Merkle anti-entropy)</h2>
+
+<p>Replicas drift apart for many reasons: a replica was down, a write reached only some replicas, a disk lost data, a hint expired. The system needs layers of healing that work at different speeds. Gossip and Merkle trees are explained in <a href="../chapters/33-gossip-merkle.html">Chapter 33</a>; here is how we use them.</p>
+
+<h3>10.1 The three repair layers</h3>
+<table>
+<tr><th>Layer</th><th>Trigger</th><th>Scope</th><th>Cost</th><th>Catches</th></tr>
+<tr><td>Hinted handoff</td><td>Node returns after a short outage</td><td>Only writes missed during outage</td><td>Very low</td><td>Short failures (minutes to hours)</td></tr>
+<tr><td>Read repair</td><td>A read sees stale or divergent replicas</td><td>Only keys that are actually read</td><td>Low (piggybacks on reads)</td><td>Hot keys that are drifting</td></tr>
+<tr><td>Anti-entropy with Merkle trees</td><td>Scheduled (for example weekly per range) or after a long outage</td><td>All data in the compared range</td><td>Moderate (disk scan, hashing)</td><td>Cold keys, lost hints, silent corruption</td></tr>
+</table>
+
+<h3>10.2 Read repair</h3>
+<p>Described in section 8.2, read repair compares the replies of a read and writes the newest version to any replica that was behind. Because it only touches keys that are read, it keeps hot data consistent cheaply but does nothing for data nobody reads. Some systems additionally query all N replicas for a small random percentage of reads (a background read repair chance) so that even lightly read keys get checked.</p>
+
+<h3>10.3 Merkle-tree anti-entropy</h3>
+<p>To compare two replicas of a key range holding millions of keys without sending every key, each replica builds a <b>Merkle tree</b> (hash tree). The leaves are hashes of small groups of keys (or key ranges, a fixed number such as 1,024 buckets per range). Each parent is a hash of its children's hashes, up to a single root hash. Two replicas first exchange root hashes. If equal, the whole range is identical, in one small message. If not, they exchange the child hashes, descend only into the subtrees that differ, and finally exchange the actual keys in the differing leaf buckets. The bandwidth is proportional to the number of differences, not the size of the data.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Merkle tree comparison between two replicas finding one differing leaf">
+  <text class="t-b" x="60" y="22">Replica 1 tree</text>
+  <text class="t-b" x="520" y="22">Replica 2 tree</text>
+
+  <rect class="box" x="140" y="36" width="130" height="34" rx="8"/><text class="t-c t-b" x="205" y="58">root: h(a,b)</text>
+  <rect class="box" x="60" y="110" width="110" height="34" rx="8"/><text class="t-c t-b" x="115" y="132">h(1,2)</text>
+  <rect class="miss" x="240" y="110" width="110" height="34" rx="8"/><text class="t-c t-b" x="295" y="132">h(3,4)</text>
+  <rect class="box" x="30" y="190" width="70" height="34" rx="8"/><text class="t-c" x="65" y="212">L1</text>
+  <rect class="box" x="130" y="190" width="70" height="34" rx="8"/><text class="t-c" x="165" y="212">L2</text>
+  <rect class="box" x="210" y="190" width="70" height="34" rx="8"/><text class="t-c" x="245" y="212">L3</text>
+  <rect class="miss" x="310" y="190" width="70" height="34" rx="8"/><text class="t-c" x="345" y="212">L4</text>
+  <path class="arrow" d="M180 70 L125 108"/><path class="arrow" d="M230 70 L285 108"/>
+  <path class="arrow" d="M95 144 L70 188"/><path class="arrow" d="M135 144 L160 188"/><path class="arrow" d="M275 144 L250 188"/><path class="arrow" d="M315 144 L340 188"/>
+
+  <rect class="box" x="600" y="36" width="130" height="34" rx="8"/><text class="t-c t-b" x="665" y="58">root: differs</text>
+  <rect class="box" x="520" y="110" width="110" height="34" rx="8"/><text class="t-c t-b" x="575" y="132">h(1,2)</text>
+  <rect class="miss" x="700" y="110" width="110" height="34" rx="8"/><text class="t-c t-b" x="755" y="132">h(3,4)</text>
+  <rect class="box" x="490" y="190" width="70" height="34" rx="8"/><text class="t-c" x="525" y="212">L1</text>
+  <rect class="box" x="590" y="190" width="70" height="34" rx="8"/><text class="t-c" x="625" y="212">L2</text>
+  <rect class="box" x="670" y="190" width="70" height="34" rx="8"/><text class="t-c" x="705" y="212">L3</text>
+  <rect class="miss" x="770" y="190" width="70" height="34" rx="8"/><text class="t-c" x="805" y="212">L4</text>
+  <path class="arrow" d="M640 70 L585 108"/><path class="arrow" d="M690 70 L745 108"/>
+  <path class="arrow" d="M555 144 L530 188"/><path class="arrow" d="M595 144 L620 188"/><path class="arrow" d="M735 144 L710 188"/><path class="arrow" d="M775 144 L800 188"/>
+
+  <rect class="hit" x="60" y="260" width="780" height="80" rx="10"/>
+  <text x="76" y="284">1. Roots differ, so compare children. 2. h(1,2) match: skip the entire left subtree.</text>
+  <text x="76" y="306">3. h(3,4) differs: compare L3 and L4. 4. Only L4 differs: exchange keys in L4 and reconcile by version.</text>
+  <text class="t-sm" x="76" y="328">Cost: a few hashes plus the keys of one leaf bucket, not the whole range.</text>
+</svg>
+<figcaption>Red boxes mark the path of differing hashes. Matching subtrees are skipped entirely, so finding a single stale key among millions costs about log(number of leaves) hash exchanges.</figcaption>
+</figure>
+
+<p>Trees are built per key range (per vnode range) so that a mismatch limits itself to that range. Building a tree requires scanning the range's data on disk, so repairs are scheduled and throttled; a typical operational rule is to run a full repair on every range more often than the tombstone grace period (section 11) to avoid resurrected deletes. Because the tree is rebuilt as data changes, real systems recompute it at repair time rather than keep it live, trading CPU for simplicity.</p>
+
+<h3>10.4 Failure detection and gossip</h3>
+<p>Every node must know which other nodes are alive and which tokens they own, without a central registry. Nodes use a <b>gossip protocol</b>: once per second each node picks a few random peers and exchanges its view of the cluster, a table of (node, heartbeat counter, state, tokens, version). Heartbeat counters only increase, so a node that sees a newer counter for X knows X was alive recently. Information spreads epidemically in about log(N) rounds (for 40 nodes, a handful of seconds).</p>
+<p>Failure detection on top of this uses an <b>accrual failure detector</b> (the Phi accrual detector, used in Cassandra and Akka). Rather than a fixed timeout, it tracks the history of heartbeat arrival intervals and computes a suspicion level phi: the larger phi, the less likely the node is alive. A node is marked down when phi exceeds a threshold (for example 8). This adapts to network jitter: a slow-but-live node on a congested link is not declared dead as readily as with a fixed 1-second timeout. Mark-down is a <b>local opinion</b>: it only controls whether this node tries to talk to the peer and whether it uses hints. It does not remove the peer from the ring; permanent removal is an explicit operator action (section 12). That keeps temporary glitches from triggering mass data movement.</p>
+
+<div class="callout tip"><b>Interview tip</b>
+Say explicitly that "down" and "removed" are different states. A transient failure triggers hinted handoff; only a human or an automation policy declares a node dead for good and triggers re-replication. This separation prevents a flaky network from causing a rebalancing storm.
+</div>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="lsm">11. Deep dive 4: the storage engine on each node (LSM tree) and tombstones</h2>
+
+<p>Everything above is about the distributed layer. When a replica receives a write, it must persist it durably and quickly. The design is a <b>log-structured merge tree</b>, covered in <a href="../chapters/19-storage-engines.html">Chapter 19</a>. Here we apply it.</p>
+
+<h3>11.1 Write path on one node</h3>
+<ol>
+  <li><b>Commit log (WAL, write-ahead log).</b> The write is first appended to a sequential log file on disk. This is fast (sequential I/O) and gives durability: after a crash the log is replayed. The log is synced either on every write (safest), in groups every few milliseconds (a good compromise, "group commit"), or periodically (fastest, risks losing the last interval's data if the machine crashes, but the other replicas still have it).</li>
+  <li><b>Memtable.</b> The record is inserted into an in-memory sorted structure (skip list or red-black tree), keyed by key. Reads check here first.</li>
+  <li><b>Flush.</b> When the memtable reaches its size limit (256 MB here), it becomes immutable, a new memtable takes over, and the old one is written out as a sorted file called an <b>SSTable</b> (sorted string table). The commit log segment covering it can then be deleted.</li>
+  <li><b>Compaction.</b> Over time many SSTables accumulate. A background process merges several SSTables into fewer, larger ones, keeping only the newest version of each key and dropping expired tombstones and overwritten data.</li>
+</ol>
+
+<h3>11.2 Read path on one node</h3>
+<ol>
+  <li>Check the memtable (and any memtable being flushed).</li>
+  <li>For each SSTable, newest first, ask its <b>bloom filter</b> whether the key might be present. A bloom filter is a compact bit array that answers "definitely not here" or "maybe here". With about 10 bits per key the false-positive rate is about 1% (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>), so nearly all SSTables that do not contain the key are skipped with no disk read.</li>
+  <li>For SSTables that pass, use the sparse index (cached in memory) to find the right block, read it (typically 4 to 64 KB), and look for the key.</li>
+  <li>Merge the results across memtable and SSTables, choosing the newest version per the record's timestamp or version, and return.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="LSM tree on one node: write path with commit log, memtable, flush to SSTables, compaction, and read path with bloom filters">
+  <text class="t-b" x="20" y="22">Write path</text>
+  <rect class="ext" x="20" y="36" width="110" height="46" rx="8"/><text class="t-c t-b" x="75" y="64">put</text>
+  <rect class="db" x="180" y="36" width="150" height="46" rx="8"/><text class="t-c t-b" x="255" y="56">Commit log</text><text class="t-c t-sm" x="255" y="72">sequential append</text>
+  <rect class="cache" x="380" y="36" width="150" height="46" rx="8"/><text class="t-c t-b" x="455" y="56">Memtable</text><text class="t-c t-sm" x="455" y="72">sorted, in RAM</text>
+  <rect class="db" x="580" y="36" width="150" height="46" rx="8"/><text class="t-c t-b" x="655" y="56">SSTable (L0)</text><text class="t-c t-sm" x="655" y="72">immutable, sorted</text>
+  <path class="arrow" d="M130 59 L176 59"/><path class="arrow" d="M330 59 L376 59"/><path class="arrow" d="M530 59 L576 59"/>
+  <text class="t-sm" x="534" y="30">flush at 256 MB</text>
+
+  <rect class="db" x="580" y="140" width="80" height="40" rx="8"/><text class="t-c t-sm" x="620" y="164">SST</text>
+  <rect class="db" x="680" y="140" width="80" height="40" rx="8"/><text class="t-c t-sm" x="720" y="164">SST</text>
+  <rect class="db" x="780" y="140" width="80" height="40" rx="8"/><text class="t-c t-sm" x="820" y="164">SST</text>
+  <path class="arrow dash" d="M655 82 L655 138"/>
+  <path class="arrow" d="M720 180 L720 218"/>
+  <rect class="db" x="560" y="220" width="320" height="46" rx="8"/><text class="t-c t-b" x="720" y="240">Compacted SSTable (bigger)</text><text class="t-c t-sm" x="720" y="256">newest version kept, old data and expired tombstones dropped</text>
+  <text class="t-sm" x="600" y="130">background compaction merges files</text>
+
+  <text class="t-b" x="20" y="152">Read path</text>
+  <rect class="ext" x="20" y="166" width="110" height="46" rx="8"/><text class="t-c t-b" x="75" y="194">get</text>
+  <rect class="cache" x="180" y="166" width="150" height="46" rx="8"/><text class="t-c t-b" x="255" y="186">Memtable</text><text class="t-c t-sm" x="255" y="202">check first</text>
+  <rect class="hit" x="180" y="240" width="150" height="46" rx="8"/><text class="t-c t-b" x="255" y="260">Bloom filters</text><text class="t-c t-sm" x="255" y="276">skip files without key</text>
+  <rect class="hit" x="380" y="240" width="150" height="46" rx="8"/><text class="t-c t-b" x="455" y="260">Index + block</text><text class="t-c t-sm" x="455" y="276">one disk read</text>
+  <path class="arrow" d="M130 189 L176 189"/><path class="arrow" d="M255 212 L255 238"/><path class="arrow" d="M330 263 L376 263"/>
+
+  <rect class="hit" x="20" y="320" width="860" height="64" rx="10"/>
+  <text x="36" y="344">Writes cost one sequential log append plus a RAM insert, so they are fast. Reads may touch several files,</text>
+  <text x="36" y="364">which bloom filters and compaction keep small. This trade (fast writes, slightly costlier reads) matches our 4:1 workload.</text>
+</svg>
+<figcaption>Top: a write goes to the commit log and memtable; full memtables flush to immutable SSTables, which compaction merges. Bottom: a read checks the memtable, then uses bloom filters to avoid reading SSTables that cannot hold the key.</figcaption>
+</figure>
+
+<h3>11.3 Compaction strategy choice</h3>
+<table>
+<tr><th>Strategy</th><th>How it works</th><th>Write amplification</th><th>Read cost</th><th>Space</th><th>Best for</th></tr>
+<tr><td>Size-tiered</td><td>Merge similarly sized SSTables when enough accumulate.</td><td>Low</td><td>Higher (a key may exist in many files)</td><td>Needs up to 2x free space for large merges</td><td>Write-heavy, time-series.</td></tr>
+<tr><td>Leveled</td><td>Files organized into levels of 10x growing size; each key in at most one file per level.</td><td>High (about 10x per level)</td><td>Low (few files per read)</td><td>Needs about 10% overhead</td><td>Read-heavy, latency-sensitive.</td></tr>
+<tr><td>Time-window</td><td>Compact by time bucket.</td><td>Low</td><td>Low for recent data</td><td>Moderate</td><td>TTL and time-series data.</td></tr>
+</table>
+<p>With a 4:1 read-heavy mix and a p99 target of 10 ms we choose <b>leveled compaction</b>, accepting higher write amplification (each byte written is rewritten several times) because NVMe write bandwidth is plentiful. We keep the 50% fill ceiling anyway, since a burst of compaction after a node rebuild can still spike space.</p>
+
+<h3>11.4 Deletes and tombstones</h3>
+<p>SSTables are immutable, so a delete cannot erase data in place. Instead it writes a special record called a <b>tombstone</b> ("this key was deleted at version V"). Reads that find a tombstone as the newest version return "not found". The tombstone must be replicated like any write, and it must live long enough to reach every replica. If a replica was down during the delete and the tombstone were discarded too soon, that replica on return would still hold the old value, and anti-entropy would copy it back to the others: a deleted key <b>resurrects</b>. Hence the rule: keep each tombstone for a <b>grace period</b> (for example 10 days, longer than the maximum time a node may be down or the repair interval) before compaction may drop it. Tombstones have their own costs: a range that was heavily deleted and then read must skip many tombstones, which slows reads; and they consume space until compaction removes them. TTL expiry is implemented the same way, with an expiry marker that turns into a tombstone.</p>
+
+<div class="callout watch"><b>Watch out</b>
+Do not set the tombstone grace period shorter than your repair cycle. If repairs run every 7 days and tombstones live 3 days, any replica that missed a delete can bring the deleted data back. The invariant is: repair interval plus longest tolerated downtime must be less than the grace period.
+</div>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="membership">12. Membership change and rebalancing</h2>
+
+<h3>12.1 Adding a node</h3>
+<ol>
+  <li>The operator starts the new node with a list of seed nodes (well-known nodes that new members contact first).</li>
+  <li>It contacts the seeds, learns the ring through gossip, and picks its tokens (256 random positions, or tokens chosen to even out ranges).</li>
+  <li>It enters a "joining" state. For every range it will take over, it streams the data from the current replicas. Because each of its 256 small ranges comes from a different neighbour, many nodes stream a little each in parallel, rather than one node bearing all the load. Moving about 1/41 of 66 TB is roughly 1.6 TB; at an aggregate 500 MB/s of throttled streaming that takes about 55 minutes.</li>
+  <li>While joining, the new node receives new writes for those ranges (so it does not fall behind) but does not serve reads until streaming completes.</li>
+  <li>Once complete it flips to "normal", gossips the new state, and the old replicas later delete the ranges they no longer own (a cleanup step run after the join finishes, because it competes for I/O).</li>
+</ol>
+
+<h3>12.2 Removing a node</h3>
+<p>A planned <b>decommission</b> streams the node's ranges to the next owners before it leaves, so data is never under-replicated. For a dead node that will not return, the operator runs a <b>remove</b>: the surviving replicas of each range stream data to the new owner to restore N = 3 copies. This is automatic repair of redundancy, and it competes for network and disk, so it is throttled. Replacing a dead node with a new one that inherits the same tokens is cheaper than a remove-and-add, because only the replacement's own ranges move.</p>
+
+<h3>12.3 Avoiding conflicting views of the ring</h3>
+<p>Because membership is gossip-based, two operators might start changes at the same time, or different nodes might briefly disagree about the ring. Dynamo used a ring-change log with versions; Cassandra historically allowed only one bootstrapping node at a time per cluster and later added consistency checks. The safe practice is: serialize topology changes, and make a node refuse to serve ranges it does not believe it owns (clients then re-fetch the ring). Some modern systems store topology in a small strongly consistent service (for example a Raft group, <a href="../chapters/29-consensus.html">Chapter 29</a>), keeping the data path decentralized while the control plane is linearizable. That is a good point to mention when asked "how do you avoid split-brain in membership?".</p>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="scaling">13. Scaling, hot keys, caching and multi-data-center</h2>
+
+<h3>13.1 Hot keys and hot partitions</h3>
+<p>Hash partitioning spreads keys evenly, but a single extremely popular key (a celebrity profile, a feature flag read by every request) still lands on three nodes, which may be overwhelmed even though the cluster is idle. Remedies, from cheapest:</p>
+<ul>
+  <li><b>Client-side or edge caching</b> with a short TTL for read-heavy hot keys (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>). A 1-second TTL cuts reads of a key to at most one per second per cache.</li>
+  <li><b>Read from more replicas:</b> use R = 1 for that key class, spreading reads over all three replicas.</li>
+  <li><b>Key splitting:</b> store the hot value under <code>key#0 ... key#k</code> (k copies), reading a random one and writing all. This works for read-heavy hot keys; for hot counters, shard the counter and sum on read.</li>
+  <li><b>Detect and adapt:</b> nodes sample request counts per key and report outliers so operators or an automatic policy can raise the replication factor for that key.</li>
+  <li><b>Request coalescing</b> at the coordinator: many concurrent reads for the same key share one replica fetch.</li>
+</ul>
+<p>Hot partitions arise too from skewed key design (for example prefixing every key with the date). The fix is key design: put a high-cardinality component first. See <a href="../chapters/25-sharding.html">Chapter 25</a> for the general discussion.</p>
+
+<h3>13.2 Rack and data center awareness</h3>
+<p>Plain "next two nodes clockwise" might choose three machines in the same rack, so one top-of-rack switch failure loses all copies. The placement strategy therefore walks the ring but skips nodes in racks already used by this key until it has spread the replicas over distinct racks (or availability zones). Across data centers, it ensures each region holds a defined number of replicas.</p>
+
+<h3>13.3 Multi-data-center replication</h3>
+<p>With three data centers (DC-A, DC-B, DC-C) we keep <b>N = 3 replicas per data center</b> (9 total) or a smaller number such as 3 + 2 + 2 depending on cost. Each data center forms a local ring segment, and the coordinator sends writes to replicas in all data centers but waits for acknowledgements only from a local quorum. Two common levels:</p>
+<ul>
+  <li><b>LOCAL_QUORUM:</b> wait for 2 of the 3 replicas in the coordinator's data center. Latency stays in single-digit milliseconds; cross-region copies arrive asynchronously (typically within 100 ms to 300 ms depending on distance). A data center failure loses at most the last few hundred milliseconds of writes from the local view, but other data centers carry on.</li>
+  <li><b>EACH_QUORUM or global quorum:</b> wait for a quorum in every data center. It gives stronger cross-region guarantees but adds a cross-region round trip (70 to 150 ms) to every write and loses availability if one region is unreachable.</li>
+</ul>
+<p>Our default is LOCAL_QUORUM reads and writes, which gives read-your-writes within a region and eventual consistency across regions. Conflicts across regions are exactly the concurrent-writes case handled by vector clocks, and cross-region repair runs through the same hinted handoff and Merkle machinery. Region-level patterns (active-active, failover, data residency) are in <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 280" role="img" aria-label="Multi data center replication with local quorum and asynchronous cross region replication">
+  <rect class="box" x="20" y="30" width="270" height="200" rx="12" style="fill:none;stroke:var(--fg);stroke-dasharray:6 4"/><text class="t-b" x="36" y="52">DC-A (client region)</text>
+  <rect class="cache" x="40" y="70" width="100" height="40" rx="8"/><text class="t-c t-b" x="90" y="95">Coordinator</text>
+  <rect class="db" x="170" y="64" width="100" height="34" rx="8"/><text class="t-c" x="220" y="86">A replica 1</text>
+  <rect class="db" x="170" y="108" width="100" height="34" rx="8"/><text class="t-c" x="220" y="130">A replica 2</text>
+  <rect class="db" x="170" y="152" width="100" height="34" rx="8"/><text class="t-c" x="220" y="174">A replica 3</text>
+  <path class="arrow-g" d="M140 82 L166 82"/><path class="arrow-g" d="M140 92 L166 124"/>
+  <text class="t-sm" x="40" y="214">LOCAL_QUORUM: ack after 2 of 3</text>
+
+  <rect class="box" x="340" y="30" width="250" height="200" rx="12" style="fill:none;stroke:var(--fg);stroke-dasharray:6 4"/><text class="t-b" x="356" y="52">DC-B</text>
+  <rect class="db" x="380" y="70" width="170" height="34" rx="8"/><text class="t-c" x="465" y="92">B replicas (3)</text>
+  <text class="t-sm" x="356" y="140">receives copy asynchronously</text>
+  <text class="t-sm" x="356" y="158">via the coordinator or a forwarding node</text>
+
+  <rect class="box" x="630" y="30" width="250" height="200" rx="12" style="fill:none;stroke:var(--fg);stroke-dasharray:6 4"/><text class="t-b" x="646" y="52">DC-C</text>
+  <rect class="db" x="670" y="70" width="170" height="34" rx="8"/><text class="t-c" x="755" y="92">C replicas (3)</text>
+  <text class="t-sm" x="646" y="140">same; if DC-C is unreachable, hints</text>
+  <text class="t-sm" x="646" y="158">are stored and replayed later</text>
+
+  <path class="arrow dash" d="M270 100 L376 90"/><path class="arrow dash" d="M270 160 C400 250 560 250 666 100"/>
+  <text class="t-sm" x="300" y="268">async, typically 100 to 300 ms behind</text>
+</svg>
+<figcaption>The client waits only for a quorum in its own data center. Other data centers are updated in the background, so the write path never pays a cross-region round trip.</figcaption>
+</figure>
+
+<h3>13.4 Caching</h3>
+<p>The store itself is the cache-like tier of many systems, so extra caches mostly exist inside the node: the memtable, the OS page cache, a row or key cache, and the bloom filters and index summaries kept in RAM. Do not add a separate cache in front unless profiling shows hot keys that justify it (section 13.1).</p>
+
+<!-- ======================= 14 ======================= -->
+<h2 id="failures">14. Failure modes, consistency decisions, security, monitoring and cost</h2>
+
+<h3>14.1 Failure modes by component</h3>
+<table>
+<tr><th>Failure</th><th>What happens</th><th>Mitigation</th></tr>
+<tr><td>One replica node crashes</td><td>Reads and writes continue via quorum (2 of 3). Hints accumulate for the dead node.</td><td>Hinted handoff, restart replays commit log, repair afterwards.</td></tr>
+<tr><td>Two replicas of a key down</td><td>Strict quorum fails for that key range; sloppy quorum accepts writes at lower durability.</td><td>Alert; keep replicas in different racks so correlated loss is rare; reads use R = 1 if staleness is tolerated.</td></tr>
+<tr><td>Slow node (not dead)</td><td>Coordinator waits for the slowest of the first R or W responses; tail latency rises.</td><td>Send reads to the fastest replicas (dynamic snitching using recent latency), speculative retry after the p99 delay to another replica, and fast timeouts.</td></tr>
+<tr><td>Network partition</td><td>Both sides continue accepting writes if they have enough nodes (sloppy quorum). Conflicts result.</td><td>Vector clocks preserve both versions; client merges after the heal.</td></tr>
+<tr><td>Disk corruption or bit rot</td><td>A block fails its checksum on read.</td><td>Per-block checksums; treat the bad replica as missing and repair from peers; Merkle repair finds silent drift.</td></tr>
+<tr><td>Coordinator dies mid-write</td><td>Some replicas may have the write, the client sees an error.</td><td>Client retries; versions make the write idempotent. Read repair or anti-entropy converges.</td></tr>
+<tr><td>Commit log lost with the node</td><td>Last unsynced writes on that node vanish.</td><td>Other replicas hold them. Use group commit and keep the commit log on its own device.</td></tr>
+<tr><td>Whole data center down</td><td>Local clients fail over to another data center at higher latency.</td><td>LOCAL_QUORUM in surviving regions; hints held for the failed one; repair on return.</td></tr>
+<tr><td>Gossip false positive</td><td>A healthy node is marked down by some peers, causing needless hints.</td><td>Phi accrual with tuned threshold; marking down never moves data by itself.</td></tr>
+<tr><td>Clock skew</td><td>LWW picks wrong winners; tombstone times off.</td><td>NTP with monitoring, vector clocks for important data, a generous tombstone grace period.</td></tr>
+<tr><td>Compaction backlog</td><td>Too many SSTables; read latency rises, disk fills.</td><td>Throttle ingest, add nodes, alert on pending compactions and keep 50% free disk.</td></tr>
+</table>
+
+<h3>14.2 Consistency and idempotency decisions</h3>
+<ul>
+  <li>Default is eventual consistency with N = 3, R = 2, W = 2; the application chooses stronger or weaker per request.</li>
+  <li>Writes are idempotent: replaying the same record with the same vector is a no-op because replicas keep only versions not dominated by others.</li>
+  <li>Reads can return siblings; the client library offers a merge callback so that application developers do not have to hand-write sibling handling each time.</li>
+  <li>For operations needing true compare-and-set (unique usernames, leases), this store is the wrong tool; use a consensus-backed store or a "lightweight transaction" feature built on Paxos per key (section 15).</li>
+</ul>
+
+<h3>14.3 Security and abuse</h3>
+<ul>
+  <li>Mutual TLS between clients and nodes and between nodes (<a href="../chapters/55-security.html">Chapter 55</a>); authentication of clients with tokens and per-keyspace authorization.</li>
+  <li>Encryption at rest per SSTable or at the volume level; keys held in a key management service.</li>
+  <li>Per-tenant quotas on request rate and stored bytes to stop a noisy tenant from filling disks or starving others (see rate limiting in <a href="../chapters/16-rate-limiting.html">Chapter 16</a>); a maximum value size (1 MB) to bound memory and network spikes.</li>
+  <li>Gossip and the admin interface live on a private network; a rogue node must not be able to join the ring without credentials.</li>
+</ul>
+
+<h3>14.4 Monitoring and SLOs</h3>
+<p>General approach is in <a href="../chapters/54-observability-slos.html">Chapter 54</a>. For this system the signals that matter:</p>
+<ul>
+  <li><b>SLOs:</b> 99.99% of requests succeed; p99 read and write latency under 10 ms in-region; p99.9 under 50 ms.</li>
+  <li><b>Per node:</b> pending compactions, SSTable count per read (target under 5 at p99), bloom filter false-positive rate, memtable flush time, commit log sync latency, disk fill percent (alert at 60%), dropped messages.</li>
+  <li><b>Cluster:</b> gossip state disagreements, hints stored and replay lag, read repair rate (a rising rate means replicas are drifting), time since last successful repair per range, tombstones scanned per read.</li>
+  <li><b>Client side:</b> sibling count per read, quorum failure rate, speculative retry rate.</li>
+</ul>
+
+<h3>14.5 Cost notes</h3>
+<ul>
+  <li>Storage dominates: 40 nodes with 4 TB NVMe each hold 66 TB of data in 160 TB raw. Compression (often 1.5 to 2 times) and moving cold data to a cheaper tier shrink it.</li>
+  <li>Replication factor and number of data centers multiply cost directly. Three data centers with three replicas each is 9 copies of every byte; ask whether every key space needs it.</li>
+  <li>Cross-region bandwidth is billed by cloud providers; compress replication traffic and avoid cross-region reads.</li>
+  <li>Repair and compaction consume I/O; sizing nodes for 50% headroom is a cost you pay for stable latency.</li>
+</ul>
+
+<!-- ======================= 15 ======================= -->
+<h2 id="raft-contrast">15. Contrast: a strongly consistent, Raft-based key-value store</h2>
+
+<p>An interviewer will often ask "what if I need linearizable reads and writes?". Stores like etcd, Consul, and the key-value layer of CockroachDB or TiKV take a different path, using <b>consensus</b> (see <a href="../chapters/29-consensus.html">Chapter 29</a>). The key range is replicated by a <b>Raft group</b> of typically 3 or 5 nodes: one is the elected leader, all writes go through the leader, which appends them to a replicated log and commits an entry once a majority has stored it. Every replica applies the same entries in the same order, so all copies are identical, and reads served by the leader (with a lease or read-index check) see the latest committed write. There are no siblings, no vector clocks, and no read repair, because divergence is prevented rather than repaired.</p>
+
+<table>
+<tr><th>Aspect</th><th>Dynamo-style (this page)</th><th>Raft-based KV</th></tr>
+<tr><td>Who accepts writes</td><td>Any replica or coordinator (leaderless)</td><td>Only the leader of the key's group</td></tr>
+<tr><td>Consistency</td><td>Eventual; tunable R and W; conflicts possible</td><td>Linearizable; single ordered log per group</td></tr>
+<tr><td>During a partition</td><td>Both sides accept writes (AP)</td><td>Only the side with a majority makes progress (CP); minority side is unavailable for writes</td></tr>
+<tr><td>Write latency</td><td>One round trip to the fastest W replicas, no leader hop</td><td>Leader hop plus majority fsync; across regions at least one cross-region round trip</td></tr>
+<tr><td>Failure recovery</td><td>Instant (any replica serves); repair later</td><td>Leader election pause, typically hundreds of milliseconds to seconds</td></tr>
+<tr><td>Conflict handling</td><td>Vector clocks, siblings, LWW, CRDT</td><td>None needed; ordering prevents conflicts</td></tr>
+<tr><td>Transactions and CAS</td><td>Not supported or limited</td><td>Natural: compare-and-set, multi-key transactions possible</td></tr>
+<tr><td>Capacity scaling</td><td>Add nodes freely; ring rebalances; very large clusters</td><td>One group has small capacity (replicas hold the same data); scale by splitting ranges into many groups (multi-Raft)</td></tr>
+<tr><td>Typical use</td><td>Shopping carts, sessions, user profiles, feeds, time-series</td><td>Configuration, leader election, locks, metadata, financial ledgers</td></tr>
+</table>
+
+<div class="callout key"><b>Key idea</b>
+The choice follows the cost of a stale or conflicting read. If a stale read costs a slightly outdated cart, choose leaderless and availability. If it costs a double-spent balance or two owners of one lock, choose consensus and accept unavailability on the minority side of a partition. Many real platforms use both: a Raft store for small, critical metadata (such as our ring topology) and a Dynamo-style store for the bulk data.
+</div>
+
+<h3>15.1 Why not just use Raft everywhere?</h3>
+<p>You can, with multi-Raft (thousands of groups, one per range), as CockroachDB and TiKV do. The cost is that every write needs a majority round trip and a leader; a multi-region deployment pays cross-region latency or sacrifices consistency across regions; and the store is unavailable for writes on the minority side of a partition. For workloads that need 99.99% write availability with single-digit-millisecond latency in each region, leaderless replication with tunable quorums remains the better fit.</p>
+
+<!-- ======================= 16 ======================= -->
+<h2 id="evolution">16. Evolution, phasing and alternatives not chosen</h2>
+
+<h3>16.1 What to build first</h3>
+<ol>
+  <li><b>Phase 1 (MVP):</b> single-node LSM engine with commit log, memtable, SSTables, bloom filters, and a simple get/put/delete API. Prove durability and performance on one box.</li>
+  <li><b>Phase 2:</b> consistent hashing with vnodes, static membership, N = 3 replication with quorums, last-write-wins. This is already a usable distributed store.</li>
+  <li><b>Phase 3:</b> gossip membership, failure detection, hinted handoff, read repair, node join and decommission with streaming.</li>
+  <li><b>Phase 4:</b> Merkle anti-entropy repair, tombstone grace periods, vector clocks with siblings for selected key spaces, rack awareness.</li>
+  <li><b>Phase 5:</b> multi-data-center replication, per-tenant quotas, hot-key tooling, backup and point-in-time restore.</li>
+</ol>
+
+<h3>16.2 What changes at 10x scale</h3>
+<ul>
+  <li>400 nodes and 220 TB logical (660 TB replicated). Gossip cost grows but remains modest (each node still talks to a few peers per second); the ring map is still small (about 100,000 tokens). Reduce tokens per node (for example 16 to 32 with smart allocation) to keep repair unit counts manageable.</li>
+  <li>Repair becomes the operational bottleneck: a full repair across 660 TB takes days. Adopt incremental repair (only data written since the last repair) and subrange repair, and run it continuously at low priority.</li>
+  <li>Large clusters benefit from <b>cells</b> (<a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>): several independent clusters of 40 to 100 nodes, with tenants assigned to cells, so a bad compaction storm or software bug only affects one cell.</li>
+  <li>Tail latency becomes dominant: add speculative retries, replica selection by latency, and admission control.</li>
+  <li>Cold data (large share of 220 TB) moves to a tiered store or is expired with TTLs.</li>
+</ul>
+
+<h3>16.3 Alternatives considered and not chosen</h3>
+<ul>
+  <li><b>Master-based sharding (HBase, Bigtable style):</b> a master assigns key ranges to servers, storing data on a distributed file system. Gives strong consistency per row and range scans, but depends on a master and a coordination service, and writes are unavailable during region reassignment.</li>
+  <li><b>Fixed hash slots with a configuration service (Redis Cluster):</b> simpler movement, but replication is asynchronous with a primary per slot, so acknowledged writes can be lost at failover.</li>
+  <li><b>Chain replication:</b> strong consistency with high throughput by passing writes down a chain, reads from the tail; needs a reliable failure detector and configuration master.</li>
+  <li><b>Quorum plus CRDTs everywhere:</b> removes siblings entirely but constrains the data model to mergeable types.</li>
+</ul>
+
+<!-- ======================= 17 ======================= -->
+<h2 id="qa">17. Interview questions and strong answers</h2>
+
+<details><summary>Why use consistent hashing with virtual nodes instead of hash modulo N?</summary>
+<p>With modulo, changing N changes the result for nearly every key, so adding one node to a 40-node cluster would move about 97.5% of the data. Consistent hashing places nodes and keys on a ring so that adding a node only takes over the ranges adjacent to its tokens, roughly 1/(N+1) of the data. A single token per node leaves uneven loads and dumps a failed node's entire load on one neighbour, so we give each machine hundreds of vnodes: the load evens out statistically, data is streamed from many peers in parallel when a node joins, and bigger machines can simply get more tokens.</p></details>
+
+<details><summary>With N = 3, how do you choose R and W, and does R + W &gt; N give strong consistency?</summary>
+<p>R = 2 and W = 2 is a balanced default: any read set overlaps any write set in at least one replica, and the system tolerates one replica being down for both operations. R = 1, W = 3 favours reads, R = 3, W = 1 favours writes. But R + W &gt; N only guarantees overlap, not linearizability. A write acknowledged by one node and reported failed can still be seen, concurrent writes can both succeed and become siblings, and sloppy quorums break overlap during failures. If you need a total order or compare-and-set, you need consensus rather than quorum overlap.</p></details>
+
+<details><summary>What is a sloppy quorum and what does it cost?</summary>
+<p>When some of the key's designated replicas are unreachable, the coordinator writes to the next healthy nodes on the ring instead and tags the data with a hint naming the intended owner. This keeps writes available even if two of three replicas are down. The costs are that a later read quorum drawn from the designated replicas may not include the node holding the hint, so the read can miss the latest write until handoff completes, and that hints can be lost or expire. It trades consistency for availability and must be paired with read repair and anti-entropy.</p></details>
+
+<details><summary>Explain vector clocks with an example, and when you would rather use last-write-wins.</summary>
+<p>A vector clock is a set of per-node counters attached to each value; a write increments the coordinating node's counter on top of the version the client read. If one vector dominates another, the dominated version is obsolete; if neither dominates, the writes were concurrent and both are kept as siblings. For example {A:3} and {A:2,B:1} are concurrent because each has a counter the other lacks. The client merges and writes back with a context covering both. Last-write-wins is acceptable when losing a concurrent update is harmless (session heartbeats, last-seen timestamps) and you prefer the simplicity of no siblings, but it depends on synchronized clocks and silently drops one of two concurrent writes.</p></details>
+
+<details><summary>How do replicas become consistent again after a node was down for two days?</summary>
+<p>Hinted handoff only covers a short window (hours), so after two days the hints have expired. The node rejoins, replays its own commit log, and then repair takes over: Merkle-tree anti-entropy compares each of its ranges with the other replicas, finds the differing leaf buckets with a few hash exchanges, and streams just those keys. Read repair also fixes keys as clients read them. The crucial operational point is to finish this repair before the tombstone grace period expires, otherwise deleted data can reappear.</p></details>
+
+<details><summary>Why are tombstones needed, and what is the risk of removing them too early?</summary>
+<p>In an LSM tree, files are immutable, and in a replicated system a delete must also reach replicas that may be down. A tombstone is a versioned "deleted" record that propagates like any write. If it is dropped before all replicas have it, a replica that missed the delete still holds the old value and later anti-entropy will treat it as the only version and copy it back, resurrecting the key. So tombstones are retained for a grace period longer than repair interval plus the maximum tolerated downtime. The downside is that many tombstones slow reads and use space, so delete-heavy workloads need tuning or a different data model such as time-bucketed tables.</p></details>
+
+<details><summary>How does the LSM tree on each node get fast writes, and how do you keep reads fast?</summary>
+<p>A write is an append to the commit log (sequential, so fast and durable) plus an insert into the in-memory memtable; no random disk write happens. Memtables flush to immutable sorted SSTables, and background compaction merges them to bound their number. Reads check the memtable, then use per-SSTable bloom filters to skip files that cannot contain the key, followed by a sparse index and one block read. Leveled compaction limits how many files can contain a key to about one per level, which keeps read latency predictable at the price of more write amplification.</p></details>
+
+<details><summary>How would you handle a hot key that receives 100,000 reads per second?</summary>
+<p>The three replicas of that key cannot absorb it while the rest of the cluster idles. First add a short-TTL cache in front (client or edge), since a one-second TTL collapses 100,000 reads to at most one per cache per second. Next let reads use R = 1 across all replicas and coalesce identical in-flight reads at the coordinator. If it is still too hot, split the value into several copies under suffixed keys and read a random one; for hot counters, shard and sum. Finally monitor per-key request rates so you can detect these keys automatically.</p></details>
+
+<details><summary>How do you add a node without downtime or a rebalancing storm?</summary>
+<p>The new node joins, learns the ring through gossip, picks its vnode tokens, and streams the data for those ranges from the current owners while receiving new writes for them. It does not serve reads until streaming completes. Because its 256 small ranges come from many different peers, each source sends only a small portion, and the streaming is throttled so foreground latency is protected. Old owners delete the moved ranges only after the join completes. Topology changes are serialized so two concurrent changes cannot give inconsistent ownership.</p></details>
+
+<details><summary>When would you choose a Raft-based store instead of this design?</summary>
+<p>When a stale read or a conflict is unacceptable: leader election and locks, configuration, unique-key constraints, financial balances, or metadata such as the cluster ring itself. Raft gives linearizable reads and writes and supports compare-and-set because a single leader orders the log, but writes pause during elections and the minority side of a partition cannot write. The leaderless store stays writable on both sides and has lower latency across regions, at the cost of siblings and eventual consistency. Many production systems combine them, keeping small critical metadata in Raft and bulk data in the leaderless store.</p></details>
+
+<details><summary>How does the failure detector decide a node is down, and what happens next?</summary>
+<p>Nodes gossip heartbeat counters. Each node tracks the arrival times of those heartbeats and a phi accrual detector converts the gap since the last one into a suspicion value, compared with a threshold. This adapts to network jitter better than a fixed timeout. Marking a node down is local and reversible: it stops sending requests there and starts storing hints, but data does not move. Only an operator action or a long-outage policy removes the node from the ring and triggers re-replication, which stops flaky networks from causing mass data movement.</p></details>
+
+<!-- ======================= 18 ======================= -->
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">18. Recap</h2>
+<ul>
+  <li>Requirements shaped the design: always-writable, low latency, horizontally scalable, eventually consistent, so a leaderless, Dynamo-style architecture.</li>
+  <li>Numbers: 200,000 average and 600,000 peak ops/s, 22 TB logical, 66 TB with N = 3, about 40 nodes with 256 vnodes each, about 33,000 replica operations/s per node at peak.</li>
+  <li>Partitioning: consistent hashing with vnodes spreads keys evenly and moves about 1/N of data on membership change. Replicas are the next distinct nodes (and racks) clockwise.</li>
+  <li>Replication: N = 3, tunable R and W (default 2 and 2). R + W &gt; N gives overlap, not linearizability. Sloppy quorum plus hinted handoff keeps writes available.</li>
+  <li>Versioning: vector clocks detect concurrent writes; siblings are returned for client merge, with LWW and CRDTs as alternatives.</li>
+  <li>Healing: hinted handoff for short outages, read repair for hot keys, Merkle anti-entropy for everything else; gossip and a phi accrual detector track membership without a master.</li>
+  <li>Node storage: commit log, memtable, SSTables, bloom filters, leveled compaction; deletes are tombstones kept longer than the repair interval.</li>
+  <li>Operations: hot keys (cache, split, spread reads), rack and data center aware placement, LOCAL_QUORUM across regions, throttled streaming.</li>
+  <li>Contrast: a Raft-based store gives linearizability and compare-and-set but is unavailable on the minority side of a partition; choose by the cost of a stale read.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> <a href="../chapters/01-interview-framework.html">Chapter 1</a> (framework), <a href="../chapters/02-estimation.html">Chapter 2</a> (estimation), <a href="../chapters/05-api-design.html">Chapter 5</a> (API design), <a href="../chapters/13-caching-patterns.html">Chapter 13</a> (hot key caching), <a href="../chapters/16-rate-limiting.html">Chapter 16</a> (tenant quotas), <a href="../chapters/19-storage-engines.html">Chapter 19</a> (LSM trees), <a href="../chapters/24-replication.html">Chapter 24</a> (replication and quorums), <a href="../chapters/25-sharding.html">Chapter 25</a> (consistent hashing), <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a> (multi-region), <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a> (clocks and ordering), <a href="../chapters/28-cap-consistency.html">Chapter 28</a> (CAP), <a href="../chapters/29-consensus.html">Chapter 29</a> (Raft), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotency), <a href="../chapters/33-gossip-merkle.html">Chapter 33</a> (gossip and Merkle trees), <a href="../chapters/42-multitenancy-cells.html">Chapter 42</a> (cells), <a href="../chapters/54-observability-slos.html">Chapter 54</a> (SLOs), <a href="../chapters/55-security.html">Chapter 55</a> (security), <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a> (bloom filters), <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a> (CRDTs).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

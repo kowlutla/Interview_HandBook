@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 16: Design a Collaborative Editor | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c16-collaborative-editor">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 16 · Worked solutions</div>
+<h1>Design a Collaborative Editor</h1>
+<p class="lead">Several people type into the same document at the same moment, each sees their own keystrokes instantly, and everyone ends up looking at exactly the same text. This worked solution shows how a central server, an operation log, operational transformation (OT) or CRDTs, and a one-server-owns-one-document rule make that possible, and what breaks when servers crash, networks split, or users edit offline.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is "Design Google Docs." That is a large product (spreadsheets, comments, drawings, add-ons), so the first job is to shrink it to the part that is genuinely hard: <b>many people editing one rich-text document at the same time, with low latency and guaranteed convergence</b>. Convergence means that once everyone has received everyone's edits, all copies of the document are byte-for-byte identical. This is the property a user will never forgive you for violating: two people staring at different texts and not knowing it.</p>
+<p>The difficulty is not storage or even scale. It is that edits are concurrent. If Alice inserts a character at position 1 while Bob deletes the character at position 2, each of them made an edit against a document the other has not yet seen. If the system naively applies both edits in the order they arrive, the positions no longer mean what their authors intended. Everything in this design exists to keep the authors' <i>intent</i> intact while still converging.</p>
+<p>Questions I would ask the interviewer, with the answers I will assume:</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>Document type?</td><td>Rich text (paragraphs, bold, lists, links). Treat it as a sequence of characters plus formatting attributes. Spreadsheets and drawings are out.</td></tr>
+<tr><td>How many editors per document?</td><td>Typical is 1 to 3. Soft cap of 100 simultaneous editors, and up to 10,000 read-only viewers on a broadcast-style document.</td></tr>
+<tr><td>Scale?</td><td>50 million daily active users, about 2 million concurrent connections at peak, 500 million documents stored.</td></tr>
+<tr><td>Latency?</td><td>Local typing must feel instant (0 ms, applied optimistically). A remote edit should appear within 200 ms at p99 on the same continent.</td></tr>
+<tr><td>Offline?</td><td>Yes: a user can keep editing on a plane and sync on reconnect. Conflicts must merge, not be rejected.</td></tr>
+<tr><td>Consistency?</td><td>Eventual convergence of all replicas, with every acknowledged edit durable. No lost keystrokes.</td></tr>
+<tr><td>History?</td><td>Version history with named versions and restore, and per-user undo.</td></tr>
+<tr><td>Sharing?</td><td>Owner, editor, commenter, viewer roles, plus link sharing. Permission changes take effect within seconds.</td></tr>
+<tr><td>Regions?</td><td>Single primary region per document with disaster recovery elsewhere; users far away accept one WAN round trip for remote edits.</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li>Create, open, and edit a document with rich-text formatting.</li>
+<li>See other editors' changes live, along with their cursors and selections (<b>presence</b>).</li>
+<li>Undo and redo that affect only the user's own edits.</li>
+<li>Offline editing with automatic merge on reconnect.</li>
+<li>Share a document by user, group, or link, with roles.</li>
+<li>Version history: browse, name, and restore past versions.</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Convergence:</b> all replicas reach the same state, always.</li>
+<li><b>Intent preservation:</b> a concurrent edit lands where its author meant it to, not shifted into the middle of someone else's word.</li>
+<li><b>Durability:</b> once the server acknowledges an edit it is never lost, even if that server dies the next millisecond.</li>
+<li><b>Latency:</b> local echo instant, remote propagation under 200 ms p99.</li>
+<li><b>Availability:</b> 99.95% for editing, 99.99% for read access. A single document may be unavailable for editing for a few seconds during failover.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Spreadsheet formulas, embedded drawings, comment threads (we mention them only as separate stores), full-text search over documents, and end-to-end encrypted editing (where the server cannot read content, which rules out server-side transformation; we note it in the evolution section).</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>Estimation here is not about reads versus writes in the usual sense; it is about <b>how many live sessions, how many operations per second, and how much state one server must hold</b>. Method is in <a href="../chapters/02-estimation.html">Chapter 2</a>.</p>
+<h3>3.1 Connections and operations</h3>
+<ul>
+<li>50 M daily active users. Peak concurrent open documents: about 2 M connections (4% of DAU at once, a reasonable working-hours peak).</li>
+<li>Average 1.7 editors per active document, so about 2 M / 1.7 ≈ <b>1.2 M concurrently active documents</b>.</li>
+<li>At any moment only about 10% of connected users are actually typing (the rest read, think, or scroll): 200 k typists.</li>
+<li>The client coalesces keystrokes. A person typing 5 characters a second does not send 5 messages; the client batches roughly every 500 ms, giving about 2 operations per second per typist.</li>
+<li>Peak inbound: 200 k × 2 = <b>400 k operations/s</b>. Average over the day is about one third: roughly 130 k ops/s.</li>
+</ul>
+<h3>3.2 Fan-out and bandwidth</h3>
+<ul>
+<li>Each operation must go to the other editors in the document: on average 0.7 others. Broadcast: 400 k × 0.7 ≈ 280 k messages/s. Plus one acknowledgement back to the author per operation: 400 k/s. Total outbound about <b>680 k messages/s</b>.</li>
+<li>Presence updates (cursor moves) are cheap but frequent: throttled to at most 5 per second per active user and sent only if the cursor moved. Assume another 300 k messages/s outbound at peak.</li>
+<li>Message size: about 100 bytes for an operation including envelope, 60 bytes for a cursor update. Inbound 400 k × 100 B = 40 MB/s; outbound about (680 k × 100 B) + (300 k × 60 B) ≈ 86 MB/s. Trivial for a fleet.</li>
+</ul>
+<h3>3.3 Storage</h3>
+<ul>
+<li>Operations per day: 130 k/s × 86,400 ≈ <b>11 billion</b>. At about 100 B each, that is 1.1 TB/day of raw operation log. Over 30 days: 33 TB of fine-grained log before compaction.</li>
+<li>Snapshots: 500 M documents × average 50 KB (compressed rich text, not counting images, which live in object storage) = <b>25 TB</b>. With a few versions retained per document, plan for about 100 TB.</li>
+<li>Version-history checkpoints beyond 30 days: operations are folded into periodic snapshots (every few thousand operations or every 30 minutes of activity); this keeps the long-term footprint close to 100 TB rather than growing with each keystroke.</li>
+</ul>
+<h3>3.4 Servers</h3>
+<ul>
+<li>Each document server holds roughly 10,000 WebSocket connections (<a href="../chapters/06-realtime.html">Chapter 6</a>) and about 6,000 active documents. For 2 M connections that is <b>200 servers</b>; provision 400 to leave 50% headroom for failover and for skewed load.</li>
+<li>Memory: an active document in RAM is the snapshot (average 50 KB) plus the recent operation tail, the per-client state and presence, roughly 200 KB. 6,000 × 200 KB = <b>1.2 GB</b> per server; the connection buffers dominate. CPU is mostly serialization and TLS, with about 2,000 operations/s per server, which is light.</li>
+</ul>
+<div class="callout key"><b>Key idea</b> The load is spread across many small, independent documents, not concentrated on one. Almost no single document is hot. The scaling problem is therefore routing (which server owns which document) and the rare mega-document, not raw throughput.</div>
+
+<h2 id="api">4. API design</h2>
+<p>Document metadata and sharing use ordinary REST (<a href="../chapters/05-api-design.html">Chapter 5</a>). Live editing uses one <b>WebSocket</b> per open document, because edits and presence flow in both directions continuously and polling would waste round trips (see <a href="../chapters/06-realtime.html">Chapter 6</a> on WebSockets versus long polling and SSE).</p>
+<h3>4.1 REST endpoints</h3>
+<table>
+<tr><th>Endpoint</th><th>Purpose</th></tr>
+<tr><td><code>POST /docs</code></td><td>Create a document. Returns <code>docId</code>.</td></tr>
+<tr><td><code>GET /docs/{id}</code></td><td>Metadata, role of the caller, and the WebSocket URL of the owning server.</td></tr>
+<tr><td><code>PUT /docs/{id}/acl</code></td><td>Grant or revoke access (user, group, link, role).</td></tr>
+<tr><td><code>GET /docs/{id}/versions</code></td><td>List named and automatic versions, paginated.</td></tr>
+<tr><td><code>POST /docs/{id}/versions/{v}/restore</code></td><td>Restore: appends a new operation set that rewrites the text to version v, so history is never rewritten.</td></tr>
+</table>
+<h3>4.2 WebSocket messages</h3>
+<pre>
+client -> server
+  join     { docId, token, lastKnownRev }              // lastKnownRev = 0 on first open
+  op       { clientId, opId, baseRev, ops:[...] }       // baseRev = server revision the client had seen
+  cursor   { range:[from,to] }                          // presence, unordered, lossy
+  undo     { opId }                                     // asks to invert one of my own ops
+
+server -> client
+  snapshot { rev, content }                             // if lastKnownRev is too old
+  catchup  { fromRev, ops:[...] }                       // the missed operations
+  ack      { opId, rev }                                // my op was accepted as revision rev
+  remote   { rev, author, ops:[...] }                   // someone else's op, already transformed
+  presence { user, color, range }                       // others' cursors
+  error    { code }                                     // e.g. forbidden, rate_limited
+</pre>
+<p>Notice <code>opId</code>: a client-generated unique id for each operation. It makes retries safe. If the connection drops after the server accepted an operation but before the ack arrived, the client resends the same <code>opId</code> on reconnect and the server recognizes the duplicate and returns the original ack instead of applying it twice (the idempotency idea from <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>).</p>
+
+<h2 id="data-model">5. Data model and storage</h2>
+<table>
+<tr><th>Data</th><th>Store</th><th>Why</th></tr>
+<tr><td>Document metadata, ACL, owner, folder</td><td>Sharded relational database or a strongly consistent key-value store (<a href="../chapters/18-relational-internals.html">Chapter 18</a>, <a href="../chapters/25-sharding.html">Chapter 25</a>)</td><td>Needs transactions for sharing changes; small and read-heavy; cached in the document server.</td></tr>
+<tr><td>Operation log: <code>(docId, rev) -> op</code></td><td>Wide-column or LSM-based store keyed by <code>docId</code> then <code>rev</code> (<a href="../chapters/19-storage-engines.html">Chapter 19</a>, <a href="../chapters/20-nosql.html">Chapter 20</a>)</td><td>Append-only writes, range scan by revision, partitioning by document so one document's log lives on one partition.</td></tr>
+<tr><td>Snapshots</td><td>Object storage (<a href="../chapters/21-object-storage.html">Chapter 21</a>) keyed <code>docId/rev</code>, pointer in the metadata row</td><td>Large blobs, written rarely, cheap per GB, versioned.</td></tr>
+<tr><td>Live session state: who is connected, cursors</td><td>In memory of the owning document server only</td><td>Ephemeral; losing it costs nothing, clients rebuild it on reconnect.</td></tr>
+<tr><td>Ownership map: docId to server</td><td>Coordination service (<a href="../chapters/30-coordination-locks.html">Chapter 30</a>) plus cache in the routing tier</td><td>Strongly consistent so two servers never both own a document.</td></tr>
+<tr><td>Images and attachments</td><td>Object storage, referenced by URL from the document</td><td>Do not put binaries in the operation stream.</td></tr>
+</table>
+<p>The operation log row looks like <code>{docId, rev, authorId, clientId, opId, baseRev, ops, timestamp}</code>. The pair <code>(docId, rev)</code> is the primary key; <code>rev</code> is a dense integer 1, 2, 3, ... assigned only by the document's owning server. That dense, gap-free numbering is the backbone of the design: the document is, by definition, the result of replaying operations 1 through N in order.</p>
+
+<h2 id="first-design">6. A first simple design, then the scaled one</h2>
+<h3>6.1 The naive version</h3>
+<p>Start with one server and one database. A client opens a WebSocket, the server loads the document into memory, and every keystroke is sent as "replace the whole document with this text." The server saves it and rebroadcasts. This fails immediately: when two people type at once, the last whole-document write wins and the other person's work vanishes. Sending the whole document on every keystroke also wastes bandwidth. So we send <b>operations</b> (small descriptions of a change) instead of states, and we need a rule for combining concurrent operations. That rule is the heart of the problem and has two families of answers, covered in section 7.</p>
+<h3>6.2 The scaled architecture</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="High-level architecture of the collaborative editor">
+  <rect class="ext" x="20" y="30" width="120" height="50" rx="8"/><text class="t-c t-b" x="80" y="52">Client A</text><text class="t-c t-sm" x="80" y="69">local replica</text>
+  <rect class="ext" x="20" y="130" width="120" height="50" rx="8"/><text class="t-c t-b" x="80" y="152">Client B</text><text class="t-c t-sm" x="80" y="169">local replica</text>
+  <rect class="ext" x="20" y="230" width="120" height="50" rx="8"/><text class="t-c t-b" x="80" y="252">Client C</text><text class="t-c t-sm" x="80" y="269">offline buffer</text>
+  <rect class="box" x="210" y="120" width="140" height="70" rx="8"/><text class="t-c t-b" x="280" y="148">WS gateway</text><text class="t-c t-sm" x="280" y="166">L7 LB, auth, route</text>
+  <rect class="box" x="430" y="30" width="170" height="70" rx="8"/><text class="t-c t-b" x="515" y="58">Doc server 1</text><text class="t-c t-sm" x="515" y="76">owns docs 17, 52, ...</text>
+  <rect class="box" x="430" y="140" width="170" height="70" rx="8"/><text class="t-c t-b" x="515" y="168">Doc server 2</text><text class="t-c t-sm" x="515" y="186">owns docs 8, 91, ...</text>
+  <rect class="box" x="430" y="250" width="170" height="70" rx="8"/><text class="t-c t-b" x="515" y="278">Doc server N</text><text class="t-c t-sm" x="515" y="296">sequencer + OT engine</text>
+  <rect class="cache" x="670" y="20" width="200" height="60" rx="8"/><text class="t-c t-b" x="770" y="46">Ownership map</text><text class="t-c t-sm" x="770" y="64">etcd / lease per doc</text>
+  <rect class="db" x="670" y="105" width="200" height="60" rx="8"/><text class="t-c t-b" x="770" y="131">Op log store</text><text class="t-c t-sm" x="770" y="149">(docId, rev) -> op</text>
+  <rect class="db" x="670" y="190" width="200" height="60" rx="8"/><text class="t-c t-b" x="770" y="216">Snapshot store</text><text class="t-c t-sm" x="770" y="234">object storage</text>
+  <rect class="db" x="670" y="275" width="200" height="60" rx="8"/><text class="t-c t-b" x="770" y="301">Metadata + ACL</text><text class="t-c t-sm" x="770" y="319">sharded SQL</text>
+  <path class="arrow" d="M140 55 L208 140"/><path class="arrow" d="M140 155 L208 155"/><path class="arrow" d="M140 255 L208 175"/>
+  <path class="arrow" d="M350 140 L428 70"/><path class="arrow" d="M350 155 L428 175"/><path class="arrow" d="M350 170 L428 275"/>
+  <path class="arrow dash" d="M600 55 L668 50"/><path class="arrow" d="M600 175 L668 135"/><path class="arrow" d="M600 190 L668 215"/><path class="arrow dash" d="M600 290 L668 305"/>
+</svg>
+<figcaption>Clients keep a local replica and connect over WebSocket through a gateway. The gateway asks the ownership map which document server owns the document and forwards the connection there. The owning server orders operations, appends them to the log, and periodically writes snapshots.</figcaption>
+</figure>
+<p>Four properties define the architecture, and each is justified in later sections:</p>
+<ol>
+<li><b>Central sequencing.</b> One server per document assigns the total order of operations.</li>
+<li><b>One owner per document.</b> All editors of document D connect, through the gateway, to the same server. No cross-server coordination is needed to edit one document.</li>
+<li><b>Operation log plus snapshots.</b> The log is the source of truth; snapshots are an optimization to avoid replaying from revision 1.</li>
+<li><b>Clients are replicas.</b> Each client applies its own edits immediately and reconciles with the server in the background.</li>
+</ol>
+
+<h2 id="ot-vs-crdt">7. Deep dive 1: operational transformation versus CRDTs</h2>
+<p>The question that decides everything: when two edits were made concurrently, how do we merge them? There are two mainstream answers. The mathematics of CRDTs (conflict-free replicated data types) is covered in <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>; here we apply it.</p>
+<h3>7.1 A worked concurrent-edit example with OT</h3>
+<p>Operational transformation represents each edit as an operation with a position, such as <code>insert(pos, text)</code> or <code>delete(pos)</code>, and defines a <b>transform function</b> that rewrites an operation so that it applies correctly after another concurrent operation has already been applied.</p>
+<p>The document is <code>ABCD</code> at revision 5. Both Alice and Bob have this exact text. Positions count from 0.</p>
+<ul>
+<li>Alice types: <code>insert(1, "X")</code>, producing <code>AXBCD</code> on her screen. She wants X between A and B.</li>
+<li>Bob, at the same time, does <code>delete(2)</code>, removing the character at index 2, which is <code>C</code>. His screen shows <code>ABD</code>.</li>
+</ul>
+<p>Both operations have <code>baseRev = 5</code>: neither author saw the other's edit. Suppose the server receives Alice's first. It assigns revision 6 and applies it: the server text becomes <code>AXBCD</code>. Now Bob's operation arrives with baseRev 5, but the server is at revision 6. If the server applied <code>delete(2)</code> literally to <code>AXBCD</code> it would delete <code>B</code>, which Bob never meant. So the server <b>transforms Bob's operation against every operation committed since his baseRev</b>, here just Alice's insert.</p>
+<p>The rule for transforming a delete against an insert: if the insert position is less than or equal to the delete position, the inserted text sits to the left, so the delete position shifts right by the length of the insertion. Alice's insert at 1 is at or before 2, so Bob's delete becomes <code>delete(3)</code>. Applying it to <code>AXBCD</code> deletes the character at index 3, which is <code>C</code>. The server text is now <code>AXBD</code>, revision 7.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Worked OT example with insert and delete on the text ABCD">
+  <text class="t-b" x="20" y="24">Document ABCD at revision 5. Alice: insert(1,"X"). Bob: delete(2). Server order: Alice first.</text>
+  <rect class="ext" x="60" y="40" width="130" height="36" rx="8"/><text class="t-c t-b" x="125" y="63">Alice</text>
+  <rect class="db" x="385" y="40" width="130" height="36" rx="8"/><text class="t-c t-b" x="450" y="63">Server</text>
+  <rect class="ext" x="710" y="40" width="130" height="36" rx="8"/><text class="t-c t-b" x="775" y="63">Bob</text>
+  <line class="life" x1="125" y1="76" x2="125" y2="385"/><line class="life" x1="450" y1="76" x2="450" y2="385"/><line class="life" x1="775" y1="76" x2="775" y2="385"/>
+  <text class="t-sm" x="30" y="105">local: AXBCD</text>
+  <text class="t-sm" x="650" y="105" >local: ABD</text>
+  <path class="arrow" d="M125 120 L446 150"/><text class="t-sm" x="190" y="125">op insert(1,X) base 5</text>
+  <path class="arrow" d="M775 120 L454 168"/><text class="t-sm" x="560" y="122">op delete(2) base 5</text>
+  <text class="t-c t-b" x="450" y="200">apply insert: AXBCD (rev 6)</text>
+  <rect class="cache" x="290" y="212" width="320" height="50" rx="8"/><text class="t-c" x="450" y="233">transform delete(2) against insert(1,X)</text><text class="t-c t-sm" x="450" y="251">1 &lt;= 2, so position shifts: delete(3)</text>
+  <text class="t-c t-b" x="450" y="290">apply delete(3): AXBD (rev 7)</text>
+  <path class="arrow-g" d="M446 310 L129 325"/><text class="t-sm" x="150" y="305">remote: delete(3) rev 7, ack for Alice</text>
+  <path class="arrow-g" d="M454 310 L771 325"/><text class="t-sm" x="520" y="340">ack rev 7 plus remote: insert(1,X) rev 6</text>
+  <text class="t-sm" x="30" y="375">Alice: AXBD</text><text class="t-sm" x="690" y="375">Bob: AXBD</text>
+</svg>
+<figcaption>Alice's insert is committed first. The server rewrites Bob's delete from position 2 to position 3 so it still removes the letter C. Bob also receives Alice's insert and must transform it against his own pending delete (shifting is not needed here because the delete is to the right of the insert). Both end with AXBD.</figcaption>
+</figure>
+<p>The same must happen on the clients. Bob has already applied his delete locally and then receives Alice's <code>insert(1,"X")</code> from the server. The server's order says Alice's operation came first, but Bob applied his own first. Bob transforms the incoming insert against his pending delete: an insert at 1 against a delete at 2 is unaffected (the delete is to the right), so he applies <code>insert(1,"X")</code> to <code>ABD</code> and gets <code>AXBD</code>. Alice receives the server's already-transformed <code>delete(3)</code>, which applies to her <code>AXBCD</code> and gives <code>AXBD</code>. Everyone converges.</p>
+<p>Ties need a rule. If both users insert at the same position, the transform must break the tie deterministically (for example by comparing client ids), otherwise Alice's copy would show "XY" and Bob's "YX". A transform function has to satisfy convergence properties for every pair of operation types (insert-insert, insert-delete, delete-delete, plus formatting operations), and the number of pairs grows with each new operation type. This is the notorious difficulty of OT: getting the algebra right for rich text is hard, which is why the correct designs rely on a server to impose a single order instead of attempting fully peer-to-peer OT.</p>
+
+<h3>7.2 The client side: one operation in flight</h3>
+<p>With a central server, OT collapses to a simple protocol. The client is always in one of three states, and the server only ever has to transform a client's operation against the operations committed since that client's <code>baseRev</code>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 230" role="img" aria-label="Client state machine: synchronized, awaiting ack, awaiting ack with buffer">
+  <rect class="hit" x="40" y="80" width="200" height="70" rx="8"/><text class="t-c t-b" x="140" y="110">Synchronized</text><text class="t-c t-sm" x="140" y="130">nothing in flight</text>
+  <rect class="cache" x="350" y="80" width="200" height="70" rx="8"/><text class="t-c t-b" x="450" y="106">Awaiting ack</text><text class="t-c t-sm" x="450" y="126">1 op sent, none buffered</text>
+  <rect class="miss" x="660" y="80" width="200" height="70" rx="8"/><text class="t-c t-b" x="760" y="106">Awaiting + buffer</text><text class="t-c t-sm" x="760" y="126">1 op sent, edits queued</text>
+  <path class="arrow" d="M240 105 L348 105"/><text class="t-c t-sm" x="294" y="95">user edits: send</text>
+  <path class="arrow" d="M550 105 L658 105"/><text class="t-c t-sm" x="604" y="95">user edits: buffer</text>
+  <path class="arrow-g" d="M450 150 Q300 205 140 152"/><text class="t-c t-sm" x="295" y="205">ack arrives</text>
+  <path class="arrow-g" d="M760 150 Q610 205 470 152"/><text class="t-c t-sm" x="615" y="218">ack: send buffer as one op</text>
+  <text class="t-sm" x="40" y="40">Remote op arriving in any state: transform it against the in-flight op and the buffer, apply it locally.</text>
+  <text class="t-sm" x="40" y="58">The server never sees more than one unacknowledged op per client, which bounds its transform work.</text>
+</svg>
+<figcaption>The client sends at most one operation at a time. Edits typed while waiting are composed into a single buffered operation. This keeps the server's job tiny: transform against the revisions committed since the client's baseRev, never against a client's long private history.</figcaption>
+</figure>
+
+<h3>7.3 CRDTs as the alternative</h3>
+<p>A CRDT avoids transformation altogether by giving every character a <b>unique, immutable identity</b> and defining operations in terms of those identities instead of positions. For text, a common design (such as the sequence types in Yjs or Automerge, based on RGA or similar algorithms) says "insert character X after the character with id (client 7, counter 42)." Delete says "mark the character with id (client 3, counter 9) as deleted" (a <b>tombstone</b>, because other replicas may still refer to it). Since the references are to ids, not to indexes, operations commute: applying them in any order, on any replica, gives the same document. No server ordering is needed for correctness.</p>
+<p>Walk the same example. Characters have ids A=a1, B=a2, C=a3, D=a4. Alice's operation is "insert X (id b1) after a1." Bob's is "delete a3." Whatever order they arrive in, the result is A, X, B, tombstone(C), D, showing <code>AXBD</code>. If two users insert after the same id, the CRDT orders them by a deterministic rule on their ids, which plays the part of OT's tie-break.</p>
+<h3>7.4 Comparison</h3>
+<table>
+<tr><th>Aspect</th><th>OT with central server</th><th>CRDT (sequence type)</th></tr>
+<tr><td>Needs a central ordering server</td><td>Yes, correctness depends on it</td><td>No, but a server is still useful for persistence, auth, and relay</td></tr>
+<tr><td>Offline editing and peer-to-peer</td><td>Harder: long divergent histories need many transforms</td><td>Natural: merge is just applying the set of operations</td></tr>
+<tr><td>Metadata per character</td><td>None; the document is plain text plus attributes</td><td>An id per character and tombstones; often 10 to 30 times the raw text size in memory unless compacted, though optimized implementations store runs of characters together</td></tr>
+<tr><td>Complexity of correctness</td><td>Transform function for every operation pair; subtle bugs are well known</td><td>Merge algorithm is simpler to prove, but rich-text formatting and moves are subtle</td></tr>
+<tr><td>History and undo</td><td>Replay the log; inverse operations are transformed</td><td>History is the set of operations; undo is an inverse operation on ids</td></tr>
+<tr><td>Garbage collection</td><td>Not needed</td><td>Tombstones must eventually be pruned, which needs knowledge that all replicas saw the delete</td></tr>
+<tr><td>Access control and server-side logic</td><td>Easy: the server sees and validates every operation in order</td><td>Still possible, but the server must validate operations against a structure it does not order</td></tr>
+<tr><td>Proven in production</td><td>Google Docs; many enterprise editors</td><td>Figma-style multiplayer for some data, many newer local-first editors</td></tr>
+</table>
+<div class="callout key"><b>Decision</b> Because we have a central server per document anyway (for auth, durability, and history), we use <b>OT with server sequencing</b> for the text. It keeps documents small, makes permission checks and version history simple, and the transform work stays bounded. We keep CRDT in mind for the offline-heavy and local-first evolution path, discussed in section 19. Many modern designs also run a CRDT <i>on top of</i> the same central log, getting offline merges while still using the server for ordering and storage.</div>
+<div class="callout tip"><b>Interview tip</b> Do not claim one is simply better. State the real tradeoff: OT is lean on data but needs a trusted sequencer and careful transform code; CRDTs trade memory and tombstones for the freedom to merge without any coordinator. The interviewer wants to hear that you chose by the constraints of the problem.</div>
+
+<h2 id="protocol">8. Deep dive 2: the sequencing protocol, step by step</h2>
+<p>Here is the core operation, an edit, written as a numbered flow. The sequence diagram that follows shows the same steps.</p>
+<ol>
+<li>The user types. The client applies the edit to its local document instantly (optimistic local application). If the client is in the Synchronized state it sends <code>op{opId, baseRev, ops}</code>; otherwise it buffers.</li>
+<li>The WebSocket gateway, which already routed this connection to the owning server at join time, forwards the frame.</li>
+<li>The document server checks the role of the sender (editor or above) from its in-memory ACL, validates the operation (positions within bounds, size under a limit), and checks <code>opId</code> against its recent-id set to reject duplicates.</li>
+<li>If <code>baseRev</code> is less than the current head, the server transforms the operation against each committed operation from <code>baseRev + 1</code> to head, in order.</li>
+<li>The server assigns <code>rev = head + 1</code>, appends the transformed operation to the operation log and waits for the durable write to be acknowledged (a quorum write in the log store, <a href="../chapters/24-replication.html">Chapter 24</a>).</li>
+<li>Only after the log write succeeds, the server applies the operation to its in-memory document, sends <code>ack{opId, rev}</code> to the author, and broadcasts <code>remote{rev, author, ops}</code> to every other connection.</li>
+<li>Each receiving client transforms the incoming operation against its own in-flight and buffered operations and applies it to the screen.</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Sequence diagram of one edit">
+  <rect class="ext" x="40" y="14" width="120" height="32" rx="8"/><text class="t-c t-b" x="100" y="35">Alice</text>
+  <rect class="box" x="290" y="14" width="140" height="32" rx="8"/><text class="t-c t-b" x="360" y="35">Doc server</text>
+  <rect class="db" x="520" y="14" width="140" height="32" rx="8"/><text class="t-c t-b" x="590" y="35">Op log store</text>
+  <rect class="ext" x="740" y="14" width="120" height="32" rx="8"/><text class="t-c t-b" x="800" y="35">Bob</text>
+  <line class="life" x1="100" y1="46" x2="100" y2="320"/><line class="life" x1="360" y1="46" x2="360" y2="320"/><line class="life" x1="590" y1="46" x2="590" y2="320"/><line class="life" x1="800" y1="46" x2="800" y2="320"/>
+  <text class="t-sm" x="30" y="72">1 apply locally</text>
+  <path class="arrow" d="M100 90 L356 90"/><text class="t-sm" x="130" y="84">2 op (base 5)</text>
+  <text class="t-sm" x="372" y="116">3 check role, dedupe</text>
+  <text class="t-sm" x="372" y="136">4 transform vs revs 6..head</text>
+  <path class="arrow" d="M360 156 L586 156"/><text class="t-sm" x="400" y="150">5 append rev 8</text>
+  <path class="arrow-g" d="M586 186 L364 186"/><text class="t-sm" x="430" y="180">durable ack</text>
+  <path class="arrow-g" d="M356 220 L104 220"/><text class="t-sm" x="150" y="214">6 ack(opId, rev 8)</text>
+  <path class="arrow-g" d="M364 250 L796 250"/><text class="t-sm" x="560" y="244">6 remote(rev 8, ops)</text>
+  <text class="t-sm" x="640" y="280">7 Bob transforms against his pending ops, applies</text>
+  <text class="t-sm" x="30" y="310">Alice sees her text at once (step 1); the network only affects when others see it.</text>
+</svg>
+<figcaption>The author never waits for the server to see her own text; only the ack and the broadcast depend on the durable log append. Acknowledging only after the append is what makes "acked means durable" true.</figcaption>
+</figure>
+<h3>8.1 Why a single server per document sequences operations</h3>
+<p>The sequencer assigns the total order. Total ordering across many machines is expensive: it needs consensus (<a href="../chapters/29-consensus.html">Chapter 29</a>) or a shared lock. But we do not need a global order across all documents, only one order per document. Documents are independent, so we assign each document to exactly one server and let that server order its operations with a local counter. The ordering becomes a trivial in-memory increment, and the only distributed problem left is "which server owns this document," solved once, rarely, by the coordination service.</p>
+<h3>8.2 Batching and flow control</h3>
+<p>If a document has 100 editors each typing, the server may receive 200 operations per second for that document and fan out each to 99 others, nearly 20,000 messages per second from one document. Two defenses: clients already coalesce to roughly 2 operations a second, and the server can additionally batch broadcasts into windows of 20 to 50 ms, sending a single frame containing several revisions. Batching raises latency slightly but cuts syscalls and frames sharply.</p>
+
+<h2 id="sharding">9. Deep dive 3: document sharding and session affinity</h2>
+<p>The rule is: <b>one server owns a document at a time, and every editor of that document is connected to that server.</b> Without this rule, two servers would each receive edits for the same document and would have to agree on the order through consensus on every keystroke.</p>
+<h3>9.1 How the owner is chosen</h3>
+<p>Two common mechanisms:</p>
+<table>
+<tr><th>Option</th><th>How it works</th><th>Tradeoff</th></tr>
+<tr><td>Consistent hashing on docId (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>)</td><td>The gateway hashes the docId onto a ring of document servers. Each gateway computes the owner locally.</td><td>No lookup, simple. But membership changes (a server joins or dies) must be seen consistently by all gateways, otherwise two gateways briefly route the same document to different servers (split ownership). Needs a fencing token to be safe.</td></tr>
+<tr><td>Lease in a coordination service (<a href="../chapters/30-coordination-locks.html">Chapter 30</a>)</td><td>A server that wants to host document D acquires a lease key <code>owner/D</code> with a TTL in etcd or similar, and renews it. Gateways read (and cache) the mapping.</td><td>Strongly consistent single owner, easy migration and rebalancing, supports placement decisions like "put this huge document on a big machine." Costs an extra lookup, cached by gateways, and lease traffic scales with the number of active documents (1.2 M leases, batched).</td></tr>
+</table>
+<p>We choose <b>leases with epoch numbers</b>. When a server takes over a document it gets a monotonically increasing <b>epoch</b> (also called a fencing token). Every write to the operation log carries the epoch, and the log store rejects writes whose epoch is lower than the one it has seen for that document. This stops a slow, paused old owner (a "zombie" after a long garbage-collection pause) from appending operations that conflict with the new owner. It is the same fencing idea described in <a href="../chapters/30-coordination-locks.html">Chapter 30</a>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Document ownership and routing through the gateway">
+  <rect class="ext" x="20" y="30" width="110" height="40" rx="8"/><text class="t-c t-b" x="75" y="55">Alice (doc 17)</text>
+  <rect class="ext" x="20" y="90" width="110" height="40" rx="8"/><text class="t-c t-b" x="75" y="115">Bob (doc 17)</text>
+  <rect class="ext" x="20" y="150" width="110" height="40" rx="8"/><text class="t-c t-b" x="75" y="175">Cy (doc 52)</text>
+  <rect class="ext" x="20" y="210" width="110" height="40" rx="8"/><text class="t-c t-b" x="75" y="235">Di (doc 8)</text>
+  <rect class="box" x="210" y="100" width="150" height="90" rx="8"/><text class="t-c t-b" x="285" y="130">Gateway</text><text class="t-c t-sm" x="285" y="150">route by docId</text><text class="t-c t-sm" x="285" y="168">cached owner map</text>
+  <rect class="cache" x="440" y="10" width="170" height="60" rx="8"/><text class="t-c t-b" x="525" y="36">Lease store</text><text class="t-c t-sm" x="525" y="54">17 -> S1 (epoch 9)</text>
+  <rect class="box" x="440" y="100" width="170" height="60" rx="8"/><text class="t-c t-b" x="525" y="126">Server S1</text><text class="t-c t-sm" x="525" y="144">docs 17, 52</text>
+  <rect class="box" x="440" y="190" width="170" height="60" rx="8"/><text class="t-c t-b" x="525" y="216">Server S2</text><text class="t-c t-sm" x="525" y="234">doc 8</text>
+  <rect class="db" x="690" y="100" width="180" height="70" rx="8"/><text class="t-c t-b" x="780" y="128">Op log + snapshots</text><text class="t-c t-sm" x="780" y="146">writes carry epoch</text>
+  <path class="arrow" d="M130 50 L208 130"/><path class="arrow" d="M130 110 L208 140"/><path class="arrow" d="M130 170 L208 160"/><path class="arrow" d="M130 230 L208 175"/>
+  <path class="arrow" d="M360 130 L438 130"/><path class="arrow" d="M360 170 L438 210"/>
+  <path class="arrow dash" d="M285 100 L440 50"/>
+  <path class="arrow" d="M610 130 L688 135"/><path class="arrow" d="M610 220 L700 170"/>
+</svg>
+<figcaption>Alice and Bob editing document 17 are both routed to server S1, which holds the lease for that document. The gateway learns the owner from the lease store (dashed) and caches it. Every log write includes the lease epoch so a stale owner is rejected.</figcaption>
+</figure>
+<h3>9.2 Load balancing and hot documents</h3>
+<p>Documents are placed by least-loaded server at lease acquisition time, not purely by hash, because load per document varies by five orders of magnitude. Typical documents cost almost nothing; a 100-editor all-hands document costs as much as several hundred ordinary ones. Remedies:</p>
+<ul>
+<li><b>Admission and placement:</b> track connections and operations per second per server; assign new leases to the least loaded server below 70% CPU.</li>
+<li><b>Mega-documents with thousands of read-only viewers:</b> the owner does not fan out to 10,000 sockets itself. It publishes each operation to a pub/sub tier (<a href="../chapters/35-messaging-patterns.html">Chapter 35</a>), and a fleet of "edge relay" servers holds the viewer connections and forwards. Editors (at most 100) stay on the owner; viewers see updates about 20 ms later.</li>
+<li><b>Migration:</b> to drain a server for a deployment, the owner flushes the log, releases the lease, tells clients to reconnect (a "go away" frame), and the next connect lands on the new owner. Clients are already built to reconnect (section 12).</li>
+</ul>
+<p>This is session affinity in its strongest form: not a sticky cookie that a load balancer may drop (<a href="../chapters/09-load-balancing.html">Chapter 9</a>) but a correctness requirement, enforced by the lease.</p>
+
+<h2 id="log-snapshot">10. Deep dive 4: operation log and periodic snapshots</h2>
+<p>The document's state at revision N is the result of replaying operations 1..N from an empty document. That is correct but slow for a document with a million operations. So we store <b>snapshots</b>: the full serialized document at some revision R, with the invariant that snapshot(R) equals replay(1..R). To load a document you read the latest snapshot and replay only operations after R.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 230" role="img" aria-label="Operation log with periodic snapshots on a revision timeline">
+  <line x1="40" y1="110" x2="860" y2="110" stroke="var(--fg)" stroke-width="2"/>
+  <g>
+    <rect class="box" x="60" y="95" width="14" height="30" rx="3"/><rect class="box" x="90" y="95" width="14" height="30" rx="3"/><rect class="box" x="120" y="95" width="14" height="30" rx="3"/><rect class="box" x="150" y="95" width="14" height="30" rx="3"/><rect class="box" x="180" y="95" width="14" height="30" rx="3"/><rect class="box" x="210" y="95" width="14" height="30" rx="3"/>
+    <rect class="box" x="300" y="95" width="14" height="30" rx="3"/><rect class="box" x="330" y="95" width="14" height="30" rx="3"/><rect class="box" x="360" y="95" width="14" height="30" rx="3"/><rect class="box" x="390" y="95" width="14" height="30" rx="3"/><rect class="box" x="420" y="95" width="14" height="30" rx="3"/><rect class="box" x="450" y="95" width="14" height="30" rx="3"/>
+    <rect class="box" x="540" y="95" width="14" height="30" rx="3"/><rect class="box" x="570" y="95" width="14" height="30" rx="3"/><rect class="box" x="600" y="95" width="14" height="30" rx="3"/><rect class="box" x="630" y="95" width="14" height="30" rx="3"/><rect class="box" x="660" y="95" width="14" height="30" rx="3"/><rect class="box" x="690" y="95" width="14" height="30" rx="3"/>
+    <rect class="box" x="780" y="95" width="14" height="30" rx="3"/><rect class="box" x="810" y="95" width="14" height="30" rx="3"/>
+  </g>
+  <rect class="db" x="235" y="30" width="60" height="40" rx="8"/><text class="t-c t-b" x="265" y="55">S@2000</text>
+  <rect class="db" x="475" y="30" width="60" height="40" rx="8"/><text class="t-c t-b" x="505" y="55">S@4000</text>
+  <rect class="db" x="715" y="30" width="60" height="40" rx="8"/><text class="t-c t-b" x="745" y="55">S@6000</text>
+  <path class="arrow-g dash" d="M265 70 L265 108"/><path class="arrow-g dash" d="M505 70 L505 108"/><path class="arrow-g dash" d="M745 70 L745 108"/>
+  <text class="t-sm" x="60" y="160">rev 1</text><text class="t-sm" x="800" y="160">head 6,2xx</text>
+  <text class="t-sm" x="40" y="190">Load = fetch snapshot@6000 + replay about 200 operations. Version history = nearest snapshot + replay to any rev.</text>
+  <text class="t-sm" x="40" y="210">Old fine-grained ops can be compacted: keep snapshots plus per-session summaries after 30 days.</text>
+</svg>
+<figcaption>Each small block is an operation; each S@N is a snapshot taken at revision N. Opening a document reads the newest snapshot and replays only the tail. Restoring any past revision reads the nearest earlier snapshot and replays forward to the target.</figcaption>
+</figure>
+<h3>10.1 When to snapshot</h3>
+<p>Snapshot when either of these triggers fires: 2,000 operations since the last snapshot, or the document went idle (no editors for 30 seconds) with unsnapshotted operations. The owning server writes the snapshot asynchronously to object storage, then records <code>(snapshotRev, objectKey)</code> in the metadata row. A crash between writing the blob and updating the pointer is harmless: the blob is just unused, and the next snapshot overwrites the decision. With 2,000-operation intervals, loading a typical document replays at most 2,000 small operations in a few milliseconds.</p>
+<h3>10.2 Ordering writes: log first, snapshot second</h3>
+<p>The log is authoritative; the snapshot is derived and can always be rebuilt from it. We never ack before the log append is durable. Snapshots are never needed for correctness, only speed, so a lost snapshot costs a longer load, not data.</p>
+<h3>10.3 Compaction and retention</h3>
+<p>Raw operations are about 1.1 TB/day (section 3). After 30 days we compact: keep snapshots at intervals and replace the operations between them by a compressed bundle, preserving attribution ("who wrote this paragraph") at a coarser granularity. Compaction runs offline per document and is safe because it never touches revisions newer than the most recent snapshot.</p>
+
+<h2 id="presence">11. Presence and cursors</h2>
+<p>Presence means "who is here and where is their cursor." It differs from edits in every way that matters: it is ephemeral (no need to persist), tolerant of loss (the next update replaces it), and high frequency. So presence travels over the same WebSocket but takes a lighter path: <b>not sequenced, not logged, not transformed by the OT engine</b>, but kept in the owner's memory and broadcast to peers.</p>
+<ul>
+<li><b>Throttling:</b> clients send cursor updates at most 5 times per second and only when the selection changed. The server coalesces: if it receives three cursor updates from Alice within a 100 ms window, it forwards only the latest.</li>
+<li><b>Cursor positions must be transformed.</b> A cursor is an index into the text. When a remote operation inserts text before the cursor, the cursor index must shift or it will drift to the wrong character. The client transforms remote cursors against every operation it applies, exactly like a zero-length operation. Alternatively the server sends cursor positions tagged with a revision so the receiver can transform them to its current state.</li>
+<li><b>Liveness:</b> presence entries expire. Each client sends a heartbeat (about every 10 s); if none arrives within 30 s, or the socket closes, the server broadcasts "Alice left" and drops her cursor.</li>
+<li><b>Fan-out cap:</b> on a document with 100 editors, showing every cursor is noise. Send full presence for the 20 most recently active editors plus a count, and deliver the rest only on hover.</li>
+</ul>
+<p>Presence lives only in the owning server's memory. If that server dies, the new owner starts with empty presence and clients repopulate it within a second as they reconnect and resend their cursors. Persisting presence would only add write load for no value. This echoes the presence design in <a href="c07-chat.html">the chat case study</a>.</p>
+
+<h2 id="offline">12. Offline editing and reconnect</h2>
+<h3>12.1 Reconnect after a short drop</h3>
+<p>On a brief disconnect (Wi-Fi switch, phone sleep), the client keeps editing locally. Its unacknowledged operation and its buffer stay in memory. When the socket re-establishes (with jittered exponential backoff, <a href="../chapters/40-resilience.html">Chapter 40</a>, so thousands of clients do not stampede after a gateway restart), it sends <code>join{docId, lastKnownRev}</code>.</p>
+<ol>
+<li>The server replies <code>catchup{fromRev, ops}</code> with every revision after <code>lastKnownRev</code>, or a fresh <code>snapshot</code> if the gap is larger than a threshold (say 5,000 revisions).</li>
+<li>The client treats these as incoming remote operations: it transforms them against its in-flight and buffered operations and applies them.</li>
+<li>The client resends its in-flight operation with the same <code>opId</code>. If the server had already accepted it before the drop, the dedupe set returns the original ack; if not, the server transforms and commits it now.</li>
+<li>The buffered operation is then sent as usual.</li>
+</ol>
+<h3>12.2 Long offline sessions</h3>
+<p>A user on a flight may produce thousands of local operations while others produce thousands of their own. Replaying with the "one operation in flight" protocol would transform a huge buffer against a huge catch-up, which is quadratic work. Two mitigations:</p>
+<ul>
+<li><b>Compose before sending.</b> The client composes its entire offline history into one compact operation (a single "delta" that touches only the regions that ended up different). The server then transforms one operation against the catch-up instead of thousands.</li>
+<li><b>Use a CRDT for the offline layer.</b> This is where a CRDT shines (section 7.4). Production local-first editors keep a CRDT replica on the device so that merges, even from devices that never saw a server, are well defined. The server stores the CRDT's updates in the same operation log.</li>
+</ul>
+<p>Offline edits must also be checked against permissions at reconnect. If the user was removed as an editor while offline, the server rejects the operation batch with <code>forbidden</code>, and the client keeps the text locally as a "rejected local changes" copy the user can export. We never silently discard the user's work.</p>
+<h3>12.3 Local persistence</h3>
+<p>The client stores its replica and pending operations in IndexedDB or a local database, so closing the tab or crashing the browser while offline loses nothing. On the next open it loads the local copy first (instant) and syncs in the background.</p>
+
+<h2 id="undo">13. Undo and redo</h2>
+<p>Single-user undo is trivial: pop the last operation and apply its inverse. With collaboration it is a trap. If Alice types "hello" and Bob then types "world" after it, what should Alice's Ctrl+Z do? The user expectation is: undo <b>my</b> last change, leave Bob's alone. A global stack would undo Bob's text.</p>
+<p>The solution is <b>selective undo</b>: each client keeps its own stack of operations it authored. To undo, it computes the inverse of its last operation (an insert's inverse is a delete of the same text; a delete's inverse is a re-insert of the deleted text), but that inverse refers to the document as it was when the operation was made. Since then other operations have been committed, so the inverse must be <b>transformed against everything that happened after</b> the original operation, exactly like a concurrent edit. The result is sent as a normal new operation, with a new revision, appearing in history like any other edit (history is never rewritten).</p>
+<p>Edge cases: if Alice inserted a word and Bob has since deleted the paragraph containing it, the transformed inverse deletes nothing; the undo becomes a no-op, which is the least surprising outcome. Formatting operations (bold) have inverses that restore the previous attribute value on the exact range, again transformed. The undo stack is kept on the client (and discarded on session end), so the server needs no extra state. An <code>undo</code> message in our API only exists for cases where the client wants the server to compute the inverse from the log, such as undoing after a refresh.</p>
+
+<h2 id="permissions">14. Permissions and sharing</h2>
+<p>Roles: owner, editor, commenter, viewer. Authorization (<a href="../chapters/55-security.html">Chapter 55</a>) is enforced at three points:</p>
+<ol>
+<li><b>Join time.</b> The gateway validates the token and the document server checks the role from the metadata store (cached in memory with a short TTL, 30 s). A user with no access gets a <code>forbidden</code> and the socket closes.</li>
+<li><b>Per operation.</b> The server checks the role on every operation, using the cached ACL. A viewer's <code>op</code> message is rejected. This protects against a modified client.</li>
+<li><b>On change.</b> When an owner revokes access, the metadata service publishes an <code>acl-changed</code> event for the document; the owning server invalidates its cache and disconnects revoked users within about a second. Without the event the worst case is the 30-second cache TTL.</li>
+</ol>
+<p>Link sharing ("anyone with the link can view") is an ACL entry with a random, unguessable 128-bit token in the URL; it can be revoked by rotating the token. Operation validation also limits abuse: maximum operation size (for example 1 MB), maximum document size (for example 50 MB of text), and per-connection rate limits (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>), say 50 operations per second, so a runaway script cannot flood a document and everyone's connection.</p>
+
+<h2 id="history">15. Version history</h2>
+<p>Because every change is an immutable, numbered operation, version history falls out of the design almost for free. A "version" is just a revision number (and optionally a name). To display version V: find the snapshot with the greatest revision at or below V and replay forward (section 10). To show "what changed," diff the text of two versions, or attribute each operation's author directly from the log.</p>
+<p><b>Restore</b> never deletes later history. Restoring version V computes the operations that turn the current text into the text at V (a diff, then expressed as operations), and commits them as new revisions authored by the restoring user. Other editors who are connected see the document change like any other edit, and the restore itself can be undone. This avoids the awful alternative of rewinding the log while others are typing.</p>
+<p>Named versions ("Final draft") are pointers to a revision in metadata; automatic versions are cut by the snapshotter (for example every 30 minutes of active editing and at every session end). We retain all snapshots 30 days, then thin to one per day for a year, and then one per week, following the compaction rules of section 10.3. Retaining the operation log forever at 1.1 TB/day would be too expensive for the value: after 30 days compact as described.</p>
+
+<h2 id="scaling">16. Scaling, bottlenecks, and hot spots</h2>
+<ul>
+<li><b>Gateways (stateless).</b> Terminate TLS and WebSockets, authenticate, route to the owner. Scale horizontally behind an L4 load balancer; each handles tens of thousands of connections. Connection counts, not CPU, are the sizing driver (<a href="../chapters/06-realtime.html">Chapter 6</a>). Gateways proxy frames to the owner; to cut one hop, the owner may be the connection terminator and the gateway only routes at connect time.</li>
+<li><b>Document servers.</b> Scale by adding servers; leases rebalance. 200 servers carry the load, so we run about 400 for headroom (section 3.4). Add servers when average CPU passes 60% or connections per server exceed 10,000.</li>
+<li><b>Operation log store.</b> 130 k writes/s average, 400 k peak, each a few hundred bytes with replication. Partitioned by docId, so a single document's writes go to one partition (at most a few hundred ops/s, well within one partition's capacity); cluster capacity scales by adding nodes (<a href="../chapters/25-sharding.html">Chapter 25</a>). Writes within a document are sequential appends, which LSM engines do well.</li>
+<li><b>Metadata store.</b> Read-heavy (join checks), with a cache in the owning server; writes only on sharing changes and rename. Not a bottleneck.</li>
+<li><b>Coordination service.</b> About 1.2 M active leases. A single etcd cluster does not carry that write load if each lease renews every 10 s (120 k renewals/s). Mitigations: renew leases per server, not per document (one server-level lease covers all its documents, with a per-document ownership record written only on acquisition and migration), or shard the coordination service by docId range into several clusters. We use server-level leases plus per-document records.</li>
+<li><b>Hot documents.</b> A document with 100 editors is bounded by a single server's fan-out; the relay tier handles thousands of viewers (section 9.2). A document with 10,000 <i>editors</i> is outside scope and is handled by switching to "suggest mode" or moving to a different data model (spreadsheet-like cell ownership).</li>
+<li><b>Caching.</b> The owner's memory is the cache: the working copy of the document and its recent operations. Cold documents are evicted after 10 minutes with no connected clients after a final snapshot flush.</li>
+</ul>
+
+<h2 id="failures">17. Failure modes</h2>
+<table>
+<tr><th>Failure</th><th>What happens</th><th>Mitigation</th></tr>
+<tr><td>Document server crashes</td><td>All its documents lose their owner; clients see sockets close. Acknowledged operations are in the log, so nothing acknowledged is lost. Unacknowledged client operations are still in client memory.</td><td>Lease expires (about 10 s TTL, or faster with a health watcher). Another server acquires it (epoch +1), loads latest snapshot plus the log tail, accepts reconnects. Clients retry with <code>opId</code> so duplicates are ignored. Typical editing pause: 5 to 15 seconds for the affected documents.</td></tr>
+<tr><td>Network partition: owner cut off from lease store but still reachable by some clients</td><td>The old owner cannot renew its lease. A new owner is elected. The old one may still accept operations from clients connected to it (split brain).</td><td>The old owner stops accepting operations when its lease is within a safety margin of expiry (it self-fences), and every log write carries the epoch, so the log rejects stale-epoch appends. Clients attached to the old owner see errors and reconnect to the new one. No two owners can both commit.</td></tr>
+<tr><td>Zombie owner after a long GC pause</td><td>Process resumes believing it still owns the document, tries to append.</td><td>Epoch fencing on the log store rejects the write; the zombie shuts down the document.</td></tr>
+<tr><td>Log store node failure</td><td>Quorum replication continues with remaining replicas; writes keep succeeding.</td><td>Replication factor 3, quorum 2 (<a href="../chapters/24-replication.html">Chapter 24</a>). If quorum is lost, the owner stops acking and clients show "reconnecting"; they keep editing locally.</td></tr>
+<tr><td>Snapshot store slow or unavailable</td><td>Snapshots lag; load times grow because more log has to be replayed.</td><td>Not a correctness issue. Alert when the tail past the latest snapshot exceeds 10,000 operations. The log is still authoritative.</td></tr>
+<tr><td>Transform bug yields divergence</td><td>Two clients permanently disagree: the worst failure.</td><td>Clients send a rolling hash of their document every N revisions; the server compares to its own, and on mismatch forces the client to reload from the snapshot and replay. Also property-based fuzz tests for every operation pair.</td></tr>
+<tr><td>Poison operation (malformed or huge)</td><td>Could crash the transformer for the document.</td><td>Validate before sequencing; run the transform in a guarded section; if it throws, reject the operation and notify only the sender.</td></tr>
+<tr><td>Thundering reconnect after gateway restart</td><td>Hundreds of thousands of clients reconnect at once.</td><td>Backoff with jitter, rolling gateway restarts, per-server connection admission limits (<a href="../chapters/40-resilience.html">Chapter 40</a>).</td></tr>
+<tr><td>Region outage</td><td>All documents in that region are unavailable for editing.</td><td>Asynchronous cross-region replication of the log; a documented small recovery point (for example a few seconds); a failover that bumps the epoch in the new region (<a href="../chapters/41-ha-dr.html">Chapter 41</a>, <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>). Operations that were acknowledged but not yet replicated are the cost of choosing async replication; clients still hold them and resend after reconnecting.</td></tr>
+</table>
+<h3>17.1 Consistency and idempotency decisions</h3>
+<p>The system is <b>strongly consistent for the order of operations in a document</b> (one sequencer, quorum-durable log) and <b>eventually consistent for what each client sees</b> (they converge after receiving all operations). In CAP terms (<a href="../chapters/28-cap-consistency.html">Chapter 28</a>), during a partition a client in the minority side stays available for local editing, but its edits only become part of the shared document when it can reach the owner again. Duplicate delivery is neutralized by <code>opId</code>; reordering within a connection cannot happen over TCP, and across reconnects the <code>baseRev</code> and transformation handle it.</p>
+
+<h2 id="security-ops">18. Security, monitoring, SLOs, cost</h2>
+<h3>18.1 Security and abuse</h3>
+<ul>
+<li>TLS for all traffic; WebSocket auth by a short-lived token passed in the first frame (not in a URL that gets logged).</li>
+<li>Check <code>Origin</code> on the upgrade request to prevent cross-site WebSocket hijacking.</li>
+<li>Server-side validation of every operation: bounds, size, and role. Never trust client-calculated positions to be safe.</li>
+<li>Sanitize rich content (links, embedded HTML) at render time to prevent stored cross-site scripting through a shared document.</li>
+<li>Audit log of sharing changes. Data at rest encrypted, with per-tenant keys for enterprise customers (<a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>).</li>
+</ul>
+<h3>18.2 Monitoring and SLOs (<a href="../chapters/54-observability-slos.html">Chapter 54</a>)</h3>
+<table>
+<tr><th>SLI</th><th>Target</th></tr>
+<tr><td>Operation propagation latency (author send to other editor render), p99</td><td>under 200 ms same continent</td></tr>
+<tr><td>Ack latency (op send to ack), p99</td><td>under 100 ms</td></tr>
+<tr><td>Document open time (click to editable), p95</td><td>under 1 s</td></tr>
+<tr><td>Failed edits (acked but later missing, reported via hash checks)</td><td>zero; any divergence is an incident</td></tr>
+<tr><td>Failover time for a dead owner</td><td>under 15 s p99</td></tr>
+<tr><td>Monitoring signals</td><td>Divergence-detector mismatches, log-tail length per document, lease churn, WebSocket reconnect rate, per-server connection count</td></tr>
+</table>
+<h3>18.3 Cost</h3>
+<p>The bill is dominated by storage and by always-on connections. Compute: 400 servers is modest. Storage: about 100 TB of snapshots plus 33 TB of 30-day log, and object storage keeps the snapshot cost low; tiering older versions to cheaper storage classes further reduces it. Bandwidth is small (under 100 MB/s outbound at peak). The best cost lever is compaction of old operations, which keeps the bill proportional to documents, not keystrokes.</p>
+
+<h2 id="evolution">19. Evolution: phasing, 10x scale, alternatives</h2>
+<h3>19.1 What to build first</h3>
+<ol>
+<li><b>Phase 1:</b> single document server, in-memory OT, log in a relational table, snapshots on every N operations. WebSocket protocol with <code>opId</code> idempotency and reconnect. This already supports thousands of users.</li>
+<li><b>Phase 2:</b> ownership leases and a gateway tier, permissions, presence, version history.</li>
+<li><b>Phase 3:</b> offline editing with local persistence, relay tier for mega-documents, compaction, divergence detection.</li>
+<li><b>Phase 4:</b> multi-region, CRDT-based local-first sync, comments and suggestions.</li>
+</ol>
+<h3>19.2 At 10x scale</h3>
+<ul>
+<li>20 M concurrent connections: about 2,000 to 4,000 document servers; the lease service must be sharded and the owner map cached in a hierarchy.</li>
+<li>Cross-region editing: pin each document to a home region near most of its editors (move it if the center of mass shifts), accept one WAN round trip for far-away editors, which is acceptable because local echo hides it.</li>
+<li>Log store at 11 TB/day raw: compaction becomes critical; more aggressive snapshots reduce replay.</li>
+</ul>
+<h3>19.3 Alternatives not chosen</h3>
+<ul>
+<li><b>Pure peer-to-peer CRDT</b> with no sequencer: great for offline and privacy, but harder for permissions, server-side search, and version history, and per-character metadata costs memory.</li>
+<li><b>Locking (check-out) model:</b> lock a paragraph while someone edits it. Simple and always correct, but users hate it, and it fails the "feels instant" requirement.</li>
+<li><b>Last-writer-wins on whole document</b> (like a wiki): loses concurrent work.</li>
+<li><b>Multi-leader per document with consensus on each op:</b> an unnecessary cost since one document has a tiny write rate that one server can order.</li>
+<li><b>End-to-end encryption:</b> the server cannot transform what it cannot read. This pushes toward CRDTs where the server relays opaque updates; a real design choice for privacy-first products.</li>
+</ul>
+
+<h2 id="qa">20. Interview Q&amp;A</h2>
+<details><summary>Why not just lock the document or paragraph while someone is editing?</summary>
+<p>Locking guarantees there are no conflicts, but it destroys the product experience: people would wait for each other, and a user who walks away holding a lock blocks everyone. It also adds latency because acquiring a lock needs a round trip before the first keystroke, violating our requirement that local typing feels instant. OT or CRDTs let everyone edit at the same time and resolve conflicts automatically in the data, which is the whole point of a collaborative editor.</p></details>
+<details><summary>Why use a central server for OT; could clients transform among themselves?</summary>
+<p>Peer-to-peer OT requires transform functions that are correct for every possible interleaving of operations from many peers, and the algebra for that is extremely hard to get right; many published algorithms were later found to be incorrect. A central server imposes a single total order, so each client only has to reconcile its own pending operations against that one stream, which reduces the problem to a tractable protocol. The server is also where we already want authorization, durability, and history, so using it as the sequencer costs almost nothing extra.</p></details>
+<details><summary>What happens if two users insert at exactly the same position?</summary>
+<p>The transform function must break the tie deterministically, otherwise two replicas could order the two insertions differently and diverge. A common rule is to give priority to the operation that the server committed first, or to compare client ids when the operations are being transformed against each other on a client. Either way every replica must apply the same rule so the final order of the two inserted strings is the same everywhere; which order wins matters less than that it is consistent.</p></details>
+<details><summary>How do you guarantee an edit is never lost after the user sees it accepted?</summary>
+<p>The server only sends an ack after the operation has been durably appended to the replicated operation log with a quorum write. Anything the client has not seen acknowledged stays in its memory and local storage, and is resent with the same <code>opId</code> after any disconnect, which makes the retry idempotent. So an operation is either acknowledged and durable, or still held by the client and being retried; there is no window in which it exists nowhere.</p></details>
+<details><summary>How do you prevent two servers from both acting as owner of a document?</summary>
+<p>Ownership is a lease in a strongly consistent coordination service, and each acquisition increments an epoch number. Every write to the log carries the epoch, and the log rejects any write with an older epoch than it has already accepted for that document. Even if an old owner pauses for a long garbage collection and wakes up thinking it still owns the lease, its writes are rejected, so at most one server can commit operations for a document at a time. The old owner also stops serving when its own clock says the lease is about to expire, shrinking the window further.</p></details>
+<details><summary>How would you handle a document with 10,000 people viewing and 50 editing?</summary>
+<p>Editors stay connected to the owning server, where operations are sequenced. The owner publishes each committed operation to a pub/sub tier, and a fleet of relay servers holds the thousands of viewer sockets and forwards operations to them. Viewers never send edits, so they do not need transformation, only ordered delivery, which the revision numbers provide. Presence for viewers is reduced to a count to avoid sending 10,000 cursors. This keeps the owner's fan-out at tens of connections instead of ten thousand.</p></details>
+<details><summary>Why snapshot at all if the log is the source of truth?</summary>
+<p>Replaying a log of a million operations to open a document would take far too long and read too much data. A snapshot is a cached result of the replay at a given revision, so opening needs one blob read plus a short tail replay. Snapshots are purely an optimization and can be regenerated from the log, so a lost or slow snapshot affects load time, never correctness. They also act as the checkpoints that make version history and compaction cheap.</p></details>
+<details><summary>How does undo work when other people have edited after my change?</summary>
+<p>Each client keeps its own stack of its own operations. To undo, it builds the inverse of its last operation, then transforms that inverse against all operations committed after the original, so that it targets the right text in the current document. The result is sent as a new ordinary operation. This means undo affects only my own changes, history stays append-only, and if my text has been deleted by someone else the transformed inverse simply does nothing.</p></details>
+<details><summary>How do you detect that two replicas have silently diverged?</summary>
+<p>Periodically (every few hundred revisions) each client computes a hash of its document at a known revision and sends it, and the server compares it with the hash of its own copy at that revision. A mismatch means a transform bug or corrupted state. The server instructs the client to discard its local state and reload from the snapshot plus log, and raises an alert, because divergence is the one failure that should never be silent. We also fuzz-test the transform functions with random concurrent operation sequences to catch these before release.</p></details>
+<details><summary>Would you use CRDTs instead? When?</summary>
+<p>With a reliable server per document and a need for permissions, history, and compact storage, I choose server-sequenced OT. I would choose CRDTs if offline and peer-to-peer collaboration were first-class (local-first apps), if the server must not read the content (end-to-end encryption), or if edits must merge across regions without a coordinator. The costs are per-character metadata, tombstone garbage collection, and a harder time doing server-side validation. A hybrid is common: a CRDT on the client for merging, and the server still storing updates in an ordered log.</p></details>
+<details><summary>What does a user experience when the document server dies mid-edit?</summary>
+<p>Their typing keeps appearing locally because the client applies edits optimistically, but the connection status flips to "reconnecting." Within roughly 5 to 15 seconds another server takes the lease, loads the latest snapshot and the log tail, and accepts the reconnect. The client catches up, transforms and resends its in-flight operation with the same <code>opId</code>, and everything converges. No acknowledged work is lost, and unacknowledged work was never lost because the client still had it.</p></details>
+
+<h2 id="recap-wrap">21. Recap</h2>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>The hard part is concurrent editing: operations authored against different document versions must be transformed (OT) or made order-independent (CRDT) so everyone converges while intent is preserved.</li>
+<li>We use <b>OT with a central sequencer per document</b>: each client has at most one operation in flight, and the server transforms it against revisions committed since the client's baseRev, appends it to a dense, numbered operation log, and only then acks.</li>
+<li>Worked example: on ABCD, insert(1,X) and delete(2) become delete(3) after the insert commits; every replica ends with AXBD.</li>
+<li><b>One server owns a document</b> via a lease with an epoch, enforced by fencing on log writes; gateways route by docId. Mega-documents offload viewers to a relay tier.</li>
+<li>The log is the truth, <b>snapshots every ~2,000 operations</b> make loading fast and version history cheap, and compaction caps long-term storage (about 100 TB snapshots, 33 TB of 30-day log).</li>
+<li>Presence is ephemeral, throttled, and kept only in owner memory; cursors are transformed like operations.</li>
+<li>Offline and reconnect rely on <code>opId</code> idempotency, catch-up by revision, composed offline deltas, and local persistence; undo is per-user selective undo via transformed inverses.</li>
+<li>Failure handling: crash means lease expiry and replay in seconds; partitions are handled by self-fencing plus epochs; divergence is caught by hash checks.</li>
+<li>Numbers: 2 M connections, 1.2 M active documents, 400 k ops/s peak, about 200 servers (400 provisioned), under 100 MB/s bandwidth.</li>
+</ul></div>
+<p class="connects"><b>Connects to:</b> <a href="../chapters/06-realtime.html">Chapter 6</a> (WebSockets and connection management), <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a> (CRDTs and OT), <a href="../chapters/25-sharding.html">Chapter 25</a> (partitioning the log), <a href="../chapters/24-replication.html">Chapter 24</a> (quorum-durable log), <a href="../chapters/29-consensus.html">Chapter 29</a> and <a href="../chapters/30-coordination-locks.html">Chapter 30</a> (leases, fencing), <a href="../chapters/28-cap-consistency.html">Chapter 28</a> (consistency), <a href="../chapters/21-object-storage.html">Chapter 21</a> (snapshots), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotent retries), <a href="../chapters/40-resilience.html">Chapter 40</a> (backoff), <a href="../chapters/55-security.html">Chapter 55</a> (authorization). Related case studies: <a href="c07-chat.html">Chat system</a>, <a href="c09-file-sync.html">Dropbox / Google Drive</a>.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

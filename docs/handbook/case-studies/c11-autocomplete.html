@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design Search Autocomplete | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c11-autocomplete">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 11 · Worked solutions</div>
+<h1>Design Search Autocomplete</h1>
+<p class="lead">As a user types into a search box, the system suggests the most likely completions within a fraction of a second. This worked solution builds it from a single trie, to a sharded and cached serving tier, to a log-driven pipeline that keeps suggestions fresh, with the numbers and failure modes an interviewer will probe.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is short: "Design the typeahead (autocomplete) feature of a web search engine." Every keystroke in the search box should show a dropdown with, say, the 10 best query completions for what has been typed so far. If the user types <code>wea</code>, we might show <code>weather</code>, <code>weather tomorrow</code>, <code>wear os</code>, <code>weasel</code>. The feature looks tiny, but it is one of the hardest latency problems in product engineering: it fires several times per search, the budget is tens of milliseconds, and the data underneath it changes every minute.</p>
+<p>A strong candidate does not start drawing. They ask questions first, and state the assumption that follows from each answer, as the framework in <a href="../chapters/01-interview-framework.html">Chapter 1</a> recommends.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th><th>Why it matters</th></tr>
+<tr><td>What are we suggesting: queries, products, people?</td><td>Past popular search queries (query completion), not entity search.</td><td>Query completion is driven by query logs and frequency; entity search needs a catalog index.</td></tr>
+<tr><td>Prefix matching only, or fuzzy?</td><td>Prefix first. Typo tolerance is a secondary requirement handled by a fallback path.</td><td>Prefix lookup fits a trie; fuzzy matching needs edit-distance machinery (section 9).</td></tr>
+<tr><td>How many suggestions?</td><td>Top 10 (K = 10), ranked by popularity with a freshness boost.</td><td>K sizes every node of the data structure.</td></tr>
+<tr><td>Scale?</td><td>200 million daily active users, 10 searches per user per day.</td><td>Drives QPS and cache sizing.</td></tr>
+<tr><td>Latency target?</td><td>p99 under 100 ms end to end, as seen by the user; server-side p99 under 20 ms.</td><td>Forces everything onto memory; no disk lookups on the hot path.</td></tr>
+<tr><td>How fresh must suggestions be?</td><td>A new trending query (breaking news) should appear within about 5 to 15 minutes; the long-tail ranking may be a day old.</td><td>Decides batch only versus batch plus streaming.</td></tr>
+<tr><td>Personalized?</td><td>Lightly: recent queries of the signed-in user get merged in. Global ranking is the base.</td><td>Personalization cannot live in the shared trie.</td></tr>
+<tr><td>Languages?</td><td>Multi-language, including non-space-separated scripts such as Chinese and Japanese.</td><td>Affects tokenization and the trie alphabet.</td></tr>
+<tr><td>Offensive content?</td><td>Must never suggest slurs, adult terms to general audiences, or personal data.</td><td>Needs a filter at build time and at serve time.</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li>Given a prefix (and optional language, locale, and user identity), return up to 10 ranked completions.</li>
+<li>Rank by how often queries are searched, boosted for recent surges (trending).</li>
+<li>Merge in a few of the signed-in user's own recent searches.</li>
+<li>Remove blocked terms from the output, and never learn them in the first place.</li>
+<li>Tolerate a small typo in the prefix (for example <code>wheather</code> still gets weather suggestions).</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Latency:</b> p50 under 30 ms and p99 under 100 ms as seen by the client, because beyond roughly 100 to 150 ms the dropdown lags behind typing and feels broken.</li>
+<li><b>Availability:</b> 99.99 percent. Autocomplete is an enhancement; if it fails, search still works, so the failure mode is "no suggestions", never an error page.</li>
+<li><b>Scalability:</b> hundreds of thousands of requests per second at peak.</li>
+<li><b>Eventual consistency is fine.</b> Two users may briefly see different suggestions. No transactions are needed.</li>
+<li><b>Freshness:</b> trending queries within minutes.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>The search results page itself, spelling correction of the full query on the results page ("did you mean"), voice input, rich suggestions with images, and ads in the dropdown. We mention where they plug in, but we do not design them.</p>
+
+<h2 id="estimation">3. Back-of-envelope estimation</h2>
+<p>We follow the method of <a href="../chapters/02-estimation.html">Chapter 2</a>: write the assumptions, then do the arithmetic and keep it consistent for the rest of the page.</p>
+<h3>3.1 Traffic</h3>
+<ul>
+<li>200 million DAU times 10 searches each is 2 billion searches per day.</li>
+<li>A typical query is about 20 characters, but the user does not trigger a request per character. With client debounce (section 10) and the fact that the user stops once they see their suggestion, we assume about 6 autocomplete requests per search. Total: 2 billion times 6 = <b>12 billion autocomplete requests per day</b>.</li>
+<li>Average QPS: 12 billion divided by 86,400 seconds is about <b>139,000 requests per second</b>.</li>
+<li>Peak: searching follows the daily cycle, so use a peak factor of 2.5: about <b>350,000 requests per second</b> at the edge.</li>
+</ul>
+<h3>3.2 Cache effect</h3>
+<p>Short prefixes are heavily repeated. Roughly the first three characters cover a small space (a few tens of thousands of distinct prefixes), and a large share of all requests are for short prefixes. We assume the browser cache plus the CDN edge absorb about 60 percent of requests, so the serving tier sees <b>about 140,000 requests per second at peak</b> (350,000 times 0.4). This is the number we shard for.</p>
+<h3>3.3 Data volume</h3>
+<ul>
+<li>Search logs: 2 billion events per day times about 100 bytes (normalized query, timestamp, locale, anonymized user bucket) is <b>200 GB per day</b>, about 73 TB per year. We keep 30 days of raw logs (6 TB) and aggregates beyond that.</li>
+<li>Distinct queries: the long tail is huge. Suppose 15 percent of daily searches are distinct, about 300 million per day. Most are seen once and are useless as suggestions. We apply a minimum-frequency threshold (say, seen at least 5 times over the window, plus a privacy threshold of several distinct users). After thresholding we keep about <b>100 million suggestion candidates</b>.</li>
+<li>Raw text: 100 million times about 25 bytes is 2.5 GB. The trie nodes (about 150 million after compressing single-child chains) at roughly 40 bytes of structure, plus 10 four-byte query ids for the top-K list, is about 80 bytes per node, so <b>about 12 GB</b>. Add a query table (id to string plus score) at 100 million times 30 bytes = 3 GB. Total: about <b>15 to 16 GB per language/locale-wide trie</b>.</li>
+</ul>
+<p>The conclusion is important: the whole structure fits in the RAM of one ordinary server (64 GB). We do not shard because of size. <b>We shard for QPS and for blast radius</b>, and we replicate for availability.</p>
+<h3>3.4 Serving capacity</h3>
+<p>One in-memory trie lookup is a handful of pointer hops plus a copy of 10 small ids, a few microseconds. A single server is limited by network and HTTP handling, not by the lookup: assume 20,000 requests per second per server for a lean service. 140,000 divided by 20,000 is 7 servers of capacity. We run <b>8 shards times 3 replicas = 24 servers</b>, with 17,500 requests per second per shard at peak, so each replica runs at about 6,000 requests per second, leaving more than 3 times headroom for a replica loss, a hot prefix, or a deploy.</p>
+<table>
+<tr><th>Quantity</th><th>Value</th></tr>
+<tr><td>Searches per day</td><td>2 billion</td></tr>
+<tr><td>Autocomplete requests per day</td><td>12 billion</td></tr>
+<tr><td>Average / peak QPS at edge</td><td>139,000 / 350,000</td></tr>
+<tr><td>Peak QPS at serving tier (after 60 percent cache hits)</td><td>140,000</td></tr>
+<tr><td>Raw log ingest</td><td>200 GB per day</td></tr>
+<tr><td>Suggestion candidates after thresholds</td><td>100 million</td></tr>
+<tr><td>Trie memory (per locale group)</td><td>about 16 GB</td></tr>
+<tr><td>Response size</td><td>10 suggestions times about 30 bytes = 300 bytes, 0.5 KB with JSON and headers</td></tr>
+<tr><td>Egress at the edge, peak</td><td>350,000 times 0.5 KB = 175 MB/s, about 1.4 Gbit/s</td></tr>
+</table>
+
+<h2 id="api">4. API design</h2>
+<p>The API is one read endpoint and one write path that is mostly implicit.</p>
+<pre><code>GET /v1/suggest?q=wea&amp;lang=en&amp;locale=US&amp;limit=10&amp;session=abc123
+Headers: Accept: application/json, Authorization: (optional)
+
+200 OK
+Cache-Control: public, max-age=60
+{
+  "prefix": "wea",
+  "suggestions": [
+    {"text": "weather",           "score": 9120000, "type": "global"},
+    {"text": "weather tomorrow",  "score": 4410000, "type": "global"},
+    {"text": "wear os",           "score": 1200000, "type": "trending"},
+    {"text": "weather radar",     "score":  980000, "type": "global"}
+  ],
+  "trie_version": "2026-11-17T09:00Z"
+}</code></pre>
+<p>Design choices that interviewers like to hear justified:</p>
+<ul>
+<li><b>GET with the prefix in the query string</b>, so responses are cacheable by browsers, CDNs, and intermediate proxies. The prefix is normalized (lowercased, Unicode NFKC form, whitespace collapsed) on the client and again on the server so that cache keys match.</li>
+<li><b>Personalization is a separate concern.</b> Anything that depends on the user must not make the whole response uncacheable. We call a second small endpoint (or the same service with a cookie) only for signed-in users and merge client-side or at the aggregation layer (section 11).</li>
+<li><b>A short <code>Cache-Control</code></b> (30 to 120 seconds) trades a tiny amount of freshness for large load savings.</li>
+<li><b>Write path:</b> there is no suggestion "write" endpoint. When the user submits a search, the existing search request is logged. A separate fire-and-forget beacon records suggestion impressions and clicks (<code>POST /v1/suggest/events</code>) so the ranking model can learn click-through rate. Both feed the pipeline in section 7.</li>
+<li><b>Versioning and observability:</b> the response carries the trie version, which makes "which build served this" visible when debugging.</li>
+</ul>
+<p>For protocol details, see <a href="../chapters/05-api-design.html">Chapter 5</a>. A persistent connection (HTTP/2 or HTTP/3) matters here because the client sends many small requests; reusing one connection avoids paying the TCP and TLS handshakes on each keystroke (<a href="../chapters/03-networking-essentials.html">Chapter 3</a>).</p>
+
+<h2 id="data-model">5. Data model and storage choice</h2>
+<p>There are three kinds of data, and each has a different best store.</p>
+<table>
+<tr><th>Data</th><th>Store</th><th>Reason</th></tr>
+<tr><td>Raw query logs (search events, suggestion clicks)</td><td>Kafka for transport, then object storage (columnar files) for the batch layer (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>, <a href="../chapters/21-object-storage.html">Chapter 21</a>)</td><td>High-volume append-only writes, replayable, cheap per GB.</td></tr>
+<tr><td>Aggregated query counts (query, window, count, unique users)</td><td>Distributed files from the batch job, plus a wide-column or key-value store for the streaming counters (<a href="../chapters/20-nosql.html">Chapter 20</a>)</td><td>Keyed increments and range reads by time window.</td></tr>
+<tr><td>Serving index (prefix to top-K)</td><td>In-memory trie in each serving process, loaded from an immutable snapshot file in object storage</td><td>Single-digit-microsecond lookups, no network hop, trivially replicated by copying a file.</td></tr>
+<tr><td>User history (recent queries per user)</td><td>Redis list or sorted set keyed by user id, or a wide-column store (<a href="../chapters/15-redis.html">Chapter 15</a>)</td><td>Small per-user data with fast reads.</td></tr>
+<tr><td>Blocklist and rules</td><td>A small versioned config store pushed to all services</td><td>Rare writes, must be consistent and quickly deployable.</td></tr>
+</table>
+<p>The central data structure is a <b>trie</b>, also called a prefix tree. It is a tree where each edge is a character and each path from the root spells a prefix. All strings sharing a prefix share the path. To find everything that starts with <code>wea</code>, you walk three edges from the root, and you are standing at the node that represents that prefix.</p>
+<p>The naive approach then collects every query in the subtree under that node and sorts it by popularity. For a short prefix such as <code>a</code>, the subtree contains millions of queries, so this is far too slow. The fix, and the crux of this problem, is to <b>precompute the top-K list at every node</b> during the build. Each node stores the ids of its K best completions. A lookup is then: walk the prefix (length L steps), read the list stored at the node, translate ids into strings. Time is O(L) with L usually under 20, independent of how many queries exist. We trade extra memory (K ids per node, which is what the 12 GB figure paid for) for constant-time reads. The text-search chapter describes the trie and its relatives (<a href="../chapters/58-geospatial-text.html">Chapter 58</a>), and the ranking structures that top-K lists resemble, such as sorted sets, are in <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Trie with precomputed top-K lists at each node">
+  <circle class="box" cx="450" cy="40" r="22"/><text class="t-c t-b" x="450" y="45">root</text>
+  <path class="arrow" d="M440 60 L260 120"/><text class="t-sm" x="330" y="82">w</text>
+  <path class="arrow" d="M460 60 L650 120"/><text class="t-sm" x="570" y="82">s</text>
+  <rect class="cache" x="170" y="120" width="180" height="52" rx="8"/><text class="t-c t-b" x="260" y="141">"w"</text><text class="t-c t-sm" x="260" y="160">top: weather, walmart, ...</text>
+  <rect class="cache" x="560" y="120" width="180" height="52" rx="8"/><text class="t-c t-b" x="650" y="141">"s"</text><text class="t-c t-sm" x="650" y="160">top: speedtest, spotify, ...</text>
+  <path class="arrow" d="M230 172 L150 238"/><text class="t-sm" x="170" y="205">e</text>
+  <path class="arrow" d="M290 172 L380 238"/><text class="t-sm" x="345" y="205">a</text>
+  <rect class="cache" x="40" y="238" width="220" height="52" rx="8"/><text class="t-c t-b" x="150" y="259">"we"</text><text class="t-c t-sm" x="150" y="278">top: weather, web md, ...</text>
+  <rect class="cache" x="290" y="238" width="190" height="52" rx="8"/><text class="t-c t-b" x="385" y="259">"wa"</text><text class="t-c t-sm" x="385" y="278">top: walmart, wacom, ...</text>
+  <path class="arrow" d="M150 290 L150 322"/><text class="t-sm" x="158" y="312">a</text>
+  <rect class="hit" x="40" y="322" width="330" height="32" rx="8"/><text class="t-b" x="52" y="343">"wea": weather, weather tomorrow, wear os, ...</text>
+  <text class="t-sm" x="540" y="250">Each amber node stores the ids of its K=10</text>
+  <text class="t-sm" x="540" y="268">best completions, computed at build time.</text>
+  <text class="t-sm" x="540" y="290">Lookup: walk L characters, read one list.</text>
+  <text class="t-sm" x="540" y="308">No subtree scan, no sort at request time.</text>
+</svg>
+<figcaption>The path root, w, e, a is the prefix "wea". The node at the end already holds its 10 best completions, so serving is a pointer walk plus a read.</figcaption>
+</figure>
+
+<h3>5.1 Making the trie small</h3>
+<ul>
+<li><b>Radix compression:</b> merge chains of single-child nodes into one edge labeled with a string. This cuts node count by several times for real query sets and is why we assumed 150 million nodes for 100 million queries.</li>
+<li><b>Ids instead of strings in the lists:</b> top-K lists hold 4-byte ids into a shared query table. A popular query like "weather" appears in the lists of the nodes for <code>w</code>, <code>we</code>, <code>wea</code>, and so on, so storing it once is a big saving.</li>
+<li><b>Scores stored once</b> in the query table, quantized to 16 bits if needed.</li>
+<li><b>Depth cap:</b> do not store top-K lists below a depth where the subtree has at most K queries; just scan the leaf set. Also cap the indexed prefix length (for example 40 characters); longer prefixes seldom benefit from suggestions.</li>
+<li><b>Flat array layout:</b> serialize the trie as contiguous arrays with integer offsets, not millions of heap objects. This removes garbage-collection pauses (a real p99 killer in Java or Go services) and lets the snapshot be loaded with a memory map in seconds.</li>
+</ul>
+
+<h2 id="first-design">6. A first simple design</h2>
+<p>Start with something one person could build in a day, and then say what breaks.</p>
+<p>A single server holds a trie in memory. At startup it reads a file of "query, count" pairs, builds the trie with top-K lists, and exposes <code>GET /suggest</code>. A nightly cron job aggregates the day's logs and writes a new file; the operator restarts the server to load it.</p>
+<p>This works for a demo and fails in production in clear ways, which gives the roadmap for the rest of the page:</p>
+<ol>
+<li>One server cannot take 140,000 requests per second and is a single point of failure, so we need <b>replication and sharding</b>.</li>
+<li>Restarting to load a new trie causes downtime and cold starts, so we need <b>atomic hot swap</b> of immutable snapshots.</li>
+<li>A nightly build misses breaking news, so we need a <b>streaming trending layer</b>.</li>
+<li>Building a trie over 200 GB of logs per day on one machine is impossible, so we need a <b>distributed pipeline</b>.</li>
+<li>Round trips to a far-away server blow the latency budget, so we need <b>caching at the client and the edge</b>.</li>
+<li>Nothing stops offensive terms, so we need <b>filtering</b>.</li>
+</ol>
+
+<h2 id="architecture">7. Scaled architecture and request flows</h2>
+<p>The architecture has two halves that meet only at a published artifact. The <b>serving path</b> (online) answers keystrokes and never touches the logs. The <b>build path</b> (offline and near-real-time) turns logs into immutable trie snapshots. Keeping them separate is the most important structural decision: serving stays simple and fast, and a failure in the pipeline makes suggestions stale but never takes autocomplete down.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 960 470" role="img" aria-label="High-level architecture of autocomplete with serving and build paths">
+  <text class="t-b" x="20" y="22">Serving path (online, per keystroke)</text>
+  <rect class="ext" x="20" y="40" width="110" height="56" rx="8"/><text class="t-c t-b" x="75" y="63">Browser</text><text class="t-c t-sm" x="75" y="81">debounce + cache</text>
+  <rect class="cache" x="170" y="40" width="110" height="56" rx="8"/><text class="t-c t-b" x="225" y="63">CDN edge</text><text class="t-c t-sm" x="225" y="81">short prefixes</text>
+  <rect class="box" x="320" y="40" width="120" height="56" rx="8"/><text class="t-c t-b" x="380" y="63">Gateway</text><text class="t-c t-sm" x="380" y="81">auth, rate limit</text>
+  <rect class="box" x="480" y="40" width="130" height="56" rx="8"/><text class="t-c t-b" x="545" y="63">Suggest service</text><text class="t-c t-sm" x="545" y="81">route by prefix</text>
+  <rect class="cache" x="660" y="14" width="130" height="44" rx="8"/><text class="t-c t-b" x="725" y="34">Trie shard A-F</text><text class="t-c t-sm" x="725" y="50">3 replicas</text>
+  <rect class="cache" x="660" y="64" width="130" height="44" rx="8"/><text class="t-c t-b" x="725" y="84">Trie shard G-M ...</text><text class="t-c t-sm" x="725" y="100">8 shards total</text>
+  <rect class="db" x="820" y="14" width="120" height="44" rx="8"/><text class="t-c t-b" x="880" y="34">Trending</text><text class="t-c t-sm" x="880" y="50">small overlay</text>
+  <rect class="db" x="820" y="64" width="120" height="44" rx="8"/><text class="t-c t-b" x="880" y="84">User history</text><text class="t-c t-sm" x="880" y="100">Redis</text>
+  <path class="arrow" d="M130 68 L166 68"/><path class="arrow" d="M280 68 L316 68"/><path class="arrow" d="M440 68 L476 68"/><path class="arrow" d="M610 60 L656 40"/><path class="arrow" d="M610 76 L656 86"/>
+  <path class="arrow dash" d="M790 36 L816 36"/><path class="arrow dash" d="M790 86 L816 86"/>
+
+  <text class="t-b" x="20" y="170">Build path (offline + near-real-time)</text>
+  <rect class="ext" x="20" y="190" width="120" height="56" rx="8"/><text class="t-c t-b" x="80" y="213">Search + click</text><text class="t-c t-sm" x="80" y="231">event logs</text>
+  <rect class="box" x="180" y="190" width="110" height="56" rx="8"/><text class="t-c t-b" x="235" y="213">Kafka</text><text class="t-c t-sm" x="235" y="231">partitioned</text>
+  <rect class="box" x="330" y="150" width="150" height="50" rx="8"/><text class="t-c t-b" x="405" y="171">Stream job</text><text class="t-c t-sm" x="405" y="188">5-min windows, trending</text>
+  <rect class="db" x="330" y="236" width="150" height="50" rx="8"/><text class="t-c t-b" x="405" y="257">Object store</text><text class="t-c t-sm" x="405" y="274">raw logs, 30 days</text>
+  <rect class="box" x="520" y="236" width="150" height="50" rx="8"/><text class="t-c t-b" x="595" y="257">Batch job</text><text class="t-c t-sm" x="595" y="274">count, filter, score</text>
+  <rect class="box" x="710" y="236" width="150" height="50" rx="8"/><text class="t-c t-b" x="785" y="257">Trie builder</text><text class="t-c t-sm" x="785" y="274">top-K, compress</text>
+  <rect class="db" x="710" y="320" width="150" height="50" rx="8"/><text class="t-c t-b" x="785" y="341">Snapshot store</text><text class="t-c t-sm" x="785" y="358">versioned, immutable</text>
+  <path class="arrow" d="M140 218 L176 218"/><path class="arrow" d="M290 206 L326 185"/><path class="arrow" d="M290 230 L326 255"/><path class="arrow" d="M480 261 L516 261"/><path class="arrow" d="M670 261 L706 261"/><path class="arrow" d="M785 286 L785 316"/>
+  <path class="arrow-g" d="M860 345 L900 345 L900 440 L725 440 L725 112"/>
+  <text class="t-sm" x="600" y="433">shards pull the new snapshot, validate, then swap atomically</text>
+  <path class="arrow-g dash" d="M480 175 L850 175 L850 112"/>
+  <text class="t-sm" x="520" y="168">trending overlay pushed every few minutes</text>
+</svg>
+<figcaption>Top: the request path from the browser through caches to a sharded in-memory trie. Bottom: logs flow through Kafka into a stream job (fast, small) and a batch job (slow, complete); the builder publishes immutable snapshots that shards pull and swap in.</figcaption>
+</figure>
+
+<h3>7.1 Request flow: a keystroke</h3>
+<ol>
+<li>The user types <code>w</code>, <code>e</code>, <code>a</code>. The browser waits for a short pause (debounce, section 10), normalizes the prefix, and checks its in-memory map of prefix to suggestions. A hit returns immediately with no network traffic.</li>
+<li>On a miss, the browser sends <code>GET /v1/suggest?q=wea</code> over an already-open HTTP/2 connection to the nearest edge location.</li>
+<li>The CDN edge looks up the URL as a cache key. For short, popular prefixes the answer is cached for 60 seconds. A hit returns in about 10 to 20 ms of network time. See <a href="../chapters/12-cdn.html">Chapter 12</a>.</li>
+<li>On an edge miss the request goes to the gateway, which authenticates (if a token is present), rate-limits per client (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>), and forwards to the suggest service.</li>
+<li>The suggest service picks the shard by the first characters of the prefix (section 8), and calls one replica. It reads the top-K ids and strings. In parallel, it fetches the small trending overlay that matches the prefix, and, for signed-in users, the user's recent queries.</li>
+<li>It merges the three sources, removes anything on the live blocklist, applies final ranking, truncates to 10, and returns the JSON with <code>Cache-Control</code>.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Sequence diagram of a suggest request">
+  <rect class="ext" x="20" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="75" y="32">Browser</text>
+  <rect class="cache" x="190" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="245" y="32">CDN edge</text>
+  <rect class="box" x="360" y="10" width="120" height="34" rx="8"/><text class="t-c t-b" x="420" y="32">Suggest svc</text>
+  <rect class="cache" x="540" y="10" width="120" height="34" rx="8"/><text class="t-c t-b" x="600" y="32">Trie shard</text>
+  <rect class="db" x="720" y="10" width="150" height="34" rx="8"/><text class="t-c t-b" x="795" y="32">Overlay + history</text>
+  <line class="life" x1="75" y1="44" x2="75" y2="330"/><line class="life" x1="245" y1="44" x2="245" y2="330"/><line class="life" x1="420" y1="44" x2="420" y2="330"/><line class="life" x1="600" y1="44" x2="600" y2="330"/><line class="life" x1="795" y1="44" x2="795" y2="330"/>
+  <path class="arrow" d="M75 70 L240 70"/><text class="t-sm" x="95" y="64">1. GET q=wea (after debounce)</text>
+  <path class="arrow-g" d="M245 100 L80 100"/><text class="t-sm" x="95" y="94">2a. edge hit: 60 s cached answer</text>
+  <path class="arrow dash" d="M245 130 L416 130"/><text class="t-sm" x="258" y="124">2b. edge miss: forward</text>
+  <path class="arrow" d="M420 160 L596 160"/><text class="t-sm" x="436" y="154">3. lookup "wea" (shard by prefix)</text>
+  <path class="arrow" d="M420 190 L791 190"/><text class="t-sm" x="560" y="184">4. overlay + user history (parallel)</text>
+  <path class="arrow-g" d="M600 220 L424 220"/><text class="t-sm" x="440" y="214">5. top-10 ids and strings</text>
+  <path class="arrow-g" d="M795 250 L424 250"/><text class="t-sm" x="560" y="244">6. trending + recents</text>
+  <path class="arrow" d="M420 280 L420 296"/><text class="t-sm" x="430" y="293">7. merge, filter, rank</text>
+  <path class="arrow-g" d="M420 318 L80 318"/><text class="t-sm" x="150" y="312">8. JSON, Cache-Control: max-age=60</text>
+</svg>
+<figcaption>Step 2a is the common case and never reaches our servers. Steps 3 and 4 run in parallel, so the service waits for the slower of the two, not the sum.</figcaption>
+</figure>
+
+<h3>7.2 Build flow: logs to a live trie</h3>
+<p>The build side follows the lambda-style pattern of <a href="../chapters/37-batch-stream.html">Chapter 37</a>: a slow, complete batch layer and a fast, approximate streaming layer, merged at read time.</p>
+<ol>
+<li><b>Collect.</b> The search service writes one event per submitted query to Kafka, partitioned by a hash of the normalized query so that all events for the same query land in the same partition. Click events on suggestions go to a second topic.</li>
+<li><b>Normalize and filter.</b> Lowercase, trim, NFKC-normalize, drop queries that are too long, contain URLs or email addresses or digit strings that look like card or phone numbers, and apply the blocklist (section 9). Bots and obviously automated traffic are dropped by a user-agent and rate heuristic.</li>
+<li><b>Count.</b> A batch job (Spark or MapReduce style) reads the last N days from object storage and computes, for each normalized query, a weighted count: more recent days weigh more, using exponential decay (for example, half life of 7 days). It also computes unique-user counts so that one noisy user cannot promote a query (privacy threshold).</li>
+<li><b>Score.</b> Final score is a blend: decayed frequency, click-through rate of the query when it was suggested, and a quality prior (language model or dictionary score) to demote junk.</li>
+<li><b>Build.</b> The trie builder sorts the candidates, inserts them, computes the top-K list for each node bottom-up (a node's top-K is the merge of its children's top-K lists and its own entry, so no subtree scan is needed), radix-compresses, and writes a flat snapshot file per shard plus a manifest with a checksum and a version.</li>
+<li><b>Publish and swap.</b> The snapshot goes to the snapshot store. Each serving process notices the new manifest, downloads its shard file in the background, loads it into a second memory region, runs a smoke test (a list of canary prefixes must return sane results, and the size must be within 20 percent of the previous version), and then atomically flips a pointer. The old version is kept until in-flight requests drain, then freed.</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Snapshot build, validate and atomic swap timeline">
+  <rect class="db" x="20" y="30" width="120" height="50" rx="8"/><text class="t-c t-b" x="80" y="52">Logs</text><text class="t-c t-sm" x="80" y="69">last 30 days</text>
+  <rect class="box" x="170" y="30" width="120" height="50" rx="8"/><text class="t-c t-b" x="230" y="52">Count + score</text><text class="t-c t-sm" x="230" y="69">decayed, ~1 h</text>
+  <rect class="box" x="320" y="30" width="120" height="50" rx="8"/><text class="t-c t-b" x="380" y="52">Build trie</text><text class="t-c t-sm" x="380" y="69">top-K, ~20 min</text>
+  <rect class="db" x="470" y="30" width="120" height="50" rx="8"/><text class="t-c t-b" x="530" y="52">Snapshot v43</text><text class="t-c t-sm" x="530" y="69">+ checksum</text>
+  <path class="arrow" d="M140 55 L166 55"/><path class="arrow" d="M290 55 L316 55"/><path class="arrow" d="M440 55 L466 55"/>
+  <rect class="cache" x="640" y="20" width="240" height="70" rx="8"/><text class="t-b" x="652" y="42">Shard process memory</text>
+  <rect class="miss" x="652" y="52" width="100" height="28" rx="6"/><text class="t-c t-sm" x="702" y="70">v42 (live)</text>
+  <rect class="hit" x="764" y="52" width="104" height="28" rx="6"/><text class="t-c t-sm" x="816" y="70">v43 (loading)</text>
+  <path class="arrow" d="M590 55 L636 55"/>
+  <text class="t-b" x="20" y="140">What happens on the shard</text>
+  <rect class="box" x="20" y="156" width="150" height="46" rx="8"/><text class="t-c t-sm" x="95" y="176">1. download in</text><text class="t-c t-sm" x="95" y="192">background</text>
+  <rect class="box" x="200" y="156" width="150" height="46" rx="8"/><text class="t-c t-sm" x="275" y="176">2. verify checksum,</text><text class="t-c t-sm" x="275" y="192">size, canary prefixes</text>
+  <rect class="box" x="380" y="156" width="150" height="46" rx="8"/><text class="t-c t-sm" x="455" y="176">3. flip pointer</text><text class="t-c t-sm" x="455" y="192">(one atomic store)</text>
+  <rect class="box" x="560" y="156" width="150" height="46" rx="8"/><text class="t-c t-sm" x="635" y="176">4. drain readers,</text><text class="t-c t-sm" x="635" y="192">free v42</text>
+  <rect class="miss" x="740" y="156" width="140" height="46" rx="8"/><text class="t-c t-sm" x="810" y="176">any check fails:</text><text class="t-c t-sm" x="810" y="192">keep v42, alert</text>
+  <path class="arrow" d="M170 179 L196 179"/><path class="arrow" d="M350 179 L376 179"/><path class="arrow" d="M530 179 L556 179"/><path class="arrow-r dash" d="M275 202 L275 240 L810 240 L810 206"/>
+  <text class="t-sm" x="20" y="270">Rollback is the same operation in reverse: flip the pointer back to v42 while it is still resident.</text>
+</svg>
+<figcaption>Because snapshots are immutable and the swap is a single pointer change, readers never see a half-built trie and a bad build can be rolled back in seconds.</figcaption>
+</figure>
+
+<h2 id="deep-sharding">8. Deep dive 1: serving tier, sharding and caching</h2>
+<p>The whole trie fits in 16 GB, so the first question is whether to shard at all. The honest answer: <b>shard for throughput and isolation, not for capacity</b>. There are three strategies; the table compares them.</p>
+<table>
+<tr><th>Strategy</th><th>How it works</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Full replicas, no sharding</td><td>Every server holds the whole trie; a load balancer sprays requests.</td><td>Simplest; any server answers any prefix; no routing; perfect failover.</td><td>Each server needs 16 GB and every deploy loads 16 GB everywhere; per-server cache locality is poor; the trie cannot grow past one machine.</td></tr>
+<tr><td>Shard by first character(s)</td><td>Shard i owns a range of prefixes, for example a to f.</td><td>Easy to reason about; range queries stay on one shard.</td><td>Badly skewed: s and c are far busier than x or q, and in other languages the distribution differs wildly. Needs manual rebalancing.</td></tr>
+<tr><td>Shard by hash of a short prefix (first 2 or 3 chars), with a mapping table</td><td>Hash the first 2 characters into 4,096 virtual buckets and map buckets to 8 physical shards, balanced from measured traffic.</td><td>Balanced load; rebalancing moves whole buckets; a lookup still needs only one shard because every prefix of length 2 or more lands in one bucket.</td><td>Prefixes of length 1 span many buckets, so length-1 answers are served from a tiny separately replicated "root" table (just 26 or a few thousand entries).</td></tr>
+</table>
+<p>We choose the third option: <b>bucket by the first two characters</b>, with a weighted bucket-to-shard map built from observed traffic, and a tiny global table for one-character prefixes. This is the standard consistent bucketing idea from <a href="../chapters/25-sharding.html">Chapter 25</a> and <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>, but because we control the map we can rebalance by measured QPS rather than by hash luck. A mapping table is small, so every suggest-service instance caches it.</p>
+<p>The "hot prefix" problem is real. A trending term such as a big event name makes one bucket take 20 times its normal traffic. Mitigations stack: the CDN and browser caches absorb most repeats; each shard has 3 replicas and the suggest service chooses by least outstanding requests; and a bucket that stays hot can be given extra replicas independently of the others, since replicas of a bucket are just copies of the same snapshot file.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 320" role="img" aria-label="Sharding autocomplete by prefix bucket">
+  <rect class="box" x="20" y="120" width="150" height="60" rx="8"/><text class="t-c t-b" x="95" y="145">Suggest svc</text><text class="t-c t-sm" x="95" y="163">holds bucket map</text>
+  <text class="t-b" x="215" y="30">Prefix to bucket to shard</text>
+  <rect class="ext" x="215" y="42" width="200" height="30" rx="6"/><text class="t-sm" x="225" y="62">"we..." -> hash("we") = bucket 1,207</text>
+  <rect class="ext" x="215" y="80" width="200" height="30" rx="6"/><text class="t-sm" x="225" y="100">"sp..." -> hash("sp") = bucket 3,890</text>
+  <rect class="ext" x="215" y="118" width="200" height="30" rx="6"/><text class="t-sm" x="225" y="138">"s" (1 char) -> root table</text>
+  <path class="arrow" d="M170 150 L211 150"/>
+  <rect class="cache" x="480" y="40" width="150" height="60" rx="8"/><text class="t-c t-b" x="555" y="64">Shard 1</text><text class="t-c t-sm" x="555" y="82">buckets 0-511 (heavy)</text><text class="t-c t-sm" x="555" y="94">3 replicas</text>
+  <rect class="cache" x="480" y="116" width="150" height="60" rx="8"/><text class="t-c t-b" x="555" y="140">Shard 2</text><text class="t-c t-sm" x="555" y="158">buckets 512-1,500</text><text class="t-c t-sm" x="555" y="170">3 replicas</text>
+  <rect class="cache" x="480" y="192" width="150" height="60" rx="8"/><text class="t-c t-b" x="555" y="216">Shard 8</text><text class="t-c t-sm" x="555" y="234">many light buckets</text><text class="t-c t-sm" x="555" y="246">3 replicas</text>
+  <path class="arrow" d="M415 60 L476 70"/><path class="arrow" d="M415 95 L476 146"/><path class="arrow" d="M415 135 L476 222"/>
+  <rect class="hit" x="680" y="40" width="200" height="212" rx="8"/><text class="t-b" x="692" y="62">Per-shard facts</text>
+  <text class="t-sm" x="692" y="86">Memory: trie slice, 2 to 4 GB</text>
+  <text class="t-sm" x="692" y="106">Load: about 17,500 QPS peak</text>
+  <text class="t-sm" x="692" y="126">Per replica: about 6,000 QPS</text>
+  <text class="t-sm" x="692" y="146">Swap: pointer flip per shard</text>
+  <text class="t-sm" x="692" y="166">Hot bucket: add replicas,</text>
+  <text class="t-sm" x="692" y="182">not a re-shard</text>
+  <text class="t-sm" x="692" y="202">Replica choice: least</text>
+  <text class="t-sm" x="692" y="218">outstanding requests,</text>
+  <text class="t-sm" x="692" y="234">hedge after p95</text>
+  <text class="t-sm" x="20" y="300">Each shard is built from the same global candidate list, filtered to the buckets it owns, so top-K lists are exact.</text>
+</svg>
+<figcaption>The first two characters pick a bucket; a weighted table maps buckets to shards. One-character prefixes come from a small replicated root table, so every lookup touches exactly one shard.</figcaption>
+</figure>
+
+<h3>8.1 Caching layers and the latency budget</h3>
+<p>Caching is applied at four levels, each with a different job (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>).</p>
+<table>
+<tr><th>Layer</th><th>Key</th><th>TTL</th><th>Expected hit rate</th><th>Notes</th></tr>
+<tr><td>Browser memory</td><td>normalized prefix</td><td>session, plus HTTP max-age</td><td>20 to 30 percent (backspacing and retyping, repeated prefixes)</td><td>Free, and removes the network entirely.</td></tr>
+<tr><td>CDN edge</td><td>URL with normalized prefix and language</td><td>60 s</td><td>about 50 percent of what reaches it</td><td>Combined with browser, about 60 percent of all requests never reach us (our estimation assumption).</td></tr>
+<tr><td>Suggest-service local cache</td><td>prefix to merged result</td><td>10 s</td><td>20 to 30 percent of the rest</td><td>Protects shards from hot bursts; stampede protection by collapsing identical in-flight requests.</td></tr>
+<tr><td>Trie itself</td><td>n/a</td><td>until next snapshot</td><td>n/a</td><td>The authoritative in-memory structure; a lookup is microseconds.</td></tr>
+</table>
+<p>The edge TTL is the knob that trades freshness for load. A 60 second TTL means trending changes appear at most about a minute late at the edge, which is within our 5 to 15 minute freshness goal. Cache key hygiene matters: if the key includes a session id or timestamp, the hit rate collapses to zero. Personalized responses use <code>Cache-Control: private</code> or are fetched via a separate call so they never poison the shared cache. See <a href="../chapters/14-caching-failures.html">Chapter 14</a> for stampedes and cache penetration; for autocomplete, the dangerous one is a newly viral prefix that misses everywhere at once, which request collapsing handles.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Latency budget bars for a 100 ms target">
+  <text class="t-b" x="20" y="22">p99 latency budget, miss path (target 100 ms)</text>
+  <rect class="ext"   x="20"  y="40" width="120" height="44" rx="4"/><text class="t-c t-sm" x="80" y="60">Debounce</text><text class="t-c t-sm" x="80" y="75">not counted</text>
+  <rect class="box"   x="140" y="40" width="190" height="44" rx="4"/><text class="t-c t-sm" x="235" y="60">Client to edge</text><text class="t-c t-sm" x="235" y="75">20 ms (warm HTTP/2)</text>
+  <rect class="cache" x="330" y="40" width="120" height="44" rx="4"/><text class="t-c t-sm" x="390" y="60">Edge to origin</text><text class="t-c t-sm" x="390" y="75">12 ms</text>
+  <rect class="box"   x="450" y="40" width="70"  height="44" rx="4"/><text class="t-c t-sm" x="485" y="60">Gateway</text><text class="t-c t-sm" x="485" y="75">3 ms</text>
+  <rect class="box"   x="520" y="40" width="70"  height="44" rx="4"/><text class="t-c t-sm" x="555" y="60">Service</text><text class="t-c t-sm" x="555" y="75">4 ms</text>
+  <rect class="hit"   x="590" y="40" width="80"  height="44" rx="4"/><text class="t-c t-sm" x="630" y="60">Shard RPC</text><text class="t-c t-sm" x="630" y="75">6 ms</text>
+  <rect class="box"   x="670" y="40" width="60"  height="44" rx="4"/><text class="t-c t-sm" x="700" y="60">Merge</text><text class="t-c t-sm" x="700" y="75">2 ms</text>
+  <rect class="ext"   x="730" y="40" width="150" height="44" rx="4"/><text class="t-c t-sm" x="805" y="60">Return path</text><text class="t-c t-sm" x="805" y="75">about 30 ms</text>
+  <text class="t-sm" x="20" y="120">Sum on a full miss: 20 + 12 + 3 + 4 + 6 + 2 + 30 = 77 ms, leaving about 23 ms of slack inside the 100 ms target.</text>
+  <text class="t-sm" x="20" y="140">Edge hit: about 20 ms out and back, nothing else. Browser hit: 0 ms of network.</text>
+  <rect class="miss" x="20" y="164" width="860" height="66" rx="8"/>
+  <text class="t-b" x="32" y="186">Where the budget is lost in practice</text>
+  <text class="t-sm" x="32" y="206">Cold TLS connections (extra 1 to 2 round trips), garbage-collection pauses on the shard, a slow replica with no hedging,</text>
+  <text class="t-sm" x="32" y="222">and user history lookups done serially instead of in parallel.</text>
+</svg>
+<figcaption>The server work is only about 15 ms; most of the budget is network. That is why edge caching, connection reuse and short-prefix caching matter more than micro-optimizing the trie.</figcaption>
+</figure>
+<p>Tail latency tactics: <b>hedged requests</b> (if a replica has not answered by the p95 latency, send the same request to another replica and take the first answer), a hard timeout of 40 ms on the shard call after which we return the trending-and-cache fallback, and pre-warming a freshly loaded snapshot by touching the pages of the hot prefixes before it takes traffic. The general approach to tail latency is covered in <a href="../chapters/40-resilience.html">Chapter 40</a>.</p>
+
+<h2 id="deep-pipeline">9. Deep dive 2: the data pipeline, freshness, filtering and typos</h2>
+<h3>9.1 Batch versus streaming, and the merge</h3>
+<p>A daily batch alone gives stable, high-quality ranking but is up to a day stale. Streaming alone is fresh but noisy and expensive to run for the whole long tail. We use both, in the lambda style of <a href="../chapters/37-batch-stream.html">Chapter 37</a>, with the streaming part kept deliberately small.</p>
+<table>
+<tr><th>Option</th><th>Freshness</th><th>Cost and complexity</th><th>Quality</th><th>Verdict</th></tr>
+<tr><td>Batch only, daily rebuild</td><td>up to 24 h</td><td>Lowest</td><td>High, stable</td><td>Misses breaking news; not acceptable alone.</td></tr>
+<tr><td>Batch only, hourly rebuild</td><td>1 to 2 h</td><td>Moderate; full rebuild 24 times a day</td><td>High</td><td>Better, still too slow for trends, and rebuild cost grows.</td></tr>
+<tr><td>Streaming updates applied directly to the live trie</td><td>seconds</td><td>High; concurrent mutation of a shared structure; top-K lists must be recomputed along the path</td><td>Noisy; spam can poison it</td><td>Rejected: breaks immutability, complicates swap and rollback.</td></tr>
+<tr><td><b>Batch snapshot plus a small streaming trending overlay</b></td><td>5 to 15 min for trends; 1 to 24 h for the rest</td><td>Moderate; overlay is tiny</td><td>High base, trends gated by thresholds</td><td><b>Chosen.</b></td></tr>
+</table>
+<p>The <b>trending overlay</b> works as follows. A stream job (Flink or Kafka Streams, see <a href="../chapters/34-queues-kafka.html">Chapter 34</a>) counts queries in tumbling or sliding 5 minute windows, keyed by normalized query. For each query it compares the recent rate with its baseline rate (taken from the batch aggregate): the ratio, or a z-score, tells how unusual the current volume is. Only queries that pass all of these gates enter the overlay: a minimum absolute count, a burst ratio above, say, 5 times baseline, a minimum number of distinct users and distinct IP prefixes (so a single bot cannot manufacture a trend), and the blocklist. The overlay is a few thousand entries, not hundreds of millions, held as a small in-memory trie or map on each suggest-service instance and refreshed every minute or two. At query time, overlay entries matching the prefix are merged with the trie's top-K list and given a boost that decays over a few hours. Counting heavy hitters in a stream with bounded memory is a classic use for Count-Min Sketch and Space-Saving (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>), which let the stream job track the top candidates without a counter per distinct query.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Merging base trie, trending overlay and user history into one ranked list">
+  <rect class="cache" x="20" y="30" width="190" height="58" rx="8"/><text class="t-c t-b" x="115" y="54">Base trie top-10</text><text class="t-c t-sm" x="115" y="72">stable, batch, hours old</text>
+  <rect class="db" x="20" y="108" width="190" height="58" rx="8"/><text class="t-c t-b" x="115" y="132">Trending overlay</text><text class="t-c t-sm" x="115" y="150">stream, minutes old</text>
+  <rect class="ext" x="20" y="186" width="190" height="58" rx="8"/><text class="t-c t-b" x="115" y="210">User recents</text><text class="t-c t-sm" x="115" y="228">per user, Redis</text>
+  <rect class="box" x="300" y="70" width="230" height="130" rx="8"/><text class="t-c t-b" x="415" y="96">Merge and rank</text>
+  <text class="t-c t-sm" x="415" y="118">dedupe by normalized text</text>
+  <text class="t-c t-sm" x="415" y="136">score = base + trend boost</text>
+  <text class="t-c t-sm" x="415" y="154">+ personal boost</text>
+  <text class="t-c t-sm" x="415" y="172">drop blocked, cap 10</text>
+  <path class="arrow" d="M210 59 L296 110"/><path class="arrow" d="M210 137 L296 137"/><path class="arrow" d="M210 215 L296 165"/>
+  <rect class="hit" x="620" y="70" width="260" height="130" rx="8"/><text class="t-b" x="634" y="96">Result for "wea" (signed in)</text>
+  <text class="t-sm" x="634" y="120">1. weather</text><text class="t-sm" x="634" y="138">2. weather tomorrow</text><text class="t-sm" x="634" y="156">3. wear os 5 release  (trending)</text><text class="t-sm" x="634" y="174">4. weatherbug  (your recent)</text>
+  <path class="arrow-g" d="M530 135 L616 135"/>
+</svg>
+<figcaption>Three sources with different freshness and different cacheability are merged at request time. The shared pieces stay cacheable; only the final small merge is per user.</figcaption>
+</figure>
+
+<h3>9.2 Ranking details</h3>
+<p>Pure frequency ranks old, uniformly popular queries first and buries the newly relevant. A practical score for a candidate q at time t is: <code>score = w1 * decayed_count + w2 * CTR_when_suggested + w3 * trend_boost + w4 * quality_prior</code>. The decay uses a half-life; CTR comes from the impression and click beacons, and corrects for position bias; the quality prior comes from language models or dictionary checks so that gibberish and one-off typos do not surface. A clean explanation of why we compute this offline: the weights can be tuned by experiments (A/B testing click-through), and the serving path only reads a precomputed score. Because the weights live in the pipeline, changing the formula needs a rebuild, not a code deploy of the serving tier.</p>
+
+<h3>9.3 Filtering offensive and sensitive suggestions</h3>
+<p>Autocomplete is uniquely dangerous because the system appears to endorse what it shows. Defense is layered:</p>
+<ul>
+<li><b>At learning time:</b> normalized queries that match a blocklist (exact, normalized for leetspeak and spacing, and pattern-based), a toxicity classifier above a threshold, or a PII detector (emails, phone numbers, national id formats, card numbers via Luhn check) never enter the candidate set.</li>
+<li><b>At build time:</b> a second pass over the final top-K lists, since a query that is fine alone might become offensive combined with a prefix.</li>
+<li><b>At serve time:</b> a live blocklist, pushed through the config channel within a minute, is applied in the merge step. This is the emergency brake: a bad suggestion discovered at 3 pm must disappear at 3:01 pm, not at the next trie build. The CDN cache is purged for affected prefixes using a targeted invalidation, which is why the TTL is also kept short.</li>
+<li><b>Privacy threshold:</b> a query must be searched by at least N distinct users (for example 50) before it can be suggested, so one person's rare, possibly sensitive search cannot be revealed to others.</li>
+<li><b>Manual and legal overrides:</b> a small human-curated override list to remove or pin entries (for example, legal takedowns), applied at the same live layer. Also consider regional policy: the blocklist is per locale.</li>
+</ul>
+<p>Anti-abuse matters too: coordinated groups can try to manufacture a trend ("search poisoning") by flooding a phrase. Defenses are distinct-user and distinct-network gates, per-user count caps per window (one user contributes at most a small number of counts per query per hour), and anomaly detection that sends suspicious spikes to a review queue before they reach the overlay. See <a href="../chapters/55-security.html">Chapter 55</a>.</p>
+
+<h3>9.4 Typo tolerance</h3>
+<p>A trie does exact prefix matching; <code>wheather</code> reaches no node at all. Options:</p>
+<table>
+<tr><th>Approach</th><th>How</th><th>Cost</th></tr>
+<tr><td>Fallback to a corrected prefix</td><td>If the exact prefix returns fewer than 3 results, run a spell-correction step (noisy-channel model using the query log as the dictionary), then look up the corrected prefix.</td><td>Extra 5 to 20 ms, only on the rare miss path.</td></tr>
+<tr><td>Bounded edit-distance search in the trie</td><td>Walk the trie while tracking an edit-distance row (Levenshtein automaton), allowing at most 1 edit for prefixes of length 4 or more.</td><td>Explores many branches; use only at fallback, with a time limit.</td></tr>
+<tr><td>Learn the misspellings</td><td>Because users often search the misspelled phrase and then correct it, the logs contain "wheather" followed by "weather" in one session; store alias entries that point from the misspelled prefix to the corrected suggestions.</td><td>Zero serve-time cost; precomputed in the pipeline.</td></tr>
+<tr><td>Phonetic or n-gram index</td><td>Index character n-grams (or use the Elasticsearch fuzziness option) to retrieve candidates.</td><td>Needs a separate index; see section 12.</td></tr>
+</table>
+<p>We choose "learned aliases" first (free at serve time) and the edit-distance fallback second, limited to one edit and to prefixes of at least 3 characters, because short prefixes have too many neighbors to be useful.</p>
+
+<h3>9.5 Multi-language</h3>
+<ul>
+<li><b>Separate tries per language and locale group</b> (English US, English UK share a base with locale overlays; Hindi, Japanese, and so on separate). The client sends the UI language and the keyboard or input-method hint; the service routes accordingly. Mixed-language users can request two tries and merge.</li>
+<li><b>Normalization:</b> Unicode NFKC, case folding, accent folding as an option (<code>cafe</code> matches <code>café</code>), full-width to half-width mapping for Japanese and Chinese.</li>
+<li><b>Trie alphabet:</b> use Unicode code points (or bytes of UTF-8) as edge labels, with radix compression absorbing the wide alphabet. A raw array of children per node would waste memory; use sorted small arrays or hash maps for sparse nodes.</li>
+<li><b>Scripts without spaces</b> (Chinese, Japanese, Thai) need word segmentation for ranking but not for prefix lookup: the prefix is still just characters. For Chinese and Japanese, input-method composition (pinyin, romaji) generates intermediate text that should not trigger requests; the client waits for composition end events.</li>
+<li><b>Right-to-left scripts:</b> prefix semantics are by logical order, not visual order, and the stored strings are logical order. Nothing special is needed server side.</li>
+<li><b>Transliteration:</b> users type "namaste" for a Hindi query; build alias entries from romanized forms in the logs.</li>
+</ul>
+
+<h2 id="deep-client">10. Deep dive 3: the client, debounce and personalization</h2>
+<h3>10.1 Debounce, cancel, and local cache</h3>
+<p>The cheapest request is the one never sent. A user typing at 5 characters per second would trigger 5 requests per second per user without any control. <b>Debounce</b> means: restart a short timer (about 100 to 150 ms) on every keystroke and only send when the timer fires, i.e., when the user pauses. It is better than throttling for this case because it skips the intermediate prefixes the user typed past. Many implementations combine both: send immediately for the first character after a longer pause (feels instant), then debounce the rest.</p>
+<p>Three more client rules matter:</p>
+<ul>
+<li><b>Cancel stale requests.</b> If the user typed <code>wea</code> and then <code>weat</code>, the response for <code>wea</code> may arrive after the one for <code>weat</code>. Each request carries a monotonically increasing sequence number; the client ignores any response older than the latest rendered one, and aborts in-flight requests when a newer one is sent.</li>
+<li><b>Local prefix cache.</b> Keep a map from prefix to results. If the cache has results for <code>wea</code> and the user types <code>weat</code>, the client can immediately filter the cached list by the new prefix while the real request is in flight (only valid when the cached list was complete, that is, fewer than K results, or as a temporary display).</li>
+<li><b>Minimum length and idle fallback.</b> Do not call the server for an empty box (show recent searches locally) or optionally require 1 to 2 characters; stop sending after a long prefix returns no suggestions, because a longer prefix cannot have more matches (a "dead prefix" optimization: remember that <code>weatherxx</code> is empty and skip calls for anything that extends it).</li>
+</ul>
+<p>With debounce, a 20 character query produces about 6 requests rather than 20, which is the number our estimation assumed. A mobile client adds one more rule: on a poor connection, rely on local history and cached results, and consider a lighter payload (see <a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>).</p>
+
+<h3>10.2 Personalization</h3>
+<p>Personalization seems to conflict with the shared trie: a trie per user is impossible. The solution is layering, as in figure 6.</p>
+<ol>
+<li><b>Global base</b> from the shared trie (cacheable, same for everyone in the locale).</li>
+<li><b>Recent history:</b> the last 50 to 100 queries per signed-in user, stored in Redis (<a href="../chapters/15-redis.html">Chapter 15</a>) as a list, or on the device itself (best for privacy and zero latency). On each request the service finds history entries starting with the prefix (a simple scan over 100 strings) and boosts them above generic suggestions, flagged so the UI can show a history icon.</li>
+<li><b>Segment-level personalization:</b> instead of per-user tries, build a few dozen tries or overlays per segment (language, region, device, topical interest cluster). Cheap, still cacheable per segment.</li>
+<li><b>Contextual signals:</b> time of day, location (nearby results), and the previous query in the session, applied as small score adjustments in the merge step.</li>
+</ol>
+<p>Cacheability is the tension. A personalized response cannot be shared in the CDN, so the design splits the response: the global part is fetched from the cache-friendly endpoint, and the personal part is fetched separately (or computed on the client from local history) and merged in the browser. This keeps 95 percent of the work cacheable. Privacy rules apply: history respects the user's setting to pause or delete it, is excluded from the shared logs unless the user consents, and is deleted on account deletion (<a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>).</p>
+
+<h2 id="alternatives">11. Alternatives: Elasticsearch and Redis sorted sets</h2>
+<p>An interviewer may ask, "Why build a custom trie service when Elasticsearch or Redis already exist?" The honest answer is that those are credible for smaller systems, and the tradeoffs are the heart of the question.</p>
+<h3>11.1 Redis sorted sets</h3>
+<p>Store one sorted set per prefix: key <code>sugg:wea</code>, members are full queries, score is popularity. A lookup is <code>ZREVRANGE sugg:wea 0 9</code>, an O(log N + 10) operation in memory. To build, for each query in the aggregate and for each of its prefixes, <code>ZADD</code> into that prefix key and trim to the top 10 with <code>ZREMRANGEBYRANK</code>. A streaming update is simply <code>ZINCRBY</code> on the score for each prefix. Sorted sets are described in <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a> and Redis operations in <a href="../chapters/15-redis.html">Chapter 15</a>.</p>
+<p>It is in effect a trie flattened into a hash table: the prefix is the key, and the top-K list is the value. Cost: each query of length 20 is written under 20 keys, so 100 million queries means up to 2 billion member writes, and memory is large: each sorted-set entry is on the order of 50 to 100 bytes with overhead, so tens of GB to over 100 GB if you keep more than K members per key, though trimming every key to the top 10 keeps about 150 million keys times about 10 members. Rough memory: 150 million keys at about 100 bytes of key and structure overhead plus 10 entries at about 40 bytes is about 75 GB, versus our 16 GB trie. Strengths: trivial to build, real-time increments, Redis Cluster shards by key with no custom code. Weaknesses: memory heavy (about 5 times the trie), trimming loses information (a query that drops out of one prefix list cannot come back without recomputation), no atomic whole-index swap (you would write a new key namespace and switch a version prefix, which doubles memory during the switch), and per-update write amplification equal to the query length.</p>
+<h3>11.2 Elasticsearch</h3>
+<p>Index each candidate as a document with a field using an <code>edge_ngram</code> analyzer (indexing "w", "we", "wea", ...), or use the completion suggester (backed by an in-memory finite state transducer) or <code>search_as_you_type</code>. Rank by a numeric popularity field via function score. Fuzzy matching is built in. See <a href="../chapters/22-search-engines.html">Chapter 22</a>.</p>
+<p>Strengths: typo tolerance and multi-field matching for free, rich filtering (by category, language, locale) and operational tooling. Weaknesses: query latency is usually 5 to 30 ms at p50 and spikes under load, versus microseconds for the trie, and serving 140,000 QPS needs a large cluster; ranking per request by scoring is more expensive than reading a precomputed list; index updates are near-real-time (refresh interval typically 1 second) but heavy merging under constant updates hurts latency.</p>
+<table>
+<tr><th>Dimension</th><th>Custom trie, precomputed top-K</th><th>Redis sorted sets per prefix</th><th>Elasticsearch completion or edge n-gram</th></tr>
+<tr><td>Lookup latency</td><td>microseconds in process, about 6 ms with RPC</td><td>sub-millisecond plus network, about 1 to 3 ms</td><td>5 to 30 ms typical</td></tr>
+<tr><td>Memory for 100M queries</td><td>about 16 GB</td><td>about 75 GB or more</td><td>tens of GB across shards, plus disk</td></tr>
+<tr><td>Freshness</td><td>snapshot plus overlay</td><td>real-time via ZINCRBY</td><td>about 1 s refresh</td></tr>
+<tr><td>Typo tolerance</td><td>custom fallback</td><td>none</td><td>built in (fuzziness)</td></tr>
+<tr><td>Atomic swap and rollback</td><td>trivial (pointer)</td><td>awkward (namespace)</td><td>index alias swap, reasonable</td></tr>
+<tr><td>Build effort</td><td>highest</td><td>low</td><td>low to moderate</td></tr>
+<tr><td>Best fit</td><td>very large scale, strict latency</td><td>small to medium, strongest real-time</td><td>when you already run ES and need fuzzy and filters</td></tr>
+</table>
+<div class="callout tip"><b>Interview tip</b>
+Say the pragmatic phased answer: start with Redis sorted sets or Elasticsearch to ship fast and learn, then move the hot read path to an in-process trie once QPS and latency pressure justify the engineering. Keep Elasticsearch for the fuzzy fallback and for entity suggestions.</div>
+
+<h2 id="scaling-failure">12. Scaling, hot spots and failure modes</h2>
+<h3>12.1 Scaling</h3>
+<ul>
+<li><b>Read scaling:</b> add replicas per shard; edge caching grows with traffic for free. The trie is read-only so no coordination is needed.</li>
+<li><b>Data growth:</b> raise the frequency threshold, raise the privacy threshold, or cap the prefix depth. Moving from 100 million to 400 million candidates grows memory to about 64 GB per full trie, which is when shard-by-bucket actually becomes necessary for size.</li>
+<li><b>Build scaling:</b> the batch job partitions by query hash; the trie builder partitions by bucket, so 8 shard files build in parallel. A hourly full build of about 20 to 30 minutes is realistic.</li>
+<li><b>Geography:</b> serve from each region with a local replica set pulling the same snapshot, so the network leg is short. Snapshots are small (16 GB) and are copied region to region via object-store replication (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>).</li>
+</ul>
+<h3>12.2 Failure modes</h3>
+<table>
+<tr><th>Component</th><th>Failure</th><th>Effect</th><th>Mitigation</th></tr>
+<tr><td>Shard replica</td><td>crashes or slow</td><td>fewer replicas; tail latency</td><td>3 replicas, least-outstanding routing, hedged requests after p95, health checks eject within seconds</td></tr>
+<tr><td>Whole shard (all 3 replicas)</td><td>bad deploy, bad snapshot</td><td>no suggestions for its buckets</td><td>Canary rollout of snapshots to 1 replica first; automatic rollback to previous snapshot; service returns cached or overlay-only results and the client degrades to local history</td></tr>
+<tr><td>Corrupt or poisoned snapshot</td><td>wrong ranking, offensive entry</td><td>users see bad suggestions</td><td>Validation gates (checksum, size delta, canary prefixes, blocklist scan), staged rollout, instant rollback by pointer flip, live blocklist as emergency brake</td></tr>
+<tr><td>Stream job down</td><td>no trending</td><td>stale but good suggestions</td><td>Overlay entries expire by TTL, base trie unaffected; alert on overlay freshness lag</td></tr>
+<tr><td>Batch job fails or late</td><td>trie not rebuilt</td><td>staleness grows</td><td>Keep serving last snapshot; alert if age exceeds 6 hours; the system degrades gracefully because serving never depends on a build</td></tr>
+<tr><td>Kafka or log loss</td><td>missing counts</td><td>slightly skewed ranking</td><td>Counts are statistical; at-least-once delivery with dedupe by event id is enough; exactness is not required</td></tr>
+<tr><td>Redis history down</td><td>no personal results</td><td>generic suggestions</td><td>Short timeout (10 ms), treat as optional, fail open</td></tr>
+<tr><td>CDN or edge issue</td><td>cache bypass</td><td>3 times to 5 times load on origin</td><td>Capacity headroom (we sized 3 times), rate limiting, serve stale on error</td></tr>
+<tr><td>Thundering herd after a deploy</td><td>cold caches, snapshot loading together</td><td>latency spike</td><td>Rolling deploy, pre-warm before taking traffic, jittered download times</td></tr>
+</table>
+<p>Consistency and idempotency: the system tolerates duplicates and reorderings because counts are approximate, but the build is made deterministic: the same input logs and the same config produce the same snapshot, and snapshot versions are immutable and monotonic, so every swap is idempotent (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>). Different replicas may briefly serve different versions during a rollout, which is fine for this product. For multi-region, each region builds nothing locally; one pipeline builds, replicas pull, and a region that cannot reach the store keeps its current snapshot.</p>
+
+<h2 id="ops">13. Security, abuse, monitoring and cost</h2>
+<h3>13.1 Security and abuse</h3>
+<ul>
+<li>Rate limit per client and per IP at the gateway; autocomplete is cheap per request but easy to scrape for harvesting what people search for. Cap response detail (no scores in public responses if scraping is a concern).</li>
+<li>Never reflect the prefix unescaped into HTML on the client: render with text nodes, since the suggestions and prefix are untrusted (cross-site scripting).</li>
+<li>Privacy: queries are anonymized in the pipeline (user id replaced by a rotating pseudonymous bucket), IP addresses truncated, and sensitive categories excluded (<a href="../chapters/55-security.html">Chapter 55</a>).</li>
+</ul>
+<h3>13.2 Monitoring and SLOs</h3>
+<table>
+<tr><th>SLI</th><th>SLO</th></tr>
+<tr><td>Server-side latency p99 for suggest</td><td>under 20 ms, 99.9 percent of 5 minute windows</td></tr>
+<tr><td>Client-observed latency p99</td><td>under 100 ms</td></tr>
+<tr><td>Availability (non-5xx or timeout fallback)</td><td>99.99 percent</td></tr>
+<tr><td>Snapshot age on every shard</td><td>under 3 hours (base), overlay lag under 10 minutes</td></tr>
+<tr><td>Suggestion quality: click-through and acceptance rate, null-result rate</td><td>tracked per release; alert on 10 percent relative drop</td></tr>
+<tr><td>Blocklist propagation time</td><td>under 2 minutes to all instances</td></tr>
+</table>
+<p>Alert on the product metrics, not just the system ones: a snapshot that loads fine but has a broken ranking will look healthy on CPU and latency while click-through falls. See <a href="../chapters/54-observability-slos.html">Chapter 54</a>.</p>
+<h3>13.3 Cost</h3>
+<p>The cost drivers, in order: the edge and egress (175 MB/s peak at the edge, mostly cache hits, which are cheaper than origin egress), the batch and stream compute (about 200 GB a day of logs; a modest cluster for an hour or two per build), and the 24 serving instances with 16 GB-class memory (small). Log storage at 6 TB for 30 days is small. The biggest cost lever is the cache hit rate: every extra 10 points of hit rate removes about 35,000 requests per second from the origin. Second, prune the candidate set aggressively; most of the 300 million daily distinct queries are noise.</p>
+
+<h2 id="evolution">14. Evolution, phasing and alternatives not chosen</h2>
+<h3>14.1 What to build first</h3>
+<ol>
+<li><b>Phase 1 (weeks):</b> daily batch job, one trie service with 2 replicas, edge caching, client debounce, blocklist. Covers the core product.</li>
+<li><b>Phase 2:</b> hourly builds, snapshot swap with validation and rollback, sharding by bucket, hedging, per-locale tries.</li>
+<li><b>Phase 3:</b> streaming trending overlay, personalization from history, click-through-based ranking.</li>
+<li><b>Phase 4:</b> typo tolerance, transliteration, segment overlays, ML ranking model, multi-region.</li>
+</ol>
+<h3>14.2 At 10x scale</h3>
+<p>Traffic of 3.5 million requests per second at the edge needs a larger cache tier but the same architecture; the serving tier is about 240 instances. Candidates may grow to a billion, so memory rises to about 160 GB for a full index, and size-driven sharding becomes mandatory; the bucket map scales to 64 shards. Build time grows, so builds become incremental: only buckets whose counts changed meaningfully are rebuilt, and unchanged shard files are reused. A learned ranker (a small model scoring candidates using context features) replaces the linear score, running on the top 50 candidates from the trie instead of the top 10.</p>
+<h3>14.3 Alternatives not chosen</h3>
+<ul>
+<li><b>Neural query generation</b> (a language model generating completions). Strong for rare queries and long text, but too slow and expensive per keystroke at this scale and risky for offensive output; used as a candidate generator offline to enrich the trie, not on the hot path.</li>
+<li><b>Ternary search tree or finite state transducer</b> instead of a trie: a finite state transducer (as in Lucene) is more compact still and supports weights, a good choice if memory is the main concern, but top-K per node is awkward to retrofit.</li>
+<li><b>Computing top-K on demand with a heap over the subtree</b> with caching: acceptable for small data, but a request for <code>a</code> touches millions of nodes, and the tail latency is unbounded.</li>
+<li><b>Fully streaming index, no snapshots:</b> fresher, but loses reproducibility, rollback and simple validation.</li>
+</ul>
+
+<h2 id="qa">15. Interview Q&amp;A</h2>
+<details><summary>Why precompute the top-K list at every node instead of computing it at query time?</summary>
+<p>Without it, a lookup for a short prefix must walk the whole subtree below the node, which can contain millions of queries, and then sort them, so latency depends on the data size and is unbounded for the most common requests (the short prefixes). With precomputed lists the lookup is O(L) for prefix length L and returns a stored list, a few microseconds regardless of data volume. The cost is memory (K ids per node, about 12 GB here) and build time, and both are paid offline where they are cheap. Building the lists is also efficient: each node's list is the merge of its children's lists, computed bottom-up in one pass.</p></details>
+<details><summary>How do you update the trie without downtime and without serving a half-built structure?</summary>
+<p>Snapshots are immutable and versioned. The builder writes a complete new file; each shard downloads it in the background, verifies the checksum and sanity (size delta against the previous version, canary prefixes returning expected results), loads it into a second memory region, and flips one atomic pointer. Requests that started on the old version finish on it, and then it is freed. Rollback is flipping the pointer back while the old version is still resident. Because we never mutate the live structure, there are no locks on the read path and no intermediate states.</p></details>
+<details><summary>How do you surface a breaking-news query within minutes if the trie is rebuilt hourly?</summary>
+<p>A stream job counts queries in 5 minute windows and compares to baseline rates, and promotes only queries with an unusual burst ratio, a minimum count, and enough distinct users and networks. They go into a small trending overlay (thousands of entries) that every suggest-service instance reloads every minute or two and merges with the trie result using a decaying boost. The base trie stays immutable and stable. The overlay is small enough to keep in memory everywhere, and since it expires by TTL, a stream outage leaves suggestions stale but never wrong in a dangerous way.</p></details>
+<details><summary>How do you prevent offensive or private suggestions, and what do you do when one slips through?</summary>
+<p>Defense is layered: filtering at learning time (blocklists, toxicity classifier, PII detectors), a privacy threshold of distinct users before any query is eligible, a second pass on the final top-K lists at build time, and a live blocklist applied in the merge step at serve time. When a bad suggestion is reported, the on-call adds it to the live blocklist, which propagates in under two minutes, and purges the matching CDN keys. It is also removed from the learning set so the next build does not reintroduce it. The post-incident step is to find why classifiers missed it and expand rules; the key point is that the emergency brake does not wait for a rebuild.</p></details>
+<details><summary>Why shard by prefix bucket and not just replicate the whole trie everywhere?</summary>
+<p>At 16 GB the trie does fit on one machine, so replication is a valid start. Sharding wins for operational reasons: smaller snapshot files load and swap faster, a hot bucket gets extra replicas without copying the entire index, a bad shard has a smaller blast radius, and a growth in candidates does not force a hardware change. I avoid splitting by the first character because letter frequency is highly skewed and varies by language; instead I hash the first two characters into thousands of virtual buckets and assign buckets to shards using measured traffic, so rebalancing moves buckets, not data models. One-character prefixes are served from a tiny replicated root table, so a request never fans out to multiple shards.</p></details>
+<details><summary>How does the client decide when to call the server, and how do you handle out-of-order responses?</summary>
+<p>The client debounces: it restarts a 100 to 150 ms timer on each keystroke and sends only when typing pauses, so the intermediate prefixes are skipped and a 20 character query makes about 6 requests instead of 20. Every request carries an increasing sequence number and the client discards any response with a lower number than the last rendered, aborting older in-flight requests. It also keeps a prefix-to-results map for instant answers on backspace or retyping and remembers dead prefixes (those with no results), skipping calls for any extension of them.</p></details>
+<details><summary>How would you add personalization without making responses uncacheable?</summary>
+<p>Split the response. The global part (top-10 from the shared trie plus trending) stays cacheable at the browser and CDN and is the same for everyone in a locale. The personal part, the user's recent queries matching the prefix, is read from the device or from a small per-user store and merged on the client or in the aggregation step, with a boost and a history marker. For deeper personalization, use a limited number of segment overlays (language, region, interest cluster), which are also cacheable per segment. A trie per user is never viable: millions of copies of mostly the same data.</p></details>
+<details><summary>Redis sorted sets look simpler. Why not use them?</summary>
+<p>They are a good first version and I would ship them for a smaller product. The reasons to move on are cost and operations at our scale: writing each query under every one of its prefixes multiplies writes by the query length, and the memory is about five times that of a compact trie (roughly 75 GB versus 16 GB by my estimate). Trimming each key to the top 10 discards information, so an item that falls out of a list cannot return without recomputation, and there is no clean atomic swap or rollback of the whole index. Their strengths remain real-time increments and trivial sharding, which is why I would keep Redis for the user history and possibly the trending overlay.</p></details>
+<details><summary>How do you support typos without making every lookup slow?</summary>
+<p>The hot path stays an exact trie lookup. When it returns fewer than a few results, we fall back, with a strict time budget, to a corrected prefix. The cheapest fallback is a table of learned aliases mined from sessions where users search a misspelling and then the corrected phrase; it costs nothing at serve time. Next comes a bounded edit-distance walk (one edit, prefix at least 3 to 4 characters). Only if both fail do we consult Elasticsearch with fuzziness. Because most keystrokes find exact matches, the extra cost applies to a small fraction of requests.</p></details>
+<details><summary>What do you do during the first few seconds after a snapshot swap, when caches are cold?</summary>
+<p>We avoid cold starts by pre-warming: after loading and before the flip, the process touches the memory pages for the most frequent prefixes (we know them from the logs), so the first real request does not take page faults. Swaps are staggered across replicas with jitter so that not all replicas change at once, and the CDN and local caches continue to serve the older answers until their TTL expires, which smooths the transition. If error or latency rises on the canary replica, the rollout stops and rolls back automatically.</p></details>
+
+<h2 id="recap-sec">16. Connects to and recap</h2>
+<p class="connects"><b>Connects to:</b> the interview method from <a href="../chapters/01-interview-framework.html">Chapter 1</a> and estimation from <a href="../chapters/02-estimation.html">Chapter 2</a>; tries and text structures in <a href="../chapters/58-geospatial-text.html">Chapter 58</a> and ranked lists in <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>; <a href="../chapters/12-cdn.html">Chapter 12</a> and <a href="../chapters/13-caching-patterns.html">Chapter 13</a> for edge and client caching; <a href="../chapters/14-caching-failures.html">Chapter 14</a> for stampedes; <a href="../chapters/15-redis.html">Chapter 15</a> for sorted sets and history; <a href="../chapters/16-rate-limiting.html">Chapter 16</a> for the gateway limits; <a href="../chapters/22-search-engines.html">Chapter 22</a> for the Elasticsearch alternative; <a href="../chapters/25-sharding.html">Chapter 25</a> and <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a> for bucketing and sketches; <a href="../chapters/34-queues-kafka.html">Chapter 34</a> and <a href="../chapters/37-batch-stream.html">Chapter 37</a> for the log pipeline; <a href="../chapters/40-resilience.html">Chapter 40</a> for hedging and degradation; <a href="../chapters/54-observability-slos.html">Chapter 54</a> for SLOs and <a href="../chapters/55-security.html">Chapter 55</a> for abuse. Related case study: <a href="c13-nearby-search.html">Nearby search</a>.</p>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>The core structure is a trie with the top-K completions precomputed at every node, so serving is an O(prefix length) walk and a list read; it takes about 16 GB for 100 million candidate queries.</li>
+<li>Traffic estimate: 2 billion searches a day, about 12 billion requests, 139,000 QPS average, 350,000 peak at the edge, about 140,000 after caching; 8 shards by 3 replicas is enough with headroom.</li>
+<li>Separate serving from building: immutable snapshots built by a log-driven batch pipeline, swapped atomically per shard with validation and instant rollback.</li>
+<li>Freshness comes from a small streaming trending overlay with burst, volume and distinct-user gates, merged at request time with a decaying boost.</li>
+<li>Latency is mostly network: browser cache, debounce, CDN edge, warm HTTP/2 connections, hedged requests and short timeouts matter more than the lookup itself; the miss path totals about 77 ms of the 100 ms budget.</li>
+<li>Shard by hashed two-character prefix buckets mapped to shards by measured load; one-character prefixes come from a tiny root table.</li>
+<li>Safety is layered: learning-time filters, privacy thresholds, a build-time pass and a live serve-time blocklist for emergencies.</li>
+<li>Typos use learned aliases first, bounded edit distance second, fuzzy search as last resort; languages get separate tries with Unicode normalization.</li>
+<li>Personalization is a merge layer on top of a cacheable global result; Redis sorted sets and Elasticsearch are valid for smaller scale or for fuzzy fallback, but cost more memory or latency than the custom trie at this scale.</li>
+</ul></div>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

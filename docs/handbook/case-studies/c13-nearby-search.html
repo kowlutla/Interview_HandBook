@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 13: Design Uber / Nearby Search | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c13-nearby-search">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 13 · Worked solutions</div>
+<h1>Design Uber / Nearby Search</h1>
+<p class="lead">A ride-hailing service must keep a live map of a million moving cars, find the best few of them around any rider in milliseconds, hand a trip to exactly one driver, and keep every phone in sync. This worked solution builds that system step by step, and then shows how the same ideas simplify into a Yelp-style search for places that do not move.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+
+<p>The prompt is short: "Design a ride-hailing service like Uber." In an interview the first job is to turn that sentence into a problem that fits in 45 minutes. The interesting core is <b>geospatial</b>: drivers move constantly, riders ask "who is near me", and the system must pair them. Everything else (payments, driver onboarding, ratings, maps rendering) is real but secondary. Following the framework in <a href="../chapters/01-interview-framework.html">Chapter 1</a>, I would ask the questions below and state the answers I will assume, so the interviewer can correct me early.</p>
+
+<table>
+<tr><th>Question I ask</th><th>Assumed answer</th></tr>
+<tr><td>Which flows matter most?</td><td>Rider requests a ride, system finds and assigns a nearby driver, both see live positions, trip runs to completion. Also the "cars near me" map shown before booking.</td></tr>
+<tr><td>Scale?</td><td>100 million monthly riders, 20 million trips per day, 5 million registered drivers of whom about 1 million are online at the daily peak, worldwide in many cities.</td></tr>
+<tr><td>How fresh must driver positions be?</td><td>A driver sends a GPS fix about every 4 seconds while online. The matching view may be up to about 5 to 10 seconds stale; the map shown to the rider should look smooth.</td></tr>
+<tr><td>Matching latency?</td><td>From tapping "Request" to the first driver offer within about 1 second at p99; full assignment depends on human drivers (seconds to tens of seconds).</td></tr>
+<tr><td>Can a driver ever be given two trips?</td><td>No. One driver, one active trip, always. This is the main correctness rule.</td></tr>
+<tr><td>Ride types?</td><td>One car type plus a few categories (economy, XL). Pooled rides and scheduled rides are out of scope.</td></tr>
+<tr><td>Pricing?</td><td>Upfront fare with surge multipliers by area. We design the surge signal; payments are out of scope.</td></tr>
+<tr><td>Static places too?</td><td>The interviewer may ask about "find restaurants near me" as a variant. I will cover it in its own section because it is the same index with very different traffic.</td></tr>
+<tr><td>Multi-region?</td><td>Yes, but a trip is local: both people are in the same city. Cities map to regions.</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li>Drivers go online or offline and stream their location.</li>
+<li>A rider sees nearby available drivers on a map and an estimated pickup time and price.</li>
+<li>A rider requests a trip with a pickup and destination; the system selects a driver, offers the trip, handles decline or timeout, and reassigns.</li>
+<li>Both parties see each other's live location and trip status until the trip ends.</li>
+<li>The trip moves through a defined set of states, and each change is durable and visible to both apps.</li>
+<li>Location history is stored for support, fraud checks, analytics, and model training.</li>
+</ul>
+
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Low latency</b> on the nearby query (p99 under 100 ms inside the service) and on dispatch.</li>
+<li><b>High write throughput</b> for locations: hundreds of thousands per second, mostly overwriting the previous value for the same driver.</li>
+<li><b>Correct assignment:</b> a driver is never assigned twice, a rider never gets two cars for one request, even under retries and crashes.</li>
+<li><b>Availability over perfect freshness</b> for the location index: losing a few seconds of positions is acceptable, losing the ability to dispatch is not. Trip state, in contrast, must be durable and strongly consistent per trip (<a href="../chapters/28-cap-consistency.html">Chapter 28</a>).</li>
+<li><b>Regional isolation:</b> a failure in one city's infrastructure must not stop other cities.</li>
+</ul>
+
+<h3>2.3 Out of scope</h3>
+<p>Payments and receipts, driver background checks, map tile rendering, turn-by-turn navigation, pooled rides, driver incentives, chat between rider and driver, and fraud models. I will name where they would plug in but not design them.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+
+<p>The method comes from <a href="../chapters/02-estimation.html">Chapter 2</a>: pick round numbers, show arithmetic, and use the results to decide the architecture.</p>
+
+<h3>3.1 Trips and dispatch</h3>
+<ul>
+<li>20 million trips per day is 20,000,000 / 86,400, about 230 trips per second on average. Demand is peaky (evening rush, Friday night), so assume a peak of 3 times, about 700 trip requests per second worldwide.</li>
+<li>Each request may produce several offers (some drivers decline): assume 3 offers on average, so about 2,100 offers per second at peak. This is small. <b>Dispatch is not a scale problem; correctness is.</b></li>
+</ul>
+
+<h3>3.2 Driver location updates</h3>
+<ul>
+<li>Peak online drivers: 1,000,000. Each sends a fix every 4 seconds, so 1,000,000 / 4 = <b>250,000 updates per second at peak</b>.</li>
+<li>Average over the day: assume 600,000 drivers online on average, so 150,000 updates per second.</li>
+<li>Message size: driver id (8 bytes), latitude and longitude (8 bytes), heading, speed, accuracy, timestamp, status: about 40 bytes of useful data, roughly 100 bytes with framing. At peak that is 250,000 x 100 bytes = 25 MB/s inbound (about 200 Mbit/s), spread over the world. This is modest for the network but very large for any system that writes every update to a disk-based relational table.</li>
+</ul>
+
+<h3>3.3 Nearby queries</h3>
+<ul>
+<li>Opening the app shows cars around the rider. Assume 5 million app opens per day in busy windows, plus riders who keep the map open and refresh every 5 seconds. Say 200,000 riders have the map open at peak, refreshing every 5 s: 40,000 queries per second at peak. In practice we push the map via the realtime channel rather than poll, but we budget for 40,000 reads per second.</li>
+<li>Read to write ratio on the location index: 40,000 queries against 250,000 writes, so this store is <b>write-heavy</b>, unusual for a "search" system.</li>
+</ul>
+
+<h3>3.4 Memory for the live index</h3>
+<ul>
+<li>One live record per driver: id, lat, lon, heading, speed, status, cell, timestamp, current trip id: about 100 bytes, rounded to 200 bytes with hash-table overhead. 1,000,000 x 200 bytes = 200 MB. Even at 10 million drivers it is 2 GB.</li>
+<li>Conclusion: the entire live driver set <b>fits in the memory of one machine</b>. We shard for write throughput (250,000 writes per second is too many for one Redis instance, which does roughly 100,000 simple operations per second per core) and for regional isolation, not for capacity.</li>
+</ul>
+
+<h3>3.5 Location history</h3>
+<ul>
+<li>Points per day on average: 150,000 per second x 86,400 = about 13 billion points per day.</li>
+<li>At 40 bytes per point: 13 x 10^9 x 40 = about 520 GB per day raw, or about 190 TB per year. Columnar compression on sorted, delta-encoded data typically gives 4 to 8 times, so around 30 to 50 TB per year compressed. This goes to a stream plus object storage, never to the serving index.</li>
+<li>Many products downsample (keep one point per 10 seconds after a week, or only trip-time points), cutting this further.</li>
+</ul>
+
+<h3>3.6 Realtime connections</h3>
+<ul>
+<li>1,000,000 online drivers hold a persistent connection each, plus riders in active trips and with the map open: say 500,000 more. 1.5 million concurrent connections. At roughly 100,000 per gateway machine that is 15 machines per peak, in practice 40 to 60 for headroom and regional spread.</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b> The numbers tell the story. Driver positions are a small, hot, overwrite-heavy dataset (200 MB) with a high write rate (250,000 per second), so it lives in memory and is sharded for throughput. Trips are rare (700 per second) and need strong correctness, so they live in a durable database. History is huge and cold, so it flows through a stream into cheap storage. Three data shapes, three stores.</div>
+
+<h2 id="api">4. API design</h2>
+
+<p>Two kinds of interfaces exist: ordinary request/response HTTPS for actions (request a ride, get an estimate), and a persistent bidirectional connection for streams (driver locations up, offers and positions down). See <a href="../chapters/05-api-design.html">Chapter 5</a> for API principles and <a href="../chapters/06-realtime.html">Chapter 6</a> for the realtime options.</p>
+
+<h3>4.1 Request/response (HTTPS, JSON or protobuf)</h3>
+<pre>GET  /v1/nearby-drivers?lat=37.77&amp;lon=-122.41&amp;radius_m=2000&amp;type=economy
+     -> { drivers: [ { id_masked, lat, lon, heading } ... up to 20 ], eta_min: 3 }
+
+POST /v1/fare-estimates        { pickup, dropoff, type }
+     -> { fare_low, fare_high, surge: 1.4, quote_id, expires_at }
+
+POST /v1/trips                 { quote_id, pickup, dropoff, type }
+     Header: Idempotency-Key: 7f3c...        (same key = same trip, never a second one)
+     -> 202 { trip_id, state: "REQUESTED" }
+
+POST /v1/trips/{id}/cancel     { reason }
+GET  /v1/trips/{id}            -> full trip document (for reconnect and recovery)
+
+POST /v1/drivers/me/status     { online: true, vehicle_type }
+POST /v1/offers/{offer_id}/accept   |   /decline
+</pre>
+
+<p>The <code>Idempotency-Key</code> matters: mobile networks drop responses, and an impatient user taps twice. Without a key the retry would create a second trip; with it, the server returns the first trip. Mechanics are in <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>. The ride request returns <code>202 Accepted</code> immediately, because matching takes unknown time; progress arrives on the realtime channel.</p>
+
+<h3>4.2 Realtime messages (WebSocket)</h3>
+<pre>driver -> server   { t: "loc", lat, lon, hdg, spd, acc, ts, seq }        every ~4 s
+server -> driver   { t: "offer", offer_id, trip_id, pickup, eta_s, fare, expires_in_s: 15 }
+driver -> server   { t: "accept", offer_id }
+server -> rider    { t: "trip", trip_id, state, driver: { name, car, plate }, version }
+server -> rider    { t: "pos", trip_id, lat, lon, hdg, eta_s }              every ~2-4 s while en route
+</pre>
+<p>Every trip message carries a <code>version</code> number that increases with each state change, so a phone that sees version 7 after version 8 (because of reordering) can ignore the older one. The location message carries a client sequence number <code>seq</code> for the same reason: the server must not let a late packet overwrite a newer position.</p>
+
+<h2 id="data-model">5. Data model and storage choices</h2>
+
+<p>Three data shapes need three storage designs.</p>
+
+<h3>5.1 Live driver index (in memory)</h3>
+<p>This is the "where is everyone right now" store. Redis (<a href="../chapters/15-redis.html">Chapter 15</a>) is a natural fit: single-digit-microsecond operations on in-memory structures, TTLs, and sorted sets. Layout:</p>
+<pre>drv:{driver_id}   HASH   lat, lon, hdg, spd, ts, status, cell, trip_id      TTL 15 s
+cell:{cell_id}    ZSET   member = driver_id, score = last update timestamp
+</pre>
+<p>On each update we write the driver hash (and refresh its TTL), and if the driver crossed into a new cell, remove the id from the old cell's set and add it to the new one. Redis also offers built-in geospatial commands (<code>GEOADD</code>, <code>GEOSEARCH</code>) which store members in one sorted set scored by a 52-bit geohash. They are convenient, but a single key cannot expire individual members and one huge key lives on one shard, so the per-cell layout is better at this scale. The reasoning is in section 8.</p>
+
+<h3>5.2 Trips and driver assignment state (durable)</h3>
+<p>Trips are few, long-lived, and must be correct, so they live in a replicated database. A relational store partitioned by trip id, or a strongly consistent NoSQL such as one with conditional writes (<a href="../chapters/20-nosql.html">Chapter 20</a>), both work; I would pick sharded relational because trip, offer and driver-assignment updates benefit from transactions (<a href="../chapters/18-relational-internals.html">Chapter 18</a>).</p>
+<pre>trips(trip_id PK, rider_id, driver_id NULL, state, version, pickup, dropoff,
+      quote_id, fare, region, created_at, updated_at)
+offers(offer_id PK, trip_id, driver_id, state[PENDING|ACCEPTED|DECLINED|EXPIRED],
+       expires_at)
+driver_assignment(driver_id PK, trip_id NULL, status[AVAILABLE|OFFERED|BUSY], version)
+</pre>
+<p>The <code>driver_assignment</code> table is the single source of truth for "is this driver free". It is deliberately a tiny, separate row per driver so that a conditional update on it is the arbiter of the one-driver-one-trip rule (section 11).</p>
+
+<h3>5.3 Location history (stream then columnar storage)</h3>
+<p>Every update is also published to a log (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>), partitioned by driver id so each driver's points stay ordered. Consumers write batches to object storage in a columnar format (<a href="../chapters/21-object-storage.html">Chapter 21</a>, <a href="../chapters/37-batch-stream.html">Chapter 37</a>), partitioned by day and region, and a time-series or analytics store serves "show the route of trip X". Trip routes are also stored compactly with the trip itself (a polyline) for receipts and disputes.</p>
+
+<h3>5.4 Which store answers which question</h3>
+<table>
+<tr><th>Question</th><th>Store</th><th>Why</th></tr>
+<tr><td>Who is within 2 km of this point right now?</td><td>In-memory cell index</td><td>Overwrite-heavy, tiny, needs microsecond reads, loss of a few seconds is fine.</td></tr>
+<tr><td>Is driver D free? Who has trip T?</td><td>Sharded relational (with Redis fast-path)</td><td>Needs atomic conditional update and durability.</td></tr>
+<tr><td>Where did driver D go last Tuesday?</td><td>Log, then columnar object storage</td><td>Huge, append-only, read rarely, in bulk.</td></tr>
+<tr><td>What is the surge multiplier in cell X?</td><td>In-memory map fed by a stream job</td><td>Derived data, recomputed every few seconds.</td></tr>
+</table>
+
+<h2 id="geo-index">6. Geospatial indexing: the core idea</h2>
+
+<p>A database index on <code>(lat, lon)</code> cannot answer "points within 2 km" well. A normal B-tree sorts by one key; sorting by latitude finds a horizontal band around the world, and sorting by longitude finds a vertical band, and the intersection is not contiguous in either order. We need a way to <b>map two dimensions to one</b> while keeping nearby points mostly nearby in the one-dimensional order, or to partition space into buckets and look up buckets. <a href="../chapters/58-geospatial-text.html">Chapter 58</a> covers the techniques in depth; here is the working recap and the choice.</p>
+
+<h3>6.1 The candidates</h3>
+<ul>
+<li><b>Geohash.</b> Interleave the bits of longitude and latitude and write the result in base 32. Each extra character divides the cell by 32 (a 5-bit refinement alternating between lon and lat). A 6-character geohash covers roughly 1.2 km by 0.6 km, and a 7-character one roughly 150 m by 150 m. Points sharing a prefix share a cell, so a prefix lookup finds a cell. The catch: two points very close across a cell boundary can have completely different prefixes (the antimeridian and the equator-like seams are the worst), so you must always query the cell <b>and its 8 neighbours</b>. Cells are rectangles whose real-world shape changes with latitude.</li>
+<li><b>Quadtree.</b> Recursively split a square into four children whenever a node holds more than K points. Dense downtown regions become deep trees with tiny leaves; deserts remain a single big leaf. This adapts to density, which is attractive, but it is a pointer-heavy tree that changes as points move; every update may delete from one leaf and insert into another, possibly triggering splits and merges. Good for static or slowly changing data; awkward for 250,000 moves per second.</li>
+<li><b>S2 (Google).</b> Project the sphere onto the six faces of a cube and order cells along a Hilbert space-filling curve. A cell has a 64-bit id, and the hierarchy is 30 levels deep. A region (circle or polygon) is converted into a small <b>covering</b> of cell ids at mixed levels. Hilbert order preserves locality better than the Z-order used by geohash, and cell shapes are nearly uniform across the globe.</li>
+<li><b>H3 (Uber).</b> Hexagonal cells in a hierarchy of 16 resolutions. Hexagons have a useful property: every neighbour is the same distance from the centre (six equidistant neighbours, no corner neighbours), which makes "ring" queries and smooth density maps (surge) cleaner. Resolution 8 hexagons are about 0.7 km<sup>2</sup>, resolution 9 about 0.1 km<sup>2</sup>. Cells at a level are not perfect parents of the next level (hexagons cannot tile exactly), a minor quirk.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Grid cells and neighbour lookup for a nearby query">
+  <text class="t-b" x="20" y="22">Cell index: a query touches the home cell plus its 8 neighbours</text>
+  <g>
+    <rect class="box" x="40"  y="40"  width="100" height="80" rx="4"/><rect class="box" x="140" y="40"  width="100" height="80" rx="4"/><rect class="box" x="240" y="40"  width="100" height="80" rx="4"/>
+    <rect class="box" x="40"  y="120" width="100" height="80" rx="4"/><rect class="hit" x="140" y="120" width="100" height="80" rx="4"/><rect class="box" x="240" y="120" width="100" height="80" rx="4"/>
+    <rect class="box" x="40"  y="200" width="100" height="80" rx="4"/><rect class="box" x="140" y="200" width="100" height="80" rx="4"/><rect class="box" x="240" y="200" width="100" height="80" rx="4"/>
+  </g>
+  <circle cx="200" cy="170" r="95" fill="none" stroke="var(--fg)" stroke-dasharray="5 4"/>
+  <circle cx="200" cy="170" r="6" fill="var(--bad)"/><text class="t-sm" x="210" y="164">rider</text>
+  <circle cx="165" cy="145" r="4" fill="var(--fg)"/><circle cx="260" cy="205" r="4" fill="var(--fg)"/><circle cx="110" cy="230" r="4" fill="var(--fg)"/>
+  <circle cx="300" cy="80"  r="4" fill="var(--fg)"/><circle cx="75" cy="85" r="4" fill="var(--fg)"/><circle cx="290" cy="160" r="4" fill="var(--fg)"/>
+  <text class="t-sm" x="45" y="296">Dashed circle = search radius. Dots = drivers. Cells are about 1 km wide.</text>
+  <text class="t-b" x="400" y="62">Steps</text>
+  <text x="400" y="88">1. Convert rider lat/lon to a cell id (the green cell).</text>
+  <text x="400" y="112">2. Compute the 8 neighbour cells, giving 9 cells to read.</text>
+  <text x="400" y="136">3. Read all drivers stored in those 9 cells (about 20-60 drivers).</text>
+  <text x="400" y="160">4. Drop drivers outside the radius using exact distance.</text>
+  <text x="400" y="184">5. If fewer than needed, widen to the next ring of cells.</text>
+  <text x="400" y="208">6. Rank the survivors (section 9) and return or offer.</text>
+  <text class="t-sm" x="400" y="240">Cell choice trades precision for work: smaller cells mean fewer</text>
+  <text class="t-sm" x="400" y="258">irrelevant drivers per read but more cells to fetch and more updates</text>
+  <text class="t-sm" x="400" y="276">that cross a boundary.</text>
+</svg>
+<figcaption>The grid turns a radius search into a handful of key lookups. The exact-distance filter at the end removes drivers who are in a looked-up cell but outside the circle.</figcaption>
+</figure>
+
+<h3>6.2 Comparison and choice</h3>
+<table>
+<tr><th>Property</th><th>Geohash</th><th>Quadtree</th><th>S2</th><th>H3</th></tr>
+<tr><td>Cell shape</td><td>Rectangle, distorted away from the equator</td><td>Square, variable size</td><td>Near-square, uniform</td><td>Hexagon, uniform</td></tr>
+<tr><td>Adapts to density</td><td>No (fixed per level)</td><td>Yes</td><td>Via choosing level per region</td><td>Via choosing resolution</td></tr>
+<tr><td>Cost of moving a point</td><td>Cheap: compute new id</td><td>Tree surgery, possible split</td><td>Cheap: compute new id</td><td>Cheap: compute new id</td></tr>
+<tr><td>Neighbour lookup</td><td>8 neighbours, edge cases at seams</td><td>Tree traversal</td><td>Library gives neighbours and coverings</td><td>6 equidistant neighbours, ring function</td></tr>
+<tr><td>Works as a plain key</td><td>Yes, string prefix</td><td>No, needs a structure</td><td>Yes, 64-bit id</td><td>Yes, 64-bit id</td></tr>
+<tr><td>Best for</td><td>Simple systems, DB prefix queries, Redis geo</td><td>Static or slowly changing points</td><td>Large-scale indexing, polygons</td><td>Aggregation, surge, smooth density maps</td></tr>
+</table>
+
+<div class="callout key"><b>Decision</b> Use a fixed-resolution hierarchical cell id as the index key (H3 or S2; geohash would also work). The cell id is a cheap pure function of latitude and longitude, so a location update does not touch any tree, and a query is "compute neighbours, read buckets". Pick a level of about 1 km cells for dispatch lookups and a coarser parent (about 10 to 20 km) as the sharding unit. I would mention geohash first because every interviewer knows it, and say I would use H3 in production because its uniform neighbours make surge and ring expansion clean. Quadtrees are the right answer for the static POI variant in section 16.</div>
+
+<div class="callout watch"><b>Watch out</b> Do not search "the cell containing the rider" only. A rider on the edge of a cell would miss a driver 20 metres away across the boundary. Always include neighbours, and always finish with an exact distance (haversine) filter, because the neighbour ring covers more area than the circle.</div>
+
+<h2 id="first-design">7. A first simple design</h2>
+
+<p>Start simple, as <a href="../chapters/01-interview-framework.html">Chapter 1</a> advises. One application server and one database: drivers POST their location every 4 seconds, the server runs <code>UPDATE drivers SET lat=?, lon=?, cell=?, ts=? WHERE id=?</code>, and a nearby query is <code>SELECT ... WHERE cell IN (9 ids) AND status='AVAILABLE'</code> with an index on <code>cell</code>. A rider requests a trip, the server picks the nearest driver, and polls tell each phone what changed.</p>
+
+<p>This works for a demo. It breaks in four predictable ways, and naming them motivates every later component:</p>
+<ol>
+<li><b>Write load.</b> 250,000 updates per second against an indexed table is far beyond one database, and each one rewrites an index entry. The data is disposable the moment the next fix arrives, so paying for durability is wasteful. This pushes the live index into memory.</li>
+<li><b>Polling.</b> Phones polling for state waste battery, add seconds of delay, and multiply request count. This pushes us to persistent connections.</li>
+<li><b>Double assignment.</b> Two requests selecting the same nearest driver at the same moment would both succeed. This forces an atomic claim step.</li>
+<li><b>One box, one city.</b> A single machine is a single point of failure and has one geographic location; cross-ocean latency is unacceptable for a city on another continent.</li>
+</ol>
+
+<h2 id="architecture">8. Scaled high-level architecture</h2>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 470" role="img" aria-label="High-level architecture of the ride-hailing system">
+  <rect class="ext" x="20" y="60" width="110" height="50" rx="8"/><text class="t-c t-b" x="75" y="84">Driver app</text><text class="t-c t-sm" x="75" y="100">GPS every 4 s</text>
+  <rect class="ext" x="20" y="260" width="110" height="50" rx="8"/><text class="t-c t-b" x="75" y="284">Rider app</text><text class="t-c t-sm" x="75" y="300">map, request</text>
+
+  <rect class="box" x="190" y="160" width="140" height="60" rx="8"/><text class="t-c t-b" x="260" y="184">Edge / LB</text><text class="t-c t-sm" x="260" y="202">TLS, routing by city</text>
+  <rect class="box" x="190" y="60" width="140" height="60" rx="8"/><text class="t-c t-b" x="260" y="84">Realtime gateway</text><text class="t-c t-sm" x="260" y="102">WebSocket, 1.5M conns</text>
+  <rect class="box" x="190" y="260" width="140" height="60" rx="8"/><text class="t-c t-b" x="260" y="284">API service</text><text class="t-c t-sm" x="260" y="302">estimate, request</text>
+
+  <rect class="box" x="400" y="40" width="150" height="56" rx="8"/><text class="t-c t-b" x="475" y="64">Location service</text><text class="t-c t-sm" x="475" y="82">validate, write, fan out</text>
+  <rect class="cache" x="400" y="130" width="150" height="56" rx="8"/><text class="t-c t-b" x="475" y="154">Live driver index</text><text class="t-c t-sm" x="475" y="172">Redis shards by cell</text>
+  <rect class="box" x="400" y="230" width="150" height="56" rx="8"/><text class="t-c t-b" x="475" y="254">Dispatch service</text><text class="t-c t-sm" x="475" y="272">search, rank, offer</text>
+  <rect class="box" x="400" y="320" width="150" height="56" rx="8"/><text class="t-c t-b" x="475" y="344">Trip service</text><text class="t-c t-sm" x="475" y="362">state machine</text>
+  <rect class="box" x="400" y="410" width="150" height="46" rx="8"/><text class="t-c t-b" x="475" y="438">ETA / routing</text>
+
+  <rect class="db" x="640" y="320" width="150" height="56" rx="8"/><text class="t-c t-b" x="715" y="344">Trips DB</text><text class="t-c t-sm" x="715" y="362">sharded, replicated</text>
+  <rect class="cache" x="640" y="230" width="150" height="56" rx="8"/><text class="t-c t-b" x="715" y="254">Surge map</text><text class="t-c t-sm" x="715" y="272">cell to multiplier</text>
+  <rect class="box" x="640" y="130" width="150" height="56" rx="8"/><text class="t-c t-b" x="715" y="154">Event log</text><text class="t-c t-sm" x="715" y="172">Kafka, by driver id</text>
+  <rect class="db" x="640" y="40" width="150" height="56" rx="8"/><text class="t-c t-b" x="715" y="64">History store</text><text class="t-c t-sm" x="715" y="82">columnar, object store</text>
+  <rect class="box" x="820" y="230" width="70" height="56" rx="8"/><text class="t-c t-b" x="855" y="254">Surge</text><text class="t-c t-sm" x="855" y="272">job</text>
+
+  <path class="arrow" d="M130 85 L186 85"/><path class="arrow" d="M130 285 L186 285"/>
+  <path class="arrow" d="M330 90 L396 70"/>
+  <path class="arrow" d="M550 70 L636 70"/>
+  <path class="arrow" d="M475 96 L475 126"/>
+  <path class="arrow" d="M550 155 L636 155"/>
+  <path class="arrow" d="M330 285 L396 258"/>
+  <path class="arrow" d="M475 230 L475 190"/>
+  <path class="arrow" d="M475 286 L475 316"/>
+  <path class="arrow" d="M550 348 L636 348"/>
+  <path class="arrow dash" d="M550 258 L636 258"/>
+  <path class="arrow dash" d="M475 376 L475 406"/>
+  <path class="arrow dash" d="M790 155 L840 226"/>
+  <path class="arrow dash" d="M820 258 L794 258"/>
+  <path class="arrow dash" d="M400 340 L334 120"/>
+</svg>
+<figcaption>Drivers stream into the realtime gateway and the location service, which updates the in-memory index and publishes to the log. Dispatch reads the index, ranks drivers with the ETA service and surge map, and the trip service owns durable state. Dashed arrows are asynchronous or lookup paths. The trip service also pushes state changes back through the gateway (last dashed arrow).</figcaption>
+</figure>
+
+<h3>8.1 Components and their jobs</h3>
+<ul>
+<li><b>Realtime gateway</b> terminates WebSocket connections (<a href="../chapters/06-realtime.html">Chapter 6</a>), authenticates them, and forwards messages inward. It keeps a map from user id to connection. It is stateless apart from that map, which is rebuilt as clients reconnect.</li>
+<li><b>Location service</b> validates updates, writes the live index, and publishes to the log.</li>
+<li><b>Live driver index</b> is the sharded in-memory store of section 5.1.</li>
+<li><b>Dispatch service</b> performs the nearby search, ranking, offers, timeouts and reassignment.</li>
+<li><b>Trip service</b> owns the trip state machine and the assignment table, and is the only writer of those.</li>
+<li><b>ETA/routing service</b> answers "how long from A to B by road now".</li>
+<li><b>Surge job</b> is a stream-processing job that computes demand and supply per cell.</li>
+<li><b>Event log and history store</b> carry location history and trip events to analytics.</li>
+</ul>
+
+<h3>8.2 Location ingest in detail</h3>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Sequence of a driver location update">
+  <rect class="ext" x="30" y="20" width="120" height="34" rx="8"/><text class="t-c t-b" x="90" y="42">Driver app</text>
+  <rect class="box" x="220" y="20" width="130" height="34" rx="8"/><text class="t-c t-b" x="285" y="42">Gateway</text>
+  <rect class="box" x="420" y="20" width="140" height="34" rx="8"/><text class="t-c t-b" x="490" y="42">Location svc</text>
+  <rect class="cache" x="630" y="20" width="120" height="34" rx="8"/><text class="t-c t-b" x="690" y="42">Redis shard</text>
+  <rect class="box" x="790" y="20" width="90" height="34" rx="8"/><text class="t-c t-b" x="835" y="42">Kafka</text>
+  <line class="life" x1="90" y1="54" x2="90" y2="345"/><line class="life" x1="285" y1="54" x2="285" y2="345"/><line class="life" x1="490" y1="54" x2="490" y2="345"/><line class="life" x1="690" y1="54" x2="690" y2="345"/><line class="life" x1="835" y1="54" x2="835" y2="345"/>
+  <path class="arrow" d="M90 90 L281 90"/><text class="t-sm" x="100" y="84">1. loc(lat, lon, seq)</text>
+  <path class="arrow" d="M285 130 L486 130"/><text class="t-sm" x="296" y="124">2. forward (driver id)</text>
+  <path class="arrow" d="M490 170 L686 170"/><text class="t-sm" x="500" y="164">3. pipeline: HSET + EXPIRE, ZADD new cell,</text>
+  <text class="t-sm" x="500" y="184">ZREM old cell (only if cell changed, seq newer)</text>
+  <path class="arrow dash" d="M686 214 L494 214"/><text class="t-sm" x="560" y="208">4. ok</text>
+  <path class="arrow dash" d="M490 254 L831 254"/><text class="t-sm" x="560" y="248">5. async publish (key = driver id)</text>
+  <path class="arrow dash" d="M486 294 L94 294"/><text class="t-sm" x="190" y="288">6. optional ack (not required)</text>
+  <text class="t-sm" x="30" y="334">Fire-and-forget: the driver does not wait. A lost update is replaced by the next one 4 s later.</text>
+</svg>
+<figcaption>One location update. The write to Redis is a small pipeline of three commands, and the history publish is off the critical path. A sequence check stops an old packet from overwriting a newer fix.</figcaption>
+</figure>
+
+<p>Walkthrough, in order:</p>
+<ol>
+<li>The driver app sends a fix over the already-open WebSocket. It batches nothing; every 4 seconds is fine. If the driver is stationary the app can slow to every 10 to 15 seconds to save battery and load. If the driver is on a trip it can speed up to every 2 seconds for a smooth rider map.</li>
+<li>The gateway adds the authenticated driver id (never trust an id inside the payload) and forwards it to the location service, choosing an instance by hashing the driver id so one driver's updates stay ordered.</li>
+<li>The location service computes the cell id from lat/lon. It runs a short Lua script or pipeline on the shard for that cell: compare <code>seq</code> to the stored one (drop if older), write the hash, refresh the 15-second TTL, and if the cell changed, move the id between cell sets. A driver who stops sending (phone dies, tunnel) vanishes from the index automatically after the TTL, with no cleanup job.</li>
+<li>The service publishes the same fix to the event log asynchronously. If the log is slow, the service buffers a small amount and then drops; history is allowed to have gaps, the live index is not blocked.</li>
+</ol>
+
+<h3>8.3 Why a cell set per key and not one geospatial key</h3>
+<p>Redis's <code>GEOSEARCH</code> works on one sorted set: simple, but a city-sized set is one key on one shard, so the largest city sets the limit of a single core, and members cannot expire individually (stale drivers would linger until removed explicitly). Per-cell keys fix both: keys spread across the cluster, expiry is handled by the timestamp score (<code>ZREMRANGEBYSCORE</code> on read or a periodic sweep) plus the TTL on the driver hash, and each query reads a small set. The cost is that we implement neighbour lookup ourselves, which the cell library gives us.</p>
+
+<h2 id="matching">9. The nearby query and ranking</h2>
+
+<p>There are two consumers of the same index: the <b>map</b> (show cars around me, approximate, cacheable) and <b>dispatch</b> (choose the best driver for a real request, precise). Both do the following:</p>
+<ol>
+<li>Compute the home cell and its ring-1 neighbours (7 hexagons or 9 squares).</li>
+<li>Issue the reads in parallel to the shards holding those cells (usually one or two shards, see section 15) and read the drivers' compact records.</li>
+<li>Filter out stale records (older than about 10 seconds), drivers whose status is not <code>AVAILABLE</code>, and drivers who do not match the vehicle type.</li>
+<li>Filter by exact distance to a maximum radius, and if fewer than a target (say 10) remain, expand to ring 2 and repeat. Each ring multiplies the cells read, so cap expansion (two or three rings).</li>
+<li>Rank the candidates.</li>
+</ol>
+
+<h3>9.1 Ranking: straight-line distance is not enough</h3>
+<p>A driver 300 metres away across a river or on the other side of a divided highway may be 12 minutes away by road, while one 900 metres away on the same street is 2 minutes away. So ranking uses <b>ETA to pickup</b>, not distance. Calling a routing engine for all 40 candidates is wasteful, so use a two-stage approach: pre-rank by straight-line distance (cheap), take the top 8 to 10, then ask the ETA service for the road time of just those, in one batch call. The ETA service (a road graph with precomputed shortcuts, often contraction hierarchies, plus live traffic speeds per road segment) answers each in about a millisecond or less; a batch of 10 stays in single-digit milliseconds. Additional ranking terms often include driver heading (a car already driving toward the rider is better), acceptance history, and fairness (do not always burn the same driver's idle time).</p>
+
+<h3>9.2 ETA and price shown on the map</h3>
+<p>The ETA shown on the nearby screen is the best driver's ETA in that cell, and does not need to be fresh per rider. Results for a rider tapping around the same block can be cached for a few seconds, keyed by cell (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>). A cached "5 cars, 3 min" is acceptable; dispatch for a real request never uses cached results.</p>
+
+<h2 id="dispatch">10. Dispatch: offers, timeouts and reassignment</h2>
+
+<p>When the rider requests a trip, the trip service creates the trip in state <code>REQUESTED</code> and hands it to dispatch. Dispatch has to turn a ranked list into exactly one accepted driver. There are three common strategies:</p>
+
+<table>
+<tr><th>Strategy</th><th>How</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Sequential offers</td><td>Offer to the best driver; wait up to about 15 s; on decline or timeout offer to the next.</td><td>Simple, one driver at a time, no wasted offers, easy to reason about.</td><td>Slow when drivers decline; each decline costs seconds.</td></tr>
+<tr><td>Broadcast to N, first accept wins</td><td>Offer to the top 3 to 5 at once; the first to accept gets it.</td><td>Faster pickup.</td><td>Drivers see offers that vanish; needs a strict atomic claim; drivers get annoyed.</td></tr>
+<tr><td>Batched global matching</td><td>Every 2 seconds, solve an assignment problem over all open requests and available drivers in a region to minimise total wait.</td><td>Better overall efficiency in busy areas; avoids greedy mistakes (nearest driver stolen from another rider who had no other).</td><td>More complex; adds up to the batch interval of latency.</td></tr>
+</table>
+
+<p>I would start with sequential offers (first version) and describe batched matching as the evolution at scale. Greedy "nearest driver per request" can be globally worse: if two riders request at the same time and one driver is nearest to both, giving that driver to rider A may leave rider B with a 15-minute wait, while giving B the same driver and A another 3-minute driver would have been better overall.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 470" role="img" aria-label="Sequence of matching with offer, timeout and reassignment">
+  <rect class="ext" x="20" y="16" width="100" height="34" rx="8"/><text class="t-c t-b" x="70" y="38">Rider</text>
+  <rect class="box" x="170" y="16" width="110" height="34" rx="8"/><text class="t-c t-b" x="225" y="38">Trip svc</text>
+  <rect class="box" x="340" y="16" width="120" height="34" rx="8"/><text class="t-c t-b" x="400" y="38">Dispatch</text>
+  <rect class="cache" x="520" y="16" width="130" height="34" rx="8"/><text class="t-c t-b" x="585" y="38">Index + ETA</text>
+  <rect class="ext" x="710" y="16" width="170" height="34" rx="8"/><text class="t-c t-b" x="795" y="38">Driver A / Driver B</text>
+  <line class="life" x1="70" y1="50" x2="70" y2="455"/><line class="life" x1="225" y1="50" x2="225" y2="455"/><line class="life" x1="400" y1="50" x2="400" y2="455"/><line class="life" x1="585" y1="50" x2="585" y2="455"/><line class="life" x1="795" y1="50" x2="795" y2="455"/>
+  <path class="arrow" d="M70 80 L221 80"/><text class="t-sm" x="80" y="74">1. POST /trips (idempotency key)</text>
+  <path class="arrow" d="M225 110 L396 110"/><text class="t-sm" x="236" y="104">2. trip REQUESTED, start match</text>
+  <path class="arrow" d="M400 140 L581 140"/><text class="t-sm" x="410" y="134">3. nearby + ETA top 10</text>
+  <path class="arrow dash" d="M581 166 L404 166"/><text class="t-sm" x="440" y="160">4. ranked list</text>
+  <path class="arrow" d="M400 196 L791 196"/><text class="t-sm" x="440" y="190">5. offer to A (hold A as OFFERED, expires 15 s)</text>
+  <rect class="miss" x="500" y="214" width="290" height="30" rx="6"/><text class="t-c t-sm" x="645" y="233">15 s pass, A does nothing: offer EXPIRED</text>
+  <path class="arrow" d="M400 276 L791 276"/><text class="t-sm" x="440" y="270">6. release A, offer to B (OFFERED)</text>
+  <path class="arrow dash" d="M791 308 L404 308"/><text class="t-sm" x="520" y="302">7. B accepts (offer_id)</text>
+  <path class="arrow" d="M400 338 L229 338"/><text class="t-sm" x="236" y="332">8. claim: trip REQUESTED to ACCEPTED, B BUSY</text>
+  <rect class="hit" x="236" y="346" width="280" height="30" rx="6"/><text class="t-c t-sm" x="376" y="365">one conditional write, succeeds for one only</text>
+  <path class="arrow dash" d="M221 400 L74 400"/><text class="t-sm" x="82" y="394">9. push: driver B, car, ETA</text>
+  <path class="arrow dash" d="M229 430 L791 430"/><text class="t-sm" x="420" y="424">10. confirm to B, start navigation</text>
+</svg>
+<figcaption>Sequential offer flow. Driver A is held as OFFERED while the offer is live, the timeout releases A, and driver B's acceptance goes through an atomic claim at the trip service. The claim, not the offer, is what makes the assignment unique.</figcaption>
+</figure>
+
+<h3>10.1 Details that interviewers probe</h3>
+<ul>
+<li><b>Offer timeout.</b> Typically 10 to 20 seconds. The timer lives in the dispatch worker but must survive its crash, so the offer row stores <code>expires_at</code> and a scheduler (<a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>) or delayed queue wakes a handler at that time; the handler checks "is this offer still PENDING?" and expires it. A late accept after expiry must be rejected by the same check.</li>
+<li><b>Hold during an offer.</b> While A is considering an offer, no other trip should offer A. Setting A's assignment status to <code>OFFERED</code> (with the offer id and expiry) does that; the nearby query already filters on <code>AVAILABLE</code>. If A declines or times out, a conditional update flips A back to <code>AVAILABLE</code> only if it still holds this offer.</li>
+<li><b>Reassignment.</b> Beyond decline and timeout there is a driver cancelling after accepting, or a driver app going silent while en route. The trip returns to <code>MATCHING</code>, the previous driver is excluded for this trip, and dispatch runs again with a fresh search and a priority boost for the rider (they already waited).</li>
+<li><b>Giving up.</b> After a bounded total time (for example 2 minutes) or number of offers (say 8) the trip becomes <code>NO_DRIVERS</code> and the rider is told, possibly with a suggestion to try later or a higher price.</li>
+<li><b>Many requests, few drivers.</b> Process requests in arrival order per region; sequential dispatch with a per-region queue prevents two workers racing for the same pool, although correctness never depends on that (section 11).</li>
+</ul>
+
+<h2 id="consistency">11. Deep dive: one driver, one trip</h2>
+
+<p>This is the part of the design where correctness matters most and a loose approach causes real harm: two riders are told the same car is coming. The location index is eventually consistent and cannot be the arbiter, because it can show a driver as available for a few seconds after they accepted another trip. So <b>the index is a hint; a separate strongly consistent record is the authority.</b></p>
+
+<h3>11.1 Options</h3>
+<table>
+<tr><th>Option</th><th>Mechanism</th><th>Strengths</th><th>Weaknesses</th></tr>
+<tr><td>A. Conditional update in the trips database</td><td><code>UPDATE driver_assignment SET status='BUSY', trip_id=:t, version=version+1 WHERE driver_id=:d AND status IN ('AVAILABLE','OFFERED') AND (offer_id=:o OR status='AVAILABLE')</code>; check rows affected.</td><td>Durable, atomic in one row, no extra system, naturally idempotent with the same trip id.</td><td>Database round trip per claim (fine at 2,000 per second); the row is a hot spot only for a very popular driver.</td></tr>
+<tr><td>B. Redis lock with TTL</td><td><code>SET lock:driver:D trip_id NX PX 20000</code> before offering.</td><td>Very fast, simple.</td><td>The lock can expire while a slow process continues; no fencing; Redis failover can lose the lock. Fine as an optimisation, unsafe as the only guard. See <a href="../chapters/30-coordination-locks.html">Chapter 30</a>.</td></tr>
+<tr><td>C. Distributed lock service with fencing tokens</td><td>Consensus-based lock (ZooKeeper, etcd) hands out a token that increases; storage rejects stale tokens.</td><td>Safe against pauses and failover.</td><td>Extra component and latency; still needs the database to check the token.</td></tr>
+<tr><td>D. Single-writer per driver</td><td>Route all operations for a driver to one owner (by hashing driver id) that serialises them.</td><td>No locks; state machine in one place.</td><td>Needs ownership handover on failure; the owner must still persist durably.</td></tr>
+</table>
+
+<p><b>Decision:</b> use option A as the source of truth, with option B as an optional fast pre-check to avoid pointless database work. The conditional write is a compare-and-set on a row: of two concurrent claims for the same driver, the database serialises them and exactly one sees the row in the expected state. Add a <code>version</code> or fencing-style check so that a stale worker (one that was paused for 30 seconds, woke up, and still believes it holds the offer) cannot overwrite a newer state: its update names an expected version or offer id that no longer matches, and affects zero rows.</p>
+
+<div class="callout key"><b>Key idea</b> Do the assignment as a state transition on a durable row, not as a lock. A lock says "I may act"; a conditional write says "the world is still as I thought, and now it is changed". The second remains correct when processes pause, crash, retry, or run twice.</div>
+
+<h3>11.2 The two-sided claim</h3>
+<p>The accept touches two entities: the trip (REQUESTED to ACCEPTED) and the driver (OFFERED to BUSY). If they live in different shards this is a distributed transaction (<a href="../chapters/31-distributed-transactions.html">Chapter 31</a>). The cleanest fix is to avoid one: <b>store the assignment on the driver shard first</b> (the claim is the commit point), then update the trip by id asynchronously with retries, and let a reconciliation process repair mismatches. Equivalent view as a saga (<a href="../chapters/48-sagas.html">Chapter 48</a>): step 1 claim the driver, step 2 attach the driver to the trip, compensation if step 2 fails (release the driver). Another approach is to colocate: shard both trips and assignments by region so a trip and its drivers live in the same database shard, and use one local transaction. Because a trip is local to a city, regional colocation is natural and I would pick it.</p>
+
+<h3>11.3 Idempotency and retries</h3>
+<p>Every state-changing call carries a key (<code>trip_id + offer_id + action</code>), so a retried accept returns the previous result rather than failing or re-applying. A driver app that loses its connection right after tapping accept reconnects and fetches the trip, learning the true state. The rider side uses the idempotency key from the request so a double tap yields one trip.</p>
+
+<h2 id="state-machine">12. The trip state machine</h2>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Trip state machine">
+  <rect class="ext" x="20" y="150" width="120" height="48" rx="8"/><text class="t-c t-b" x="80" y="179">REQUESTED</text>
+  <rect class="box" x="190" y="150" width="120" height="48" rx="8"/><text class="t-c t-b" x="250" y="179">MATCHING</text>
+  <rect class="box" x="360" y="150" width="120" height="48" rx="8"/><text class="t-c t-b" x="420" y="179">ACCEPTED</text>
+  <rect class="box" x="530" y="150" width="130" height="48" rx="8"/><text class="t-c t-b" x="595" y="179">DRIVER_ARRIVED</text>
+  <rect class="box" x="705" y="150" width="120" height="48" rx="8"/><text class="t-c t-b" x="765" y="179">IN_PROGRESS</text>
+  <rect class="hit" x="705" y="270" width="120" height="48" rx="8"/><text class="t-c t-b" x="765" y="299">COMPLETED</text>
+  <rect class="miss" x="190" y="270" width="120" height="48" rx="8"/><text class="t-c t-b" x="250" y="299">NO_DRIVERS</text>
+  <rect class="miss" x="400" y="270" width="200" height="48" rx="8"/><text class="t-c t-b" x="500" y="299">CANCELLED</text>
+  <path class="arrow" d="M140 174 L186 174"/>
+  <path class="arrow" d="M310 174 L356 174"/><text class="t-sm" x="312" y="166">accept</text>
+  <path class="arrow" d="M480 174 L526 174"/>
+  <path class="arrow" d="M660 174 L701 174"/><text class="t-sm" x="660" y="166">start</text>
+  <path class="arrow" d="M765 198 L765 266"/><text class="t-sm" x="772" y="236">end</text>
+  <path class="arrow-r" d="M250 198 L250 266"/><text class="t-sm" x="258" y="236">gave up</text>
+  <path class="arrow-r dash" d="M420 198 L470 266"/><path class="arrow-r dash" d="M595 198 L540 266"/><path class="arrow-r dash" d="M80 198 L400 285"/>
+  <path class="arrow dash" d="M370 150 C 330 100 270 100 250 146"/><text class="t-sm" x="280" y="96">driver cancels or silent: back to MATCHING</text>
+  <text class="t-sm" x="20" y="344">Every transition is a conditional write: UPDATE ... SET state=new, version=version+1 WHERE id=? AND state=old.</text>
+</svg>
+<figcaption>States of a trip. Red edges end the trip without service, and dashed edges are the recovery and cancellation paths. IN_PROGRESS cannot be cancelled by the simple path; it is ended by completing or by a support-driven abort.</figcaption>
+</figure>
+
+<p>The state machine is where rules live. It defines the legal transitions (for example <code>COMPLETED</code> is terminal; <code>ACCEPTED</code> may return to <code>MATCHING</code> but <code>IN_PROGRESS</code> may not), who may trigger each (driver app, rider app, system timer, support), and which side effects fire on entry: a push notification, an event on the log, a charge on completion, a surge counter on request. Putting this in one service with conditional writes means two components can never push the trip into contradictory states, and the <code>version</code> number lets clients ignore stale messages. Transitions publish an event to the log using the outbox pattern (write the event in the same transaction as the state change, a separate relay publishes it), so downstream payment and analytics never miss or invent a transition (<a href="../chapters/36-event-driven.html">Chapter 36</a>).</p>
+
+<h2 id="surge">13. Surge pricing and demand signals</h2>
+
+<p>Surge pricing nudges supply and demand toward balance in an area: when requests outnumber available drivers, the multiplier rises, which reduces marginal demand and attracts drivers. The system part is a streaming aggregation (<a href="../chapters/37-batch-stream.html">Chapter 37</a>):</p>
+<ol>
+<li>Events: trip requests (with pickup cell) and driver availability counts come from the log.</li>
+<li>A windowed job counts, per cell at about H3 resolution 8 (roughly 0.7 km<sup>2</sup>), the requests in the last 1 to 5 minutes and the number of available drivers now. Neighbouring cells are smoothed together, so prices do not jump from 1.0 to 2.5 across a street.</li>
+<li>The multiplier is a function of the demand-to-supply ratio, clamped (say 1.0 to 5.0), rate-limited so it changes gradually, and recomputed every 30 to 60 seconds.</li>
+<li>The result is written into an in-memory map (cell to multiplier) replicated to the API servers.</li>
+<li>When the rider gets a fare estimate, the server reads the multiplier for the pickup cell and returns a <code>quote_id</code> that <b>locks</b> the price for a short time. The trip stores the quote, so a surge change mid-request does not change what the rider agreed to.</li>
+</ol>
+<p>Surge is a good example of derived data: it can be a little stale, computed per cell independently, and recomputed if lost. It does not need the strong consistency that assignment needs. Fairness and regulation add caps in some cities and a duty to show the multiplier before booking.</p>
+
+<h2 id="realtime">14. Realtime delivery to rider and driver</h2>
+
+<p>Polling is wasteful, so we use persistent connections (<a href="../chapters/06-realtime.html">Chapter 6</a>). WebSocket is the usual choice for bidirectional low-latency traffic: driver locations flow up, offers and trip updates flow down. Server-sent events would work for the rider but not for the driver upstream stream; push notifications (APNs and FCM) cover the case when the app is in the background or the socket is down.</p>
+
+<h3>14.1 How a message finds the right connection</h3>
+<p>The gateway servers are many; the trip service needs to push a message to "rider R". A <b>presence/routing table</b> in Redis maps <code>user_id</code> to <code>gateway_id</code> (written when the socket opens, with a TTL refreshed by pings). The trip service publishes to the gateway named in the table via a pub/sub channel or direct RPC. If no entry exists (user offline), it falls back to a mobile push notification. This is the same pattern as in the chat case study (<a href="c07-chat.html">Case study 7</a>).</p>
+
+<h3>14.2 Live position of the driver for the rider</h3>
+<p>During a trip the rider needs to see the car move. Each driver update on an active trip is also fanned to the rider's gateway: the location service looks up the driver's <code>trip_id</code> (from the driver hash) and sends a message to the rider's connection every 2 to 4 seconds. The app interpolates between points for smooth animation, and the server sends a heading and speed to help. Because this stream is per active trip only (about 20 million per day, at peak maybe 400,000 trips in progress), it is a modest add-on to the 250,000 per second of uplink.</p>
+
+<h3>14.3 Reconnect and ordering</h3>
+<p>Mobile connections drop constantly. On reconnect the client sends its last seen trip <code>version</code>, and the server replies with the current trip document (idempotent state sync) instead of replaying every message. Position messages are "latest wins": the server never needs to deliver an old point, so if the socket is slow it can drop intermediate positions. State-change messages are important, so they are acknowledged and re-sent, and they also exist in the trip record so reconnect always recovers them. A push notification is sent for key transitions (driver arrived) as a backup.</p>
+
+<h2 id="scaling">15. Scaling, sharding and hot cells</h2>
+
+<h3>15.1 Sharding the live index</h3>
+<p>The index is sharded for write throughput: 250,000 writes per second at peak, each a pipeline of a few commands, which is about 5 to 8 Redis shards worth of work if each handles 50,000 pipelined updates per second comfortably; run 16 or more for headroom and for skew. What is the shard key? Three choices:</p>
+<table>
+<tr><th>Shard key</th><th>Effect on updates</th><th>Effect on a nearby query</th><th>Verdict</th></tr>
+<tr><td>Hash of driver id</td><td>Perfectly even; one shard per driver</td><td>Every query must ask <b>all</b> shards (scatter-gather), cost grows with shard count</td><td>Poor for reads</td></tr>
+<tr><td>Hash of the fine cell id (1 km)</td><td>Even by cell; neighbouring cells scatter</td><td>9 cells on up to 9 different shards</td><td>Acceptable, but many round trips</td></tr>
+<tr><td>Coarse parent cell (about 15 km), mapped to shards by a lookup table</td><td>Uneven across cells (city centre is busy)</td><td>A query almost always hits one shard, at most 2 or 3 at borders</td><td>Best locality; needs hot-cell handling</td></tr>
+</table>
+<p>I choose the coarse parent cell with a <b>directory</b> (consistent hashing or an explicit assignment table from coarse cell to shard, <a href="../chapters/25-sharding.html">Chapter 25</a>) so that we can rebalance specific cells. Queries at a border read two or three shards in parallel, which is cheap.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Hot cell splitting across shards">
+  <text class="t-b" x="20" y="24">Before: one city-centre cell is hot</text>
+  <rect class="cache" x="30" y="40" width="190" height="64" rx="8"/><text class="t-c t-b" x="125" y="66">Shard 1</text><text class="t-c t-sm" x="125" y="86">suburbs A (cool)</text>
+  <rect class="miss" x="250" y="40" width="190" height="64" rx="8"/><text class="t-c t-b" x="345" y="66">Shard 2</text><text class="t-c t-sm" x="345" y="86">downtown (hot, 70% CPU)</text>
+  <rect class="cache" x="470" y="40" width="190" height="64" rx="8"/><text class="t-c t-b" x="565" y="66">Shard 3</text><text class="t-c t-sm" x="565" y="86">suburbs B (cool)</text>
+  <text class="t-b" x="20" y="150">After: the hot parent cell is split into child cells, children spread over shards</text>
+  <rect class="cache" x="30" y="166" width="190" height="64" rx="8"/><text class="t-c t-b" x="125" y="192">Shard 1</text><text class="t-c t-sm" x="125" y="212">suburbs A + downtown child 1</text>
+  <rect class="hit" x="250" y="166" width="190" height="64" rx="8"/><text class="t-c t-b" x="345" y="192">Shard 2</text><text class="t-c t-sm" x="345" y="212">downtown children 2, 3</text>
+  <rect class="cache" x="470" y="166" width="190" height="64" rx="8"/><text class="t-c t-b" x="565" y="192">Shard 3</text><text class="t-c t-sm" x="565" y="212">suburbs B + downtown child 4</text>
+  <rect class="ext" x="690" y="166" width="190" height="64" rx="8"/><text class="t-c t-b" x="785" y="192">Read replicas</text><text class="t-c t-sm" x="785" y="212">for map reads (stale ok)</text>
+  <text class="t-sm" x="30" y="268">Dispatch reads a hot area by asking each child cell shard in parallel and merging;</text>
+  <text class="t-sm" x="30" y="288">the directory records which level each area uses. Maps read replicas, dispatch reads primaries.</text>
+  <text class="t-sm" x="30" y="316">Typical downtown count: about 10,000 drivers online in a 15 km parent cell at peak.</text>
+</svg>
+<figcaption>A hot parent cell is split into finer children that are placed on different shards. The directory tells every reader which resolution applies to which area, so the split is invisible to callers.</figcaption>
+</figure>
+
+<h3>15.2 Hot cells</h3>
+<p>City centres, airports, stadiums after an event and train stations concentrate both drivers and requests. A cell with 10,000 drivers produces 2,500 updates per second on its own keys, which is within one core's capacity, but the reads are the bigger problem: a stadium emptying creates thousands of near-simultaneous requests to the same 9 cells, each reading hundreds of drivers. Remedies, in order of use:</p>
+<ol>
+<li><b>Cap what a query reads.</b> A rider only needs the best 10 to 20. Keep a short per-cell list ordered by availability or read a sample, not all 500.</li>
+<li><b>Finer cells where dense.</b> Move from level 8 to level 9 inside hot areas (the directory records it). Each query reads more but smaller cells in parallel; load spreads over more keys and shards.</li>
+<li><b>Replicas for the map.</b> The "cars near me" map uses read replicas with a few seconds of lag (<a href="../chapters/24-replication.html">Chapter 24</a>) and a small cache keyed by cell. Dispatch reads primaries.</li>
+<li><b>Coalesce requests.</b> If 500 requests from a stadium arrive in one second, dispatch can batch them per cell and run a single read and a single assignment solve, which also improves the matching quality.</li>
+<li><b>Queue at the venue.</b> Airports use explicit queues of drivers in a staging area; that is a product rule that removes the problem.</li>
+</ol>
+
+<h3>15.3 Multi-region</h3>
+<p>A trip involves one rider and one driver in one city, so the data is naturally regional. Each city belongs to a <b>home region</b> that holds its live index, dispatch, trips database, and realtime gateways. Users connect to the nearest edge, which routes to the home region of the city they are in (by the coordinates of the request). The global pieces are thin: user accounts and profiles (replicated read-mostly), payment methods, and the analytics pipeline (location events are shipped to a central lake asynchronously).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Multi-region layout with regional cells and a global control plane">
+  <rect class="ext" x="20" y="20" width="860" height="52" rx="8"/><text class="t-c t-b" x="450" y="44">Global edge, DNS and accounts (read-mostly, replicated)</text><text class="t-c t-sm" x="450" y="62">routes each request to the home region of the city</text>
+  <rect class="box" x="30" y="110" width="250" height="150" rx="10"/><text class="t-c t-b" x="155" y="134">Region US-West (SF, LA, Seattle)</text>
+  <text class="t-sm" x="46" y="160">Live index shards, dispatch, gateways</text><text class="t-sm" x="46" y="180">Trips DB primary + 2 replicas (3 AZs)</text><text class="t-sm" x="46" y="200">Surge job, ETA, local Kafka</text><text class="t-sm" x="46" y="228">Failover partner: US-East</text>
+  <rect class="box" x="325" y="110" width="250" height="150" rx="10"/><text class="t-c t-b" x="450" y="134">Region EU-West (London, Paris)</text>
+  <text class="t-sm" x="341" y="160">Live index shards, dispatch, gateways</text><text class="t-sm" x="341" y="180">Trips DB primary + 2 replicas (3 AZs)</text><text class="t-sm" x="341" y="200">Surge job, ETA, local Kafka</text><text class="t-sm" x="341" y="228">Failover partner: EU-Central</text>
+  <rect class="box" x="620" y="110" width="250" height="150" rx="10"/><text class="t-c t-b" x="745" y="134">Region AP-South (Mumbai, Delhi)</text>
+  <text class="t-sm" x="636" y="160">Live index shards, dispatch, gateways</text><text class="t-sm" x="636" y="180">Trips DB primary + 2 replicas (3 AZs)</text><text class="t-sm" x="636" y="200">Surge job, ETA, local Kafka</text><text class="t-sm" x="636" y="228">Failover partner: AP-Southeast</text>
+  <path class="arrow dash" d="M155 72 L155 106"/><path class="arrow dash" d="M450 72 L450 106"/><path class="arrow dash" d="M745 72 L745 106"/>
+  <rect class="db" x="30" y="280" width="840" height="38" rx="8"/><text class="t-c t-sm" x="450" y="304">Central data lake: async replication of location history and trip events from every region</text>
+  <path class="arrow dash" d="M155 260 L155 278"/><path class="arrow dash" d="M450 260 L450 278"/><path class="arrow dash" d="M745 260 L745 278"/>
+</svg>
+<figcaption>Each city is served by one home region that holds all state needed for dispatch. Regions fail over to a paired region using replicated trip state; the live index is simply rebuilt from fresh driver updates in seconds.</figcaption>
+</figure>
+
+<p>Key choices (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>, <a href="../chapters/42-multitenancy-cells.html">Chapter 42</a> for cell-based isolation): trips for a city are written in only one region at a time, so there are no conflicting writes and no need for multi-master conflict resolution. Trip rows replicate asynchronously (or synchronously within a region's availability zones) to the failover partner. The live index is <b>not</b> replicated across regions at all, because the next updates 4 seconds later rebuild it, and replicating 250,000 writes per second across oceans would be wasteful. A city on the border of two regions (rare) is assigned to exactly one. Cross-city trips are tied to the pickup city's region.</p>
+
+<h2 id="poi">16. Variant: static nearby search (Yelp-style)</h2>
+
+<p>Now the interviewer says: "Forget cars. Design 'find restaurants near me'." Same geometry, very different workload, and showing that you adapt the design is the point of this section.</p>
+
+<h3>16.1 Requirements and numbers</h3>
+<ul>
+<li>Data: 200 million places worldwide, each about 1 KB of metadata (name, address, category, rating, hours, location): 200 GB. Photos and reviews live elsewhere (object storage, a reviews DB).</li>
+<li>Changes: new or edited places are rare, perhaps 100,000 per day (about 1 per second). <b>Writes are negligible.</b></li>
+<li>Reads: 100 million searches per day, 1,200 per second on average, 5,000 at peak. The ratio is the reverse of the driver case: read-heavy, almost no writes.</li>
+<li>Query: "restaurants within 3 km, open now, rating at least 4, sorted by relevance or distance, 20 per page".</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Static point of interest nearby search architecture">
+  <rect class="ext" x="20" y="110" width="110" height="50" rx="8"/><text class="t-c t-b" x="75" y="140">Client</text>
+  <rect class="box" x="180" y="110" width="130" height="50" rx="8"/><text class="t-c t-b" x="245" y="132">Search API</text><text class="t-c t-sm" x="245" y="150">parse, cell cover</text>
+  <rect class="cache" x="360" y="30" width="150" height="50" rx="8"/><text class="t-c t-b" x="435" y="52">Result cache</text><text class="t-c t-sm" x="435" y="70">key: cell + filters</text>
+  <rect class="box" x="360" y="110" width="150" height="50" rx="8"/><text class="t-c t-b" x="435" y="132">Search index</text><text class="t-c t-sm" x="435" y="150">geo + text + filters</text>
+  <rect class="box" x="360" y="190" width="150" height="50" rx="8"/><text class="t-c t-b" x="435" y="212">Ranking</text><text class="t-c t-sm" x="435" y="230">distance, rating, ML</text>
+  <rect class="db" x="580" y="110" width="140" height="50" rx="8"/><text class="t-c t-b" x="650" y="132">Places DB</text><text class="t-c t-sm" x="650" y="150">source of truth</text>
+  <rect class="box" x="770" y="110" width="110" height="50" rx="8"/><text class="t-c t-b" x="825" y="132">CDC / indexer</text><text class="t-c t-sm" x="825" y="150">builds index</text>
+  <path class="arrow" d="M130 135 L176 135"/><path class="arrow" d="M310 135 L356 135"/><path class="arrow dash" d="M280 110 L360 62"/><path class="arrow" d="M435 160 L435 186"/>
+  <path class="arrow dash" d="M770 135 L724 135"/><path class="arrow dash" d="M580 135 L514 135"/>
+  <text class="t-sm" x="540" y="108">full rebuild + incremental updates</text>
+  <text class="t-sm" x="20" y="280">Index sharded by geography (cell prefix), replicated for read capacity.</text>
+</svg>
+<figcaption>A read-heavy design: the places database is the source of truth, a change-data-capture pipeline builds a search index, and a cache absorbs repeated queries for popular areas.</figcaption>
+</figure>
+
+<h3>16.2 Design</h3>
+<ul>
+<li><b>Index choice.</b> Since the data barely changes, a quadtree becomes attractive: it adapts to density (Manhattan splits deeply, Nevada stays one leaf) and can be built once and held in memory. Rebuilding is cheap and happens offline. Alternatively store each place with its cell id (S2 or geohash prefix) in a search engine or relational table with an index on <code>(cell_id)</code>, and combine the cell lookup with filters; this is simpler operationally and is how most production systems do it, with Elasticsearch-style geo support (<a href="../chapters/22-search-engines.html">Chapter 22</a>, <a href="../chapters/58-geospatial-text.html">Chapter 58</a>). I would pick the search engine for its ability to combine geo, text ("pizza"), category and "open now" filters in one query, and add a quadtree only for a custom in-memory service.</li>
+<li><b>Sharding.</b> Shard by geography (cell prefix), so a query reads one or two shards, and replicate shards for read capacity. A dense city shard can be split by finer prefix, the same hot-cell idea, but done offline on a schedule, not live. With 200 GB the full index fits on a handful of machines; shards exist for query throughput, not size.</li>
+<li><b>Caching.</b> Because places do not move and many users search the same downtown, results cache well: key = (cell id, category, filter hash, sort), TTL of minutes. Snap the rider's location to a cell centre before building the key, accepting that results are "near this cell" (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>). Hit rates in busy areas are high.</li>
+<li><b>Expanding the radius.</b> Start with a ring of cells; if fewer than 20 results after filtering, widen. Sparse areas (rural) may require a larger radius, so it is useful to store a density hint per cell.</li>
+<li><b>Ranking.</b> Mix distance, rating, number of reviews, popularity and personalisation. Exact distance is computed only for the candidates that survive the filters.</li>
+<li><b>Freshness.</b> A place edit lands in the database, a change-data-capture stream updates the index within seconds to minutes, and "open now" is evaluated at query time from stored hours and the place's timezone.</li>
+</ul>
+
+<h3>16.3 Compare the two workloads</h3>
+<table>
+<tr><th>Aspect</th><th>Moving drivers (Uber)</th><th>Static places (Yelp)</th></tr>
+<tr><td>Write rate</td><td>250,000 per second</td><td>about 1 per second</td></tr>
+<tr><td>Read rate</td><td>40,000 per second</td><td>5,000 per second</td></tr>
+<tr><td>Data size</td><td>200 MB, in memory</td><td>200 GB, on disk and page cache</td></tr>
+<tr><td>Staleness allowed</td><td>seconds</td><td>minutes</td></tr>
+<tr><td>Best index</td><td>Fixed-grid cell keys (H3/S2/geohash)</td><td>Search engine with geo filter, or quadtree</td></tr>
+<tr><td>Caching</td><td>Little (data changes constantly)</td><td>Heavy, by cell and filters</td></tr>
+<tr><td>Hot spot handling</td><td>Live split, replicas</td><td>Offline split, cache</td></tr>
+<tr><td>Consistency need</td><td>Strict for assignment, loose for positions</td><td>Eventual everywhere</td></tr>
+</table>
+
+<h2 id="failures">17. Failure modes and mitigations</h2>
+
+<table>
+<tr><th>Component</th><th>Fails, slows or lies</th><th>Effect</th><th>Mitigation</th></tr>
+<tr><td>Redis shard (live index)</td><td>Primary crashes</td><td>Drivers in that area missing from searches</td><td>Replica promoted in seconds; even without it, drivers' next updates (4 s) repopulate a fresh shard. Dispatch widens search; rider sees fewer cars for a moment. Data is disposable by design.</td></tr>
+<tr><td>Location service</td><td>Overloaded</td><td>Updates dropped or delayed, positions stale</td><td>Autoscale; shed load by dropping older updates (latest wins); drivers lower update rate when told by server (backpressure hint in the ack).</td></tr>
+<tr><td>Stale index</td><td>Shows a driver who is already busy</td><td>Offer to unavailable driver</td><td>The claim at the assignment row rejects it; dispatch moves on to the next candidate. Never trust the index for correctness.</td></tr>
+<tr><td>Dispatch worker</td><td>Crashes mid-offer</td><td>Driver stuck OFFERED; rider waits</td><td>Offer rows carry <code>expires_at</code>; a sweeper or delayed job expires them and re-enqueues the trip. Dispatch is stateless and restartable from the trip row.</td></tr>
+<tr><td>Trips DB</td><td>Primary fails</td><td>No new claims, state changes blocked</td><td>Automatic failover to a synchronous replica within the region (<a href="../chapters/24-replication.html">Chapter 24</a>); clients retry with idempotency keys. Requests during the 10 to 30 second window queue or fail fast with a retry message.</td></tr>
+<tr><td>Gateway</td><td>Node dies</td><td>Thousands of sockets drop</td><td>Clients reconnect with jittered backoff to another gateway and resync trip version; presence table TTL clears the dead entries.</td></tr>
+<tr><td>Realtime push</td><td>Message lost</td><td>Phone does not show accept</td><td>Versioned state; reconnect sync; mobile push as backup; driver app polls the trip once on foreground.</td></tr>
+<tr><td>ETA service</td><td>Slow or down</td><td>Cannot rank by road time</td><td>Circuit breaker (<a href="../chapters/40-resilience.html">Chapter 40</a>), fallback to straight-line distance times a city factor; accept somewhat worse matches.</td></tr>
+<tr><td>Surge job</td><td>Behind or wrong</td><td>Bad prices</td><td>Last known value with maximum age; clamp; alert if age above 5 minutes; falls back to 1.0 with a cap.</td></tr>
+<tr><td>GPS data</td><td>Wrong (tunnel, spoofing, urban canyon)</td><td>Driver appears at wrong place</td><td>Reject fixes with poor accuracy, impossible speed (teleport), or out-of-order sequence; smooth with map-matching to snap to the road.</td></tr>
+<tr><td>Region</td><td>Whole region lost</td><td>City down</td><td>Fail over to the paired region using replicated trip state; drivers reconnect; index rebuilds within seconds; in-flight trips resume by version.</td></tr>
+<tr><td>Event log</td><td>Lag or loss</td><td>History gaps, surge delayed</td><td>Acceptable for history; surge falls back as above; the serving path does not depend on the log.</td></tr>
+</table>
+
+<div class="callout watch"><b>Watch out</b> The most common wrong design is to use the location index as the lock ("remove the driver from the cell set when they get an offer"). Between the read and the removal another dispatch can read the same driver, and a crash after removal leaves a driver invisible forever. Use the index to find, and the assignment row to decide.</div>
+
+<h2 id="ops">18. Security, abuse, monitoring and cost</h2>
+
+<h3>18.1 Security and privacy</h3>
+<ul>
+<li>Authenticate every socket and request (<a href="../chapters/55-security.html">Chapter 55</a>); take the driver id from the token, never from the message. Rate-limit per user (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>) so a rooted phone cannot flood updates.</li>
+<li>Do not expose exact driver ids or exact positions of idle drivers on the public map. Show jittered or snapped positions and masked ids. Reveal the driver's identity and exact position only to the rider with an active trip.</li>
+<li>Location is sensitive personal data: encrypt in transit and at rest, limit retention (for example trip points kept long, idle points kept days), restrict internal access and audit it (<a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>).</li>
+<li>Abuse: GPS spoofing to fake surge or claim phantom availability, fake requests to reduce competitors' supply, and drivers going online far from the area to farm surge. Detect with speed and plausibility checks, device attestation, and model-based fraud scoring on the history stream.</li>
+</ul>
+
+<h3>18.2 Monitoring and SLOs</h3>
+<p>Follow <a href="../chapters/54-observability-slos.html">Chapter 54</a>. Useful service level indicators for this system:</p>
+<ul>
+<li>Update-to-visible lag: time from the driver's timestamp to the record being readable. Target p99 under 2 seconds.</li>
+<li>Nearby query latency p99 under 100 ms; dispatch first-offer latency p99 under 1 s.</li>
+<li>Match rate: fraction of requests that reach <code>ACCEPTED</code> within 2 minutes, per city. This is the business-level SLO.</li>
+<li>Correctness counters that must be zero: double assignments, trips with two drivers, drivers with two active trips. Alert immediately on any non-zero value, and run a reconciliation job that scans for violations.</li>
+<li>Offer acceptance rate, timeout rate and number of reassignments per trip (rising numbers point to bad ranking or a stale index).</li>
+<li>Gateway connection count and reconnect rate; Redis shard CPU and per-cell skew.</li>
+</ul>
+
+<h3>18.3 Cost</h3>
+<p>The live index is small (hundreds of megabytes), so its cost is CPU and network, not memory: maybe 16 to 32 modest Redis nodes in total. The gateways dominate fleet size (1.5 million sockets), and cross-AZ and cross-region data transfer is a visible bill, which is another reason not to replicate the live index across regions. Location history storage is the largest by bytes (about 30 to 50 TB per year compressed at the rates above), handled with tiered storage and downsampling after a retention window. Mapping and routing APIs (if bought) are charged per call, so batching ETA calls and caching per cell matters.</p>
+
+<h2 id="evolution">19. Evolution, phasing and alternatives not chosen</h2>
+
+<h3>19.1 What I would build first</h3>
+<ol>
+<li><b>Phase 1 (one city):</b> one Redis, one trips database, sequential offers, WebSocket gateway, straight-line ranking, polling fallback. Prove the state machine and the conditional-write claim.</li>
+<li><b>Phase 2:</b> real ETA ranking, surge map, event log and history store, replicas for the map, push notifications.</li>
+<li><b>Phase 3:</b> sharded index with a directory, hot-cell splitting, multiple regions with failover.</li>
+<li><b>Phase 4:</b> batched global matching, pooled rides, predictive positioning of drivers, machine-learned ETA.</li>
+</ol>
+
+<h3>19.2 At 10 times the scale</h3>
+<ul>
+<li>2.5 million updates per second. Send fewer: adaptive update rates (fast when moving near requests, slow when parked), and client-side dead reckoning that sends a fix only when the position deviates from the predicted path by a threshold. This can cut volume by half or more.</li>
+<li>Split Redis by region of the world, more shards, and move the cell index from Redis hashes to a purpose-built in-process store (per-shard memory arrays, custom replication) if per-operation overhead matters.</li>
+<li>Move from per-request greedy matching to batched optimisation with a regional solver.</li>
+<li>Edge gateways closer to drivers so the TLS and keep-alive cost is local.</li>
+</ul>
+
+<h3>19.3 Alternatives not chosen</h3>
+<ul>
+<li><b>PostGIS or a relational geo index for live positions:</b> excellent for static data and rich queries, but 250,000 updates per second would crush it; fine for the POI variant.</li>
+<li><b>A quadtree for live drivers:</b> adapts to density but suffers under constant movement and is harder to shard and replicate.</li>
+<li><b>Polling instead of WebSocket:</b> simpler infrastructure; costs battery, latency and requests. Acceptable only for a first prototype.</li>
+<li><b>Peer-to-peer or driver-side search:</b> pushing nearby requests to drivers to self-select (broadcast) is simpler but loses control over ranking and fairness.</li>
+<li><b>Distributed lock for assignment:</b> workable with fencing tokens but adds a component the conditional write already makes unnecessary.</li>
+</ul>
+
+<h2 id="qa">20. Interview Q&amp;A</h2>
+
+<details><summary>Why not store driver locations in a relational database with a lat/lon index?</summary>
+<p>A B-tree index sorts on one dimension, so "within 2 km" degenerates into a scan of a band of latitudes, which is a large share of the table. Spatial indexes (R-tree in PostGIS) do work, but the real problem here is write rate: 250,000 updates per second that each rewrite an index entry and are obsolete four seconds later. Disk-based transactions and durability are paid for with no benefit. An in-memory store keyed by cell id turns each update into a few constant-time operations and each query into a handful of key reads. A relational spatial index is fine for the static place variant, where writes are rare.</p></details>
+
+<details><summary>How do you choose the cell size?</summary>
+<p>Cell size balances two costs. Smaller cells hold fewer irrelevant drivers per read and give a tighter search, but a query covers more cells, and more driver updates cross cell boundaries, each causing two writes instead of one. A good rule is to choose a cell about as wide as the typical search radius divided by 2 or 3, so that the home cell plus its ring covers the radius. For a 2 km radius that is cells about 1 km wide (H3 resolution 8, geohash length 6 or 7). Dense areas can use a finer level through the directory, and sparse areas a coarser one. The decision is also checkable with numbers: 1 million drivers over 1,500 active cities' cells gives tens of drivers per cell on average, which is comfortable to read in one call.</p></details>
+
+<details><summary>Two riders request at the same instant and the same driver is nearest to both. What happens?</summary>
+<p>Both dispatch flows read the index and both rank the driver first. Both try to offer; the first conditional update that sets the driver from AVAILABLE to OFFERED for its trip succeeds, and the other affects zero rows. The loser's dispatch sees the failure and moves to its second candidate, with no human involved. If instead both offers were somehow sent (broadcast mode), the accept step is the second guard: only one accept changes the driver to BUSY and the trip to ACCEPTED, and the other driver or rider gets a "no longer available" result. The database row, not the cached index, decides, so the answer is the same under retries, crashes and clock skew.</p></details>
+
+<details><summary>How do you detect that a driver went offline without telling you?</summary>
+<p>Every driver record has a time-to-live of about 15 seconds that each update refreshes, and each cell entry carries the last update timestamp. If the phone dies, the app is killed or the car enters a tunnel, updates stop and the record expires by itself. Queries also ignore entries older than about 10 seconds, so a driver disappears from searches before the physical expiry. For drivers who are on a trip, a missing heartbeat for more than a threshold (say 60 seconds) triggers an alert to the rider and a support workflow, but not an automatic cancel, because tunnels are normal. The TTL approach avoids a cleanup job and fails safe: stale means invisible.</p></details>
+
+<details><summary>Why use ETA instead of distance for ranking, and how do you keep it cheap?</summary>
+<p>Straight-line distance ignores rivers, one-way streets, closed roads, traffic and turn restrictions, so the nearest driver by distance is often not the quickest. ETA is what the rider experiences and what drives cancellations. Computing a road route for every driver in range would be expensive, so I pre-filter by straight-line distance to about 10 candidates and call the routing service in one batch for just those. A road graph with precomputed shortcuts answers each query in about a millisecond, so the whole step costs a few milliseconds. If the routing service fails, a circuit breaker falls back to a distance-based estimate times a city-specific factor, which is slightly worse but available.</p></details>
+
+<details><summary>How would you avoid the thundering herd when a stadium empties?</summary>
+<p>Several layers help. The nearby map reads from replicas and a per-cell cache, so thousands of riders opening the app do not hit the primary. Dispatch coalesces requests per cell into batches and reads each hot cell once per batch rather than once per request. The hot parent cell is split into finer children over several shards so no single core serves all the reads, and each query caps the number of candidates it reads. At the product level, surge pricing and pickup zones spread demand over time and space. Finally admission control sheds or delays excess requests with a clear "high demand" message rather than letting dispatch collapse, which keeps latency for the accepted requests healthy.</p></details>
+
+<details><summary>What consistency do you need for the location data versus the trip data?</summary>
+<p>They are opposite ends of the spectrum. Location data is eventually consistent, last-write-wins by sequence number, and may be a few seconds stale or occasionally lost; losing one point costs nothing because the next arrives soon. Trip and assignment data need strong consistency per record: a conditional write on a single row, durable replication before acknowledging, and monotonic versions so clients can order messages. This is the CAP and PACELC tradeoff made per data type (<a href="../chapters/28-cap-consistency.html">Chapter 28</a>): availability and speed for positions, correctness for assignments. Mixing them, for example making location writes synchronously durable, would waste a lot of capacity, and the reverse would risk double assignment.</p></details>
+
+<details><summary>How does the system behave if a whole region goes down?</summary>
+<p>Users of that region's cities fail over to the paired region through DNS or the global edge. The trips database has a replica there, so open trips and assignment rows are available with a small possible loss of the most recent asynchronous writes, which is reconciled using trip versions and driver reports (a driver's app knows its own trip state and re-asserts it on reconnect). The live index needs no copy: within one or two update intervals every online driver has re-published its position into the new region's index. Gateways accept the reconnect storm using jittered backoff and admission control. In-progress trips continue because the apps hold state, and payment and history sync later from the event logs. The recovery objective is therefore minutes for dispatch and near zero for in-flight trips on the devices.</p></details>
+
+<details><summary>How would the design change for a Yelp-style place search?</summary>
+<p>The workload flips: writes almost vanish (about 1 per second) and the dataset is larger (200 GB) but static, so the index can be a search engine or a quadtree rebuilt offline, sharded by geography, replicated for reads, and fronted by a cache keyed by cell and filters. We drop the TTLs, the sequence checks and the hot-path memory store, and add text relevance, category filters, open-now logic and ranking by rating and popularity. Freshness requirements relax from seconds to minutes, so change-data-capture indexing is enough. The same ideas remain: convert the point to a cell, read the cell and its neighbours, filter by exact distance, expand rings when results are sparse.</p></details>
+
+<details><summary>How do you test and verify the "never two trips" rule in production?</summary>
+<p>Unit and integration tests cover concurrency by running many parallel claims against one driver row and asserting exactly one success; fault injection tests kill workers between offer and claim and pause them past expiry to check that fenced updates reject the stale worker. In production a continuous reconciliation job scans for drivers with more than one active trip or trips with more than one driver, and alerts on any non-zero count; the rate must be exactly zero. A small shadow percentage of traffic can also replay the state machine against the event log to find illegal transitions. Together these turn the invariant into an observable, alertable metric.</p></details>
+
+<h2 id="recap-section">21. Recap and connections</h2>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>Three data shapes drive three stores: a tiny, hot, overwrite-heavy live index in memory (200 MB, 250,000 writes per second), durable strongly consistent trips and assignments, and a huge cold location history in a log and columnar storage.</li>
+<li>Index space by converting each point to a cell id (geohash, S2 or H3), read the home cell plus neighbours, filter by exact distance, expand rings if sparse. Quadtrees suit static data; fixed grids suit moving data.</li>
+<li>Shard the live index by a coarse parent cell with a directory so queries touch one or two shards, split hot cells into finer children, serve the map from replicas and caches.</li>
+<li>Drivers disappear automatically through TTLs; the index is a hint, never the authority.</li>
+<li>Dispatch ranks by ETA, offers sequentially with timeouts that survive crashes, and reassigns on decline, timeout or cancel; batched matching is the scale-up step.</li>
+<li>One driver, one trip is enforced by a conditional write on a durable assignment row with versions or fencing, not by a lock or the cache; every call is idempotent.</li>
+<li>The trip is an explicit state machine with versioned, conditional transitions and outbox events; realtime delivery uses WebSockets with a presence table, version sync on reconnect and push as backup.</li>
+<li>Surge is derived stream data computed per cell and smoothed; quotes lock the price.</li>
+<li>A trip is local, so each city has a home region; the live index is not replicated across regions, only trip state is.</li>
+<li>The static POI variant is read-heavy: search engine or quadtree, geographic shards, cell-keyed caches, CDC indexing.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> uses estimation from <a href="../chapters/02-estimation.html">Chapter 2</a> and the framework of <a href="../chapters/01-interview-framework.html">Chapter 1</a>; geospatial theory in <a href="../chapters/58-geospatial-text.html">Chapter 58</a>; realtime transports in <a href="../chapters/06-realtime.html">Chapter 6</a>; Redis in <a href="../chapters/15-redis.html">Chapter 15</a>; sharding in <a href="../chapters/25-sharding.html">Chapter 25</a>; replication in <a href="../chapters/24-replication.html">Chapter 24</a>; consistency in <a href="../chapters/28-cap-consistency.html">Chapter 28</a>; locks and fencing in <a href="../chapters/30-coordination-locks.html">Chapter 30</a>; idempotency in <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>; log and stream processing in <a href="../chapters/34-queues-kafka.html">Chapter 34</a> and <a href="../chapters/37-batch-stream.html">Chapter 37</a>; multi-region in <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>; resilience in <a href="../chapters/40-resilience.html">Chapter 40</a>. Related case studies: <a href="c07-chat.html">Chat</a> (connection routing) and <a href="c15-ticket-booking.html">Ticket booking</a> (one seat, one buyer, the same claim problem).</p>
+
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

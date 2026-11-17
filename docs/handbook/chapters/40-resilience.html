@@ -1,0 +1,972 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 40: Resilience Patterns and Tail Latency | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="40-resilience">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+  </defs>
+</svg>
+
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+
+<main>
+<div class="kicker">Chapter 40 · Module 6 · Reliability</div>
+<h1>Resilience Patterns and Tail Latency</h1>
+<p class="lead">In a distributed system something is always slow, broken or overloaded. This chapter explains the toolbox that keeps one sick component from taking down everything else: timeouts, retries, circuit breakers, bulkheads, fallbacks, load shedding, hedging, and the testing habits that prove they work. It also explains why the slowest one percent of requests matters far more than it seems.</p>
+
+<!-- ======================= 1 ======================= -->
+<h2 id="mindset">1. Why resilience is its own discipline</h2>
+
+<p>A single program on a single machine mostly either works or crashes. A system made of many services talking over a network has a third, nastier state: <b>partially working</b>. A database that answers in 8 seconds instead of 8 milliseconds, a network link that drops 2 percent of packets, or one server in a pool that has quietly run out of memory are all examples. Nothing has crashed, so nothing triggers an obvious alarm, yet users are suffering and, worse, the other services that depend on the sick one start to suffer as well.</p>
+
+<p>Resilience is the set of design habits that make a system <b>keep giving useful answers while parts of it are slow or broken</b>, and recover by itself when those parts come back. It is different from high availability (Chapter <a href="41-ha-dr.html">41</a>), which is mostly about having redundant copies so a failed component can be replaced. Resilience is about what the <i>callers</i> do while a dependency is misbehaving: how long they wait, whether they try again, whether they stop calling, and what they show the user instead.</p>
+
+<p>The guiding observation, used throughout this chapter, is that <b>the most dangerous failure is not a dead dependency but a slow one</b>. A dead dependency refuses connections instantly, and the caller can react in microseconds. A slow dependency holds on to the caller's threads, connections and memory for seconds. Because the caller is now stuck, its own callers get slow, and the slowness travels up the call chain like a traffic jam traveling backwards along a motorway.</p>
+
+<div class="callout key"><b>Key idea</b>
+Every resilience pattern in this chapter does one of three things: it <b>limits how long</b> you wait (timeouts, deadlines), it <b>limits how much</b> you send or accept (retry budgets, bulkheads, load shedding, backpressure), or it <b>gives you something else to do</b> (fallbacks, degradation, hedging). Good designs use all three, layered.
+</div>
+
+<p>This page assumes you know what a load balancer does (Chapter <a href="09-load-balancing.html">9</a>), how caches fail (Chapter <a href="14-caching-failures.html">14</a>), and how rate limiters work (Chapter <a href="16-rate-limiting.html">16</a>). It covers the single-service toolbox and the mathematics of tail latency. Chapter <a href="51-microservice-resilience.html">51</a> shows how these patterns are applied across a whole microservice estate.</p>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="taxonomy">2. A taxonomy of failures</h2>
+
+<p>You cannot choose the right defence until you know what you are defending against. Failures differ in how <b>visible</b> they are and how <b>long</b> they last, and each combination wants a different response.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Failure taxonomy: crash, omission, slow, byzantine, overload, partial">
+  <text class="t-b" x="20" y="22">What can go wrong with a dependency you call</text>
+
+  <rect class="miss" x="20"  y="40" width="270" height="100" rx="10"/>
+  <text class="t-b" x="34" y="64">Crash (fail-stop)</text>
+  <text class="t-sm" x="34" y="84">Process dies, connection refused fast.</text>
+  <text class="t-sm" x="34" y="102">Easy: error returns in microseconds.</text>
+  <text class="t-sm" x="34" y="120">Defence: retry on another replica.</text>
+
+  <rect class="cache" x="315" y="40" width="270" height="100" rx="10"/>
+  <text class="t-b" x="329" y="64">Omission (silence)</text>
+  <text class="t-sm" x="329" y="84">Packet lost, host frozen, no reply.</text>
+  <text class="t-sm" x="329" y="102">Indistinguishable from slow. Hard.</text>
+  <text class="t-sm" x="329" y="120">Defence: timeouts, then retry.</text>
+
+  <rect class="cache" x="610" y="40" width="270" height="100" rx="10"/>
+  <text class="t-b" x="624" y="64">Slow (performance failure)</text>
+  <text class="t-sm" x="624" y="84">Answers, but 100x later than usual.</text>
+  <text class="t-sm" x="624" y="102">Most dangerous: holds resources.</text>
+  <text class="t-sm" x="624" y="120">Defence: timeouts, breaker, bulkhead.</text>
+
+  <rect class="miss" x="20"  y="160" width="270" height="100" rx="10"/>
+  <text class="t-b" x="34" y="184">Overload</text>
+  <text class="t-sm" x="34" y="204">Demand exceeds capacity; queues grow.</text>
+  <text class="t-sm" x="34" y="222">Latency climbs, then errors follow.</text>
+  <text class="t-sm" x="34" y="240">Defence: shedding, backpressure.</text>
+
+  <rect class="miss" x="315" y="160" width="270" height="100" rx="10"/>
+  <text class="t-b" x="329" y="184">Partial / gray failure</text>
+  <text class="t-sm" x="329" y="204">One AZ, one shard, one tenant, one</text>
+  <text class="t-sm" x="329" y="222">endpoint is bad; health check is green.</text>
+  <text class="t-sm" x="329" y="240">Defence: per-endpoint breakers, bulkheads.</text>
+
+  <rect class="ext" x="610" y="160" width="270" height="100" rx="10"/>
+  <text class="t-b" x="624" y="184">Wrong answer (Byzantine)</text>
+  <text class="t-sm" x="624" y="204">Corrupt or stale data, buggy deploy.</text>
+  <text class="t-sm" x="624" y="222">Looks like success to the caller.</text>
+  <text class="t-sm" x="624" y="240">Defence: validation, canaries, checksums.</text>
+
+  <rect class="hit" x="20" y="280" width="860" height="60" rx="10"/>
+  <text class="t-b" x="34" y="304">Rule of thumb</text>
+  <text class="t-sm" x="34" y="324">A caller cannot tell "dead", "slow" and "lost message" apart. It only knows "no answer within my timeout", so every pattern below is built on that one signal.</text>
+</svg>
+<figcaption>Six failure shapes. The top row (crash, omission, slow) look identical from the caller's seat: no useful reply arrives in time. Overload and gray failures are the ones that quietly cause outages while dashboards stay green.</figcaption>
+</figure>
+
+<h3>2.1 Transient, intermittent and persistent</h3>
+<p>Failures also differ in duration. A <b>transient</b> failure disappears on its own within moments: a single dropped packet, a leader election lasting two seconds, a connection reset by a load balancer. Retrying quickly works well. An <b>intermittent</b> failure comes and goes, such as a single bad node in a pool that fails one request in ten. Retrying on a different node works well. A <b>persistent</b> failure lasts until a human or an automatic recovery fixes it, such as a bad deploy or a full disk. Retrying a persistent failure only adds load to something that is already struggling, which is why retries must be paired with circuit breakers.</p>
+
+<h3>2.2 The fallacies behind these failures</h3>
+<p>Almost every real incident traces back to a hidden assumption from the well-known "fallacies of distributed computing": the network is reliable, latency is zero, bandwidth is infinite, topology does not change. Resilience engineering is the practice of deleting those assumptions from your code, one call site at a time. Each remote call should have an explicit answer to four questions: how long will I wait, what if it fails, what if it fails again, and what if it is so slow that many callers are waiting at once?</p>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="timeouts">3. Timeouts: the foundation</h2>
+
+<p>A <b>timeout</b> is the maximum time a caller is willing to wait for something. Without one, a caller waits as long as the operating system allows, which for a TCP read can be many minutes or forever. Every other pattern in this chapter assumes timeouts exist, because "no answer within the timeout" is the only failure signal a caller receives.</p>
+
+<h3>3.1 Connect timeout versus read timeout</h3>
+<p>A network call has distinct phases and each deserves its own limit.</p>
+<ul>
+  <li><b>Connect timeout:</b> how long to wait for the TCP (and TLS) handshake to complete. If the target host is alive and reachable in the same data center, this takes about one round trip, well under a millisecond to a few milliseconds. A connect timeout of 100 to 500 ms is typical inside a region. A connect that does not finish quickly almost always means the host or network path is unhealthy, so there is no benefit in waiting seconds. A short connect timeout lets the caller try another replica fast.</li>
+  <li><b>Read (response) timeout:</b> how long to wait for the response bytes after the request is sent. This must cover the server's real processing time. It should be set from measured latency, for example a little above the dependency's p99.9, not from a guess.</li>
+  <li><b>Write timeout and idle timeout:</b> limits on sending the request body and on how long a pooled connection may sit unused. Idle timeouts matter because a load balancer may silently drop idle connections after, say, 60 seconds; if your client believes the connection is still open it will write into a dead socket and discover this only through an error.</li>
+  <li><b>Total (overall) timeout:</b> a cap on the whole operation including retries, queueing for a connection from the pool, and DNS lookup. Many libraries only offer connect and read timeouts, and a slow trickle of bytes can reset the read timer forever, so the total timeout is the one that actually bounds user-visible latency.</li>
+</ul>
+
+<div class="callout watch"><b>Watch out</b>
+A read timeout that resets every time a byte arrives does not bound the call. A server that sends one byte per second can keep a client waiting indefinitely. Always add an overall deadline on top of the per-read limit.
+</div>
+
+<h3>3.2 Choosing a timeout value</h3>
+<p>Too short and you create false failures, which trigger retries, which add load. Too long and the caller's resources stay pinned while the dependency is sick. A practical method is to look at the dependency's measured latency distribution and set the timeout just beyond the point where a successful response is unlikely to still be coming. For example, if the dependency has p50 = 20 ms, p99 = 120 ms and p99.9 = 300 ms, a timeout of 400 to 500 ms means about one request in a thousand is cut off wrongly, and a hung call frees its resources in half a second. A timeout of 30 seconds, which is a frequent library default, would let a sick dependency pin 60 times more concurrent calls.</p>
+
+<p>The link between timeouts and capacity is Little's law, introduced in Chapter <a href="02-estimation.html">2</a>: the average number of requests in flight equals the arrival rate times the average time each spends in the system. We return to it in section 11, but note now that the timeout is the <i>maximum</i> time a hung call spends in your system, so it directly caps how many hung calls can accumulate.</p>
+
+<h3>3.3 Deadlines and propagation</h3>
+<p>Imagine a user request that passes through a gateway, a web service, an order service and a payment service. If each hop applies its own fresh 5-second timeout, the outermost caller may give up after 5 seconds while the deepest service keeps working for another 15 seconds on a result nobody will read. That wasted work is pure load on an already slow system.</p>
+
+<p>The fix is to carry a <b>deadline</b>, an absolute point in time by which the whole user request must finish, down the entire call chain. Each hop subtracts the time already used and passes the remainder to the next hop. gRPC has this built in (the deadline travels in request metadata and surfaces as a cancelled context). With plain HTTP you pass the remaining budget in a header, for example a custom <code>X-Request-Deadline</code> or <code>X-Timeout-Ms</code>, and each service reads it, caps its own outgoing timeouts to it, and refuses to start work that cannot finish in time.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Deadline propagation and timeout budget across four hops">
+  <text class="t-b" x="20" y="22">User request with a 1000 ms deadline. Time flows left to right.</text>
+
+  <line x1="120" y1="40" x2="120" y2="300" class="life"/>
+  <line x1="120" y1="40" x2="120" y2="40" class="life"/>
+  <text class="t-sm" x="116" y="316">0 ms</text>
+  <line x1="780" y1="40" x2="780" y2="300" class="life"/>
+  <text class="t-sm" x="740" y="316">1000 ms deadline</text>
+
+  <text class="t-b" x="20" y="68">Gateway</text>
+  <rect class="box" x="120" y="52" width="660" height="26" rx="6"/><text class="t-c t-sm" x="450" y="70">gateway holds 1000 ms budget</text>
+
+  <text class="t-b" x="20" y="118">Web service</text>
+  <rect class="box" x="140" y="102" width="600" height="26" rx="6"/><text class="t-c t-sm" x="440" y="120">remaining 950 ms after 50 ms of own work</text>
+
+  <text class="t-b" x="20" y="168">Order svc</text>
+  <rect class="box" x="200" y="152" width="480" height="26" rx="6"/><text class="t-c t-sm" x="440" y="170">remaining 750 ms; leave 100 ms slack to reply</text>
+
+  <text class="t-b" x="20" y="218">Payment svc</text>
+  <rect class="cache" x="260" y="202" width="330" height="26" rx="6"/><text class="t-c t-sm" x="425" y="220">passes 500 ms to payment provider</text>
+
+  <text class="t-b" x="20" y="268">Provider</text>
+  <rect class="miss" x="320" y="252" width="270" height="26" rx="6"/><text class="t-c t-sm" x="455" y="270">sick: would take 3000 ms</text>
+  <path class="arrow-r" d="M590 265 L640 265"/>
+  <text class="t-sm" x="644" y="269" style="fill:var(--bad)">cancelled at 590 ms</text>
+</svg>
+<figcaption>Each hop receives the remaining budget, shortens it for its own work and reply time, and passes the rest on. When the deadline expires, the deepest call is cancelled instead of continuing wastefully. Without propagation, the provider call would run its full 3000 ms long after the user gave up.</figcaption>
+</figure>
+
+<h3>3.4 The timeout budget rule</h3>
+<p>A useful rule: the timeout at each layer must be <b>shorter than the timeout of the layer above it</b>, with room for its retries. If the client waits 2 seconds, the service it calls should wait less than 2 seconds on any of its dependencies, or the client times out while the service is still retrying, and the retry is wasted. The budget can be written as an inequality. For a caller that makes up to <i>k</i> attempts each limited to <i>t</i> seconds with backoff <i>b</i> between them, the caller's own timeout <i>T</i> must satisfy roughly <i>T</i> &ge; <i>k</i>&middot;<i>t</i> + (<i>k</i> &minus; 1)&middot;<i>b</i>, and the timeout of its caller must be larger still. Writing this budget down on a whiteboard, hop by hop, is one of the most convincing things a candidate can do in an interview.</p>
+
+<div class="callout tip"><b>Interview tip</b>
+When you draw a call chain, annotate each arrow with a timeout and make the numbers shrink as you go deeper (for example 2 s, 1 s, 400 ms, 150 ms). Say out loud: "inner timeouts are smaller than outer ones so that outer layers can still retry or degrade before their own deadline."
+</div>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="retries">4. Retries</h2>
+
+<p>When a call fails, trying again is often the right thing. A transient failure such as a dropped packet will vanish on the second attempt, and a request routed to one bad replica will succeed on another. Retries turn many short-lived faults into non-events. But retries are also the single biggest cause of self-inflicted outages, because they multiply load exactly when a dependency is least able to handle it.</p>
+
+<h3>4.1 When is a retry safe?</h3>
+<p>Two conditions must hold. First, the failure should be <b>retryable</b>: a timeout, a connection reset, an HTTP 503 or 429 with a Retry-After header, or a gRPC UNAVAILABLE status. A 400 Bad Request or 404 will fail identically every time, so retrying it only wastes work. Second, the operation must be <b>safe to run twice</b>, which is the idempotency question.</p>
+
+<p>A timeout is especially tricky: the caller does not know whether the server never received the request, received it and is still working, or finished it and the reply was lost. If the operation is "charge this card" and you retry blindly after a timeout, you may charge the customer twice. Reads and naturally idempotent writes (set a value, delete by key) are safe. Non-idempotent writes need an <b>idempotency key</b>: the client generates a unique identifier once per logical operation and sends it with every attempt, and the server remembers the result for that key and returns it instead of repeating the work. Chapter <a href="32-idempotency-ids.html">32</a> covers the mechanism in detail.</p>
+
+<table>
+<tr><th>Situation</th><th>Retry?</th><th>Why</th></tr>
+<tr><td>Connection refused or connect timeout</td><td>Yes, on a different replica</td><td>Request never reached the server, so no duplicate risk.</td></tr>
+<tr><td>HTTP 503 / 429 with Retry-After</td><td>Yes, after the stated delay</td><td>Server explicitly said it is temporarily unable.</td></tr>
+<tr><td>Read timeout on a GET</td><td>Yes, within budget</td><td>Reads have no side effects.</td></tr>
+<tr><td>Read timeout on a POST with idempotency key</td><td>Yes</td><td>Server deduplicates by key.</td></tr>
+<tr><td>Read timeout on a POST without a key</td><td>No (or ask the user)</td><td>May already have executed; risk of double side effect.</td></tr>
+<tr><td>HTTP 400, 401, 403, 404, 422</td><td>No</td><td>Deterministic client error; same result every time.</td></tr>
+<tr><td>HTTP 500 from a bug</td><td>Rarely</td><td>Often deterministic; bounded retry at most, and watch the breaker.</td></tr>
+</table>
+
+<h3>4.2 Backoff: do not retry immediately</h3>
+<p>If a server is overloaded and 1000 clients all retry the instant they fail, the server receives another 1000 requests immediately. <b>Exponential backoff</b> spaces retries out: wait base, then 2&times;base, then 4&times;base, up to a cap. For example with a base of 100 ms and a cap of 10 s the waits are 100, 200, 400, 800, 1600 ms and so on. This gives the server breathing room, and it reduces the retry rate geometrically.</p>
+
+<p>Backoff alone has a flaw. If 1000 clients all failed at the same instant (because the server blipped), they all wait exactly 100 ms and retry together, then all wait 200 ms and retry together. The retries stay synchronised in sharp waves. The remedy is <b>jitter</b>, a random component in the wait.</p>
+
+<ul>
+  <li><b>Full jitter:</b> sleep = random(0, min(cap, base &times; 2<sup>attempt</sup>)). The wait is spread uniformly from zero up to the exponential bound. This is simple and works very well at breaking up synchronised waves, at the cost that an individual retry may happen almost immediately.</li>
+  <li><b>Equal jitter:</b> sleep = half the exponential bound plus random(0, half). Guarantees some minimum delay but spreads less.</li>
+  <li><b>Decorrelated jitter:</b> sleep = min(cap, random(base, previous_sleep &times; 3)). Each wait depends on the previous wait rather than the attempt number, which keeps clients decorrelated even if they start in lockstep. Widely recommended in published analyses of contention-heavy workloads.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 320" role="img" aria-label="Retry timing with and without jitter">
+  <text class="t-b" x="20" y="22">Four clients fail at t = 0. Each tick is a retry attempt.</text>
+
+  <text class="t-b" x="20" y="60">No backoff</text>
+  <line x1="150" y1="80" x2="880" y2="80" class="life"/>
+  <rect class="miss" x="150" y="62" width="10" height="36" rx="2"/><rect class="miss" x="170" y="62" width="10" height="36" rx="2"/><rect class="miss" x="190" y="62" width="10" height="36" rx="2"/><rect class="miss" x="210" y="62" width="10" height="36" rx="2"/><rect class="miss" x="230" y="62" width="10" height="36" rx="2"/>
+  <text class="t-sm" x="260" y="84">all clients hammer the server back to back</text>
+
+  <text class="t-b" x="20" y="140">Exponential, no jitter</text>
+  <line x1="150" y1="160" x2="880" y2="160" class="life"/>
+  <rect class="cache" x="190" y="142" width="14" height="36" rx="2"/>
+  <rect class="cache" x="270" y="142" width="14" height="36" rx="2"/>
+  <rect class="cache" x="430" y="142" width="14" height="36" rx="2"/>
+  <rect class="cache" x="750" y="142" width="14" height="36" rx="2"/>
+  <text class="t-sm" x="450" y="196">4 clients retry together at 100, 200, 400, 800 ms: spikes of 4 requests</text>
+
+  <text class="t-b" x="20" y="240">Full jitter</text>
+  <line x1="150" y1="260" x2="880" y2="260" class="life"/>
+  <rect class="hit" x="170" y="242" width="10" height="36" rx="2"/><rect class="hit" x="215" y="242" width="10" height="36" rx="2"/><rect class="hit" x="260" y="242" width="10" height="36" rx="2"/><rect class="hit" x="300" y="242" width="10" height="36" rx="2"/>
+  <rect class="hit" x="340" y="242" width="10" height="36" rx="2"/><rect class="hit" x="395" y="242" width="10" height="36" rx="2"/><rect class="hit" x="470" y="242" width="10" height="36" rx="2"/><rect class="hit" x="560" y="242" width="10" height="36" rx="2"/>
+  <rect class="hit" x="620" y="242" width="10" height="36" rx="2"/><rect class="hit" x="700" y="242" width="10" height="36" rx="2"/><rect class="hit" x="790" y="242" width="10" height="36" rx="2"/>
+  <text class="t-sm" x="450" y="300">same average delay, attempts spread out: the server sees a smooth trickle</text>
+</svg>
+<figcaption>Without jitter, retries form synchronised waves that act like a repeated mini-attack on a recovering server. Jitter turns the waves into a smooth, lower peak load. Marker positions are illustrative.</figcaption>
+</figure>
+
+<h3>4.3 Retry budgets and limits</h3>
+<p>A fixed "retry 3 times" rule is dangerous at scale. Suppose a dependency starts failing every call. With three retries each client now sends four times its normal traffic to a service that is already failing. A <b>retry budget</b> limits retries as a proportion of normal traffic instead: for example, "retries may add at most 10 percent on top of first attempts, measured over the last minute." When the dependency is healthy, almost no retries are needed and the budget is barely used. When it is failing broadly, the budget runs out quickly, and the client stops adding load. Envoy and gRPC implement this idea (a token bucket of retry tokens that refills as successes arrive and drains on retries), as does the Finagle library.</p>
+
+<p>Other sensible limits: a maximum attempt count (usually 2 or 3 in total), a maximum total elapsed time tied to the deadline, and retry only at one layer of the stack (see next section).</p>
+
+<h3>4.4 Retry amplification across layers</h3>
+<p>The most expensive mistake is retrying at every layer. Consider a chain of four services, A calls B, B calls C, C calls D, and D calls the database. Each layer is configured, reasonably, to make up to 3 attempts. If the database fails every request, how many database queries does one user request cause?</p>
+
+<p>The multiplication is 3 &times; 3 &times; 3 &times; 3 = <b>81</b> database attempts for one user action. If the system takes 1000 user requests per second, a database that was healthy at 1000 queries per second suddenly has to absorb 81,000 per second precisely when it is failing. Even a partial failure, say 50 percent of calls failing, produces large amplification. The database cannot recover because the retry traffic keeps it saturated.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Retry amplification: 3 attempts at each of 4 layers gives 81 database calls">
+  <rect class="ext" x="20"  y="110" width="110" height="60" rx="10"/><text class="t-c t-b" x="75" y="136">User</text><text class="t-c t-sm" x="75" y="154">1 request</text>
+  <rect class="box" x="170" y="110" width="110" height="60" rx="10"/><text class="t-c t-b" x="225" y="136">Service A</text><text class="t-c t-sm" x="225" y="154">3 attempts</text>
+  <rect class="box" x="320" y="110" width="110" height="60" rx="10"/><text class="t-c t-b" x="375" y="136">Service B</text><text class="t-c t-sm" x="375" y="154">3 attempts</text>
+  <rect class="box" x="470" y="110" width="110" height="60" rx="10"/><text class="t-c t-b" x="525" y="136">Service C</text><text class="t-c t-sm" x="525" y="154">3 attempts</text>
+  <rect class="box" x="620" y="110" width="110" height="60" rx="10"/><text class="t-c t-b" x="675" y="136">Service D</text><text class="t-c t-sm" x="675" y="154">3 attempts</text>
+  <rect class="miss" x="770" y="110" width="110" height="60" rx="10"/><text class="t-c t-b" x="825" y="136">Database</text><text class="t-c t-sm" x="825" y="154">failing</text>
+  <path class="arrow" d="M130 140 L168 140"/><path class="arrow" d="M280 140 L318 140"/><path class="arrow" d="M430 140 L468 140"/><path class="arrow" d="M580 140 L618 140"/><path class="arrow-r" d="M730 140 L768 140"/>
+
+  <text class="t-c t-b" x="225" y="210">x1</text>
+  <text class="t-c t-b" x="375" y="210">x3</text>
+  <text class="t-c t-b" x="525" y="210">x9</text>
+  <text class="t-c t-b" x="675" y="210">x27</text>
+  <text class="t-c t-b" x="825" y="210" style="fill:var(--bad)">x81</text>
+  <text class="t-c t-sm" x="450" y="250">Calls reaching each layer when everything below is failing. 3 x 3 x 3 x 3 = 81 queries for one user click.</text>
+  <text class="t-c t-sm" x="450" y="272">Fix: retry at one layer only (usually the edge), and give every other layer a zero-retry or budgeted policy.</text>
+</svg>
+<figcaption>Multiplication, not addition. Each layer sees the product of all attempts above it. Layer-by-layer retries are acceptable only if the retry budget at each layer is a few percent of traffic rather than a fixed count.</figcaption>
+</figure>
+
+<h3>4.5 Retry storms</h3>
+<p>A <b>retry storm</b> is the feedback loop that results when retries push a dependency from "slow" to "down". The sequence is: a dependency slows slightly, some calls time out, clients retry, the extra load slows the dependency further, more calls time out, more retries follow, and the load grows until the dependency collapses. Removing the original trigger does not end the storm, because the retries alone now keep the system saturated. This is a <i>metastable failure</i>, described in section 14. The defences are exactly the ones already described: jittered backoff, retry budgets, single-layer retries, circuit breakers that stop calls entirely, and load shedding on the server.</p>
+
+<div class="callout watch"><b>Watch out</b>
+Client-side retries inside a mobile app or a browser are invisible to your server-side budgets. A million phones that each retry three times after a brief outage deliver a large synchronised spike. Include jitter and a server-supplied <code>Retry-After</code> value in client libraries too.
+</div>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="breaker">5. Circuit breakers</h2>
+
+<p>An electrical circuit breaker cuts power when current is dangerously high, so the house does not burn down, and you reset it after fixing the fault. A software <b>circuit breaker</b> does the same for calls to a dependency. It watches recent results, and when too many fail it <b>stops sending requests</b> for a while and fails immediately instead. This protects two parties: the caller (which does not waste threads waiting for doomed calls) and the dependency (which gets quiet time to recover instead of being pounded by retries).</p>
+
+<h3>5.1 The three states</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Circuit breaker state diagram: closed, open, half-open">
+  <rect class="hit" x="60"  y="110" width="200" height="100" rx="14"/>
+  <text class="t-c t-b" x="160" y="146">CLOSED</text>
+  <text class="t-c t-sm" x="160" y="168">calls flow normally</text>
+  <text class="t-c t-sm" x="160" y="186">failures are counted</text>
+
+  <rect class="miss" x="640" y="110" width="200" height="100" rx="14"/>
+  <text class="t-c t-b" x="740" y="146">OPEN</text>
+  <text class="t-c t-sm" x="740" y="168">calls rejected at once</text>
+  <text class="t-c t-sm" x="740" y="186">fallback is used</text>
+
+  <rect class="cache" x="350" y="250" width="200" height="80" rx="14"/>
+  <text class="t-c t-b" x="450" y="284">HALF-OPEN</text>
+  <text class="t-c t-sm" x="450" y="306">a few trial calls allowed</text>
+
+  <path class="arrow-r" d="M260 140 L636 140"/>
+  <text class="t-c t-sm" x="450" y="128">failure rate over threshold (e.g. 50% of 20+ calls)</text>
+  <text class="t-c t-sm" x="450" y="158">or slow-call rate over threshold</text>
+
+  <path class="arrow dash" d="M740 210 L740 240 L554 285"/>
+  <text class="t-sm" x="640" y="240">wait time elapses (e.g. 30 s)</text>
+
+  <path class="arrow-g" d="M346 285 L160 285 L160 214"/>
+  <text class="t-sm" x="180" y="270">trials succeed: close</text>
+
+  <path class="arrow-r" d="M460 246 L690 214"/>
+  <text class="t-sm" x="560" y="210" style="fill:var(--bad)">any trial fails: reopen</text>
+
+  <text class="t-sm" x="60" y="40">Start here: CLOSED. A rolling window of recent calls decides when to trip.</text>
+  <text class="t-sm" x="60" y="60">The OPEN state is what protects the dependency: it receives zero traffic.</text>
+</svg>
+<figcaption>Closed lets traffic through while counting failures. Crossing the threshold trips the breaker to open, where calls fail fast. After a cool-down it moves to half-open and lets a small number of probe calls through. Success closes it; failure reopens it for another cool-down.</figcaption>
+</figure>
+
+<ul>
+  <li><b>Closed</b> is normal operation. The breaker keeps a rolling record of recent outcomes, either the last N calls (count-based window) or the last T seconds (time-based window).</li>
+  <li><b>Open</b> means the failure rate crossed a threshold. Every call is rejected immediately with an exception or fallback value, in microseconds, without touching the network. This lasts for a configured wait duration.</li>
+  <li><b>Half-open</b> is the trial period. The breaker allows a limited number of calls (for example 5). If they succeed, the dependency is assumed healthy and the breaker closes. If any fail beyond a tolerance, it opens again for another wait duration.</li>
+</ul>
+
+<h3>5.2 Thresholds and what counts as failure</h3>
+<p>The settings that matter, using Resilience4j names as an example:</p>
+<ul>
+  <li><b>Failure rate threshold</b> (for example 50 percent): trip if at least this share of calls in the window failed.</li>
+  <li><b>Minimum number of calls</b> (for example 20): do not trip on small samples. One failure out of two calls is a 50 percent failure rate but means nothing statistically.</li>
+  <li><b>Slow call threshold and slow call rate</b>: treat calls longer than, say, 2 seconds as failures for breaker purposes. This is how a breaker catches the dangerous "slow" failure, not only the explicit errors.</li>
+  <li><b>Wait duration in open state</b> (for example 30 seconds), often with an increasing schedule.</li>
+  <li><b>Permitted calls in half-open</b> (for example 5) and the failure tolerance among them.</li>
+  <li><b>Which exceptions count</b>: timeouts, connection errors and 5xx responses count; a 404 or a validation error is the caller's fault and must not trip the breaker.</li>
+</ul>
+
+<h3>5.3 Scope: per endpoint, per host</h3>
+<p>One breaker for an entire downstream service is too coarse. If only the <code>/export</code> endpoint is slow, tripping the breaker for the whole service also blocks healthy <code>/lookup</code> calls. Using one breaker per endpoint (or per operation, or per tenant shard) limits the blast radius. Similarly, a client talking to ten replicas should ideally keep a breaker per replica or use outlier detection, so one bad host is ejected while nine remain in use. Envoy does this with <b>outlier detection</b>: hosts that return consecutive 5xx responses are temporarily ejected from the load-balancing pool (see Chapter <a href="09-load-balancing.html">9</a>), with a cap on the percentage ejected so that a global problem does not eject everything.</p>
+
+<div class="callout watch"><b>Watch out</b>
+Breakers that all reopen at the same instant produce a synchronised probe wave. Use jitter on wait durations, limit half-open trial calls, and when the breaker is distributed across many client instances remember each instance decides independently, so the dependency sees many small probes at once.
+</div>
+
+<h3>5.4 What to do when open</h3>
+<p>Failing fast is only half the value. The other half is what happens next: return a cached value, a default, a reduced response, or a clear error that the caller's caller can handle. Section 7 covers the fallback menu. A breaker without a fallback just converts slow errors into fast errors, which is still better, but a well-chosen fallback converts them into success.</p>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="bulkheads">6. Bulkheads: isolating resources</h2>
+
+<p>On a ship, <b>bulkheads</b> are watertight walls that divide the hull into compartments. A hole floods one compartment instead of sinking the ship. In software a bulkhead means <b>giving each dependency, endpoint or tenant its own limited pool of resources</b>, so exhaustion of one pool cannot starve the others.</p>
+
+<p>Without a bulkhead, a service that calls three dependencies shares one thread pool of, say, 200 threads. If dependency C becomes slow, requests to C each hold a thread for the full timeout. Within seconds all 200 threads are stuck waiting on C, and requests that only needed healthy dependencies A and B also cannot run. One slow dependency has taken out the entire service.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Bulkhead: shared pool versus per-dependency pools">
+  <text class="t-b" x="20" y="22">Shared pool (no bulkhead)</text>
+  <rect class="box" x="20" y="36" width="380" height="160" rx="10"/>
+  <text class="t-sm" x="34" y="56">Service with ONE pool of 200 threads</text>
+  <rect class="miss" x="34" y="70" width="352" height="30" rx="6"/><text class="t-c t-sm" x="210" y="90">190 threads stuck waiting on slow dependency C</text>
+  <rect class="hit"  x="34" y="108" width="352" height="30" rx="6"/><text class="t-c t-sm" x="210" y="128">10 threads left for A, B and everything else</text>
+  <text class="t-sm" x="34" y="164">Requests for healthy A and B queue behind C.</text>
+  <text class="t-sm" x="34" y="182">Whole service looks down.</text>
+
+  <text class="t-b" x="470" y="22">Bulkheads (per-dependency pools)</text>
+  <rect class="box" x="470" y="36" width="410" height="160" rx="10"/>
+  <text class="t-sm" x="484" y="56">Service with separate limits</text>
+  <rect class="hit" x="484" y="70" width="120" height="50" rx="6"/><text class="t-c t-b" x="544" y="92">Pool A</text><text class="t-c t-sm" x="544" y="110">80 threads, ok</text>
+  <rect class="hit" x="614" y="70" width="120" height="50" rx="6"/><text class="t-c t-b" x="674" y="92">Pool B</text><text class="t-c t-sm" x="674" y="110">80 threads, ok</text>
+  <rect class="miss" x="744" y="70" width="122" height="50" rx="6"/><text class="t-c t-b" x="805" y="92">Pool C</text><text class="t-c t-sm" x="805" y="110">40, saturated</text>
+  <text class="t-sm" x="484" y="146">C rejects extra calls fast (pool full).</text>
+  <text class="t-sm" x="484" y="164">A and B keep serving at full speed.</text>
+  <text class="t-sm" x="484" y="182">Damage is confined to the C feature.</text>
+
+  <rect class="cache" x="20" y="220" width="860" height="90" rx="10"/>
+  <text class="t-b" x="34" y="244">Kinds of bulkhead</text>
+  <text class="t-sm" x="34" y="266">Thread-pool: separate executor per dependency (strong isolation, extra context switching).</text>
+  <text class="t-sm" x="34" y="284">Semaphore: a counter limiting concurrent calls, same thread (cheap, no queue, cannot interrupt a stuck call).</text>
+  <text class="t-sm" x="34" y="302">Connection pool, process, node pool or whole cell: bigger walls for per-tenant or per-region isolation.</text>
+</svg>
+<figcaption>Left: a single shared pool lets the slowest dependency monopolise all workers. Right: capped pools turn "everything is slow" into "one feature is degraded". The cap should be sized with Little's law (section 11) from the dependency's normal concurrency plus headroom.</figcaption>
+</figure>
+
+<h3>6.1 Flavours of bulkhead</h3>
+<ul>
+  <li><b>Thread-pool bulkhead:</b> each dependency gets its own thread pool and queue. A call is submitted to that pool; if the pool and queue are full the call is rejected immediately. It offers strong isolation and lets you abandon a stuck call by timing out the future, but it adds a thread hand-off, which costs a little latency and memory.</li>
+  <li><b>Semaphore bulkhead:</b> a counter of permitted concurrent calls (for example 50). Calls run on the caller's own thread and a call beyond the limit is rejected or waits briefly. It is cheaper and works well with asynchronous or non-blocking code, where there are no thread pools to separate in the first place. In event-loop runtimes you bound in-flight requests per dependency instead.</li>
+  <li><b>Connection-pool bulkheads:</b> separate HTTP or database connection pools per dependency or per workload. A reporting query that grabs every database connection should not be able to starve the checkout path. Many teams run analytic queries against a read replica or a separate pool for this reason.</li>
+  <li><b>Process, container and cell isolation:</b> run risky or noisy workloads in separate processes, pods or node groups. In a <b>cell-based architecture</b> the whole stack is replicated into independent cells, each serving a slice of customers, so an outage hits a small fraction (Chapter <a href="41-ha-dr.html">41</a> discusses cells and regions).</li>
+</ul>
+
+<h3>6.2 Per-tenant bulkheads</h3>
+<p>In multi-tenant systems the biggest threat to a well-behaved tenant is a noisy neighbour. A per-tenant concurrency limit or quota means one tenant that launches a huge job can consume at most its own share. Combine it with fair queuing so each tenant gets a turn, and with rate limits (Chapter <a href="16-rate-limiting.html">16</a>) at the entry point. For heavy tenants, <b>shuffle sharding</b> assigns each tenant to a small random subset of workers, so any two tenants share only a few workers and a poisonous tenant can only hurt the few that overlap with it.</p>
+
+<p>The cost of bulkheads is capacity efficiency. Separate pools mean idle threads in one pool cannot help a busy one. Accept this: you are paying a small utilisation tax for a large reduction in blast radius. Size each pool with Little's law and review them as traffic changes.</p>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="fallbacks">7. Fallbacks and graceful degradation</h2>
+
+<p>When a dependency is unavailable, the choice is not just "work or error". A product that <b>degrades gracefully</b> keeps its core promise and sheds the nice-to-haves. A recommendation panel that cannot load is replaced by popular items; the shopping cart still works. Designing this deliberately requires deciding in advance, per dependency, what the user experience is when it is gone.</p>
+
+<h3>7.1 The fallback menu</h3>
+<ul>
+  <li><b>Cached or stale data:</b> serve the last known good answer. A product page can show yesterday's price list or review count when the review service is down, labelling or silently accepting the staleness. Caches that are allowed to serve expired entries when the origin fails are called "stale-if-error" or "serve-stale" (Chapter <a href="14-caching-failures.html">14</a> discusses cache behaviour under failure).</li>
+  <li><b>Static default:</b> return a safe constant, such as an empty list of recommendations, a generic avatar, or a "feature flags off" default configuration.</li>
+  <li><b>Simplified computation:</b> use a cheaper approximation, for example non-personalised ranking when the personalisation model is unavailable.</li>
+  <li><b>Alternative source:</b> read from a replica, a different region, or a secondary provider (a backup payment gateway, a second email vendor).</li>
+  <li><b>Queue for later:</b> accept the request, store it durably and process it when the dependency returns (the order is "received", the confirmation email comes later). This pairs with queue-based load levelling in section 10.</li>
+  <li><b>Fail closed versus fail open:</b> decide, per dependency, which direction to fail. A fraud-scoring timeout might fail <i>open</i> (allow small payments) to preserve revenue, while an authorisation check must fail <i>closed</i> (deny). Make this a conscious, documented choice.</li>
+</ul>
+
+<h3>7.2 Feature shedding</h3>
+<p>Under heavy load or partial outage you can turn features off in priority order, often via feature flags that operators or automation flip. A typical order for a retail site might be: disable personalised recommendations, then recently-viewed lists, then live inventory counts (show "in stock" generically), and finally throttle search suggestions, while protecting search results, cart and checkout to the end. The important design step is to <b>classify features by criticality</b> ahead of time so that when a bad day comes the on-call engineer is executing a plan instead of inventing one.</p>
+
+<div class="callout watch"><b>Watch out</b>
+A fallback that has never run in production is a hidden outage waiting to happen. Fallback code paths are rarely exercised, often make assumptions that no longer hold, and sometimes call the very dependency that failed. Test them regularly with failure injection (section 17), and make sure a fallback does not itself add heavy load, such as a cache fallback that stampedes the database (see Chapter <a href="14-caching-failures.html">14</a>).
+</div>
+
+<div class="callout tip"><b>Interview tip</b>
+Whenever you design a read path with several dependencies, say what the page looks like if each one is down. "If recommendations fail we show trending items from a cache refreshed every five minutes; if the price service fails we show the cached price with a note and block checkout until it recovers." That one sentence demonstrates graceful degradation, criticality ranking and staleness thinking.
+</div>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="shedding">8. Load shedding and admission control</h2>
+
+<p>Every service has a maximum throughput. Past that point, accepting more work does not make more work finish; it makes <i>everything</i> slower, because requests queue, memory fills, garbage collection runs more often and context switching grows. If a server can complete 1000 requests per second and receives 1500, a naive server tries all 1500, each is slower, most time out on the client side, and the useful completion rate (<b>goodput</b>) can fall far below 1000. This collapse is called <b>congestion collapse</b> or the overload cliff.</p>
+
+<p><b>Load shedding</b> is the deliberate refusal of some requests so the rest can succeed. It is better to answer 1000 requests well and tell 500 "try later" than to answer 1500 requests badly. <b>Admission control</b> is the decision point that determines which requests get in. Rate limiting (Chapter <a href="16-rate-limiting.html">16</a>) enforces fixed per-client quotas; load shedding is the adaptive, server-protecting counterpart that reacts to actual current overload regardless of whose traffic it is.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 320" role="img" aria-label="Goodput versus offered load with and without shedding">
+  <line x1="80" y1="260" x2="860" y2="260" class="arrow"/>
+  <line x1="80" y1="260" x2="80" y2="40" class="arrow"/>
+  <text class="t-sm" x="560" y="290">offered load (requests per second) increasing to the right</text>
+  <text class="t-sm" x="12" y="36">goodput</text>
+
+  <path d="M80 260 L340 100 L430 100" stroke="var(--good)" stroke-width="3" fill="none"/>
+  <path d="M340 100 L600 100 L860 100" stroke="var(--good)" stroke-width="3" fill="none" stroke-dasharray="1 0"/>
+  <text class="t-sm" x="620" y="90" style="fill:var(--good)">with shedding: goodput stays at capacity</text>
+
+  <path d="M340 100 C420 110 500 190 600 240 L860 256" stroke="var(--bad)" stroke-width="3" fill="none"/>
+  <text class="t-sm" x="600" y="200" style="fill:var(--bad)">without shedding: collapse</text>
+
+  <line x1="340" y1="260" x2="340" y2="100" class="life"/>
+  <text class="t-c t-sm" x="340" y="278">capacity</text>
+  <text class="t-sm" x="110" y="150">below capacity every</text>
+  <text class="t-sm" x="110" y="168">request is served</text>
+</svg>
+<figcaption>Beyond capacity, an unprotected server's useful throughput falls because work is wasted on requests that time out anyway. A shedding server keeps goodput flat at its capacity and rejects only the surplus.</figcaption>
+</figure>
+
+<h3>8.1 How to decide what to shed</h3>
+<ul>
+  <li><b>Concurrency limit:</b> allow at most N requests in flight (N from Little's law, section 11). Beyond that, reject immediately with 503 or 429. Adaptive versions (Netflix's concurrency-limits library, Envoy's adaptive concurrency filter) raise and lower N automatically using observed latency, in the style of TCP congestion control.</li>
+  <li><b>Queue time or CoDel-style control:</b> measure how long requests sit in the queue; if the minimum queue delay stays above a target (for example 5 ms), start dropping. The controlled-delay idea keeps queues short without a fixed length.</li>
+  <li><b>Priority-based shedding:</b> classify requests (health checks and payments critical; batch exports and prefetches sheddable). Shed the lowest class first. Many gateways tag traffic with a priority header at the edge.</li>
+  <li><b>LIFO under overload:</b> when the queue is long, serve the newest request first. Old requests are likely abandoned by the client already, so serving them is wasted work. Serve fresh ones that can still succeed, and drop the oldest.</li>
+  <li><b>Deadline awareness:</b> drop any request whose propagated deadline has already passed, or cannot be met given current queue delay. Doing work for a dead request is the worst use of capacity.</li>
+  <li><b>Client-aware shedding:</b> reject early and cheaply, ideally before expensive parsing, authentication or database access. The cost of saying no must be tiny compared with the cost of saying yes.</li>
+</ul>
+
+<p>Tell the client what happened. A 429 (Too Many Requests) or 503 (Service Unavailable) with a <code>Retry-After</code> header lets well-behaved clients back off intelligently, and the client's retry budget can recognise shedding responses and not retry them aggressively. Shedding at the load balancer or gateway (Chapter <a href="09-load-balancing.html">9</a>) protects the application servers behind it.</p>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="backpressure">9. Backpressure</h2>
+
+<p><b>Backpressure</b> is the mechanism by which a slow consumer tells a fast producer to slow down, so that the buffer between them does not grow without limit. Water pipes work this way: a closed tap downstream raises pressure upstream. In software the alternatives to backpressure are unbounded queues (memory grows until the process dies) or silent dropping (data loss). Backpressure makes the limit visible and pushes the decision to the party that can best handle it.</p>
+
+<p>Forms you will meet:</p>
+<ul>
+  <li><b>TCP flow control:</b> the receiver advertises a window size; the sender cannot have more unacknowledged bytes in flight than that window. A slow reader shrinks the window to zero and the writer blocks.</li>
+  <li><b>Blocking bounded queues:</b> a producer calling <code>put</code> on a full bounded queue blocks until space appears. Simple and effective inside one process.</li>
+  <li><b>Reactive streams and pull-based consumption:</b> the consumer requests N items at a time (<code>request(n)</code> in Reactive Streams, <code>prefetch</code> counts in message consumers). The producer may send only what has been requested.</li>
+  <li><b>HTTP/2 and gRPC flow control:</b> per-stream and per-connection windows, plus limits on concurrent streams.</li>
+  <li><b>Explicit signals:</b> returning 429 or 503, or a "slow down" response code, so the client chooses to wait, drop or retry later.</li>
+  <li><b>Consumer lag as a signal:</b> with a log system such as Kafka, producers can be throttled based on consumer group lag (Chapter <a href="34-queues-kafka.html">34</a>).</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b>
+Every queue in a system must be <b>bounded</b>, and the behaviour at the bound must be a design decision: block the producer, reject the newest, drop the oldest, or spill to disk. An unbounded queue is not a resilience feature; it is a delayed out-of-memory crash and a source of enormous latency, because items wait behind everything already queued.
+</div>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="leveling">10. Queue-based load levelling</h2>
+
+<p>Many workloads are spiky: a flash sale, an end-of-month batch, a viral post. Sizing the processing tier for the peak wastes money the rest of the time, and sizing it for the average fails at the peak. <b>Queue-based load levelling</b> places a durable queue between the producers and the consumers. Producers write at whatever rate arrives; consumers pull at the rate they can sustain. The queue absorbs the difference.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="Queue-based load leveling smooths a spike">
+  <rect class="ext" x="20" y="60" width="130" height="60" rx="10"/><text class="t-c t-b" x="85" y="86">Producers</text><text class="t-c t-sm" x="85" y="104">spiky: 5000 rps</text>
+  <rect class="cache" x="260" y="60" width="200" height="60" rx="10"/><text class="t-c t-b" x="360" y="86">Durable queue</text><text class="t-c t-sm" x="360" y="104">bounded; depth is the buffer</text>
+  <rect class="box" x="570" y="60" width="150" height="60" rx="10"/><text class="t-c t-b" x="645" y="86">Consumers</text><text class="t-c t-sm" x="645" y="104">steady: 1000 rps</text>
+  <rect class="db" x="790" y="60" width="90" height="60" rx="10"/><text class="t-c t-b" x="835" y="95">Database</text>
+  <path class="arrow" d="M150 90 L256 90"/><path class="arrow" d="M460 90 L566 90"/><path class="arrow" d="M720 90 L786 90"/>
+
+  <text class="t-b" x="20" y="165">Worked numbers</text>
+  <text class="t-sm" x="20" y="187">Spike of 5000 rps for 60 s with consumers fixed at 1000 rps: backlog grows 4000 per second, reaching 240,000 messages.</text>
+  <text class="t-sm" x="20" y="205">After the spike (arrivals back to 400 rps) the net drain is 600 per second: 240,000 / 600 = 400 s to catch up.</text>
+  <text class="t-sm" x="20" y="223">Cost: those last messages wait about 240 s. Acceptable for email or analytics, not for a user clicking "pay".</text>
+  <text class="t-sm" x="20" y="251">Needs: a depth alarm, a dead-letter queue for poison messages, an upper bound on age, and producers that can tolerate async replies.</text>
+</svg>
+<figcaption>The queue converts a short burst into a longer, gentler flow for the downstream system. The price is latency during the burst, which is only acceptable for asynchronous work.</figcaption>
+</figure>
+
+<p>This pattern pairs with backpressure: if the queue depth reaches its limit, producers must be told (reject, slow, or degrade) rather than letting the queue grow forever. It also pairs with the idempotency work of Chapter <a href="32-idempotency-ids.html">32</a>, because queue consumers see duplicates when messages are redelivered. Details of queue internals are in Chapter <a href="34-queues-kafka.html">34</a>.</p>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="littles-law">11. Timeouts, queue lengths and Little's law</h2>
+
+<p>Little's law (Chapter <a href="02-estimation.html">2</a>) says that for any stable system, <b>L = &lambda; &times; W</b>: the average number of items in the system (L) equals their arrival rate (&lambda;) times the average time each spends inside (W). It is the best single tool for sizing thread pools, connection pools and queues, and for seeing why slowness destroys capacity.</p>
+
+<h3>11.1 A worked example: when latency rises, concurrency explodes</h3>
+<p>A service receives &lambda; = 400 requests per second and normally each one takes W = 50 ms to finish (calling a database). The average in-flight work is L = 400 &times; 0.05 = <b>20 concurrent requests</b>. A thread pool of 50 therefore has comfortable headroom.</p>
+
+<p>Now the database becomes slow and each call takes 2 seconds (hitting a 2 s timeout in some cases). The arrival rate has not changed, but L = 400 &times; 2 = <b>800 concurrent requests</b>. The pool of 50 is exhausted within a tenth of a second. The extra 750 requests either queue (adding more delay, which increases W further) or are rejected. Nothing was wrong with the traffic; the latency of one dependency multiplied the required concurrency by forty.</p>
+
+<table>
+<tr><th>Scenario</th><th>&lambda; (req/s)</th><th>W</th><th>L = &lambda;W (in flight)</th><th>Pool of 50?</th></tr>
+<tr><td>Healthy</td><td>400</td><td>50 ms</td><td>20</td><td>OK, 40% used</td></tr>
+<tr><td>Dependency at p99 slowness</td><td>400</td><td>250 ms</td><td>100</td><td>Saturated; queueing begins</td></tr>
+<tr><td>Dependency stalled to timeout 2 s</td><td>400</td><td>2 s</td><td>800</td><td>Hopelessly exhausted</td></tr>
+<tr><td>Same stall, timeout lowered to 300 ms</td><td>400</td><td>300 ms</td><td>120</td><td>Still saturated, but 6.7x less pinned than with 2 s</td></tr>
+<tr><td>Same, with semaphore bulkhead of 50 + fast reject</td><td>400</td><td>300 ms for admitted</td><td>capped at 50</td><td>Excess rejected quickly; rest of service healthy</td></tr>
+</table>
+
+<h3>11.2 Using it to size things</h3>
+<ul>
+  <li><b>Pool size</b> &ge; &lambda; &times; W<sub>normal</sub> &times; headroom (typically 2 to 3 for bursts and tail latency). With &lambda; = 400, W = 50 ms and headroom 3, a pool of 60 is reasonable.</li>
+  <li><b>Queue bound</b> in front of that pool: queue length should be small enough that the wait at the back is still within the caller's timeout. If the pool processes 400 requests per second, a queue of 200 adds up to 500 ms of waiting; if the caller times out at 300 ms, then deeper queued items are guaranteed wasted work. Set queue length &le; throughput &times; (timeout &minus; typical service time).</li>
+  <li><b>Timeout as a cap on pinned resources</b>: worst-case concurrent hung calls is roughly &lambda; &times; timeout, which tells you how large the damage can be and justifies a lower timeout.</li>
+  <li><b>Deriving the overload point</b>: if a service has N workers and a mean service time S, its maximum throughput is N / S. With 50 workers and S = 50 ms, that is 1000 requests per second; above that the queue grows without bound, which is the moment shedding must begin.</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b>
+Slowness converts directly into held resources. A dependency that is 40 times slower needs 40 times the concurrency to carry the same traffic, so a caller with a fixed pool always runs out first. Short timeouts, bounded queues and concurrency limits are what stop that arithmetic from taking the caller down.
+</div>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="tail">12. Tail latency and percentiles</h2>
+
+<p>Chapter <a href="02-estimation.html">2</a> introduced percentiles. Quick recap: the <b>p50</b> (median) is the latency that half of requests beat. The <b>p99</b> is the latency that 99 percent of requests beat, so 1 request in 100 is slower. The <b>p99.9</b> is slower than all but 1 in 1000. The slow end of the distribution is the <b>tail</b>.</p>
+
+<p>Averages hide the tail. A service with a mean of 40 ms may have a p50 of 20 ms and a p99 of 400 ms. Latency distributions are typically right-skewed (long tail to the slow side), roughly log-normal, caused by things such as garbage-collection pauses, cache misses, lock contention, background compaction, noisy neighbours, network retransmits (a TCP retransmit timeout can add 200 ms or more), and queueing. You cannot average percentiles across servers either: the p99 of a fleet is not the mean of each server's p99. Store histograms and merge them (HDR histogram, t-digest, or fixed Prometheus buckets) and compute percentiles after merging.</p>
+
+<h3>12.1 Why the tail matters more than it seems: fan-out</h3>
+<p>If a single request to a backend has a 1 percent chance of being slow (it is slower than the backend's p99), that sounds tolerable. But a modern user request rarely makes one call. A search page might fan out to 100 shards; a social feed to dozens of services; a checkout to a dozen. The user's request is only as fast as the <b>slowest</b> of its sub-requests.</p>
+
+<p>The maths is simple. Let each sub-call independently be "fast" (below its p99) with probability 0.99. The probability that <i>all</i> N sub-calls are fast is 0.99<sup>N</sup>, so the probability that at least one is slow is 1 &minus; 0.99<sup>N</sup>.</p>
+
+<table>
+<tr><th>Fan-out N</th><th>P(all N fast) = 0.99<sup>N</sup></th><th>P(request hits at least one slow call)</th></tr>
+<tr><td>1</td><td>99.0%</td><td>1.0%</td></tr>
+<tr><td>5</td><td>95.1%</td><td>4.9%</td></tr>
+<tr><td>10</td><td>90.4%</td><td>9.6%</td></tr>
+<tr><td>50</td><td>60.5%</td><td>39.5%</td></tr>
+<tr><td>100</td><td>36.6%</td><td>63.4%</td></tr>
+<tr><td>500</td><td>0.66%</td><td>99.3%</td></tr>
+<tr><td>1000</td><td>0.004%</td><td>99.996%</td></tr>
+</table>
+
+<p>With a fan-out of 100, <b>63 percent of user requests include at least one backend call that is slower than the backend's p99</b>. The backend's p99 has effectively become the front end's median. The same logic with p99.9 (0.999<sup>N</sup>): at N = 100, 9.5 percent of user requests hit a p99.9-slow call. This is the "tail at scale" effect described by Dean and Barroso in their well-known paper: at large fan-out, rare backend events become common user events. To keep a fan-out of 100 mostly fast, each backend must have a good p99.9 or better, or the system must use hedging and other tail-cutting tricks (section 13).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Fan-out tail amplification: probability of hitting a slow call versus fan-out">
+  <line x1="90" y1="270" x2="860" y2="270" class="arrow"/>
+  <line x1="90" y1="270" x2="90" y2="40" class="arrow"/>
+  <text class="t-sm" x="20" y="36">P(slow)</text>
+  <text class="t-sm" x="500" y="310">fan-out N (parallel sub-requests)</text>
+
+  <text class="t-sm" x="50" y="274">0%</text>
+  <text class="t-sm" x="38" y="160">50%</text>
+  <text class="t-sm" x="30" y="48">100%</text>
+  <line x1="90" y1="154" x2="860" y2="154" class="life"/>
+
+  <rect class="miss" x="130" y="258" width="50" height="12" rx="3"/><text class="t-c t-sm" x="155" y="288">1</text>
+  <rect class="miss" x="220" y="223" width="50" height="47" rx="3"/><text class="t-c t-sm" x="245" y="288">10</text>
+  <rect class="miss" x="310" y="170" width="50" height="100" rx="3"/><text class="t-c t-sm" x="335" y="288">50</text>
+  <rect class="miss" x="400" y="118" width="50" height="152" rx="3"/><text class="t-c t-sm" x="425" y="288">100</text>
+  <rect class="miss" x="490" y="56" width="50" height="214" rx="3"/><text class="t-c t-sm" x="515" y="288">500</text>
+  <rect class="miss" x="580" y="50" width="50" height="220" rx="3"/><text class="t-c t-sm" x="605" y="288">1000</text>
+
+  <text class="t-sm" x="640" y="100">Each sub-call is slow 1% of the time.</text>
+  <text class="t-sm" x="640" y="120">At N = 100 about 63% of user</text>
+  <text class="t-sm" x="640" y="140">requests include a slow sub-call.</text>
+  <text class="t-sm" x="640" y="168">Tail of the parts becomes the</text>
+  <text class="t-sm" x="640" y="188">median of the whole.</text>
+</svg>
+<figcaption>Bar height is 1 minus 0.99 to the power N. Even a small per-call tail probability saturates as the fan-out grows. This is why large scatter-gather systems obsess over p99.9 and use hedging.</figcaption>
+</figure>
+
+<h3>12.2 Sequential chains also add up</h3>
+<p>Series calls add rather than take a maximum. A chain of 5 services each with p99 = 100 ms does not have an overall p99 of 100 ms; the tail of the sum is typically near 300 to 500 ms when each stage's tail event is independent, and the probability of experiencing at least one tail event along the chain is 1 &minus; 0.99<sup>5</sup> &asymp; 4.9 percent. Deep call chains therefore damage tail latency, and setting latency objectives (SLOs) at p99 per hop is often not enough: set them for the end-to-end path and budget each hop (section 3.4).</p>
+
+<h3>12.3 Where the tail comes from, and general remedies</h3>
+<ul>
+  <li><b>Queueing delays:</b> utilisation near 100 percent makes waiting explode. Keep utilisation of any shared resource below roughly 70 to 80 percent so queues stay short. The relationship is nonlinear: in a simple single-server queue, mean waiting time grows like &rho;/(1&minus;&rho;), so at 90 percent utilisation it is nine service times, and at 99 percent it is ninety-nine.</li>
+  <li><b>Garbage collection and runtime pauses:</b> tune or choose low-pause collectors; stagger restarts; avoid sending requests to a node in a long pause (health checks, outlier ejection).</li>
+  <li><b>Background activity:</b> compactions, backups, cron jobs, log rotation. Throttle them or schedule them per replica so not every replica is busy at once.</li>
+  <li><b>Head-of-line blocking:</b> one slow request in a shared queue or connection delays those behind it. Use multiple queues, per-request deadlines, and HTTP/2 or HTTP/3 multiplexing.</li>
+  <li><b>Cold caches and cold JITs:</b> pre-warm new instances before adding them to the load balancer (see readiness in section 15).</li>
+  <li><b>Replica variance:</b> some instances are simply slower (noisy neighbour, bad disk). Load balancing that considers load (least outstanding requests, "power of two choices") routes around them (Chapter <a href="09-load-balancing.html">9</a>).</li>
+</ul>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="hedging">13. Hedged requests, backup requests and coalescing</h2>
+
+<h3>13.1 Hedged (backup) requests</h3>
+<p>If one replica might be slow, ask two. A <b>hedged request</b> sends the request to one replica, and if no reply arrives within a short delay, sends a second copy to a different replica. Whichever answers first wins, and the other is cancelled. The delay is chosen near the service's p95 or p99 latency so that only a small fraction of requests (roughly 1 to 5 percent) are hedged, adding a few percent of load but cutting the tail dramatically.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Hedged request timeline">
+  <text class="t-b" x="20" y="22">Timeline of one hedged request (time to the right)</text>
+  <text class="t-sm" x="20" y="64">Client</text>
+  <text class="t-sm" x="20" y="124">Replica 1</text>
+  <text class="t-sm" x="20" y="184">Replica 2</text>
+
+  <line x1="110" y1="60" x2="860" y2="60" class="life"/>
+  <line x1="110" y1="120" x2="860" y2="120" class="life"/>
+  <line x1="110" y1="180" x2="860" y2="180" class="life"/>
+
+  <path class="arrow" d="M130 62 L130 114"/><text class="t-sm" x="140" y="90">t=0 send #1</text>
+  <rect class="miss" x="130" y="108" width="500" height="24" rx="5"/><text class="t-c t-sm" x="380" y="125">replica 1 is stuck in a GC pause (takes 400 ms)</text>
+
+  <path class="arrow dash" d="M300 62 L300 174"/><text class="t-sm" x="310" y="150">t=95 ms (p95): no reply yet, send #2</text>
+  <rect class="hit" x="300" y="168" width="110" height="24" rx="5"/><text class="t-c t-sm" x="355" y="185">fast: 40 ms</text>
+
+  <path class="arrow-g" d="M410 174 L410 66"/><text class="t-sm" x="420" y="90" style="fill:var(--good)">reply at 135 ms: done</text>
+  <path class="arrow-r dash" d="M410 64 L410 112"/><text class="t-sm" x="560" y="90" style="fill:var(--bad)">cancel #1</text>
+
+  <text class="t-sm" x="20" y="240">Without hedging the user waits 400 ms. With it, 95 ms + 40 ms = 135 ms. About 5% of requests send a second copy: +5% load.</text>
+  <text class="t-sm" x="20" y="262">Only hedge idempotent reads (or deduplicated writes), cancel the loser, and cap hedges with a budget.</text>
+</svg>
+<figcaption>The second request is sent only after waiting roughly the p95 latency, so the extra load is small. The user sees the faster of the two replies. In Google's published measurements, hedging at the 95th percentile cut a high-percentile latency by a large factor for a few percent more requests.</figcaption>
+</figure>
+
+<p>Variants: <b>tied requests</b> send both immediately to two replicas that know about each other and cancel each other's queue entry as soon as one starts executing, which avoids the duplicated work but needs server cooperation. Hedging gRPC and Envoy both support configurable hedge policies. Use hedging with care: it is only safe for idempotent operations (Chapter <a href="32-idempotency-ids.html">32</a>), and during a widespread overload it makes things worse, since hedges add load. Therefore combine hedging with a budget, and disable it when the system is shedding.</p>
+
+<h3>13.2 Request coalescing (single flight)</h3>
+<p>If 1000 concurrent requests ask for the same expensive thing (the same cache key, the same report), do the work once and share the result. <b>Request coalescing</b>, also called <b>single flight</b> or collapsed forwarding, makes the first request do the work while later identical requests wait on its result. It is the central defence against the cache stampede in Chapter <a href="14-caching-failures.html">14</a> and is built into CDNs and proxies as "request collapsing". Go's <code>singleflight</code> package, Caffeine's loading cache and Varnish's request coalescing all implement it. Combine it with a timeout on the waiters and a short stale-serving window so that a slow leader does not hold everyone hostage.</p>
+
+<!-- ======================= 14 ======================= -->
+<h2 id="cascade">14. Cascading and metastable failures</h2>
+
+<p>A <b>cascading failure</b> is one in which the failure of one component raises the load or error rate on its peers, making them fail too, and so on, until a large portion of the system is down. The classic trigger is a node failure in a pool: the remaining nodes take on its traffic, a few of them tip over from the extra load, which puts yet more load on the survivors. A <b>metastable failure</b> is the nastiest cousin: the system enters a bad state that <b>persists even after the original trigger is removed</b>, because a feedback loop (usually retries or cache misses) sustains the overload by itself.</p>
+
+<h3>14.1 Walkthrough of a typical cascade</h3>
+<p>Consider a service tier of 10 servers, each able to handle 1000 requests per second, serving a steady 7000 rps (70 percent utilisation) from users, backed by a database fronted by a cache.</p>
+<ol>
+  <li><b>Trigger.</b> A small deploy briefly slows the cache layer. Cache lookups that took 1 ms now take 800 ms and time out at 500 ms.</li>
+  <li><b>Fallthrough.</b> Timed-out cache lookups are treated as misses. All 7000 rps now go to the database, which normally sees 700 rps (a 90 percent hit rate). The database is asked to carry ten times its usual load and its latency rises from 5 ms to 2 s.</li>
+  <li><b>Thread exhaustion.</b> By Little's law each app server now holds 700 requests &times; 2 s = 1400 in-flight calls but has only 200 threads. Requests queue and time out.</li>
+  <li><b>Retries.</b> Clients and upstream layers retry the timed-out requests: three attempts each. Offered load climbs from 7000 to 21,000 rps.</li>
+  <li><b>Health checks fail.</b> A server whose threads are all stuck cannot answer the load balancer's health check, so the balancer removes it. With 9 servers left, each now receives more load; they too fail their checks. The pool shrinks toward zero.</li>
+  <li><b>Restart herd.</b> Operators restart servers. Cold servers with empty caches and cold connection pools are added back all at once, and immediately overwhelmed by the retry backlog, so they fail again.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Metastable failure feedback loop">
+  <rect class="cache" x="30" y="30" width="200" height="56" rx="10"/><text class="t-c t-b" x="130" y="55">1. Trigger</text><text class="t-c t-sm" x="130" y="73">brief slowdown or cache loss</text>
+
+  <rect class="miss" x="350" y="30" width="200" height="56" rx="10"/><text class="t-c t-b" x="450" y="55">2. Latency rises</text><text class="t-c t-sm" x="450" y="73">calls time out</text>
+
+  <rect class="miss" x="670" y="30" width="200" height="56" rx="10"/><text class="t-c t-b" x="770" y="55">3. Retries and misses</text><text class="t-c t-sm" x="770" y="73">offered load multiplies</text>
+
+  <rect class="miss" x="670" y="160" width="200" height="56" rx="10"/><text class="t-c t-b" x="770" y="185">4. Queues and pools fill</text><text class="t-c t-sm" x="770" y="203">goodput collapses</text>
+
+  <rect class="miss" x="350" y="160" width="200" height="56" rx="10"/><text class="t-c t-b" x="450" y="185">5. Nodes marked unhealthy</text><text class="t-c t-sm" x="450" y="203">less capacity, same demand</text>
+
+  <path class="arrow" d="M230 58 L346 58"/>
+  <path class="arrow" d="M550 58 L666 58"/>
+  <path class="arrow-r" d="M770 86 L770 156"/>
+  <path class="arrow-r" d="M670 188 L554 188"/>
+  <path class="arrow-r" d="M450 160 L450 90"/>
+
+  <rect class="hit" x="30" y="260" width="840" height="84" rx="10"/>
+  <text class="t-b" x="44" y="284">Breaking the loop</text>
+  <text class="t-sm" x="44" y="306">The trigger can vanish at step 2 and the loop (2 to 5) still sustains itself. You must cut load, not just fix the cause:</text>
+  <text class="t-sm" x="44" y="324">shed load or stop retries at step 3, shrink the offered load below capacity, then ramp traffic back slowly (section 14.3).</text>
+</svg>
+<figcaption>A feedback loop between latency, retries and capacity keeps the system down after the initial trigger has gone. Bronson et al. call such systems metastable. The remedy is to reduce load below the recovery threshold, not merely to repair the original fault.</figcaption>
+</figure>
+
+<h3>14.2 Why metastability happens, and how to prevent it</h3>
+<p>Metastable states exist when a <b>sustaining effect</b> is stronger than the trigger. Common sustaining effects are retry amplification, a cache that is empty and therefore sends all load to the database (the database cannot refill the cache fast enough because it is overloaded), and GC thrash under memory pressure from long queues. Prevention strategies map directly onto earlier sections: retry budgets and jitter (4), circuit breakers (5), concurrency limits and shedding (8), bounded queues (9), short timeouts (3), and avoiding hard dependence on cold caches by warming and by request coalescing (13). A rule of thumb from capacity planning: keep enough headroom that the system survives losing its biggest failure domain (one AZ, one cache node group) without crossing the overload cliff, the N+1 or N+2 sizing described in Chapter <a href="41-ha-dr.html">41</a>.</p>
+
+<h3>14.3 Thundering herd on recovery</h3>
+<p>Recovery is dangerous too. When a dependency returns, every waiting client, queued job, paused consumer and tripped breaker tries to proceed at once, a <b>thundering herd</b>. A database with 20 minutes of backlog and 50,000 clients all reconnecting in the same second will fall over again. Defences:</p>
+<ul>
+  <li>Jittered retry delays and jittered breaker wait times so clients return gradually.</li>
+  <li><b>Slow start / ramp-up</b> in load balancers: a newly healthy instance receives a gradually increasing share of traffic over, say, 60 seconds (supported by Envoy, NGINX Plus and cloud load balancers).</li>
+  <li>Rate-limit queue consumers on restart, and drain backlog at a controlled speed instead of the maximum.</li>
+  <li>Pre-warm caches and connection pools before taking traffic, and use request coalescing for the first misses.</li>
+  <li>Stagger restarts and deploys (rolling in small batches) so not all instances are cold simultaneously.</li>
+  <li>Operationally, bring traffic back in steps (10, 25, 50, 100 percent), watching error rates at each stage.</li>
+</ul>
+
+<!-- ======================= 15 ======================= -->
+<h2 id="health">15. Health checks, readiness and graceful shutdown</h2>
+
+<h3>15.1 Liveness versus readiness</h3>
+<p>Orchestrators such as Kubernetes distinguish the questions "is this process alive?" and "is it ready for traffic?" and use different probes.</p>
+<ul>
+  <li><b>Liveness probe:</b> "Is the process stuck beyond repair?" If it fails repeatedly, the orchestrator <i>restarts</i> the container. It should check only the process's own internal health (the event loop responds, no deadlock), not dependencies. A liveness probe that checks the database will restart every pod during a database outage, turning a dependency failure into a total outage plus a restart herd.</li>
+  <li><b>Readiness probe:</b> "Can this instance serve requests right now?" If it fails, the instance is <i>removed from load balancing</i> but not restarted. It can include warm-up completion, loaded configuration and caches, and (carefully) dependency checks. Temporary overload can legitimately flip readiness to false so the instance can drain its queue.</li>
+  <li><b>Startup probe:</b> gives slow-starting applications time to boot before liveness checks begin, so they are not killed during initialisation.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Liveness vs readiness probes and what they trigger">
+  <rect class="box" x="20" y="100" width="190" height="90" rx="10"/>
+  <text class="t-c t-b" x="115" y="130">Pod / instance</text>
+  <text class="t-c t-sm" x="115" y="152">app + probes endpoints</text>
+  <text class="t-c t-sm" x="115" y="170">/livez  /readyz</text>
+
+  <rect class="cache" x="330" y="30" width="230" height="80" rx="10"/>
+  <text class="t-c t-b" x="445" y="58">Liveness probe</text>
+  <text class="t-c t-sm" x="445" y="78">internal only: not deadlocked</text>
+  <text class="t-c t-sm" x="445" y="96">no dependency checks</text>
+
+  <rect class="cache" x="330" y="180" width="230" height="80" rx="10"/>
+  <text class="t-c t-b" x="445" y="208">Readiness probe</text>
+  <text class="t-c t-sm" x="445" y="228">warmed up, config loaded,</text>
+  <text class="t-c t-sm" x="445" y="246">not overloaded</text>
+
+  <rect class="miss" x="680" y="30" width="200" height="80" rx="10"/>
+  <text class="t-c t-b" x="780" y="64">Orchestrator</text>
+  <text class="t-c t-sm" x="780" y="84">on failure: RESTART it</text>
+
+  <rect class="hit" x="680" y="180" width="200" height="80" rx="10"/>
+  <text class="t-c t-b" x="780" y="214">Load balancer</text>
+  <text class="t-c t-sm" x="780" y="234">on failure: STOP sending traffic</text>
+
+  <path class="arrow" d="M210 125 L326 75"/><path class="arrow" d="M210 165 L326 215"/>
+  <path class="arrow-r" d="M560 70 L676 70"/><path class="arrow" d="M560 220 L676 220"/>
+</svg>
+<figcaption>Liveness decides whether to kill and restart; readiness decides whether to route traffic. Mixing them (for example putting a database check in liveness) is a common cause of cascading outages.</figcaption>
+</figure>
+
+<h3>15.2 Deep versus shallow health checks</h3>
+<p>A <b>shallow</b> check returns 200 if the process is up. A <b>deep</b> check exercises dependencies (a trivial database query). Deep checks catch more problems but are dangerous at fleet scale: if the shared database blips, every instance fails its deep check and the load balancer removes the entire fleet, even though a degraded response would have been better than none. A good compromise: shallow checks in the load balancer, deep checks as a separate dashboard signal, and a per-instance decision to go unready only for instance-local problems. Many load balancers also support a <b>panic threshold</b>: if more than, say, 50 percent of hosts are unhealthy, ignore health status and send traffic to all of them, assuming the health checks are the problem. Details about balancer health checks are in Chapter <a href="09-load-balancing.html">9</a>.</p>
+
+<h3>15.3 Graceful shutdown and connection draining</h3>
+<p>Deploys, autoscaling and node maintenance all stop instances. If an instance is killed while handling requests, those requests fail, which shows up as a burst of errors at every deploy. A graceful shutdown sequence avoids this:</p>
+<ol>
+  <li>The instance receives a termination signal (SIGTERM in containers).</li>
+  <li>It immediately marks itself <b>not ready</b> so the load balancer or service registry stops sending new requests. Because deregistration takes time to propagate (seconds for endpoint lists and DNS), the instance should keep serving for a short grace period, often a 5 to 15 second sleep, before closing listeners.</li>
+  <li>It stops accepting new connections, tells HTTP/1.1 clients <code>Connection: close</code> or sends HTTP/2 GOAWAY, and lets <b>in-flight requests finish</b> (connection draining), up to a drain timeout.</li>
+  <li>It flushes buffers, finishes or hands back queue messages (negative acknowledge so they are redelivered), closes database connections and exits cleanly.</li>
+  <li>If the drain timeout expires, the orchestrator sends SIGKILL. The drain timeout must exceed your longest normal request, and the deregistration delay should not exceed the orchestrator's termination grace period (30 seconds by default in Kubernetes), so set both deliberately.</li>
+</ol>
+
+<div class="callout watch"><b>Watch out</b>
+Clients holding long-lived keep-alive connections to a draining instance can keep sending requests into it. Close idle connections, send GOAWAY, and set maximum connection age on servers and proxies (for example 5 minutes) so connections naturally rebalance, which also helps spread load after scale-out.
+</div>
+
+<!-- ======================= 16 ======================= -->
+<h2 id="libraries">16. Libraries and infrastructure that implement these patterns</h2>
+
+<p>You rarely hand-write these patterns. Know the common ones and what each option is called.</p>
+
+<table>
+<tr><th>Tool</th><th>Where it runs</th><th>Provides</th></tr>
+<tr><td><b>Resilience4j</b> (Java)</td><td>In the application, composable decorators</td><td>CircuitBreaker, Retry (with exponential backoff and jitter), RateLimiter, Bulkhead (semaphore and thread pool), TimeLimiter, Cache. Successor to Netflix Hystrix, which is in maintenance mode.</td></tr>
+<tr><td><b>Polly</b> (.NET)</td><td>In the application, via resilience pipelines (integrated with HttpClientFactory)</td><td>Retry, Circuit Breaker, Timeout, Bulkhead isolation, Hedging, Fallback, Rate limiter.</td></tr>
+<tr><td><b>Envoy</b> and service meshes (Istio, Linkerd, Consul)</td><td>Sidecar or edge proxy, language agnostic</td><td>Timeouts, retry policies with budgets and backoff, circuit breaking via connection and request limits, outlier detection, hedging, adaptive concurrency, local and global rate limiting, slow start.</td></tr>
+<tr><td><b>gRPC</b></td><td>Client library</td><td>Deadlines that propagate, retry policies, hedging policy, keepalive, flow control.</td></tr>
+<tr><td>Go: <code>sony/gobreaker</code>, <code>singleflight</code>; Python: <code>tenacity</code>, <code>pybreaker</code>; Node: <code>cockatiel</code>, <code>opossum</code></td><td>In the application</td><td>Equivalent breaker, retry and coalescing primitives.</td></tr>
+<tr><td>Cloud load balancers and gateways</td><td>Managed edge</td><td>Health checks, connection draining, slow start, WAF and rate limiting, request-level timeouts.</td></tr>
+</table>
+
+<h3>16.1 Library versus mesh</h3>
+<p>Putting policies in a proxy or mesh gives consistency across languages and lets operators change them without a redeploy, but the proxy sees only the network call, not application meaning. It cannot know a particular call is idempotent unless told, nor can it provide business-level fallbacks (show cached recommendations). Application libraries can do both but must be kept consistent across teams. Many organisations use both: the mesh for timeouts, retries and outlier detection, application code for fallbacks and degradation. Be careful that retries are not enabled in both places, which would reintroduce the multiplication of section 4.4.</p>
+
+<h3>16.2 A composition order that works</h3>
+<p>The order of decorators matters. A common, sensible nesting from outermost to innermost is: <b>Fallback</b> wraps <b>Bulkhead</b> wraps <b>Retry</b> wraps <b>Circuit breaker</b> wraps <b>Timeout</b> wraps the actual call. Reading from the inside: each attempt has a timeout; the breaker records the outcome of each attempt and rejects when open; the retry policy re-attempts (and treats a breaker rejection as non-retryable, so it does not spin); the bulkhead caps total concurrency; and the fallback produces a degraded response if everything else failed. Placing retry outside the breaker is deliberate: the breaker sees every attempt and can trip, while retry stops once the breaker is open. Resilience4j and Polly document equivalent orderings, and getting this order wrong is a common review comment.</p>
+
+<pre><code>// Pseudocode composition (outermost first)
+fallback(
+  bulkhead(maxConcurrent = 50,
+    retry(maxAttempts = 2, backoff = exponentialFullJitter(100ms, cap 2s),
+          retryOn = [timeout, 503], skipWhen = breakerOpen,
+      circuitBreaker(failureRate = 50%, minCalls = 20, slowCall = 800ms, wait = 30s,
+        timeout(perAttempt = 400ms, overall = deadline.remaining(),
+          httpCall()))))),
+  onError = cachedOrDefaultResponse)</code></pre>
+
+<!-- ======================= 17 ======================= -->
+<h2 id="testing">17. Chaos engineering, game days and resilience testing</h2>
+
+<p>A resilience mechanism that has never been exercised under real failure should be assumed broken. <b>Chaos engineering</b> is the discipline of running controlled experiments on a system to build confidence that it withstands turbulent conditions. It was popularised by Netflix (Chaos Monkey terminated random instances; the wider Simian Army injected latency and killed whole regions in tests).</p>
+
+<h3>17.1 The experiment loop</h3>
+<ol>
+  <li><b>Define steady state</b> as a measurable business or service metric, such as orders per minute or p99 latency, not "CPU is fine".</li>
+  <li><b>Form a hypothesis:</b> "If one of three cache nodes dies, steady state is unchanged and p99 rises less than 20 percent."</li>
+  <li><b>Limit the blast radius:</b> start in staging, then in production for a small slice (one cell, 1 percent of traffic) with a clear abort button and watching alarms.</li>
+  <li><b>Inject the failure</b> and observe.</li>
+  <li><b>Learn and fix:</b> if the hypothesis fails you found a weakness before customers did. Fix it, then repeat the experiment as a regression test.</li>
+</ol>
+
+<h3>17.2 Kinds of failure injection</h3>
+<ul>
+  <li><b>Resource:</b> kill processes, pods or instances; fill a disk; exhaust memory, CPU or file descriptors.</li>
+  <li><b>Network:</b> add latency (for example 500 ms to a dependency), packet loss, bandwidth limits, partition two services, break DNS. Tools: Linux <code>tc netem</code>, Toxiproxy, Envoy fault injection, service-mesh fault injection.</li>
+  <li><b>Application-level:</b> make a dependency return 500s or time out for a percentage of calls, corrupt responses, throw exceptions in chosen code paths (fault-injection filters in a gateway or mesh do this without code changes).</li>
+  <li><b>Dependency and platform:</b> take away a whole availability zone, a database failover, expire a certificate, stop a clock sync, throttle a cloud API. Managed services exist for this (AWS Fault Injection Service, Azure Chaos Studio, Gremlin, Chaos Mesh, LitmusChaos).</li>
+  <li><b>Human and process:</b> restore from backup, rotate secrets, run failover drills (these overlap with Chapter <a href="41-ha-dr.html">41</a>).</li>
+</ul>
+
+<h3>17.3 Game days</h3>
+<p>A <b>game day</b> is a scheduled, cross-team exercise where a realistic failure is simulated (or injected) while engineers respond using real runbooks and dashboards. It tests people and process as much as software: do the alerts fire, does the right person get paged, is the runbook accurate, can the team find the cause in the observability tools, does anyone know how to flip the feature flags that shed load. Typical output is a list of fixes to alerts, dashboards, runbooks and code. Run them regularly, record what was learned, and include on-call engineers who do not own the failing component.</p>
+
+<h3>17.4 Other resilience testing</h3>
+<ul>
+  <li><b>Load and stress tests</b> that push past capacity to find the overload cliff and verify that shedding keeps goodput flat (section 8). Include a <b>soak test</b> for slow leaks.</li>
+  <li><b>Retry and timeout tests</b> in CI using fault-injecting proxies: assert that a dependency returning 503 produces bounded extra load, not 81 times.</li>
+  <li><b>Recovery tests:</b> stop a dependency for ten minutes and restore it; verify there is no thundering herd (section 14.3).</li>
+  <li><b>Canary deploys and progressive rollout</b> to catch a faulty release (the Byzantine failure of section 2) while it affects 1 percent of traffic, with automatic rollback.</li>
+  <li><b>Static review:</b> search code for network calls with no timeout, unbounded queues and thread pools, retries at multiple layers, and health checks with dependency calls. This catches most production incidents before they start.</li>
+</ul>
+
+<div class="callout good"><b>Good practice</b>
+Pair each resilience pattern with the metric that proves it is working: breaker state and rejection counts, retry rate as a percentage of calls, queue depth and age, shed request count, hedge rate, bulkhead rejections, and p99 versus p50 gap. A pattern you cannot observe will eventually fail silently.
+</div>
+
+<!-- ======================= 18 ======================= -->
+<h2 id="widget">18. Try it: retry amplification and breaker simulator</h2>
+
+<p>This small simulator shows how retries and a circuit breaker change the load that reaches a failing dependency. Choose the number of layers, attempts per layer, and the base request rate. It computes the worst-case load multiplication (all calls failing) and the load when a fraction of calls fail, with and without a breaker that stops calls after the threshold.</p>
+
+<div class="widget">
+<h4>Retry amplification calculator</h4>
+<div class="row">
+<label>Layers that retry <input type="number" id="rs-layers" value="4" min="1" max="8"></label>
+<label>Attempts per layer <input type="number" id="rs-attempts" value="3" min="1" max="6"></label>
+<label>User requests per second <input type="number" id="rs-rps" value="1000" min="1" max="100000"></label>
+</div>
+<div class="row">
+<label>Failure probability at the dependency (%) <input type="number" id="rs-fail" value="50" min="0" max="100"></label>
+<label>Breaker trips above this failure (%) <input type="number" id="rs-trip" value="40" min="1" max="100"></label>
+<button id="rs-go" type="button">Compute</button>
+</div>
+<div class="log" id="rs-out">Press Compute.</div>
+</div>
+
+<p>The model is simple: with per-call failure probability <i>p</i> and <i>a</i> attempts per layer, the expected attempts per incoming call at one layer is 1 + p + p&sup2; + ... up to <i>a</i> terms, and the multipliers of the layers multiply. At <i>p</i> = 1 it is exactly <i>a</i> to the power of the number of layers.</p>
+
+<!-- ======================= 19 ======================= -->
+<h2 id="example">19. Worked example: hardening a checkout page</h2>
+
+<p>Let us apply the whole chapter to one realistic flow. A checkout page calls: Cart (internal, critical), Pricing (internal, critical), Inventory (internal, important), Recommendations (internal, optional), Payments (external provider, critical), and Email (external, deferrable). The page receives 600 requests per second at peak and has a user-facing target of p99 under 1.5 seconds.</p>
+
+<table>
+<tr><th>Dependency</th><th>Normal p50 / p99</th><th>Timeout</th><th>Retry</th><th>Isolation</th><th>On failure</th></tr>
+<tr><td>Cart</td><td>5 / 30 ms</td><td>150 ms</td><td>1 retry, other replica, full jitter</td><td>Semaphore, 100</td><td>Error: cannot check out without cart</td></tr>
+<tr><td>Pricing</td><td>8 / 50 ms</td><td>200 ms</td><td>1 retry</td><td>Semaphore, 100</td><td>Use cached price if under 5 minutes old, else error</td></tr>
+<tr><td>Inventory</td><td>10 / 80 ms</td><td>250 ms</td><td>1 retry</td><td>Semaphore, 80</td><td>Fail open for items marked "plenty"; re-check at fulfilment</td></tr>
+<tr><td>Recommendations</td><td>20 / 200 ms</td><td>250 ms</td><td>None</td><td>Thread pool 20, breaker</td><td>Hide the panel (shed feature)</td></tr>
+<tr><td>Payments (external)</td><td>400 / 1500 ms</td><td>3 s</td><td>Retry only with idempotency key; budget 5%</td><td>Own pool, 60</td><td>Show "payment pending", resolve async, secondary provider</td></tr>
+<tr><td>Email</td><td>n/a</td><td>n/a</td><td>Queue with retries and DLQ</td><td>Queue leveling</td><td>Delivered later; never blocks checkout</td></tr>
+</table>
+
+<p>Walk the numbers with Little's law. Payments at 400 ms with, say, 150 payment attempts per second (checkouts, not page views) holds 150 &times; 0.4 = 60 calls in flight; a pool of 60 equals the average, so it needs headroom: set it at 120. During a provider stall at 3 s, the cap of 120 admitted calls bounds the damage, and the remaining attempts are rejected quickly with "payment pending". The deadline of 1.5 seconds for the page cannot include a 3 s provider call, so payment is initiated synchronously but confirmed asynchronously (the provider's webhook or polling completes the order), which is a design choice made to satisfy both the SLO and the timeout budget.</p>
+
+<p>The page fans out to Cart, Pricing, Inventory and Recommendations in parallel. With per-dependency p99 each at 1 percent slow, the chance that at least one of the four is slow is 1 &minus; 0.99<sup>4</sup> &asymp; 3.9 percent. The Recommendations call is the slowest and the least valuable, so its 250 ms timeout and hide-on-failure policy removes it from the critical path: the page assembles without it and the p99 improves. A hedged request to a second Inventory replica after 80 ms (its p99) cuts that call's tail for about 1 percent extra load. Readiness probes exclude cold instances; the deploy process drains each pod for 20 seconds. The chaos plan has quarterly game days: slow Recommendations to 5 s (hypothesis: checkout p99 unchanged), kill one AZ (hypothesis: no error rise above 0.5 percent), and fail Payments with 503s (hypothesis: the breaker opens within 10 seconds and "payment pending" is shown, no duplicate charges).</p>
+
+<!-- ======================= 20 ======================= -->
+<h2 id="checklists">20. Checklists</h2>
+
+<h3>20.1 Per outbound call</h3>
+<ul>
+  <li>Connect timeout, read timeout and an overall deadline are set, and the deadline is propagated to the callee.</li>
+  <li>Each timeout is shorter than its caller's timeout, with room for the retries in the budget.</li>
+  <li>The operation is classified as idempotent or carries an idempotency key before any retry is enabled.</li>
+  <li>Retries use exponential backoff with jitter, a small attempt cap, a retry budget, and happen at a single layer.</li>
+  <li>A circuit breaker (per endpoint) with slow-call detection guards the call, and a fallback is defined.</li>
+  <li>A bulkhead (pool, semaphore or per-tenant quota) isolates the call from others.</li>
+</ul>
+
+<h3>20.2 Per service</h3>
+<ul>
+  <li>All queues and thread pools are bounded, with defined behaviour when full.</li>
+  <li>Concurrency limit and load shedding exist; overload returns fast 429/503 with Retry-After; expired deadlines are dropped.</li>
+  <li>Liveness checks are internal only; readiness reflects warm-up and local overload; shutdown drains gracefully.</li>
+  <li>Capacity headroom survives the loss of the largest failure domain; utilisation targets leave queues short.</li>
+  <li>Features are classified by criticality, and shedding switches are tested.</li>
+  <li>Dashboards show retry rate, breaker state, queue depth and age, p50/p99/p99.9, shed counts, and saturation.</li>
+</ul>
+
+<h3>20.3 Per organisation</h3>
+<ul>
+  <li>Failure injection in CI and staging; regular production game days with written findings.</li>
+  <li>Runbooks for load shedding, traffic ramp-up and disabling features, rehearsed by on-call engineers.</li>
+  <li>Post-incident reviews that ask which pattern was missing, and add a regression experiment.</li>
+</ul>
+
+<!-- ======================= 21 ======================= -->
+<h2 id="qa">21. Interview questions and answers</h2>
+
+<details><summary>Why is a slow dependency more dangerous than a dead one?</summary>
+<p>A dead dependency usually refuses connections immediately, so the caller learns about it in microseconds and can fail over or use a fallback. A slow dependency accepts the call and then holds the caller's thread, connection and memory until the timeout. By Little's law, the concurrency needed equals arrival rate times latency, so a dependency that is 40 times slower needs 40 times as many workers. The caller runs out of workers, becomes slow itself, and the slowness spreads up the call chain. This is why timeouts, bulkheads and breakers with slow-call detection exist.</p></details>
+
+<details><summary>How do you decide whether it is safe to retry a request?</summary>
+<p>First check that the failure is plausibly transient (timeout, connection reset, 503, 429), not a deterministic client error. Then check that running the operation twice is harmless. Reads and set-style writes are naturally idempotent; payments, order creation and counter increments are not, so they need an idempotency key that the server uses to deduplicate. I would also check that this layer is the only one retrying, otherwise attempts multiply, and that a retry budget limits the added load during widespread failure.</p></details>
+
+<details><summary>Explain exponential backoff with jitter and why jitter is needed.</summary>
+<p>Exponential backoff increases the wait between attempts (100 ms, 200 ms, 400 ms and so on up to a cap), giving a struggling server time to recover. Without jitter, every client that failed at the same moment retries at the same moments, producing synchronised bursts. Jitter randomises the wait; with full jitter each wait is a random value between zero and the exponential bound, which spreads the retries into a smooth stream and lowers peak load. Decorrelated jitter bases each wait on the previous one, which also works well when clients start in lockstep.</p></details>
+
+<details><summary>A request passes through four services that each retry three times. What happens when the database fails?</summary>
+<p>Attempts multiply: 3 &times; 3 &times; 3 &times; 3 = 81 database calls per user request. At 1000 user requests per second the failing database receives 81,000 attempts per second, which prevents its recovery and may form a metastable retry storm. The fix is to retry at one layer only (typically the closest to the user, or the layer nearest the failing call), use retry budgets of about 10 percent of traffic, add jittered backoff, and use circuit breakers so deeper layers stop calling once the dependency is clearly down.</p></details>
+
+<details><summary>Describe how a circuit breaker works and how you would configure one.</summary>
+<p>It has three states. Closed passes calls and records outcomes over a rolling window. When the failure or slow-call rate exceeds a threshold (say 50 percent over at least 20 calls) it opens, rejecting calls instantly for a wait period (say 30 seconds) while a fallback serves. Then it goes half-open and admits a handful of trial calls; if they succeed it closes, otherwise it reopens. I would scope breakers per endpoint or host so one bad operation does not block healthy ones, count only timeouts and 5xx as failures, include slow calls, and add jitter to wait durations to avoid synchronised probing.</p></details>
+
+<details><summary>What is the bulkhead pattern and when would you use thread pools versus semaphores?</summary>
+<p>A bulkhead gives each dependency or tenant a separate, capped resource pool so one failing component cannot consume everything. Thread-pool bulkheads provide strong isolation and allow timing out a stuck call, but cost context switches and memory. Semaphore bulkheads are just a limit on concurrent calls on the caller's thread: cheap, suitable for non-blocking code, but they cannot interrupt a hung call. I use pools for blocking calls to risky dependencies and semaphores for cheap, fast calls and async code, sizing both using Little's law with headroom.</p></details>
+
+<details><summary>What is load shedding, and how is it different from rate limiting?</summary>
+<p>Rate limiting enforces a per-client or per-key quota regardless of server state, which is fairness and abuse control. Load shedding is the server protecting itself: when current load or queue delay exceeds what it can handle, it rejects some requests quickly so the rest still meet their latency targets, keeping goodput at capacity instead of collapsing. Good shedders prioritise (shed batch before interactive), drop requests whose deadline has already passed, reject cheaply before expensive work, and return 503 or 429 with Retry-After so clients back off.</p></details>
+
+<details><summary>Why does fan-out make tail latency worse? Give the numbers.</summary>
+<p>A user request that waits for N parallel sub-calls is as slow as the slowest one. If each sub-call is slower than its p99 with probability 1 percent, the chance that at least one of N is slow is 1 minus 0.99 to the N. For N = 10 that is about 9.6 percent, for N = 100 it is about 63 percent, so the backend's p99 becomes the front end's typical latency. To cope, reduce fan-out, tighten backend p99.9, use hedged requests, set per-call deadlines with partial results, and keep utilisation low enough to avoid queueing.</p></details>
+
+<details><summary>What are hedged requests and what are the risks?</summary>
+<p>A hedged request sends a duplicate to a second replica if the first has not answered within roughly the p95 latency, takes whichever reply arrives first and cancels the other. Because only the slow few percent are duplicated, extra load is small, while the tail latency drops substantially. The risks are that the operation must be idempotent, that hedging increases load in overload (so it must be budgeted and disabled while shedding), and that the cancel must actually free server work. Tied requests, where replicas cancel each other, reduce duplicated work further.</p></details>
+
+<details><summary>What is a metastable failure and how do you recover from one?</summary>
+<p>A metastable failure is a state where the system stays overloaded after the initial trigger is gone because a feedback loop sustains it, typically retries multiplying load, or an empty cache sending all traffic to the database so that it cannot refill the cache. Fixing the original cause is not enough. You must cut load below capacity, by shedding, disabling retries, turning off non-critical features or temporarily blocking clients, then ramp traffic back gradually with warm caches. Prevention is retry budgets, circuit breakers, bounded queues, concurrency limits and headroom.</p></details>
+
+<details><summary>What is the difference between liveness and readiness probes, and why does it matter?</summary>
+<p>Liveness asks whether the process is irrecoverably stuck, and failing it causes a restart. Readiness asks whether the instance should receive traffic now, and failing it removes the instance from load balancing without restarting. If a liveness probe checks a shared dependency like the database, a database blip restarts every instance and turns a partial problem into a total outage with a cold-start herd. So liveness should be internal and cheap, and readiness should cover warm-up and local overload, with care about dependency checks.</p></details>
+
+<details><summary>How would you shut a service down without dropping requests?</summary>
+<p>On SIGTERM, the instance first flips to not-ready so the load balancer or registry stops routing new requests, and keeps serving for a few seconds because deregistration takes time to propagate. Then it closes listeners, signals clients to reconnect (Connection close or HTTP/2 GOAWAY), and waits for in-flight requests to finish within a drain timeout. It flushes buffers, returns unacknowledged queue messages for redelivery, closes connections and exits. The drain timeout must exceed the longest normal request and fit inside the orchestrator's termination grace period before SIGKILL.</p></details>
+
+<details><summary>How do you test that your resilience mechanisms actually work?</summary>
+<p>I treat untested fallbacks as broken. I use failure injection in staging and CI (latency, errors and partitions via Toxiproxy, mesh fault injection or tc netem), asserting bounded retry load and breaker behaviour. I run load tests beyond capacity to find the overload cliff and confirm shedding keeps goodput flat. In production I run chaos experiments with a defined steady state, a hypothesis and a limited blast radius, and periodic game days so humans, alerts and runbooks are exercised too. Findings become regression experiments.</p></details>
+
+<!-- ======================= 22 ======================= -->
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">22. Recap</h2>
+<ul>
+  <li>The dangerous failures are slow and partial ones. A caller can only see "no answer in time", so timeouts underpin everything else.</li>
+  <li>Use separate connect and read timeouts plus an overall deadline that propagates down the call chain, with inner timeouts smaller than outer ones.</li>
+  <li>Retry only retryable failures on idempotent (or keyed) operations, with exponential backoff and jitter, a retry budget, and at one layer. Layered retries multiply: 3 attempts across 4 layers is 81 times the load.</li>
+  <li>Circuit breakers (closed, open, half-open, per endpoint, counting slow calls) stop pounding a sick dependency and enable fast fallbacks.</li>
+  <li>Bulkheads cap resources per dependency or tenant, so one failure is confined; size pools and queues with Little's law, because latency times arrival rate equals concurrency.</li>
+  <li>Plan fallbacks and feature shedding ahead of time: cached or stale data, defaults, deferral, and conscious fail-open or fail-closed choices.</li>
+  <li>Shed load, apply backpressure and keep every queue bounded; queue-based levelling smooths spikes for asynchronous work at the cost of delay.</li>
+  <li>At fan-out N, a per-call 1 percent tail hits 1 &minus; 0.99<sup>N</sup> of requests (63 percent at N = 100), so fight the tail with low utilisation, hedging, coalescing and lower fan-out.</li>
+  <li>Metastable failures need load reduction and slow ramp-up, not just a bug fix; thundering herds on recovery are prevented by jitter, slow start and staged traffic.</li>
+  <li>Liveness is internal and restarts; readiness controls routing; shutdown drains. Verify all of it with chaos experiments, game days and failure injection.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="02-estimation.html">Chapter 2</a> (percentiles, Little's law), <a href="09-load-balancing.html">Chapter 9</a> (health checks, outlier ejection), <a href="14-caching-failures.html">Chapter 14</a> (stampedes, serve-stale), <a href="16-rate-limiting.html">Chapter 16</a> (limits and shedding) and <a href="32-idempotency-ids.html">Chapter 32</a> (safe retries). Leads to <a href="41-ha-dr.html">Chapter 41</a> (redundancy, failover, regions) and <a href="51-microservice-resilience.html">Chapter 51</a> (applying these patterns across a microservice estate).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+<script>
+(function () {
+  function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+  function setParts(node, parts) { node.textContent = ''; parts.forEach(function (p) { if (typeof p === 'string') node.appendChild(document.createTextNode(p)); else node.appendChild(el('b', null, p.b)); }); }
+  function num(id, lo, hi) { var v = parseFloat(document.getElementById(id).value); if (isNaN(v)) v = lo; return Math.min(hi, Math.max(lo, v)); }
+  var btn = document.getElementById('rs-go');
+  var out = document.getElementById('rs-out');
+  function perLayer(p, a) { var s = 0, t = 1, i; for (i = 0; i < a; i++) { s += t; t *= p; } return s; }
+  function run() {
+    var layers = num('rs-layers', 1, 8), a = num('rs-attempts', 1, 6), rps = num('rs-rps', 1, 100000);
+    var failPct = num('rs-fail', 0, 100), trip = num('rs-trip', 1, 100);
+    var p = failPct / 100;
+    var worst = Math.pow(a, layers);
+    var expected = Math.pow(perLayer(p, a), layers);
+    var tripped = failPct > trip;
+    var withBreaker = tripped ? 0.05 : expected;
+    out.textContent = '';
+    var lines = [
+      ['Worst case (every call fails): ', { b: worst.toFixed(0) + 'x' }, ' multiplication, so ', { b: Math.round(worst * rps).toLocaleString() }, ' dependency calls per second.'],
+      ['At ' + failPct + '% failure: expected ', { b: expected.toFixed(2) + 'x' }, ' per request, so ', { b: Math.round(expected * rps).toLocaleString() }, ' calls per second reach the dependency.'],
+      [tripped ? 'Breaker trips (failure above ' + trip + '%): only probe traffic, about ' : 'Breaker stays closed (failure not above ' + trip + '%): load is ', { b: Math.round(withBreaker * rps).toLocaleString() }, ' calls per second.'],
+      ['With a single retrying layer instead: ', { b: perLayer(p, a).toFixed(2) + 'x' }, ' per request, about ', { b: Math.round(perLayer(p, a) * rps).toLocaleString() }, ' calls per second.']
+    ];
+    lines.forEach(function (parts) { var d = el('div'); setParts(d, parts); out.appendChild(d); });
+  }
+  btn.addEventListener('click', run);
+})();
+</script>
+</body>
+</html>

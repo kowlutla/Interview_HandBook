@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 21: Design a Distributed Lock Service | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c21-lock-service">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 21 · Worked solutions</div>
+<h1>Design a Distributed Lock Service</h1>
+<p class="lead">We design a Chubby or etcd style service that lets many independent processes agree on who holds a lock right now. The hard part is not the lock table. It is making the answer stay correct when clocks drift, processes pause, networks split and the service's own leader dies.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is short: "Design a distributed lock service." A strong candidate does not start drawing boxes. A lock service is a deceptively small product with a very sharp correctness requirement, so we first pin down what it is for. We are building the kind of service that Google's Chubby, Apache ZooKeeper and etcd provide: a small, strongly consistent, highly available cluster that many applications call to elect leaders, guard exclusive access to a resource, and publish small pieces of configuration or membership. It is not a general database and it is not a high-volume work queue.</p>
+<p>Here are the questions we would ask the interviewer, and the answers we assume for the rest of the page.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>What is the lock used for: efficiency or correctness?</td><td>Both kinds exist. Some callers only want to avoid duplicate work (a lost lock is a minor waste). Others protect shared state (a lost lock corrupts data). We must support the second kind, which forces fencing tokens (section 8).</td></tr>
+<tr><td>Who are the clients?</td><td>Internal services, about 50,000 client processes across the company, each holding a long lived connection to the service.</td></tr>
+<tr><td>How many locks?</td><td>About 1 million named lock nodes, but only a small fraction are contended at any moment.</td></tr>
+<tr><td>Lock holding time?</td><td>Seconds to hours. Leader election locks are held for days. Short critical sections of milliseconds should not use this service at all.</td></tr>
+<tr><td>Availability and consistency target?</td><td>Never grant the same lock to two live holders (safety). Stay available as long as a majority of the replicas is reachable. When forced to choose, choose consistency (CP in the terms of <a href="../chapters/28-cap-consistency.html">Chapter 28</a>).</td></tr>
+<tr><td>Regions?</td><td>One cluster per region for regional work. A global lock is allowed but pays cross region latency (section 14).</td></tr>
+<tr><td>Can clients trust their clocks?</td><td>No. We assume bounded clock <em>rate</em> drift, but no synchronized wall clocks and no bound on process pauses.</td></tr>
+<tr><td>Do we need fairness?</td><td>Yes, first come first served among waiters, to avoid starvation.</td></tr>
+</table>
+<div class="callout tip"><b>Interview tip</b> Say the central sentence early: "A lock with a timeout can never be perfectly safe by itself, because the holder can be paused after it checks the lock. So the design is a lease plus a fencing token enforced by the protected resource." Interviewers for this question are listening for exactly that insight.</div>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li><b>Sessions.</b> A client opens a session, kept alive by heartbeats. Everything the client owns (locks, ephemeral nodes, watches) is tied to the session.</li>
+<li><b>Lock operations.</b> <code>Acquire</code> (blocking with a wait timeout), <code>TryAcquire</code> (return immediately), <code>Release</code>, and <code>Renew</code> (implicit through the session).</li>
+<li><b>Waiters queue.</b> Contending clients line up in order and are granted the lock one at a time.</li>
+<li><b>Fencing token.</b> Every successful acquire returns a token that strictly increases for that lock. Downstream resources use it to reject stale holders.</li>
+<li><b>Ephemeral nodes.</b> A small key value tree where a node disappears when the session that created it ends. This supports membership and leader election.</li>
+<li><b>Watches.</b> A client can subscribe to changes of a node or lock and be notified, instead of polling.</li>
+<li><b>Linearizable reads and cheaper reads.</b> The caller chooses between a read that reflects every completed write and a faster, possibly stale read.</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Safety first:</b> at most one valid holder per lock at any time as seen through fencing tokens.</li>
+<li><b>Availability:</b> 99.99 percent for the write path, which means surviving the loss of any one replica in a five replica cluster, or any one zone.</li>
+<li><b>Latency:</b> acquire of an uncontended lock under 10 ms at p99 inside one region. Failure detection (a dead holder's lock becomes free) within the session TTL, typically 10 to 30 seconds.</li>
+<li><b>Durability:</b> an acknowledged lock grant survives any minority failure.</li>
+<li><b>Scale:</b> read heavy. Many more reads and heartbeats than writes. Many watchers.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>We do not design a general purpose database, a transactional multi key store, a task queue, or a rate limiter (see <a href="c03-rate-limiter.html">Case study 3</a>). We also do not design the client applications' business logic. We assume a trusted internal network, with authentication covered briefly in section 16.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>A lock service is sized by three streams: heartbeats (one per session per interval), writes through consensus (acquire, release, session create and expire), and reads plus watch notifications. Let us do the arithmetic. Estimation technique is covered in <a href="../chapters/02-estimation.html">Chapter 2</a>.</p>
+<h3>3.1 Sessions and heartbeats</h3>
+<p>50,000 client processes, each with one session. Session TTL is 15 seconds and the client sends a keepalive every 5 seconds (one third of the TTL, so two consecutive heartbeats can be lost before expiry). Heartbeat rate is 50,000 / 5 = <b>10,000 per second</b>. Each is about 100 bytes on the wire, so 10,000 x 100 B = 1 MB/s inbound. That is trivial for bandwidth, but the important design point is that 10,000 per second must <em>not</em> go through the consensus log. If each one were a Raft write, we would spend most of the cluster's write budget on keeping sessions alive. Section 6 explains how the leader tracks lease times in memory instead.</p>
+<h3>3.2 Lock writes</h3>
+<p>Assume an average of 2,000 state changing operations per second (acquire, release, create, delete, session expiry), and a peak of 3x, so 6,000 per second. A single Raft group on SSDs with batching typically sustains roughly 10,000 to 30,000 small writes per second, so we have headroom of about 2x to 5x at peak. Each log entry is about 300 bytes, so the log grows at 2,000 x 300 B = 600 KB/s average, which is 600 KB x 86,400 = about 52 GB per day of raw write ahead log. We do not keep it: the state machine is snapshotted and the log truncated, so steady state disk is the snapshot (below) plus a few hundred megabytes of recent log.</p>
+<h3>3.3 State size</h3>
+<p>1,000,000 lock and config nodes at about 1 KB each (name, value, owner session, token counter, waiter list pointers) is 1 GB. That fits comfortably in memory on every replica. Plus 50,000 session records at 200 B is 10 MB. This small total is a deliberate design constraint: <b>the whole state lives in RAM on every replica</b>, and the service rejects values larger than 1 MB (practically a few KB).</p>
+<h3>3.4 Reads and watches</h3>
+<p>Assume 100,000 reads per second at peak (a 50:1 read to write ratio at the average), mostly "who holds this lock" and config reads. Assume 500,000 active watches (10 per session). Each write triggers watches on average 10 clients, so notification fan out is 2,000 x 10 = <b>20,000 notifications per second</b> at the average and 60,000 at peak. A write to a popular config node watched by 40,000 clients creates a burst of 40,000 notifications at once, called a thundering herd, handled in section 12.</p>
+<h3>3.5 Summary table</h3>
+<table>
+<tr><th>Quantity</th><th>Value</th><th>Where it matters</th></tr>
+<tr><td>Sessions</td><td>50,000</td><td>memory for lease table, heartbeat load</td></tr>
+<tr><td>Heartbeats</td><td>10,000 / s, 1 MB/s</td><td>leader CPU; must stay off the Raft log</td></tr>
+<tr><td>Raft writes</td><td>2,000 / s avg, 6,000 / s peak</td><td>about 20 to 30 percent of a group's capacity</td></tr>
+<tr><td>Raw log</td><td>about 52 GB / day before truncation</td><td>snapshot every N entries, keep a few hundred MB</td></tr>
+<tr><td>State</td><td>about 1 GB in RAM</td><td>snapshot and replica catch up time</td></tr>
+<tr><td>Reads</td><td>100,000 / s peak</td><td>must be spread beyond the leader</td></tr>
+<tr><td>Watches</td><td>500,000 open, 20,000 to 60,000 events / s</td><td>fan out tier</td></tr>
+<tr><td>Cluster</td><td>5 replicas, 1 Raft group</td><td>tolerates 2 failures</td></tr>
+</table>
+<p>Conclusion: a single Raft group of five replicas is enough. We do not shard the core, which keeps cross lock atomicity simple. What we must engineer is the read, heartbeat and watch path, not the write path.</p>
+
+<h2 id="api">4. API design</h2>
+<p>The API is a small set of RPCs over a long lived, multiplexed connection (gRPC style streams, see <a href="../chapters/05-api-design.html">Chapter 5</a>). Heartbeats and watch events flow on the same stream so the client holds a single connection per process.</p>
+<pre><code>CreateSession(ttl_ms)                 -> { session_id, ttl_ms, lease_epoch }
+KeepAlive(session_id)                 -> { ttl_ms }          // server may hold the call (long poll) and reply near expiry
+CloseSession(session_id)              -> {}                  // releases all locks and deletes ephemerals
+
+Acquire(lock, session_id, wait_ms, mode)  -> { granted, fencing_token, version }   // mode: EXCLUSIVE | SHARED
+TryAcquire(lock, session_id, mode)        -> { granted, fencing_token, holder? }
+Release(lock, session_id, fencing_token)  -> {}
+GetLockInfo(lock, consistency)            -> { holder_session, token, waiters, version }
+
+Create(path, value, ephemeral, sequential, session_id) -> { path, version }
+Get(path, consistency)                    -> { value, version, mod_revision }
+Set(path, value, expected_version)        -> { version }       // compare and set
+Delete(path, expected_version)            -> {}
+Watch(path | prefix, from_revision)       -> stream of { type, path, revision, value }
+Txn(compares[], ops[])                    -> { succeeded, results[] }  // small atomic multi-op
+
+consistency: LINEARIZABLE | SERIALIZABLE (follower, may be stale)</code></pre>
+<p>Notes on the choices. <code>Release</code> carries the fencing token so that a delayed release from a previous holder cannot release the lock a newer holder owns (the same stale actor problem as in writes). <code>Set</code> and <code>Delete</code> carry <code>expected_version</code>, which makes them compare and set operations and therefore idempotent under retry (see <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>). Every response carries a <code>revision</code>, the global Raft log index at which the state last changed, which lets a client resume a watch exactly where it stopped. <code>Acquire</code> with a <code>wait_ms</code> is a server side wait: the request is parked and answered when the grant happens, so clients do not poll.</p>
+
+<h2 id="data-model">5. Data model and storage choice</h2>
+<p>All state is a small in memory tree, persisted through a replicated write ahead log and periodic snapshots. We choose an embedded storage engine (a B+tree or an append only log with an in memory index) on each replica, not an external database, because the service is the foundation other systems depend on. If it needed a database that itself needed a lock service, we would have a circular dependency. Storage engines are described in <a href="../chapters/19-storage-engines.html">Chapter 19</a>.</p>
+<table>
+<tr><th>Record</th><th>Fields</th><th>Notes</th></tr>
+<tr><td>Session</td><td>id, ttl, lease deadline (leader memory only), owned keys</td><td>The creation and close are Raft log entries; deadline extensions are not.</td></tr>
+<tr><td>Node (key)</td><td>path, value, version, create_revision, mod_revision, owner_session (if ephemeral)</td><td>The tree gives locks, config and membership one namespace.</td></tr>
+<tr><td>Lock</td><td>name, holder_session, fencing_counter, ordered waiter list</td><td>The counter only ever increases and survives holder changes and restarts, because it is in the log.</td></tr>
+<tr><td>Watch</td><td>client stream, path or prefix, next revision</td><td>Held in memory on whichever replica serves the stream; not replicated.</td></tr>
+<tr><td>Revision history</td><td>last N revisions of changes</td><td>Allows watch resume; compacted regularly.</td></tr>
+</table>
+<p>The fencing counter is the key persistent field. A common mistake is to derive the token from the clock or from a per holder counter. The correct approach is to make the token the <b>Raft log index (revision) of the grant entry</b>, or a per lock counter incremented inside the same entry. Either way it is assigned by the single linearized log, so it is monotonic for the lock even across leader changes. Using the global revision has the nice property that tokens are comparable even across different locks, which some protected resources like.</p>
+
+<h2 id="simple-design">6. A first simple design, then the real one</h2>
+<h3>6.1 Single box</h3>
+<p>The first design is one server holding a hash map from lock name to owner, with an expiry time per lock. Acquire sets the owner if absent or expired. It is simple and fast, and it is wrong for three reasons: the server is a single point of failure, which makes every locked system unavailable; when it restarts it loses the lock table, so two clients may now hold the same lock; and a time based expiry on the server tells us nothing about what the client believes. Doubling it as a primary and a backup does not help: if the primary is just slow and the backup promotes itself, both accept acquires, which is split brain (see <a href="../chapters/29-consensus.html">Chapter 29</a>).</p>
+<h3>6.2 Replicated state machine</h3>
+<p>The real design replicates the lock table as a <b>state machine</b> with Raft. All commands (create session, acquire, release, expire session) are entries in a replicated log. Each replica applies the same entries in the same order, so each ends with an identical lock table. A command is acknowledged to the client only after a majority has stored it durably, so a minority failure loses nothing. Section 7 covers how this works and what Raft offers us.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 420" role="img" aria-label="High level architecture of the lock service">
+  <rect class="ext" x="20" y="30" width="170" height="44" rx="8"/><text class="t-c t-b" x="105" y="57">App A (client lib)</text>
+  <rect class="ext" x="20" y="100" width="170" height="44" rx="8"/><text class="t-c t-b" x="105" y="127">App B (client lib)</text>
+  <rect class="ext" x="20" y="170" width="170" height="44" rx="8"/><text class="t-c t-b" x="105" y="197">App C (client lib)</text>
+  <rect class="ext" x="20" y="240" width="170" height="44" rx="8"/><text class="t-c t-b" x="105" y="267">... 50,000 processes</text>
+
+  <rect class="box" x="290" y="60" width="150" height="60" rx="8"/><text class="t-c t-b" x="365" y="86">Edge proxy tier</text><text class="t-c t-sm" x="365" y="104">watch + read fan out</text>
+  <rect class="box" x="290" y="170" width="150" height="60" rx="8"/><text class="t-c t-b" x="365" y="196">Edge proxy tier</text><text class="t-c t-sm" x="365" y="214">session multiplexing</text>
+
+  <rect class="cache" x="560" y="40" width="170" height="64" rx="8"/><text class="t-c t-b" x="645" y="66">Leader (replica 1)</text><text class="t-c t-sm" x="645" y="86">lease table in memory</text>
+  <rect class="db" x="560" y="130" width="170" height="52" rx="8"/><text class="t-c t-b" x="645" y="154">Follower (replica 2)</text><text class="t-c t-sm" x="645" y="172">WAL + lock table</text>
+  <rect class="db" x="560" y="204" width="170" height="52" rx="8"/><text class="t-c t-b" x="645" y="228">Follower (replica 3)</text><text class="t-c t-sm" x="645" y="246">WAL + lock table</text>
+  <rect class="db" x="560" y="278" width="170" height="52" rx="8"/><text class="t-c t-b" x="645" y="302">Follower (replica 4)</text><text class="t-c t-sm" x="645" y="320">WAL + lock table</text>
+  <rect class="db" x="560" y="352" width="170" height="52" rx="8"/><text class="t-c t-b" x="645" y="376">Follower (replica 5)</text><text class="t-c t-sm" x="645" y="394">WAL + lock table</text>
+
+  <rect class="ext" x="780" y="130" width="110" height="100" rx="8"/><text class="t-c t-b" x="835" y="170">Protected</text><text class="t-c t-b" x="835" y="188">resource</text><text class="t-c t-sm" x="835" y="208">checks token</text>
+
+  <path class="arrow" d="M190 52 L286 80"/><path class="arrow" d="M190 122 L286 100"/><path class="arrow" d="M190 192 L286 200"/><path class="arrow" d="M190 262 L286 215"/>
+  <path class="arrow" d="M440 90 L556 72"/><path class="arrow" d="M440 200 L556 100"/>
+  <path class="arrow dash" d="M645 104 L645 128"/><path class="arrow dash" d="M700 104 L700 202"/>
+  <text class="t-sm" x="455" y="262">Raft replication (append entries)</text>
+  <path class="arrow-g dash" d="M190 242 C400 410 700 420 776 224"/>
+  <text class="t-sm" x="250" y="392">client sends fencing token with each use</text>
+</svg>
+<figcaption>Clients hold one stream each to an edge proxy tier, which forwards writes to the Raft leader and serves cached reads and watch fan out. Only the five replicas run consensus. The protected resource is outside the lock service and checks the fencing token on every request.</figcaption>
+</figure>
+<p>The edge proxy tier is a scaling device explained in section 12. At small scale clients can connect directly to the replicas, as ZooKeeper and etcd clients do. At our scale the proxies keep 50,000 connections off the five consensus nodes.</p>
+
+<h2 id="raft">7. Raft replicated state machine</h2>
+<p><a href="../chapters/29-consensus.html">Chapter 29</a> covers Raft in depth. We recap only what the lock service depends on.</p>
+<ul>
+<li><b>One leader per term.</b> Followers elect a leader if they stop hearing from it. A candidate needs votes from a majority, which for five replicas means three. Each election increments the <em>term</em>, a number that acts as a logical clock.</li>
+<li><b>Log replication.</b> The leader appends a command to its log and sends it to followers. Once a majority (three of five) has persisted it, the entry is <em>committed</em>. The leader applies it to the state machine and replies.</li>
+<li><b>Safety.</b> A replica with a stale log cannot win an election, and a committed entry is present in the log of every future leader. So no acknowledged grant can be forgotten.</li>
+<li><b>Fault tolerance.</b> With five replicas, any two can fail. With three, only one can. We pick five for the lock service because it is critical infrastructure and because planned maintenance of one node should still leave tolerance for one unplanned failure.</li>
+</ul>
+<h3>7.1 Why the lock table is a deterministic state machine</h3>
+<p>Every command is applied identically on every replica, so the apply function must be deterministic: no wall clock reads, no random numbers, no external calls. Where a command needs a timestamp (for example a session creation time), the leader chooses it and puts it inside the log entry, so every replica uses the same value. The fencing counter is incremented as part of applying the acquire entry, not by the client. This is the "replicated state machine" idea: agreeing on the order of commands is enough to agree on all state.</p>
+<h3>7.2 Request flow: acquire</h3>
+<ol>
+<li>The client calls <code>Acquire(lock, session, wait)</code> on its edge proxy, which forwards to the leader (a follower would redirect or forward).</li>
+<li>The leader validates the session is live and appends a log entry <code>ACQUIRE(lock, session)</code>.</li>
+<li>The leader replicates it to four followers in parallel and waits for two acknowledgements (itself plus two is a majority of five).</li>
+<li>The entry commits. The leader applies it: if the lock is free, the session becomes holder and the fencing counter increments to, say, 34. Otherwise the session is appended to the waiter queue.</li>
+<li>If granted, the leader replies <code>{granted, token 34}</code>. If queued, the reply is held (parked) and sent later at grant time.</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Sequence diagram of acquire through Raft">
+  <rect class="ext" x="30" y="20" width="110" height="32" rx="8"/><text class="t-c t-b" x="85" y="41">Client</text>
+  <rect class="box" x="230" y="20" width="110" height="32" rx="8"/><text class="t-c t-b" x="285" y="41">Leader</text>
+  <rect class="db" x="450" y="20" width="110" height="32" rx="8"/><text class="t-c t-b" x="505" y="41">Follower 2</text>
+  <rect class="db" x="640" y="20" width="110" height="32" rx="8"/><text class="t-c t-b" x="695" y="41">Follower 3</text>
+  <rect class="db" x="800" y="20" width="90" height="32" rx="8"/><text class="t-c t-b" x="845" y="41">F4, F5</text>
+  <line class="life" x1="85" y1="52" x2="85" y2="350"/><line class="life" x1="285" y1="52" x2="285" y2="350"/><line class="life" x1="505" y1="52" x2="505" y2="350"/><line class="life" x1="695" y1="52" x2="695" y2="350"/><line class="life" x1="845" y1="52" x2="845" y2="350"/>
+  <path class="arrow" d="M85 84 L281 84"/><text class="t-sm" x="100" y="78">1. Acquire(lock-7)</text>
+  <path class="arrow" d="M285 120 L501 120"/><path class="arrow" d="M285 130 L691 130"/><path class="arrow dash" d="M285 140 L841 140"/>
+  <text class="t-sm" x="300" y="112">2. AppendEntries(ACQUIRE lock-7, index 9120)</text>
+  <path class="arrow-g dash" d="M501 176 L289 176"/><path class="arrow-g dash" d="M691 186 L289 186"/>
+  <text class="t-sm" x="300" y="170">3. fsync, then ack (majority = leader + 2)</text>
+  <rect class="hit" x="190" y="206" width="190" height="46" rx="8"/><text class="t-c t-sm" x="285" y="226">4. commit, apply:</text><text class="t-c t-sm" x="285" y="242">holder = S, token = 9120</text>
+  <path class="arrow-g" d="M281 288 L89 288"/><text class="t-sm" x="100" y="282">5. {granted, token 9120}</text>
+  <text class="t-sm" x="300" y="326">Late followers learn the commit index in the next heartbeat; the client never waits for them.</text>
+</svg>
+<figcaption>An acquire costs one network round trip to the leader plus one parallel round trip to a majority, with an fsync at each. Here the fencing token equals the log index of the grant entry, 9120.</figcaption>
+</figure>
+<p>Latency check: inside one region the round trip between zones is about 1 ms, an SSD fsync with batching is about 1 to 2 ms, so a committed write takes roughly 3 to 6 ms, matching our 10 ms p99 goal for an uncontended acquire.</p>
+
+<h2 id="sessions">8. Sessions, leases, heartbeats and TTL</h2>
+<p>A lock must be released automatically if its holder crashes, otherwise one dead process blocks the lock forever. The mechanism is a <b>lease</b>: a promise that lasts for a limited time unless renewed (see <a href="../chapters/30-coordination-locks.html">Chapter 30</a>). We attach the lease not to each lock but to the <b>session</b>, so one heartbeat keeps all of a client's locks alive. That is the Chubby model, and etcd's lease model is similar (a lease with a TTL to which many keys attach).</p>
+<h3>8.1 The session lifecycle</h3>
+<ul>
+<li><b>Create.</b> The client creates a session with a TTL of 15 seconds. This is a Raft write. The server returns a <code>session_id</code> and a lease epoch.</li>
+<li><b>Keepalive.</b> Every 5 seconds the client sends a keepalive. The leader resets the session's deadline to now + TTL in <em>leader memory</em>. This is not a Raft write. Chubby does this too: the master holds the keepalive RPC open and replies near the end of the lease, which both saves messages and carries invalidations.</li>
+<li><b>Expiry.</b> If the leader sees no keepalive before the deadline, it appends <code>EXPIRE_SESSION(id)</code> to the Raft log. When that entry commits, every replica atomically releases all locks owned by that session, deletes its ephemeral nodes, and hands the locks to the next waiters, bumping their fencing tokens.</li>
+<li><b>Close.</b> A clean shutdown sends <code>CloseSession</code>, doing the same without waiting for the TTL.</li>
+</ul>
+<h3>8.2 Why TTL and heartbeat interval are chosen the way they are</h3>
+<table>
+<tr><th>Setting</th><th>Short TTL (3 s)</th><th>Long TTL (60 s)</th></tr>
+<tr><td>Failure detection</td><td>Fast: dead holder replaced in about 3 s</td><td>Slow: a lock may stay stuck for a minute</td></tr>
+<tr><td>False expiry from GC pause or network blip</td><td>Frequent, causes lock churn and leader flapping</td><td>Rare</td></tr>
+<tr><td>Heartbeat load</td><td>Higher (50,000 / 1 s = 50,000/s)</td><td>Low</td></tr>
+<tr><td>Typical use</td><td>Latency sensitive leader election</td><td>Batch jobs, long critical sections</td></tr>
+</table>
+<p>We pick 15 seconds as default and let callers choose between 5 and 60. A rule of thumb is a heartbeat every TTL / 3, so that two successive heartbeats can be lost before the session expires. Choosing a TTL shorter than the worst plausible GC pause or network hiccup just creates false expiries.</p>
+<h3>8.3 The clock assumption</h3>
+<p>The server decides expiry using its own monotonic clock: "no keepalive for 15 seconds since my last receipt". The client decides when it must <em>stop trusting</em> its lease using its own monotonic clock too, with a conservative rule: the client's local lease timeout starts counting from the time it <em>sent</em> the keepalive (not when the response arrived) and is shortened by an allowance for clock rate drift. The safety argument needs only the assumption that clocks run at nearly the same <em>rate</em> (drift of 100 ppm is typical, which is 1.5 ms over 15 s). We never compare wall clock timestamps from different machines. Time ordering issues are covered in <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>.</p>
+<div class="callout watch"><b>Watch out</b> A client that checks "do I still hold the lock?" and then acts is not safe, even with a perfect lease. A stop the world garbage collection, a VM live migration, a laptop suspend or a swap storm can pause the process between the check and the action for longer than the TTL. The lock service cannot prevent this. Only the resource, using fencing tokens, can.</div>
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Session timeline with heartbeats, expiry and grace">
+  <line x1="40" y1="130" x2="860" y2="130" stroke="var(--fg)" stroke-width="2"/>
+  <text class="t-sm" x="40" y="150">time</text>
+  <circle cx="100" cy="130" r="6" class="hit"/><text class="t-c t-sm" x="100" y="112">t=0 create</text>
+  <circle cx="220" cy="130" r="6" class="hit"/><text class="t-c t-sm" x="220" y="112">t=5 ka</text>
+  <circle cx="340" cy="130" r="6" class="hit"/><text class="t-c t-sm" x="340" y="112">t=10 ka</text>
+  <circle cx="460" cy="130" r="6" class="miss"/><text class="t-c t-sm" x="460" y="112">t=15 lost</text>
+  <circle cx="580" cy="130" r="6" class="miss"/><text class="t-c t-sm" x="580" y="112">t=20 lost</text>
+  <rect class="hit" x="100" y="170" width="480" height="30" rx="6"/><text class="t-c t-sm" x="340" y="190">server lease: deadline moves to last_ka + 15 s (t=25)</text>
+  <rect class="miss" x="580" y="170" width="140" height="30" rx="6"/><text class="t-c t-sm" x="650" y="190">expire at t=25</text>
+  <rect class="cache" x="340" y="214" width="260" height="30" rx="6"/><text class="t-c t-sm" x="470" y="234">client local lease runs out (stops using lock)</text>
+  <path class="arrow-r" d="M720 154 L720 70"/><text class="t-c t-sm" x="760" y="62">EXPIRE entry in Raft,</text><text class="t-c t-sm" x="760" y="78">next waiter gets token+1</text>
+  <text class="t-sm" x="40" y="280">Client stops itself before the server frees the lock; fencing covers the case where it fails to.</text>
+</svg>
+<figcaption>The client counts from when it sent the last acknowledged keepalive, so its local timer ends before the server's. The gap is the safety margin. A stalled process may still act late, which is why fencing is required on top.</figcaption>
+</figure>
+
+<h2 id="locks">9. Lock acquire, release, try, waiters and watches</h2>
+<h3>9.1 Semantics</h3>
+<ul>
+<li><b>TryAcquire</b> is one Raft write when the lock is free and a plain read when the lock is clearly held. It returns the current holder session so the caller can decide to back off.</li>
+<li><b>Acquire with wait</b> appends the session to the lock's waiter queue (itself a Raft write), parks the RPC, and completes it when the lock is granted or the wait timeout fires. A timeout is another log entry that removes the session from the queue, so the replicated waiter list is always exactly right.</li>
+<li><b>Release</b> by the holder appends <code>RELEASE(lock, token)</code>. On apply, if the token matches the current holder, the first waiter becomes the holder, the counter increments, and its parked RPC is answered. A release with a stale token is rejected.</li>
+<li><b>Shared mode</b> (reader writer locks) allows many readers or one writer. The waiter queue keeps order, so a waiting writer blocks newer readers to prevent writer starvation.</li>
+</ul>
+<h3>9.2 Waiters queue and the herd effect</h3>
+<p>There are two ways to build a waiting line, and the difference is a classic interview point.</p>
+<table>
+<tr><th>Approach</th><th>How it works</th><th>Cost</th></tr>
+<tr><td>Server side queue (our choice)</td><td>The waiter list is part of the lock state. On release, the state machine hands the lock to the head and notifies only that client.</td><td>One notification per release. FIFO is exact. Needs queue logic in the state machine.</td></tr>
+<tr><td>ZooKeeper recipe with sequential ephemeral nodes</td><td>Each contender creates <code>/lock/n-000123</code>. The lowest sequence number holds the lock. Each other node watches only the node just before it.</td><td>No server queue logic; one watcher per node avoids a herd. Slightly more round trips for the client.</td></tr>
+<tr><td>Naive: everyone watches the lock node</td><td>All waiters retry when it changes.</td><td>With N waiters, every release wakes N clients and only one wins. At 1,000 waiters this is a thundering herd and should be avoided.</td></tr>
+</table>
+<p>Because the data model supports both, library authors can choose. Our built in lock uses the server queue for speed, and the ephemeral sequential recipe remains available for custom patterns such as barriers and group membership.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Lock state machine with waiters queue">
+  <rect class="box" x="30" y="40" width="200" height="90" rx="10"/><text class="t-c t-b" x="130" y="68">FREE</text><text class="t-c t-sm" x="130" y="90">holder = none</text><text class="t-c t-sm" x="130" y="108">counter = 33</text>
+  <rect class="hit" x="350" y="40" width="200" height="90" rx="10"/><text class="t-c t-b" x="450" y="68">HELD</text><text class="t-c t-sm" x="450" y="90">holder = S1, token 34</text><text class="t-c t-sm" x="450" y="108">queue empty</text>
+  <rect class="cache" x="670" y="40" width="200" height="90" rx="10"/><text class="t-c t-b" x="770" y="68">HELD + WAITERS</text><text class="t-c t-sm" x="770" y="90">holder = S1, token 34</text><text class="t-c t-sm" x="770" y="108">queue: S2, S3, S4</text>
+  <path class="arrow" d="M230 70 L346 70"/><text class="t-c t-sm" x="288" y="62">acquire</text>
+  <path class="arrow" d="M550 70 L666 70"/><text class="t-c t-sm" x="608" y="62">acquire</text>
+  <path class="arrow dash" d="M670 120 C600 210 300 210 230 126"/><text class="t-c t-sm" x="450" y="196">release or session expiry, queue empty</text>
+  <path class="arrow-g" d="M770 130 L770 250 L560 250 L520 134"/><text class="t-c t-sm" x="660" y="270">release or expiry: S2 granted, token 35</text>
+  <path class="arrow dash" d="M450 130 L450 160 L230 160 L150 134"/>
+  <text class="t-sm" x="40" y="310">Every arrow is a committed log entry. The counter never decreases, even when the lock returns to FREE.</text>
+</svg>
+<figcaption>Lock states. Grants always increment the counter; session expiry and explicit release take the same path, so a crashed holder is handled exactly like a polite one.</figcaption>
+</figure>
+<h3>9.3 Watches</h3>
+<p>A watch tells a client that something changed so it need not poll. We follow etcd's model: a watch is a stream of ordered events from a given revision. If the client's stream breaks, it reconnects with <code>from_revision = last_seen + 1</code> and the service replays missed events from the history, unless that history has been compacted, in which case the client gets a "too old" error and must re read the state and start a new watch. The client library hides this. Compare ZooKeeper's one time watches, which fire once and must be re registered (with a gap in which an event can be missed unless the client re reads). The streaming design avoids the gap.</p>
+<p>Events are delivered in revision order and exactly once per revision to each watcher, with a guarantee that a client that sees event N has previously seen all events before N. That ordering is what makes watches useful for building higher level coordination.</p>
+
+<h2 id="fencing">10. Deep dive: fencing tokens and protecting downstream resources</h2>
+<p>This is the part an interviewer will probe hardest. See <a href="../chapters/30-coordination-locks.html">Chapter 30</a> for the general treatment; here we apply it.</p>
+<h3>10.1 The zombie client problem</h3>
+<p>Client A acquires the lock with token 33, then suffers a 40 second GC pause. Its session expires after 15 seconds. The service gives the lock to client B with token 34. B writes to the storage. Then A wakes up. Its code still believes it holds the lock (it checked a moment before the pause) and writes. Without protection, A's stale write overwrites B's work. No amount of lease tuning removes this, because the pause can be arbitrarily long and can occur at any instruction.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="Zombie client rejected by fencing token">
+  <rect class="ext" x="40" y="20" width="120" height="32" rx="8"/><text class="t-c t-b" x="100" y="41">Client A</text>
+  <rect class="box" x="260" y="20" width="140" height="32" rx="8"/><text class="t-c t-b" x="330" y="41">Lock service</text>
+  <rect class="ext" x="500" y="20" width="120" height="32" rx="8"/><text class="t-c t-b" x="560" y="41">Client B</text>
+  <rect class="db" x="720" y="20" width="140" height="32" rx="8"/><text class="t-c t-b" x="790" y="41">Storage</text>
+  <line class="life" x1="100" y1="52" x2="100" y2="370"/><line class="life" x1="330" y1="52" x2="330" y2="370"/><line class="life" x1="560" y1="52" x2="560" y2="370"/><line class="life" x1="790" y1="52" x2="790" y2="370"/>
+  <path class="arrow-g" d="M104 80 L326 80"/><text class="t-sm" x="112" y="74">1. acquire</text>
+  <path class="arrow-g dash" d="M326 100 L104 100"/><text class="t-sm" x="112" y="116">token 33</text>
+  <path class="arrow" d="M104 138 L786 138"/><text class="t-sm" x="400" y="132">2. write(token 33): accepted, max_seen = 33</text>
+  <rect class="miss" x="40" y="160" width="120" height="46" rx="6"/><text class="t-c t-sm" x="100" y="180">3. GC pause</text><text class="t-c t-sm" x="100" y="196">40 s</text>
+  <text class="t-sm" x="340" y="176">session expires (15 s)</text>
+  <path class="arrow" d="M556 210 L334 210"/><text class="t-sm" x="350" y="204">4. acquire</text>
+  <path class="arrow-g dash" d="M334 230 L556 230"/><text class="t-sm" x="380" y="246">token 34</text>
+  <path class="arrow" d="M560 268 L786 268"/><text class="t-sm" x="590" y="262">5. write(34): accepted, max_seen = 34</text>
+  <path class="arrow-r" d="M104 308 L786 308"/><text class="t-sm" x="190" y="302">6. A wakes, write(token 33)</text>
+  <rect class="miss" x="560" y="322" width="300" height="40" rx="6"/><text class="t-c t-sm" x="710" y="346">7. REJECTED: 33 is less than max_seen 34</text>
+</svg>
+<figcaption>The storage remembers the highest token it has seen per resource and rejects anything lower. The zombie A is harmless, even though it still believes it owns the lock.</figcaption>
+</figure>
+<h3>10.2 What the protected resource must do</h3>
+<p>The resource (a database row, an object store, a file server, a downstream API) keeps <code>max_token_seen</code> per protected object and applies this rule on every mutation: if the request token is smaller than <code>max_token_seen</code>, reject; otherwise accept and set <code>max_token_seen = token</code>. In a SQL database this is a compare in the same transaction: <code>UPDATE t SET v=?, fence=? WHERE id=? AND fence &lt;= ?</code>. For object stores that support conditional writes, the token is carried in a version or ETag precondition. For resources that cannot be modified, we put a thin gateway in front of them that does the check.</p>
+<h3>10.3 Options compared</h3>
+<table>
+<tr><th>Option</th><th>Protects against zombie?</th><th>Cost</th><th>Verdict</th></tr>
+<tr><td>Lease timeout only</td><td>No. A paused client acts after expiry.</td><td>None</td><td>Acceptable only for efficiency locks (duplicate work is harmless).</td></tr>
+<tr><td>Client self check before each write ("am I still holder?")</td><td>No. The pause happens after the check.</td><td>One extra RPC per write</td><td>Narrows the window but does not close it. Not sufficient.</td></tr>
+<tr><td>Fencing token checked by the resource</td><td>Yes, regardless of pauses and clock errors.</td><td>The resource must store and compare a number</td><td>Required for correctness locks. Our choice.</td></tr>
+<tr><td>Make the resource itself the arbiter (compare and set on a version, no external lock)</td><td>Yes</td><td>Needs a resource with CAS</td><td>Best when possible: sometimes no lock is needed at all.</td></tr>
+</table>
+<p>We therefore ship the lock service with a documented contract: "the lock gives you the right to <em>try</em>; the token proves your right to <em>succeed</em>." The client library exposes the token on the lock handle and offers wrappers for common stores. For resources that cannot verify tokens, we state clearly that the lock is only advisory efficiency protection.</p>
+<div class="callout key"><b>Key idea</b> Monotonic tokens work because they come from the replicated log. Two holders can never receive the same token or tokens out of order, so "highest token wins" is a total order that the resource can enforce without trusting any clock.</div>
+
+<h2 id="leader-failover">11. Leader failover, session grace and read consistency</h2>
+<h3>11.1 What happens to sessions when the leader dies</h3>
+<p>The leader holds all session deadlines in memory. When it crashes, a new leader is elected (typically in a few hundred milliseconds to a couple of seconds: an election timeout of 1 second plus a vote round). The new leader does not know when each session last sent a keepalive. If it simply trusted deadlines it could expire sessions immediately, causing a mass lock loss (up to 50,000 sessions at once) for something the clients did nothing wrong in.</p>
+<p>The solution, taken from Chubby, is a <b>grace period</b>. On becoming leader, the new leader sets every live session's deadline to <em>now + full TTL</em> and treats that as the starting point. Clients that cannot reach a leader keep their local lease until it runs out, then enter a <em>jeopardy</em> state: they stop acting on locks but keep their session for an extra grace window (for example another 45 seconds, Chubby used 45 s) while they look for the new leader. If they reconnect inside the window, the session survives and the locks stay with the holder. If not, the session is dead.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 320" role="img" aria-label="Leader failover and client grace period">
+  <line x1="40" y1="160" x2="860" y2="160" stroke="var(--fg)" stroke-width="2"/>
+  <rect class="miss" x="120" y="60" width="140" height="40" rx="6"/><text class="t-c t-sm" x="190" y="84">leader crashes</text>
+  <path class="arrow-r" d="M190 100 L190 154"/>
+  <rect class="cache" x="190" y="180" width="200" height="34" rx="6"/><text class="t-c t-sm" x="290" y="201">election (about 1 to 3 s)</text>
+  <rect class="hit" x="390" y="60" width="180" height="40" rx="6"/><text class="t-c t-sm" x="480" y="84">new leader, resets deadlines</text>
+  <path class="arrow-g" d="M480 100 L480 154"/>
+  <rect class="cache" x="190" y="232" width="300" height="34" rx="6"/><text class="t-c t-sm" x="340" y="253">clients: local lease running, then jeopardy</text>
+  <rect class="hit" x="490" y="232" width="250" height="34" rx="6"/><text class="t-c t-sm" x="615" y="253">reconnect, session kept, locks kept</text>
+  <rect class="miss" x="740" y="232" width="120" height="34" rx="6"/><text class="t-c t-sm" x="800" y="253">late: dead</text>
+  <text class="t-sm" x="40" y="302">If reconnect happens before the grace ends, no lock changes hands and no token is issued.</text>
+</svg>
+<figcaption>A failover of a few seconds does not lose any locks. Clients freeze, wait out the election, and resume. Only a failover longer than TTL plus grace costs sessions.</figcaption>
+</figure>
+<p>This creates a safety rule: the new leader must not <em>expire</em> any session earlier than the old leader could have. Resetting every deadline to a full TTL from the start of the new term guarantees that, because the old deadlines were at most one TTL ahead of the last heartbeat. A trade off is that a client that truly died just before the failover has its lock freed up to one TTL later than usual.</p>
+<h3>11.2 Is the old leader dangerous?</h3>
+<p>A deposed leader may not know it was deposed (a network partition, a long pause). If it keeps answering reads from its memory it could return stale data, and might even confirm that a session is alive. Raft prevents wrong <em>writes</em>, since the old leader cannot reach a majority to commit anything. To protect <em>reads</em> we use either of two techniques: a read goes through the log, or the leader confirms leadership with a majority before answering (<b>ReadIndex</b> in etcd), or the leader relies on a <b>leader lease</b> (it assumes no other leader can exist for the election timeout after its last majority heartbeat, which requires a bound on clock rate drift). We choose ReadIndex by default and the leader lease as an opt in optimization.</p>
+<h3>11.3 Linearizable reads versus follower reads</h3>
+<table>
+<tr><th>Mode</th><th>How</th><th>Latency</th><th>Guarantee</th><th>Use for</th></tr>
+<tr><td>Linearizable via log</td><td>Read is a log entry</td><td>Same as a write, 3 to 6 ms</td><td>Sees all completed writes</td><td>Rare; simplest correct option</td></tr>
+<tr><td>Linearizable via ReadIndex</td><td>Leader records commit index, confirms leadership with a heartbeat round, waits for apply, reads</td><td>1 round trip to a majority, about 1 to 2 ms, no disk write</td><td>Sees all completed writes</td><td>"Who holds this lock now", before taking a decision</td></tr>
+<tr><td>Follower read with ReadIndex</td><td>Follower asks the leader only for the current commit index, then waits to apply up to it and serves locally</td><td>Cheap for the leader, local data read</td><td>Linearizable, and spreads read CPU over replicas</td><td>High volume reads that still must be fresh</td></tr>
+<tr><td>Serializable (stale) follower read</td><td>Follower answers from its current state</td><td>Under 1 ms</td><td>May be behind by a little; never goes back in time on one connection if the client passes its last revision</td><td>Config reads, dashboards, cached lookups</td></tr>
+</table>
+<p>A crucial rule: <b>never decide to hold a lock based on a stale read.</b> Acquire always goes through the leader. Stale reads are for observing, not for deciding. See <a href="../chapters/28-cap-consistency.html">Chapter 28</a> for the consistency models.</p>
+
+<h2 id="ephemeral">12. Ephemeral nodes, scaling reads and watch fan out</h2>
+<h3>12.1 Ephemeral nodes and recipes</h3>
+<p>An <b>ephemeral node</b> is a key owned by a session and deleted when that session ends. It turns "who is alive" into data. Typical uses: group membership (each worker registers <code>/workers/w-17</code>), service discovery (see <a href="../chapters/49-discovery-config.html">Chapter 49</a>), and leader election (candidates create sequential ephemeral nodes and the lowest is the leader). The <em>sequential</em> flag makes the server append a monotonically increasing number, assigned by the log. Because deletion on session expiry is a single committed log entry that removes all of the session's nodes together, observers see a consistent cut: either the whole worker is gone, or none of it.</p>
+<h3>12.2 Where the load really is</h3>
+<p>Our estimates showed that the consensus group is not the bottleneck: 6,000 writes per second at peak is a fraction of the capacity. The bottleneck is the number of connections, heartbeats, reads and watch notifications. Four techniques address it.</p>
+<ol>
+<li><b>Keep heartbeats out of the log.</b> Already covered: 10,000 keepalives per second are served from leader memory.</li>
+<li><b>Edge proxy tier.</b> Stateless proxies terminate the 50,000 client streams and multiplex them into a few connections to the replicas. A proxy can coalesce watchers: if 2,000 clients on 30 proxies watch the same key, each proxy holds one upstream watch and fans out locally, so the cluster sends 30 events instead of 2,000. This resembles the etcd gRPC proxy.</li>
+<li><b>Followers and observers.</b> Serve serializable and ReadIndex reads from followers. For larger read volume, add non voting <em>observer</em> replicas (a ZooKeeper concept) that replicate the log but do not count toward quorum, so adding them raises read capacity without making writes slower or changing fault tolerance.</li>
+<li><b>Client side caching with invalidation.</b> Chubby clients cache data and the master invalidates caches through the keepalive replies before accepting a write. We offer cached reads with watch based invalidation for config nodes.</li>
+</ol>
+<h3>12.3 Thundering herd on watches</h3>
+<p>If 40,000 clients all watch <code>/config/flags</code> and it changes, 40,000 notifications go out at once, and then all 40,000 clients read the new value, so the burst doubles. Mitigations: deliver the new value inside the event (no follow up read); fan out through the proxy tier; add random jitter to client reactions; rate limit watch registrations per session; and for locks specifically, prefer the server queue (one wake per release) over everyone watching the lock node.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Watch fan out through proxy tier">
+  <rect class="db" x="40" y="110" width="150" height="70" rx="8"/><text class="t-c t-b" x="115" y="138">Raft leader</text><text class="t-c t-sm" x="115" y="158">1 event per commit</text>
+  <rect class="box" x="300" y="40" width="150" height="50" rx="8"/><text class="t-c t-b" x="375" y="62">Proxy 1</text><text class="t-c t-sm" x="375" y="78">1 upstream watch</text>
+  <rect class="box" x="300" y="125" width="150" height="50" rx="8"/><text class="t-c t-b" x="375" y="147">Proxy 2</text><text class="t-c t-sm" x="375" y="163">1 upstream watch</text>
+  <rect class="box" x="300" y="210" width="150" height="50" rx="8"/><text class="t-c t-b" x="375" y="232">Proxy 30</text><text class="t-c t-sm" x="375" y="248">1 upstream watch</text>
+  <rect class="ext" x="620" y="30" width="240" height="70" rx="8"/><text class="t-c t-sm" x="740" y="58">about 1,300 watching clients</text><text class="t-c t-sm" x="740" y="78">per proxy</text>
+  <rect class="ext" x="620" y="115" width="240" height="70" rx="8"/><text class="t-c t-sm" x="740" y="143">about 1,300 watching clients</text><text class="t-c t-sm" x="740" y="163">per proxy</text>
+  <rect class="ext" x="620" y="200" width="240" height="70" rx="8"/><text class="t-c t-sm" x="740" y="228">about 1,300 watching clients</text><text class="t-c t-sm" x="740" y="248">per proxy</text>
+  <path class="arrow" d="M190 130 L296 70"/><path class="arrow" d="M190 145 L296 150"/><path class="arrow" d="M190 160 L296 232"/>
+  <path class="arrow" d="M450 65 L616 65"/><path class="arrow" d="M450 150 L616 150"/><path class="arrow" d="M450 235 L616 235"/>
+  <text class="t-sm" x="40" y="292">30 events leave the leader instead of 40,000; each proxy sends about 1,300 locally.</text>
+</svg>
+<figcaption>Watch coalescing at the proxy tier turns one event at the leader into thousands of client notifications without any extra work for the consensus group.</figcaption>
+</figure>
+
+<h2 id="multi-region">13. Failure modes: partition, split brain, zombie</h2>
+<p>For each component, what happens when it fails, slows, or lies?</p>
+<table>
+<tr><th>Failure</th><th>What happens</th><th>Mitigation</th></tr>
+<tr><td>Follower crashes (1 or 2 of 5)</td><td>Quorum is still 3. No client impact apart from slightly less read capacity.</td><td>Replace the node; it catches up from a snapshot plus log tail (1 GB state: about 10 to 30 seconds on a fast network).</td></tr>
+<tr><td>Leader crashes</td><td>Writes pause during election (1 to 3 s). Clients freeze, then resume. See section 11.</td><td>Randomized election timeouts, grace period, client retry with backoff.</td></tr>
+<tr><td>Leader slow (disk stall, long GC)</td><td>Followers time out and elect a new leader; old leader may still think it leads.</td><td>Fsync latency alerts; a term check in every message makes the old leader step down; ReadIndex protects reads.</td></tr>
+<tr><td>Network partition, majority side contains leader</td><td>Service continues on the majority side. The minority replicas stop serving writes and linearizable reads.</td><td>Clients on the minority side get errors and must treat their locks as lost after their local lease expires.</td></tr>
+<tr><td>Partition with the leader in the minority</td><td>The old leader cannot commit; the majority elects a new one. Old leader steps down upon seeing the higher term.</td><td>Because the old leader cannot commit, no split brain in the lock table. Fencing handles the clients that were on its side.</td></tr>
+<tr><td>Client partitioned from the service</td><td>Session expires on the server; locks move on. The client's local timer expires earlier, so it stops acting.</td><td>Library stops the protected work callback when the lease is lost.</td></tr>
+<tr><td>Client paused (zombie)</td><td>It wakes up believing it still holds the lock.</td><td>Fencing token at the resource. Section 10.</td></tr>
+<tr><td>Clock jumps on a server</td><td>Using a monotonic clock for TTL means a wall clock jump does not shorten or lengthen leases.</td><td>Never use wall time for expiry; monitor NTP separately.</td></tr>
+<tr><td>Replica returns corrupted or wrong data</td><td>Rare but possible (bit rot).</td><td>Checksums on every log entry and snapshot; a replica that fails a check refuses to start and is rebuilt from peers.</td></tr>
+<tr><td>Total loss of a quorum</td><td>Writes stop. Reads from survivors are stale only.</td><td>Spread five replicas over three zones (2, 2, 1); backups of snapshots to object storage for disaster recovery.</td></tr>
+<tr><td>Retry storm after a failover</td><td>50,000 clients reconnect at once to the new leader.</td><td>Exponential backoff with jitter in client library; proxies absorb the reconnect wave.</td></tr>
+</table>
+<p>Split brain deserves a direct statement. The lock table itself cannot have two leaders both committing, because commits need a majority and two disjoint majorities do not exist. The split brain risk that remains is at the <em>application</em> level: two clients both acting as the holder, because one is stale. The service ensures that only one of them holds the latest token, and the resource decides by token. General resilience patterns are in <a href="../chapters/40-resilience.html">Chapter 40</a> and availability in <a href="../chapters/41-ha-dr.html">Chapter 41</a>.</p>
+
+<h2 id="client">14. Client library behaviours and multi-region</h2>
+<h3>14.1 What the client library must do</h3>
+<p>Most lock bugs are in the clients, so we ship a thick library and keep the semantics inside it.</p>
+<ul>
+<li><b>Background keepalive thread</b> that is isolated from application work (a dedicated thread or event loop) so that a busy application does not starve heartbeats. This does not defend against full process pauses.</li>
+<li><b>Session state machine:</b> CONNECTED, JEOPARDY (cannot reach the service, local lease still valid), and EXPIRED. The library publishes state changes as callbacks. In JEOPARDY the app should pause new critical work; in EXPIRED it must stop and drop the lock handle immediately.</li>
+<li><b>Lock handle with a cancellation signal.</b> The holder gets a token and a context that is cancelled as soon as the local lease is lost. Long operations should check it between steps.</li>
+<li><b>Safe retries.</b> Acquire is idempotent per session (re acquiring a held lock returns the same token). Release carries the token. Retries use backoff with jitter.</li>
+<li><b>Endpoint discovery and leader redirect,</b> caching of the last known leader, and fast failover to another replica or proxy.</li>
+<li><b>Grace window:</b> after reconnecting inside the grace period, the library re validates ownership of each lock with a linearizable read before resuming, and discards locks that were lost.</li>
+</ul>
+<h3>14.2 Multi-region</h3>
+<p>Consensus latency is bounded by the round trip to a majority. Within a region, zones are about 1 ms apart. Across regions, 60 to 150 ms. Therefore a single Raft group stretched over three regions makes every write cost around 70 to 150 ms and lets the service survive a full region loss. Two real choices exist.</p>
+<table>
+<tr><th>Option</th><th>Design</th><th>Write latency</th><th>Survives region loss?</th><th>Use for</th></tr>
+<tr><td>Regional clusters (default)</td><td>One 5 node cluster per region; locks scoped to a region; clients use the local one</td><td>3 to 10 ms</td><td>Region fails: its locks are unavailable, but other regions are unaffected</td><td>Most workloads: a region's jobs lock in that region</td></tr>
+<tr><td>Global cluster across 3 regions</td><td>One Raft group with replicas in 3 regions (2 + 2 + 1); leader pinned near the busiest region</td><td>70 to 150 ms</td><td>Yes (any one region)</td><td>Truly global singletons, such as a global scheduler leader</td></tr>
+<tr><td>Global lock via a small dedicated "global" cluster, regional clusters for the rest</td><td>Two tiers; a small number of global locks</td><td>Global ones slow, others fast</td><td>Yes for global ones</td><td>Our recommendation when both needs exist</td></tr>
+</table>
+<p>We never try to run active active lock tables in two regions with asynchronous replication: it would mean two regions can both grant the same lock, which breaks the core promise. More on multi-region data in <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>. Read heavy clients in remote regions can still use serializable follower or observer reads placed in their own region, for config and discovery, where bounded staleness is acceptable.</p>
+
+<h2 id="alternatives">15. Comparison: Redis Redlock, database advisory locks, ZooKeeper and etcd</h2>
+<p>An interviewer will ask "why not just use Redis?" The answer depends on what the lock protects.</p>
+<table>
+<tr><th>Property</th><th>Raft service (etcd, Chubby style)</th><th>Redis single node <code>SET NX PX</code></th><th>Redis Redlock</th><th>DB advisory lock</th></tr>
+<tr><td>Replication model</td><td>Consensus, majority commit</td><td>Async replica; failover can lose a just granted lock</td><td>5 independent masters, majority of them, no consensus</td><td>Whatever the database gives; a single primary</td></tr>
+<tr><td>Fencing token</td><td>Yes, from the log</td><td>No (you can add a counter, but failover can reset it)</td><td>No built in monotonic token</td><td>No (a version column can serve)</td></tr>
+<tr><td>Safety under pauses</td><td>Yes, with fencing at the resource</td><td>No</td><td>Depends on timing and bounded clock drift assumptions; criticized for unsafe behaviour with pauses and clock jumps</td><td>Session bound: lock ends when the connection ends</td></tr>
+<tr><td>Failure detection</td><td>Session lease and heartbeats</td><td>Key TTL</td><td>Key TTL on each node</td><td>Connection loss (TCP timeouts may be slow)</td></tr>
+<tr><td>Throughput</td><td>Thousands of writes/s per group</td><td>Very high (100k+ ops/s)</td><td>High, but 5 round trips per acquire</td><td>Limited by DB load and connections</td></tr>
+<tr><td>Waiters and watches</td><td>Built in</td><td>Polling or pub/sub by hand</td><td>Polling</td><td>Blocking calls hold a DB connection</td></tr>
+<tr><td>Best for</td><td>Correctness locks, leader election, config</td><td>Efficiency locks (avoid duplicate cron runs)</td><td>Debated; if you need correctness, use fencing and a consensus system</td><td>When the data to protect already lives in that database</td></tr>
+</table>
+<p>Details. With single node Redis, if the master grants a lock and crashes before the replica sees it, the promoted replica has no record, so a second client can take the same lock. Redlock tries to fix this by asking five independent Redis masters and requiring a majority, but it depends on timing assumptions (bounded network delay, process pauses and clock drift) that real systems violate, and it produces no fencing token. So for a correctness lock, we prefer a real consensus system plus fencing. For a cheap, best effort "only one instance should run this cron job," Redis is a reasonable and much simpler choice, and we say so honestly. See <a href="../chapters/15-redis.html">Chapter 15</a>.</p>
+<p>Database advisory locks (for example Postgres <code>pg_advisory_lock</code>) are session scoped locks managed by the database. They are excellent when the thing being protected is in that same database, because the lock and the data share a failure domain and fate. Their weaknesses: they hold a database connection per lock; they depend on the database's availability; and they do not generalize to guarding other systems. We would offer them as the recommended answer for "serialize work on this row" and the lock service for "elect one leader among 200 pods." See <a href="../chapters/18-relational-internals.html">Chapter 18</a>.</p>
+<p>ZooKeeper versus etcd as the implementation: ZooKeeper uses ZAB (an atomic broadcast protocol similar in spirit to Raft), sessions with tick based timeouts, one time watches and the znode tree with sequential and ephemeral flags. etcd uses Raft, leases attached to keys, a flat versioned key space with revisions, streaming watches with history, and multi key transactions. Our design borrows from both. Building from scratch is rarely right in a real organization: we would run etcd or ZooKeeper and wrap it. The interview asks us to explain what is inside.</p>
+
+<h2 id="deep-dives">16. Further deep dives</h2>
+<h3>16.1 Why not make every lock a separate Raft group?</h3>
+<p>If one group becomes a bottleneck, we can shard locks by name hash across several Raft groups, each with its own leader and log (the pattern of <a href="../chapters/25-sharding.html">Chapter 25</a>). Each group would run on the same set of machines to share hardware. Our estimates say a single group is enough, and sharding costs us cross shard atomicity: a session expiry that must release locks on several groups becomes a multi group operation, and a multi lock transaction becomes a distributed transaction (<a href="../chapters/31-distributed-transactions.html">Chapter 31</a>). So we start with a single group, and design the session owner record so that sessions could later be homed on a single group, with locks routed by hash and expiry fanned out by that owner.</p>
+<h3>16.2 Tradeoff table for the heartbeat path</h3>
+<table>
+<tr><th>Option</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Each heartbeat is a Raft write</td><td>New leaders know exact deadlines; no need for a grace reset</td><td>10,000 extra log writes per second; roughly 5x our normal write load; log bloat</td></tr>
+<tr><td>Leader memory only, with grace reset on failover (our choice)</td><td>No log load; cheap; matches Chubby and etcd</td><td>After failover, dead sessions are detected up to a TTL later</td></tr>
+<tr><td>Periodic checkpoint of deadlines through the log (every 10 s, batched)</td><td>Bounds the post failover error without per heartbeat cost</td><td>Extra complexity; we would add it only if the grace delay hurts</td></tr>
+</table>
+<h3>16.3 Security and abuse</h3>
+<p>Clients authenticate with mutual TLS, and each service identity is limited by an access control list to path prefixes (<code>/payments/*</code>), with separate permissions to read, write and watch (see <a href="../chapters/55-security.html">Chapter 55</a>). Abuse controls: per client quotas on sessions, nodes, watches and request rate (a runaway client creating a million nodes can fill memory), a maximum value size, and a cap on the waiters per lock. A lock held by a buggy client forever is caught by a "max hold" alert, and operators can revoke a session by hand. All administrative actions are audit logged.</p>
+<h3>16.4 Monitoring and SLOs</h3>
+<ul>
+<li><b>SLIs:</b> acquire latency p50 and p99; commit latency; fsync latency (the number one cause of problems); election count per hour; session expiry rate; heartbeat lag; watch event delivery lag; proposals pending; database size.</li>
+<li><b>SLOs:</b> 99.99 percent of linearizable operations succeed over 30 days; p99 write under 25 ms; failover recovery under 5 seconds at p99; watch delivery lag under 500 ms at p99.</li>
+<li><b>Alerts:</b> more than 1 leader change per 10 minutes (flapping); fsync p99 above 50 ms; any follower more than 1,000 entries behind; session expiry spike (a sign of a client or network event, not service failure).</li>
+</ul>
+<p>See <a href="../chapters/54-observability-slos.html">Chapter 54</a>.</p>
+<h3>16.5 Cost notes</h3>
+<p>The cluster is small and boring: five machines with 8 cores, 32 GB memory (state is 1 GB, the rest is page cache and headroom), and fast SSDs or NVMe with low fsync latency, which matters more than capacity. Proxy tier: 6 to 10 small stateless instances. The expensive part is operational: upgrades, backups and on call. This is why many companies run a shared lock service for the whole organization rather than one per team.</p>
+
+<h2 id="evolution">17. Scaling, evolution and phasing</h2>
+<h3>17.1 What changes at 10x</h3>
+<p>At 500,000 clients: heartbeats reach 100,000 per second, which the leader can still handle if it only touches memory, but 500,000 connections demand a larger proxy tier (about 100 proxies at 5,000 connections each). Watches reach 5 million, so coalescing in the proxies becomes mandatory. Writes at 20,000 per second approach one group's ceiling, so we shard by lock prefix into several Raft groups and introduce a session owner design as in 16.1. State grows to 10 GB, so snapshots and catch up become minutes, and we move to incremental snapshots. We would also push more reads to observers and add per tenant isolation (see <a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>) so one team's watch storm cannot hurt another team.</p>
+<h3>17.2 What we build first</h3>
+<ol>
+<li><b>Phase 1:</b> adopt an existing Raft or ZooKeeper cluster as the core. Build the client library with sessions, local lease timers, jeopardy handling and the fencing token API.</li>
+<li><b>Phase 2:</b> add the proxy tier and watch coalescing, quotas and access control, dashboards, and the documentation contract for fencing.</li>
+<li><b>Phase 3:</b> add follower and observer reads, shared mode locks, and the multi region layout.</li>
+<li><b>Phase 4:</b> sharding into several groups if growth demands it.</li>
+</ol>
+<h3>17.3 Alternatives not chosen</h3>
+<ul>
+<li><b>Lock on top of a general database with row locks:</b> simple, but the database becomes the dependency and failure detection depends on connection timeouts.</li>
+<li><b>Peer to peer or gossip based lock:</b> gossip (<a href="../chapters/33-gossip-merkle.html">Chapter 33</a>) is eventually consistent, so it cannot give mutual exclusion.</li>
+<li><b>Time based leases from synchronized clocks (as in Spanner's TrueTime):</b> allows lock free reads but needs special hardware clocks and bounded uncertainty; too heavy for general use.</li>
+<li><b>Avoiding locks entirely:</b> use idempotent operations, optimistic concurrency with versions, or a single writer queue (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>). Often the best answer.</li>
+</ul>
+
+<h2 id="qa">18. Interview Q&amp;A</h2>
+<details><summary>Can a lock with a TTL ever be perfectly safe on its own?</summary>
+<p>No. The holder can check the lock, then stall for a stop the world garbage collection, a VM pause, or a network delay on a write that was already sent, for longer than the TTL. Meanwhile the lock moves to another client. When the first client resumes, it acts on stale belief. The lock service cannot see or stop that. The fix is to make the protected resource participate: every grant carries a monotonic fencing token and the resource rejects any request carrying a token lower than the highest it has seen. The lock then gives mutual exclusion in practice and the token gives it in the worst case.</p></details>
+<details><summary>Why are heartbeats not written through Raft?</summary>
+<p>At 50,000 sessions with a 5 second interval that would be 10,000 extra writes per second, each needing disk and a majority round trip, consuming most of the capacity of the group and bloating the log with information that has no long term value. Instead the leader keeps deadlines in memory. The price is that a new leader does not know the deadlines, so it resets every session to a full TTL and clients get a grace window to reconnect. Detection of dead holders after a failover is slightly later, which is a good trade for safety and throughput.</p></details>
+<details><summary>What happens to held locks if the leader dies?</summary>
+<p>Nothing, if the election and reconnection fit inside the lease and grace windows. The committed lock table is on a majority, so the new leader has it. The new leader gives each session a fresh full TTL. Clients notice the broken connection, enter jeopardy (stop starting new critical work), find the new leader, and reconnect with the same session id. Their locks and tokens are unchanged. Only when a client fails to reconnect within TTL plus grace does its session expire and its locks pass to waiters with higher tokens.</p></details>
+<details><summary>How do you choose the fencing token, and why is it monotonic across leader changes?</summary>
+<p>The token is assigned inside the state machine when the acquire entry is applied, either as the Raft log index of that entry or as a per lock counter incremented in the apply function. Because the log is a single total order agreed by consensus, and a committed entry survives every future leader, two grants can never get equal or reversed tokens, even if the leader changes between them. A token taken from a wall clock or a per leader memory counter would not have that property, since clocks disagree and a new leader would restart its counter.</p></details>
+<details><summary>When is it fine to read from a follower, and when is it dangerous?</summary>
+<p>Follower reads are fine for observing data that tolerates bounded staleness: configuration, service discovery, dashboards, and cache refreshes. They are dangerous for any read that feeds a decision such as "is the lock free, so I will take it", because a lagging follower may show an old holder or an old value. Decisions must go through the leader via ReadIndex or a write. A middle path is the follower ReadIndex read, which asks the leader only for the current commit index and then serves from the follower after catching up, giving linearizable data while offloading the data read from the leader.</p></details>
+<details><summary>Why five replicas and not three or seven?</summary>
+<p>Three replicas tolerate one failure, but during planned maintenance on one node a second failure loses quorum, so critical infrastructure usually runs five, which tolerates two. Seven tolerates three but each write needs four acknowledgements, adds latency and replication load, and rarely increases real availability because correlated failures (a zone, a bad deploy) dominate. We spread five replicas over three zones as 2, 2, 1 so that losing any zone keeps a majority of three.</p></details>
+<details><summary>How would you stop a thundering herd when a popular lock is released?</summary>
+<p>Do not let all waiters watch the lock node. Use a server side queue so a release wakes only the head waiter, or the ZooKeeper style recipe where each contender creates a sequential ephemeral node and watches only its predecessor. For config style nodes watched by many clients, coalesce watches in a proxy tier, include the new value in the event so there are no follow up reads, and add client jitter. Rate limiting watch registration per session protects the service from a client bug that opens thousands of watches.</p></details>
+<details><summary>Why not just use Redis Redlock?</summary>
+<p>Redlock asks five independent Redis masters and needs a majority, but it has no consensus protocol, no fencing token, and its safety argument depends on bounded network delay, bounded pauses and bounded clock drift, which real systems do not guarantee. A client paused after acquiring can still act once its key has expired and another client has locked. For efficiency locks, such as preventing two cron instances from running the same report, plain Redis is fine and operationally simple. For correctness locks, I would use a consensus backed service with fencing tokens, or avoid the lock and use a compare and set on the data.</p></details>
+<details><summary>How do you handle multi-region?</summary>
+<p>Consensus latency equals the round trip to a majority, so a global group costs 70 to 150 ms per write. I would run a separate cluster per region for regional work, which keeps writes at a few milliseconds, and keep a small global cluster for the few truly global singletons. I would not replicate lock tables asynchronously between regions, since both sides could then grant the same lock. Remote readers can use follower or observer reads for configuration where staleness is acceptable.</p></details>
+<details><summary>How would you test that the service is actually safe?</summary>
+<p>Use deterministic simulation and Jepsen style fault injection: random partitions, process pauses, clock rate skew, leader kills and disk stalls while many clients acquire, write with tokens and release. A checker verifies that tokens strictly increase per lock, that no two accepted writes carry out of order tokens, and that the history of lock operations is linearizable. We also test the client library by injecting pauses between the "hold" check and the write to prove that the resource rejects the stale token.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">19. Recap</h2>
+<ul>
+<li>A lock service is a small, strongly consistent, replicated state machine: five Raft replicas, all state in memory, about 1 GB, one group is enough for 2,000 to 6,000 writes per second.</li>
+<li>Sessions with TTL and heartbeats own locks, ephemeral nodes and watches. Heartbeats (10,000 per second) live in leader memory, not in the log. A new leader resets deadlines and clients get a grace window.</li>
+<li>Locks have a server side FIFO queue, try and blocking acquire, and watches with revision replay. Waking one waiter per release avoids the herd.</li>
+<li>Safety in the face of pauses and clock errors comes from <b>fencing tokens</b> taken from the log and checked by the protected resource, not from the TTL.</li>
+<li>Reads: linearizable via ReadIndex for decisions, follower or observer reads for observing; the real scaling work is in reads, heartbeats and watch fan out through a proxy tier.</li>
+<li>Failure modes: partitions cannot produce two leaders that both commit; zombie clients are handled by fencing; clients must treat jeopardy and expiry as "stop work".</li>
+<li>Regional clusters by default, a small global cluster for global singletons, no async active active locks.</li>
+<li>Redis based locks are fine for efficiency; use consensus plus fencing, or a database compare and set, when correctness matters.</li>
+</ul></div>
+<p class="connects"><b>Connects to:</b> built on <a href="../chapters/29-consensus.html">Chapter 29</a> (Raft, quorums, split brain) and <a href="../chapters/30-coordination-locks.html">Chapter 30</a> (leases, fencing, ZooKeeper and etcd). Related: <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a> (clocks and ordering), <a href="../chapters/28-cap-consistency.html">Chapter 28</a> (consistency models), <a href="../chapters/24-replication.html">Chapter 24</a> (replication), <a href="../chapters/25-sharding.html">Chapter 25</a> (sharding), <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a> (multi region), <a href="../chapters/49-discovery-config.html">Chapter 49</a> (discovery and config), <a href="../chapters/15-redis.html">Chapter 15</a> (Redis), <a href="../chapters/40-resilience.html">Chapter 40</a> (resilience), <a href="../chapters/54-observability-slos.html">Chapter 54</a> (SLOs). Compare with <a href="c03-rate-limiter.html">Case study 3</a> and <a href="c04-key-value-store.html">Case study 4</a>.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 27: Failure, Time and Ordering | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="27-failure-time-ordering">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+  </defs>
+</svg>
+
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+
+<main>
+<div class="kicker">Chapter 27 · Module 4 · Distributed Systems Theory</div>
+<h1>Failure, Time and Ordering</h1>
+<p class="lead">On one machine, a function call either returns or crashes, and "before" and "after" are decided by one clock. Across machines neither is true: calls vanish without a trace, clocks disagree, and nobody can say for certain which of two events happened first. This chapter explains why, and then builds the tools (failure detectors, logical clocks, version vectors, bounded-uncertainty time) that real systems use to reason about it anyway.</p>
+
+<!-- ======================= 1 ======================= -->
+<h2 id="why">1. Why distributed systems are different</h2>
+
+<p>A program on one computer lives in a comfortable world. If it calls a function, one of two things happens: the function returns a result, or the whole process dies, and then nobody is left to be confused. All the threads read the same memory and the same clock. If you ask "did operation A happen before operation B?", there is an answer, because the hardware gives every instruction a place in one sequence.</p>
+
+<p>A distributed system is a set of machines that cooperate by sending messages over a network. Three facts about that setting break the comfortable assumptions, and nearly every topic in the rest of this module (<a href="28-cap-consistency.html">Chapter 28</a> on CAP and consistency, <a href="29-consensus.html">Chapter 29</a> on consensus, <a href="24-replication.html">Chapter 24</a> on replication) is a response to one of them.</p>
+
+<h3>1.1 Partial failure</h3>
+<p>On one machine, failure is mostly all-or-nothing. In a distributed system, <b>part of the system can fail while the rest keeps running</b>. One node loses power while nine others are fine. One network cable is cut. One process is stuck in a long garbage-collection pause. This is called <b>partial failure</b>, and it is the defining difficulty: the surviving parts must continue to make correct decisions without knowing exactly what the failed part did or is doing. Worse, failures are often <b>nondeterministic</b>: the same request might succeed now and fail a second later, which makes them hard to reproduce and test.</p>
+
+<h3>1.2 Unreliable networks</h3>
+<p>The network lets you send a message but promises almost nothing about it. A message may be lost, delayed for an arbitrary time, delivered twice, delivered out of order, or corrupted (usually detected by checksums). TCP hides some of this by retransmitting lost packets and ordering bytes inside a single connection, but TCP cannot rescue you if the connection itself breaks, if the other side crashes after receiving data but before acting on it, or if a middlebox silently drops state. Every layer above TCP still has to assume that any request or response can disappear.</p>
+
+<h3>1.3 No shared clock, no shared memory</h3>
+<p>Each machine has its own hardware clock, a quartz crystal that counts oscillations. Crystals run at slightly different speeds, so clocks drift apart; protocols such as NTP pull them back together, but only to within some error, and that error is not zero. There is also no shared memory: machine A cannot look at machine B's state, it can only send a message and wait for a reply, and the reply describes the past. By the time it arrives, B's state may have changed.</p>
+
+<div class="callout key"><b>Key idea</b>
+A distributed system is defined by what you <b>cannot</b> assume: you cannot assume a call returns, you cannot assume a lost message was not processed, you cannot assume two clocks agree, and you cannot assume the answer you received is still true. The craft of the field is designing protocols that stay correct under those uncertainties, and being honest about the guarantees that remain.
+</div>
+
+<p>Interviewers like this topic because it is where hand-waving gets exposed. "We will just use timestamps to pick the latest write" and "we will retry on timeout" both sound reasonable and both cause real data loss, as sections 6 and 3 will show.</p>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="faults">2. Fault types and network partitions</h2>
+
+<p>To reason about failures, we classify them by how badly the failed component misbehaves. A protocol designed for a mild fault model is simpler and faster; a protocol designed for a harsh model costs more. You should always say which model you assume.</p>
+
+<table>
+<tr><th>Fault type</th><th>What the component does</th><th>Example</th><th>Typical defence</th></tr>
+<tr><td><b>Crash (fail-stop)</b></td><td>Works correctly, then stops forever and does nothing else. Other nodes may or may not eventually notice.</td><td>Power loss, kernel panic, OOM kill</td><td>Replication, failover, restart and recover from a log</td></tr>
+<tr><td><b>Crash-recovery</b></td><td>Stops, then later restarts, usually having lost memory but keeping disk. It may rejoin with stale knowledge.</td><td>Process restarted by the orchestrator</td><td>Write-ahead log, fsync before acknowledging, rejoin protocol</td></tr>
+<tr><td><b>Omission</b></td><td>Keeps running, but some messages it sends or receives are dropped.</td><td>Full socket buffer, overloaded NIC, packet loss</td><td>Retries with idempotency (<a href="32-idempotency-ids.html">Chapter 32</a>), acknowledgements</td></tr>
+<tr><td><b>Timing / slow (performance)</b></td><td>Responds correctly but too late: a response arrives after the caller gave up.</td><td>GC pause, noisy neighbour, disk stall, VM pause</td><td>Timeouts, hedged requests, deadlines, backpressure</td></tr>
+<tr><td><b>Byzantine</b></td><td>Behaves arbitrarily: sends contradictory messages to different peers, lies, or is malicious or corrupted.</td><td>Compromised node, memory corruption, buggy firmware</td><td>Byzantine fault tolerant protocols (cost: 3f+1 nodes to tolerate f), signatures, in practice distrust boundaries</td></tr>
+</table>
+
+<p>Most data-center systems assume <b>crash-recovery plus omission and slowness</b> and explicitly do <i>not</i> defend against Byzantine behaviour, because inside one organisation's trusted network the cost of Byzantine tolerance outweighs the benefit. Blockchains and systems spanning mutually distrusting parties are the main places where Byzantine tolerance is worth paying for. Slow nodes deserve special attention, because they are the most common real-world fault and the hardest to distinguish from a dead one (section 3.2).</p>
+
+<h3>2.1 Network partitions</h3>
+<p>A <b>network partition</b> is a failure of the network (not of any node) that splits the machines into groups that can each talk internally but not across the split. Each side is alive and healthy; each side thinks the other side died. Partitions in the wild are rarely a clean cut in half. They are asymmetric (A can reach B but B cannot reach A), partial (A reaches B and C, but B cannot reach C), or intermittent (flapping). Causes include a failed switch, a misconfigured firewall rule, a congested link dropping heartbeats, a bad deployment of a routing change, or cross-region links breaking.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="A network partition splits a cluster into two groups that both stay alive">
+  <rect class="box" x="40"  y="60"  width="120" height="46" rx="10"/><text class="t-c t-b" x="100" y="88">Node A</text>
+  <rect class="box" x="40"  y="150" width="120" height="46" rx="10"/><text class="t-c t-b" x="100" y="178">Node B</text>
+  <rect class="box" x="300" y="105" width="120" height="46" rx="10"/><text class="t-c t-b" x="360" y="133">Node C</text>
+  <path class="arrow" d="M100 106 L100 150" marker-start="url(#ah)"/>
+  <path class="arrow" d="M160 83 L300 120"/>
+  <path class="arrow" d="M160 173 L300 138"/>
+  <path d="M470 20 L470 250" stroke="var(--bad)" stroke-width="3" stroke-dasharray="8 6" fill="none"/>
+  <text class="t-c t-b" x="470" y="262" style="fill:var(--bad)">partition</text>
+  <rect class="db" x="560" y="60"  width="120" height="46" rx="10"/><text class="t-c t-b" x="620" y="88">Node D</text>
+  <rect class="db" x="560" y="150" width="120" height="46" rx="10"/><text class="t-c t-b" x="620" y="178">Node E</text>
+  <path class="arrow" d="M620 106 L620 150" marker-start="url(#ah)"/>
+  <path class="arrow-r dash" d="M420 128 L560 128"/>
+  <text class="t-c t-sm" x="490" y="116">messages dropped</text>
+  <text class="t-sm" x="40" y="30">Side 1: A, B, C (majority, 3 of 5)</text>
+  <text class="t-sm" x="540" y="30">Side 2: D, E (minority, 2 of 5)</text>
+  <text class="t-sm" x="720" y="100">Each side believes the other</text>
+  <text class="t-sm" x="720" y="120">side crashed. Both are alive</text>
+  <text class="t-sm" x="720" y="140">and may keep accepting writes</text>
+  <text class="t-sm" x="720" y="160">unless a rule stops one of them.</text>
+</svg>
+<figcaption>A partition is a network failure, not a node failure. The rule that decides which side may continue (usually "the side with a majority") is the subject of <a href="29-consensus.html">Chapter 29</a>; the choice between availability and consistency during the split is the subject of <a href="28-cap-consistency.html">Chapter 28</a>.</figcaption>
+</figure>
+
+<p>The dangerous outcome of a partition is <b>split brain</b>: both sides conclude the leader is gone, both elect a new leader, and both accept writes that later conflict. Defences are majority quorums (only a side with more than half the nodes may proceed), fencing tokens (section 4.3), and leases that expire.</p>
+
+<div class="callout watch"><b>Watch out</b>
+Partitions are not exotic. Large operators report that network faults (including partial and brief ones) are among the most frequent causes of serious incidents. "The network is reliable" is the first of the classic fallacies of distributed computing. Design as if partitions will happen, because they will, and decide in advance what each side does.
+</div>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="timeouts">3. The two generals problem, timeouts, and slow versus dead</h2>
+
+<h3>3.1 The two generals problem</h3>
+<p>Two armies, led by two generals, sit on opposite hills with an enemy in the valley between them. They will win only if both attack at the same time; if only one attacks, it loses. They can communicate only by sending messengers through the valley, and any messenger may be captured. General 1 sends "attack at dawn". If General 2 receives it, should General 2 attack? Only if General 1 knows the message arrived. So General 2 sends an acknowledgement. But now General 2 does not know if the acknowledgement arrived. General 1 could acknowledge the acknowledgement, and so on forever: no finite number of messages can make both generals <b>certain</b> that the other will attack.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Two generals exchanging acknowledgements, each message possibly lost, with no end to the uncertainty">
+  <rect class="ext" x="60"  y="20" width="150" height="40" rx="8"/><text class="t-c t-b" x="135" y="45">General 1</text>
+  <rect class="ext" x="690" y="20" width="150" height="40" rx="8"/><text class="t-c t-b" x="765" y="45">General 2</text>
+  <line class="life" x1="135" y1="60" x2="135" y2="290"/><line class="life" x1="765" y1="60" x2="765" y2="290"/>
+  <path class="arrow" d="M135 95 L761 120"/><text class="t-sm" x="280" y="90">1. "attack at dawn"</text>
+  <path class="arrow dash" d="M761 150 L139 175"/><text class="t-sm" x="480" y="150">2. "got it, I will attack"</text>
+  <path class="arrow" d="M135 205 L761 230"/><text class="t-sm" x="280" y="200">3. "got your got-it"</text>
+  <text class="t-c t-sm" x="450" y="268">... and so on forever. Any one of these arrows may be lost, so the last sender is never sure.</text>
+</svg>
+<figcaption>Each acknowledgement raises confidence but never reaches certainty, because the sender of the last message cannot know it arrived.</figcaption>
+</figure>
+
+<p>The result is a proof that <b>no protocol can guarantee agreement over a channel that may lose messages</b> if the answer has to be certain after a bounded number of steps. This is why distributed systems never promise "exactly-once delivery" at the network level: that would require solving the two generals problem. What systems do instead is accept the uncertainty and engineer around it: they repeat messages until acknowledged (at-least-once) and make repeats harmless (idempotency, <a href="32-idempotency-ids.html">Chapter 32</a>), or they accept possible loss (at-most-once). Real consensus protocols (<a href="29-consensus.html">Chapter 29</a>) reach agreement not by beating this proof but by assuming messages are <i>eventually</i> delivered if you keep retrying, and by tolerating a minority of failures.</p>
+
+<h3>3.2 Timeouts and why slow looks like dead</h3>
+<p>You send a request and wait. Nothing comes back. What happened? There are at least four possibilities, and from the caller's side they are <b>indistinguishable</b>: the request was lost on the way; the server crashed before processing it; the server processed it and crashed before replying; the server processed it and the reply was lost or is merely slow. The only evidence you have is silence.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Four different failures that all look like a timeout to the client">
+  <text class="t-b" x="20" y="22">What the client sees: no reply before the timeout. What actually happened:</text>
+
+  <rect class="ext" x="30" y="40" width="110" height="34" rx="8"/><text class="t-c t-b" x="85" y="62">Client</text>
+  <rect class="db" x="250" y="40" width="110" height="34" rx="8"/><text class="t-c t-b" x="305" y="62">Server</text>
+  <text class="t-b" x="400" y="62">A. Request lost: server never saw it, nothing changed</text>
+  <path class="arrow-r dash" d="M140 57 L200 57"/><text class="t-b" x="205" y="62" style="fill:var(--bad)">X</text>
+
+  <rect class="ext" x="30" y="105" width="110" height="34" rx="8"/><text class="t-c t-b" x="85" y="127">Client</text>
+  <rect class="miss" x="250" y="105" width="110" height="34" rx="8"/><text class="t-c t-b" x="305" y="127">Server (dead)</text>
+  <text class="t-b" x="400" y="127">B. Server crashed before processing: nothing changed</text>
+  <path class="arrow" d="M140 122 L246 122"/>
+
+  <rect class="ext" x="30" y="170" width="110" height="34" rx="8"/><text class="t-c t-b" x="85" y="192">Client</text>
+  <rect class="miss" x="250" y="170" width="110" height="34" rx="8"/><text class="t-c t-b" x="305" y="192">Server (dead)</text>
+  <text class="t-b" x="400" y="192">C. Crashed after committing, before replying: change HAPPENED</text>
+  <path class="arrow" d="M140 187 L246 187"/>
+
+  <rect class="ext" x="30" y="235" width="110" height="34" rx="8"/><text class="t-c t-b" x="85" y="257">Client</text>
+  <rect class="db" x="250" y="235" width="110" height="34" rx="8"/><text class="t-c t-b" x="305" y="257">Server</text>
+  <text class="t-b" x="400" y="257">D. Reply lost, or just slow (GC pause): change HAPPENED</text>
+  <path class="arrow" d="M140 252 L246 252"/><path class="arrow-r dash" d="M246 262 L190 262"/>
+
+  <text class="t-sm" x="30" y="305">A and B: retrying is safe. C and D: retrying a non-idempotent operation applies it twice. The client cannot tell which case it is in.</text>
+</svg>
+<figcaption>A timeout carries almost no information. Cases C and D are why a payment API must accept an idempotency key before a client may safely retry.</figcaption>
+</figure>
+
+<p>This leads to a fundamental limit: <b>in an asynchronous network (no upper bound on delay) you cannot distinguish a crashed node from a very slow one</b>. A timeout is therefore only a <i>guess</i>. If you set it too short, you declare healthy but slow nodes dead, trigger needless failovers, and in the worst case cause a cascading failure: a slow node is declared dead, its load moves to the others, they become slow, and are declared dead in turn. If you set it too long, real failures take long to notice and users stare at spinners.</p>
+
+<p>Practical guidance for timeouts:</p>
+<ul>
+<li><b>Derive the timeout from measured latency</b>, for example a little above the 99.9th percentile of healthy latency, not from a round number.</li>
+<li><b>Use deadlines, not just per-hop timeouts.</b> A request carries a total time budget; each downstream call gets what remains, so a chain of three services cannot silently multiply the wait.</li>
+<li><b>Retry with exponential backoff and jitter</b>, and only for idempotent operations or with an idempotency key. Without jitter, thousands of clients retry in lockstep and hammer a recovering server.</li>
+<li><b>Treat a timeout as "unknown", not "failed".</b> Before retrying a write, you either need idempotency or a way to ask "did my earlier attempt apply?".</li>
+</ul>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="detectors">4. Failure detectors</h2>
+
+<p>Since certainty is impossible, systems use a <b>failure detector</b>: a component that gives each node a running opinion on which peers are alive. Its output is a <i>suspicion</i>, and it can be wrong in two ways: <b>false positives</b> (suspecting a node that is actually fine) and <b>false negatives</b> (not yet suspecting a node that already died). Detectors are judged on <b>completeness</b> (every crashed node is eventually suspected by everyone) and <b>accuracy</b> (healthy nodes are not wrongly suspected). You cannot maximise both at once in an asynchronous network, so you tune the tradeoff.</p>
+
+<h3>4.1 Heartbeats</h3>
+<p>The simplest design: each node sends a small "I am alive" message to a monitor every interval (say, every second), or the monitor pings each node. If no heartbeat arrives within a timeout (say, 5 intervals), the node is suspected. This is cheap and easy, but a fixed timeout is brittle: it is wrong whenever network latency changes, for example during a busy period.</p>
+
+<h3>4.2 Adaptive detection: phi accrual</h3>
+<p>The <b>phi accrual failure detector</b> (used by Cassandra and Akka) replaces the yes/no answer with a continuous number. It keeps a history of recent heartbeat arrival intervals for each peer, models their distribution, and computes <b>phi</b>, a value that grows the longer the current silence is compared to the normal pattern. Phi of 1 means roughly a 10 percent chance the silence is normal; phi of 8 means roughly a one in 100 million chance. Each application picks the threshold it wants (Cassandra's default is around 8). The point is that the detector adapts: on a jittery network the learned distribution is wide, so it waits longer before suspecting, and on a stable network it reacts fast.</p>
+
+<h3>4.3 Gossip-based detection and what to do with a suspicion</h3>
+<p>A central monitor is itself a single point of failure and does not scale. Large clusters let nodes <b>gossip</b>: each node periodically tells a few random peers what it knows about everyone else's liveness, so a failure rumour spreads to the whole cluster in a logarithmic number of rounds. Variants such as SWIM add indirect probes: before suspecting node X, node A asks several other nodes to ping X on its behalf, which filters out failures that are just a broken A-to-X link. The mechanism, along with anti-entropy via Merkle trees, is covered in <a href="33-gossip-merkle.html">Chapter 33</a>.</p>
+
+<p>A suspicion is only an opinion, so what you do with it matters. Never let a suspected node's old authority linger:</p>
+<ul>
+<li><b>Leases.</b> A node holds a lock or leadership only for a bounded time (for example 10 seconds) and must renew it. If it is paused and the lease expires, others may take over.</li>
+<li><b>Fencing tokens.</b> Each time a lock or leadership is granted, the coordinator issues a monotonically increasing number. The protected resource (a database, a file store) rejects any request carrying a number lower than one it has already seen. Then a zombie leader that wakes up after a long pause cannot corrupt data, because its token is stale. This is how you stay safe even when the failure detector was wrong. (More in <a href="30-coordination-locks.html">Chapter 30</a>.)</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="Fencing token prevents a paused old leader from overwriting newer data">
+  <rect class="ext" x="40"  y="20" width="150" height="38" rx="8"/><text class="t-c t-b" x="115" y="44">Old leader</text>
+  <rect class="box" x="300" y="20" width="150" height="38" rx="8"/><text class="t-c t-b" x="375" y="44">Lock service</text>
+  <rect class="ext" x="530" y="20" width="150" height="38" rx="8"/><text class="t-c t-b" x="605" y="44">New leader</text>
+  <rect class="db"  x="740" y="20" width="130" height="38" rx="8"/><text class="t-c t-b" x="805" y="44">Storage</text>
+  <line class="life" x1="115" y1="58" x2="115" y2="280"/><line class="life" x1="375" y1="58" x2="375" y2="280"/><line class="life" x1="605" y1="58" x2="605" y2="280"/><line class="life" x1="805" y1="58" x2="805" y2="280"/>
+  <path class="arrow" d="M119 85 L371 85"/><text class="t-sm" x="130" y="80">acquire lock</text>
+  <path class="arrow dash" d="M371 105 L119 105"/><text class="t-sm" x="150" y="122">granted, token 33</text>
+  <text class="t-sm" x="30" y="150" style="fill:var(--bad)">long GC pause ...</text>
+  <path class="arrow" d="M601 150 L379 150"/><text class="t-sm" x="425" y="145">lease expired, acquire</text>
+  <path class="arrow dash" d="M379 170 L601 170"/><text class="t-sm" x="425" y="187">granted, token 34</text>
+  <path class="arrow-g" d="M609 205 L801 205"/><text class="t-sm" x="640" y="200">write, token 34 : accepted</text>
+  <path class="arrow-r" d="M119 245 L801 245"/><text class="t-sm" x="300" y="240" style="fill:var(--bad)">old leader wakes, writes with token 33 : REJECTED (33 &lt; 34)</text>
+</svg>
+<figcaption>The old leader does not know it lost the lock, since it was paused. The storage layer, not the leader, enforces safety by refusing stale tokens.</figcaption>
+</figure>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="physical">5. Physical clocks: drift, skew, NTP, leap seconds</h2>
+
+<p>Every computer has a hardware clock built from a quartz crystal. The operating system turns its oscillations into a count of time. Two terms describe how two such clocks disagree:</p>
+<ul>
+<li><b>Drift</b> is the <i>rate</i> difference. A typical server crystal gains or loses on the order of tens of parts per million (commonly quoted as around 10 to 200 ppm depending on temperature and quality). At 50 ppm that is 50 microseconds per second, or roughly 4 seconds per day. Temperature and load change the rate.</li>
+<li><b>Skew</b> is the <i>offset</i> between two clocks at one instant: "machine A reads 12:00:00.000 while machine B reads 12:00:00.037, so the skew is 37 ms". Drift is what makes skew grow over time.</li>
+</ul>
+
+<h3>5.1 NTP and its limits</h3>
+<p>The <b>Network Time Protocol (NTP)</b> keeps clocks roughly synchronised. A client asks a time server for its time, records when it sent the request and when the reply came back, assumes the network delay was symmetric (half each way), and estimates its own offset. It does this against several servers and discards outliers. Servers are organised in strata: stratum 0 is a reference such as a GPS receiver or atomic clock, stratum 1 servers are attached to it, and so on down.</p>
+<p>On a good data-center network NTP typically keeps clocks within a few milliseconds; across the public internet the error can be tens or even hundreds of milliseconds. The protocol's limits are important for design: the symmetry assumption is often false (congestion on only one direction), the sync happens only every few minutes so drift accumulates in between, and a misconfigured, firewalled, or failed time source can leave a machine wrong by seconds or more without any alarm. NTP also corrects in two ways: it can <b>slew</b> (gradually speed up or slow down the clock until it matches) or, if the error is large, <b>step</b> (jump immediately), and a step can move the clock <b>backwards</b>. For tighter bounds, the Precision Time Protocol (PTP) with hardware timestamping reaches microseconds, and cloud providers now offer GPS or atomic clock backed time services.</p>
+
+<h3>5.2 Leap seconds</h3>
+<p>The Earth's rotation is slightly irregular, so UTC occasionally inserts a <b>leap second</b>, making one minute 61 seconds long (23:59:60 exists). Software that assumes a minute has 60 seconds can crash, loop, or see time go backwards or repeat. Several well-known outages were caused by leap seconds. Large operators avoid the problem by <b>smearing</b>: spreading the extra second over many hours so the clock never shows 23:59:60 and never steps. The lesson is that even wall-clock time is not monotonic or uniform.</p>
+
+<h3>5.3 Wall clocks versus monotonic clocks</h3>
+<p>Operating systems offer two kinds of clock, and using the wrong one is a classic bug.</p>
+<table>
+<tr><th></th><th>Time-of-day (wall) clock</th><th>Monotonic clock</th></tr>
+<tr><td>Meaning</td><td>Calendar time, "the number of seconds since 1970-01-01 UTC"</td><td>Time since some arbitrary starting point, such as boot</td></tr>
+<tr><td>Can jump?</td><td>Yes: NTP steps, manual changes, leap second handling, VM migration</td><td>Never goes backwards; may be slewed slightly in rate</td></tr>
+<tr><td>Comparable across machines?</td><td>Roughly, within the skew</td><td>No. The values are meaningless on another machine</td></tr>
+<tr><td>Use for</td><td>Showing times to users, logs, expiry dates, TTL stored in data</td><td>Measuring durations: timeouts, elapsed time, rate limits, lease timers on one machine</td></tr>
+<tr><td>Java / Go / Python</td><td>System.currentTimeMillis / time.Now wall part / time.time</td><td>System.nanoTime / time.Now monotonic part / time.monotonic</td></tr>
+</table>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Wall clock jumps backwards after an NTP step while the monotonic clock keeps increasing">
+  <line x1="70" y1="20" x2="70" y2="250" stroke="var(--fg)" stroke-width="1.5"/>
+  <line x1="70" y1="250" x2="620" y2="250" stroke="var(--fg)" stroke-width="1.5"/>
+  <text class="t-sm" x="78" y="16">clock reading</text>
+  <text class="t-sm" x="520" y="274">real elapsed time</text>
+  <path d="M70 230 L620 40" stroke="var(--accent)" stroke-width="3" fill="none"/>
+  <text class="t-sm" x="330" y="108" style="fill:var(--accent)">monotonic clock: steady, never back</text>
+  <path d="M70 230 L300 150" stroke="var(--bad)" stroke-width="3" fill="none"/>
+  <path d="M300 150 L300 205" stroke="var(--bad)" stroke-width="3" stroke-dasharray="5 4" fill="none"/>
+  <path d="M300 205 L620 94" stroke="var(--bad)" stroke-width="3" fill="none"/>
+  <text class="t-sm" x="120" y="204" style="fill:var(--bad)">wall clock</text>
+  <text class="t-sm" x="312" y="236" style="fill:var(--bad)">NTP step back</text>
+  <rect class="miss" x="660" y="40" width="210" height="190" rx="8"/>
+  <text class="t-b" x="672" y="64">Consequences</text>
+  <text class="t-sm" x="672" y="88">Duration = end - start</text>
+  <text class="t-sm" x="672" y="106">can come out negative.</text>
+  <text class="t-sm" x="672" y="130">Two events can be stamped</text>
+  <text class="t-sm" x="672" y="148">in the wrong order.</text>
+  <text class="t-sm" x="672" y="172">Timers keyed to wall time</text>
+  <text class="t-sm" x="672" y="190">fire early or very late.</text>
+  <text class="t-sm" x="672" y="214">Fix: durations use monotonic.</text>
+</svg>
+<figcaption>When NTP corrects a clock that ran ahead, the wall clock can step backwards. A monotonic clock keeps counting forward, so it is the only safe source for measuring elapsed time.</figcaption>
+</figure>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="lie">6. Why timestamps lie</h2>
+
+<p>It is tempting to say "each write gets the time it was made, and the write with the latest time wins". This policy is called <b>last write wins (LWW)</b>, and several real databases (Cassandra by default, DynamoDB global tables, many caches) offer it because it is simple and needs no coordination. But it is only as trustworthy as the clocks behind it, and clocks are untrustworthy in several specific ways.</p>
+
+<h3>6.1 Four ways a timestamp misleads</h3>
+<ol>
+<li><b>Clock skew between machines.</b> Node A's clock is 300 ms ahead of node B's. A user updates a record via B at real time 100 ms later than an update via A, but B stamps it with an earlier number, so the newer write loses.</li>
+<li><b>Clocks stepping backwards.</b> After an NTP step, a node produces timestamps lower than ones it created earlier, so its newest write may lose to its own older one.</li>
+<li><b>Process pauses.</b> A thread reads the clock, then is paused by a stop-the-world garbage collection, an OS scheduler delay, a container CPU throttle, or a VM live migration, and acts seconds later. Its timestamp or lease check is now stale. A classic bug: a client checks "my lease has 8 seconds left", then pauses for 15 seconds, then writes believing it still holds the lease.</li>
+<li><b>Low resolution and ties.</b> Two writes within the same millisecond receive the same timestamp, and the tie-break (often arbitrary, such as by value) silently drops one.</li>
+</ol>
+
+<div class="callout watch"><b>Watch out</b>
+LWW does not just risk picking the "wrong" winner in a close race: it also <b>silently discards</b> the loser with no error and no record. Concurrent writes that should have been merged (two people adding different items to a cart) lose data. Worse, a node whose clock is far in the future can write values that will beat every correct write for a long time, because nothing can overwrite a timestamp from the future until real time catches up.
+</div>
+
+<p>Can you fix this by synchronising clocks better? Only partially. Even with a tight bound, two events that happen within the error bound of each other cannot be ordered by timestamp. Systems that need a true order therefore either avoid physical time for ordering (logical clocks, sections 7 to 9), or make the uncertainty explicit and wait it out (TrueTime, section 10). The worked example in section 14 shows a concrete lost update caused by LWW and its fix.</p>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="logical">7. Logical time: happens-before and Lamport clocks</h2>
+
+<p>Leslie Lamport's key insight (1978) was that for most purposes we do not need to know <i>when</i> something happened in wall-clock terms. We need to know the <b>causal order</b>: could event A have influenced event B? Causality needs no clock at all, only the knowledge of what information could have flowed where.</p>
+
+<h3>7.1 The happens-before relation</h3>
+<p>Define the relation "A happens before B", written A → B, by three rules:</p>
+<ol>
+<li>If A and B occur on the <b>same process</b> and A comes first in that process's local order, then A → B.</li>
+<li>If A is the <b>sending</b> of a message and B is the <b>receipt</b> of that same message, then A → B.</li>
+<li>It is <b>transitive</b>: if A → B and B → C then A → C.</li>
+</ol>
+<p>If neither A → B nor B → A, the events are <b>concurrent</b> (written A ∥ B). Concurrent does not mean "at the same instant"; it means "no chain of messages connects them, so neither could have known about the other". If A → B, then A <i>might have caused</i> B. If they are concurrent, neither caused the other and the system is free to order them either way, but must be careful not to lose either.</p>
+
+<h3>7.2 Lamport clocks</h3>
+<p>A <b>Lamport clock</b> is a single integer counter kept by each process, giving every event a number that respects happens-before. The rules:</p>
+<ol>
+<li>Start the counter at 0.</li>
+<li>Before each <b>local event</b> (including sending a message), increment the counter by 1. The event's timestamp is the new value.</li>
+<li>When <b>sending</b> a message, attach the current counter value to it.</li>
+<li>When <b>receiving</b> a message with timestamp <i>m</i>, set the counter to <b>max(local counter, m) + 1</b>. That is the crucial step: the receiver jumps past anything the sender had seen, so the receive is ordered after the send.</li>
+</ol>
+<p>Guarantee: <b>if A → B then L(A) &lt; L(B)</b>. Read the arrow only one way. The converse is false: L(A) &lt; L(B) does not tell you A happened before B, because they might be concurrent and simply have drawn counters that happen to be ordered. Lamport timestamps can be turned into a <b>total order</b> by breaking ties with the process id: order by (counter, process id). Every node computes the same total order without coordination, and that order is consistent with causality. But it is arbitrary for concurrent events, and it cannot <i>detect</i> concurrency.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="Step-through of Lamport clocks across three processes with messages m1, m2, m3">
+  <text class="t-b" x="20" y="24">P1</text><line x1="60" y1="50" x2="880" y2="50" stroke="var(--fg)" stroke-width="1.5"/>
+  <text class="t-b" x="20" y="124">P2</text><line x1="60" y1="120" x2="880" y2="120" stroke="var(--fg)" stroke-width="1.5"/>
+  <text class="t-b" x="20" y="194">P3</text><line x1="60" y1="190" x2="880" y2="190" stroke="var(--fg)" stroke-width="1.5"/>
+
+  <path class="arrow" d="M300 50 L416 120"/><text class="t-sm" x="330" y="76">m1 (ts 2)</text>
+  <path class="arrow" d="M520 120 L636 190"/><text class="t-sm" x="560" y="146">m2 (ts 4)</text>
+  <path class="arrow" d="M740 190 L816 50"/><text class="t-sm" x="778" y="130">m3 (ts 6)</text>
+
+  <circle class="box" cx="160" cy="50" r="14"/><text class="t-c t-b" x="160" y="55">1</text>
+  <circle class="box" cx="300" cy="50" r="14"/><text class="t-c t-b" x="300" y="55">2</text>
+  <circle class="box" cx="820" cy="50" r="14"/><text class="t-c t-b" x="820" y="55">7</text>
+  <circle class="cache" cx="420" cy="120" r="14"/><text class="t-c t-b" x="420" y="125">3</text>
+  <circle class="cache" cx="520" cy="120" r="14"/><text class="t-c t-b" x="520" y="125">4</text>
+  <circle class="db" cx="200" cy="190" r="14"/><text class="t-c t-b" x="200" y="195">1</text>
+  <circle class="db" cx="640" cy="190" r="14"/><text class="t-c t-b" x="640" y="195">5</text>
+  <circle class="db" cx="740" cy="190" r="14"/><text class="t-c t-b" x="740" y="195">6</text>
+
+  <text class="t-sm" x="130" y="30">local</text>
+  <text class="t-sm" x="270" y="30">send m1</text>
+  <text class="t-sm" x="770" y="30">recv m3</text>
+  <text class="t-sm" x="360" y="102">recv m1</text>
+  <text class="t-sm" x="480" y="102">send m2</text>
+  <text class="t-sm" x="170" y="172">local</text>
+  <text class="t-sm" x="600" y="226">recv m2</text>
+  <text class="t-sm" x="704" y="226">send m3</text>
+
+  <text class="t-sm" x="60" y="262">Recv m1: max(0, 2) + 1 = 3.  Recv m2: max(1, 4) + 1 = 5.  Recv m3: max(2, 6) + 1 = 7.</text>
+  <text class="t-sm" x="60" y="282">P1's first event and P3's first event both carry 1: equal numbers, yet they are concurrent.</text>
+</svg>
+<figcaption>Step through left to right. Each send increments and stamps the message; each receive jumps to one past the larger of the two counters, which is why the receive always has a bigger number than its send. Two different events with similar numbers say nothing about their order.</figcaption>
+</figure>
+
+<p>Check understanding with one more point: P3's local event (1) and P1's send m1 (2) have 1 &lt; 2, yet they are concurrent: no message links them. That is exactly the limitation vector clocks remove. You can try this yourself in the stepper widget in section 13.</p>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="vector">8. Vector clocks and detecting concurrency</h2>
+
+<p>A Lamport clock compresses the entire causal history of an event into one number, and that loses information. A <b>vector clock</b> keeps more: each process maintains an array with one counter per process, [c1, c2, ..., cn]. Entry <i>ci</i> means "the number of events of process <i>i</i> that I know about (that are in my causal past)".</p>
+
+<h3>8.1 Rules</h3>
+<ol>
+<li>Each process starts with all zeros.</li>
+<li>On a <b>local event</b> at process <i>i</i>: increment its own entry, <i>vi</i>[i] += 1.</li>
+<li>On <b>sending</b>: do the local-event step, then attach a copy of the whole vector.</li>
+<li>On <b>receiving</b> a vector <i>m</i>: set each entry to max(own[k], m[k]), then increment its own entry (the receive is itself an event).</li>
+</ol>
+
+<h3>8.2 Comparing two vectors</h3>
+<p>Given the vectors of events A and B:</p>
+<ul>
+<li><b>A happened before B</b> (A → B) if every entry of A is less than or equal to the matching entry of B, and at least one is strictly less.</li>
+<li><b>B happened before A</b> if the reverse holds.</li>
+<li>They are <b>identical</b> if all entries are equal (the same event or a copy).</li>
+<li>Otherwise, each has some entry larger than the other: the events are <b>concurrent</b> (A ∥ B).</li>
+</ul>
+<p>This is the property Lamport clocks lack: vector clocks are <b>exact</b>. A → B if and only if V(A) &lt; V(B). That means they can reliably tell a system "this update is a descendant of that one, keep the newer" versus "these two updates are siblings that neither saw, so you must merge or preserve both".</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Vector clock example where events on P1 and P3 are concurrent and the receive on P2 is after both">
+  <text class="t-b" x="20" y="54">P1</text><line x1="60" y1="50" x2="880" y2="50" stroke="var(--fg)" stroke-width="1.5"/>
+  <text class="t-b" x="20" y="144">P2</text><line x1="60" y1="140" x2="880" y2="140" stroke="var(--fg)" stroke-width="1.5"/>
+  <text class="t-b" x="20" y="234">P3</text><line x1="60" y1="230" x2="880" y2="230" stroke="var(--fg)" stroke-width="1.5"/>
+
+  <path class="arrow" d="M280 50 L398 140"/>
+  <path class="arrow" d="M450 230 L618 140"/>
+
+  <circle class="box" cx="150" cy="50" r="7"/>
+  <circle class="box" cx="280" cy="50" r="7"/>
+  <circle class="cache" cx="400" cy="140" r="7"/>
+  <circle class="cache" cx="620" cy="140" r="7"/>
+  <circle class="db" cx="300" cy="230" r="7"/>
+  <circle class="db" cx="450" cy="230" r="7"/>
+
+  <text class="t-sm" x="110" y="34">a [1,0,0]</text>
+  <text class="t-sm" x="250" y="34">b = send [2,0,0]</text>
+  <text class="t-sm" x="412" y="164">d = recv b [2,1,0]</text>
+  <text class="t-sm" x="632" y="164">f = recv e [2,2,2]</text>
+  <text class="t-sm" x="240" y="254">c [0,0,1]</text>
+  <text class="t-sm" x="410" y="254">e = send [0,0,2]</text>
+
+  <rect class="hit" x="680" y="64" width="200" height="70" rx="8"/>
+  <text class="t-sm" x="690" y="84">b [2,0,0] vs c [0,0,1]:</text>
+  <text class="t-sm" x="690" y="102">2 &gt; 0 but 0 &lt; 1, neither</text>
+  <text class="t-sm" x="690" y="120">dominates: CONCURRENT</text>
+  <rect class="cache" x="680" y="190" width="200" height="70" rx="8"/>
+  <text class="t-sm" x="690" y="210">b [2,0,0] vs d [2,1,0]:</text>
+  <text class="t-sm" x="690" y="228">all entries &lt;= and one &lt;,</text>
+  <text class="t-sm" x="690" y="246">so b HAPPENED BEFORE d</text>
+  <text class="t-sm" x="60" y="290">At f, P2 merges [2,1,0] and [0,0,2] by element-wise max = [2,1,2], then adds 1 to its own entry = [2,2,2].</text>
+</svg>
+<figcaption>Vector clocks answer the question Lamport clocks cannot. Events b and c are concurrent because neither vector dominates the other; b and d are causally ordered because d's vector is greater or equal in every position.</figcaption>
+</figure>
+
+<h3>8.3 Cost and limits</h3>
+<p>The vector has one slot per process, so its size grows with the number of participants. For a handful of replicas that is fine; if every client or short-lived process gets a slot, the vectors grow without bound and need pruning (which can reintroduce errors) or a switch to per-replica identifiers (next section). Vector clocks also tell you <i>that</i> two versions are concurrent, but not <i>how</i> to merge them. That decision belongs to the application or to a data type designed to merge automatically (section 12).</p>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="versionvec">9. Version vectors, dotted version vectors and hybrid clocks</h2>
+
+<h3>9.1 Version vectors: causality for replicated data</h3>
+<p>Vector clocks order <i>events</i> in a message-passing computation. Replicated storage has a related but slightly different need: ordering <i>versions of a data item</i> that live on several replicas. A <b>version vector</b> has the same shape and the same comparison rules as a vector clock, but its entries count <b>updates accepted by each replica</b> for that one item, and it is attached to the item (and to each client read) rather than to every message. The flow is:</p>
+<ol>
+<li>A client reads key <code>cart</code> and gets the value along with its version vector, say <code>{A:2, B:1}</code>. This vector is the <b>causal context</b>: "this is everything I have seen".</li>
+<li>The client modifies the value and writes it back, sending the context it read.</li>
+<li>The replica that accepts the write increments its own entry, producing <code>{A:3, B:1}</code>. Since the new vector dominates the context the client supplied, this write is a descendant that <b>replaces</b> the old version.</li>
+<li>If a different client wrote concurrently to replica B, producing <code>{A:2, B:2}</code>, then <code>{A:3, B:1}</code> and <code>{A:2, B:2}</code> are concurrent. Neither dominates, so the store keeps <b>both</b> as <i>siblings</i> and returns both on the next read, so the application can merge them.</li>
+</ol>
+
+<h3>9.2 Dotted version vectors, briefly</h3>
+<p>Plain version vectors have a subtle weakness when replicas, not clients, are the identities: two clients writing through the same replica without having seen each other's writes can end up with the second write wrongly <i>replacing</i> the first, or the system can generate more and more siblings ("sibling explosion"). The cause is that the vector entry "A:3" conflates "I have seen A's first three events" with "this specific write is A's third event".</p>
+<p>A <b>dotted version vector</b> (DVV) separates the two. It stores the causal context as an ordinary vector, plus one extra <b>dot</b>, a single pair such as <code>(A, 4)</code>, naming exactly the event that created this version. When comparing, a write replaces exactly the versions that its context covers, and any version whose dot is not covered by the writer's context remains as a sibling. The result is precise sibling tracking with a vector that stays the size of the number of replicas. Riak adopted dotted version vectors for this reason. For an interview, remember the one-line summary: <b>a dot names the single event; the vector says what was seen</b>.</p>
+
+<h3>9.3 Hybrid logical clocks (HLC)</h3>
+<p>Logical clocks respect causality but have no relation to real time, so you cannot ask "show me the state as of 3 pm" or expire a record after 24 hours. Physical clocks have meaning but can skew or step back. A <b>hybrid logical clock</b> combines them. Each timestamp is a pair <b>(l, c)</b>:</p>
+<ul>
+<li><b>l</b> is the largest physical time the node has seen, either its own wall clock or one received in a message. It stays close to real time.</li>
+<li><b>c</b> is a small counter used only to break ties when <b>l</b> does not advance (many events within one millisecond, or the wall clock stepped back).</li>
+</ul>
+<p>On a local or send event: take <code>pt</code> as the node's current wall time. If <code>pt</code> is greater than <code>l</code>, set <code>l = pt</code> and <code>c = 0</code>; otherwise keep <code>l</code> and increment <code>c</code>. On receiving a timestamp <code>(lm, cm)</code>: set <code>l</code> to the maximum of the old <code>l</code>, <code>lm</code> and <code>pt</code>; if that maximum equals one or both of the old values, set <code>c</code> to one more than the larger matching counter, otherwise set <code>c = 0</code>. Timestamps compare lexicographically: first by <code>l</code>, then by <code>c</code>.</p>
+<p>What you get: the Lamport guarantee (if A → B then HLC(A) &lt; HLC(B)), a value that is within the clock skew bound of real wall time (so time-based queries and TTLs make sense), and compactness (fits into 64 or 96 bits, no per-node vector). What you do not get is concurrency detection: like Lamport clocks, HLC gives an order consistent with causality but cannot prove two events were concurrent. CockroachDB and MongoDB use hybrid logical clocks for exactly this reason: a causally consistent, time-meaningful timestamp without special hardware.</p>
+
+<table>
+<tr><th>Clock</th><th>Size</th><th>Respects causality?</th><th>Detects concurrency?</th><th>Related to wall time?</th></tr>
+<tr><td>Wall-clock timestamp</td><td>8 bytes</td><td>No (skew, steps)</td><td>No</td><td>Yes (but wrong)</td></tr>
+<tr><td>Lamport clock</td><td>8 bytes</td><td>Yes (A to B implies L(A) &lt; L(B))</td><td>No</td><td>No</td></tr>
+<tr><td>Hybrid logical clock</td><td>8 to 12 bytes</td><td>Yes</td><td>No</td><td>Yes, within skew</td></tr>
+<tr><td>Vector clock / version vector</td><td>grows with replicas</td><td>Yes, exactly</td><td>Yes</td><td>No</td></tr>
+<tr><td>TrueTime interval</td><td>two timestamps</td><td>Yes, via waiting</td><td>Not needed (total order)</td><td>Yes, bounded error</td></tr>
+</table>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="truetime">10. TrueTime and bounded uncertainty (Spanner commit-wait)</h2>
+
+<p>Google Spanner takes a different approach: instead of avoiding physical time, it makes the <b>uncertainty explicit and small</b>. Each data center has time-master machines equipped with GPS receivers and atomic clocks, and every server regularly syncs with them. The TrueTime API does not return a single time. It returns an <b>interval</b>: <code>TT.now()</code> gives <code>[earliest, latest]</code>, with the guarantee that the true absolute time lies somewhere inside. The interval half-width, called ε (epsilon), is typically a few milliseconds (the published figures are in the range of about 1 to 7 ms) and it grows between synchronisations.</p>
+
+<p>Spanner wants <b>external consistency</b>: if transaction T1 commits (and the client is told so) before T2 begins, then T2 must get a larger commit timestamp than T1, in true real-time order, across the whole planet. Using timestamps this way is dangerous if clocks are uncertain, so Spanner adds <b>commit-wait</b>:</p>
+<ol>
+<li>When a transaction is ready to commit, the coordinator picks a commit timestamp <b>s</b> no smaller than <code>TT.now().latest</code>. Since the true time is at most <code>latest</code>, s is not in the past.</li>
+<li>The coordinator then <b>waits</b> until <code>TT.after(s)</code> is true, meaning <code>TT.now().earliest</code> is greater than s, so s has definitely passed in real time everywhere.</li>
+<li>Only then does it make the commit visible and acknowledge the client.</li>
+</ol>
+<p>Any transaction that starts after this acknowledgement will pick a timestamp greater than s, because its own <code>latest</code> is greater than the true time, which already exceeds s. Real-time order and timestamp order are therefore guaranteed to agree. The cost is the wait, on the order of 2ε, so a few milliseconds up to roughly ten. The design trades a small latency tax for a global total order with no coordination message between unrelated transactions. Reducing ε (better clocks) directly improves commit latency.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Spanner commit wait timeline showing uncertainty interval, chosen timestamp s, and wait until s is definitely in the past">
+  <line x1="40" y1="200" x2="870" y2="200" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#ah)"/>
+  <text class="t-sm" x="800" y="226">true time</text>
+  <rect class="cache" x="150" y="90" width="200" height="34" rx="6"/>
+  <text class="t-c t-sm" x="250" y="112">TT.now() at commit start</text>
+  <text class="t-sm" x="150" y="80">earliest</text><text class="t-sm" x="310" y="80">latest</text>
+  <line x1="150" y1="124" x2="150" y2="200" stroke="var(--fg)" stroke-dasharray="3 3"/>
+  <line x1="350" y1="124" x2="350" y2="200" stroke="var(--fg)" stroke-dasharray="3 3"/>
+  <text class="t-sm" x="205" y="190">real time is somewhere in here</text>
+  <circle cx="350" cy="200" r="6" fill="var(--accent)"/>
+  <text class="t-b" x="326" y="228">s = latest</text>
+  <rect class="miss" x="350" y="150" width="200" height="34" rx="6"/>
+  <text class="t-c t-sm" x="450" y="172">commit-wait (about 2 epsilon)</text>
+  <rect class="hit" x="550" y="90" width="200" height="34" rx="6"/>
+  <text class="t-c t-sm" x="650" y="112">TT.now() after wait</text>
+  <text class="t-sm" x="550" y="80">earliest &gt; s</text>
+  <line x1="550" y1="124" x2="550" y2="200" stroke="var(--good)" stroke-dasharray="3 3"/>
+  <text class="t-b" x="560" y="250" style="fill:var(--good)">s is certainly past: release locks, acknowledge client</text>
+</svg>
+<figcaption>The coordinator picks s at the top of the uncertainty interval, then holds the commit until even the earliest possible current time is later than s. Waiting converts clock uncertainty into a small, bounded latency.</figcaption>
+</figure>
+
+<p>You can approximate the idea without special hardware, but the bound is looser. CockroachDB, for example, assumes a configured maximum clock offset and uses <b>uncertainty intervals</b>: when a read sees a value stamped within the uncertainty window of its own timestamp, it cannot tell whether that write came earlier, so it restarts the read at a later timestamp. Cloud providers now also offer time services with microsecond-scale bounds. The principle is the same: bound the error, then either wait it out or retry.</p>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="order">11. Total order, partial order, and ordering guarantees in practice</h2>
+
+<h3>11.1 Partial versus total order</h3>
+<p>A <b>total order</b> ranks every pair of events: for any A and B, either A is before B or B is before A. A <b>partial order</b> ranks only some pairs; the others are incomparable. Happens-before is a partial order, and that is honest: concurrent events really have no order. Total orders are easier to program against (everyone agrees on one history, like entries in a bank ledger) but cost more, because manufacturing a total order means making independent events agree, which requires coordination. The cheapest total orders (Lamport timestamps with tie-breaks) are arbitrary for concurrent events, which is fine for some uses (unique ordering of mutex requests) but not for others (deciding whose bank withdrawal succeeded, which needs the order <i>everyone agrees on and that matches what clients observed</i>, a consensus problem, <a href="29-consensus.html">Chapter 29</a>).</p>
+
+<p>Between these sits <b>causal ordering</b> (or causal consistency): every node sees causally related events in the same order, while concurrent ones may appear in different orders at different nodes. For example, if you post a question and someone posts a reply, no replica should ever show the reply without the question. Causal consistency needs only metadata (vectors or HLC-derived dependencies) and no global coordination, which is why it is the strongest consistency that stays available during a partition. The full consistency hierarchy is in <a href="28-cap-consistency.html">Chapter 28</a>.</p>
+
+<h3>11.2 Ordering guarantees you actually get</h3>
+<p>In practice, engineers do not carry vector clocks everywhere. They choose a scope within which order is guaranteed, and give up order outside it.</p>
+<ul>
+<li><b>Per-key ordering.</b> All operations on one key (one user, one order id, one account) are routed to the same partition or leader, which processes them in arrival order. Different keys proceed in parallel with no order between them. Kafka guarantees order within a partition and messages with the same key land in the same partition; databases using one leader per shard order writes to a row the same way. This is the workhorse because most invariants are per-entity, and it scales by adding partitions (<a href="25-sharding.html">Chapter 25</a>).</li>
+<li><b>Sequence numbers.</b> A single authority (a database sequence, a leader, a ticket server) hands out increasing numbers. Order by number gives a total order on everything that passes through that authority. Replication logs use this: each write receives a log sequence number, and followers apply in that order (<a href="24-replication.html">Chapter 24</a>). Per-sender sequence numbers also allow a receiver to detect gaps and duplicates and to reorder out-of-order arrivals, and they pair naturally with idempotency keys (<a href="32-idempotency-ids.html">Chapter 32</a>).</li>
+<li><b>Ordering via a single log.</b> Funnel every change through one append-only log, and let every consumer read it in log order. The log's offsets are the total order. Distributed log systems partition the log for scale, restoring a per-partition order and giving up a global one. The mechanics are in <a href="34-queues-kafka.html">Chapter 34</a>; consensus-based logs (Raft, Paxos) give a replicated total order that survives node failure (<a href="29-consensus.html">Chapter 29</a>).</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Producers write to a partitioned log. Keys map to partitions so each key's order is preserved but there is no order between partitions.">
+  <rect class="ext" x="20" y="40"  width="130" height="40" rx="8"/><text class="t-c t-b" x="85" y="65">Producer 1</text>
+  <rect class="ext" x="20" y="120" width="130" height="40" rx="8"/><text class="t-c t-b" x="85" y="145">Producer 2</text>
+  <rect class="ext" x="20" y="200" width="130" height="40" rx="8"/><text class="t-c t-b" x="85" y="225">Producer 3</text>
+  <rect class="box" x="240" y="100" width="130" height="80" rx="10"/><text class="t-c t-b" x="305" y="132">hash(key)</text><text class="t-c t-sm" x="305" y="152">mod partitions</text>
+  <path class="arrow" d="M150 60 L238 130"/><path class="arrow" d="M150 140 L238 140"/><path class="arrow" d="M150 220 L238 150"/>
+
+  <text class="t-b" x="450" y="38">Partition 0</text>
+  <rect class="db" x="450" y="46" width="60" height="34" rx="4"/><text class="t-c t-sm" x="480" y="68">0: k1</text>
+  <rect class="db" x="514" y="46" width="60" height="34" rx="4"/><text class="t-c t-sm" x="544" y="68">1: k1</text>
+  <rect class="db" x="578" y="46" width="60" height="34" rx="4"/><text class="t-c t-sm" x="608" y="68">2: k4</text>
+  <text class="t-b" x="450" y="126">Partition 1</text>
+  <rect class="db" x="450" y="134" width="60" height="34" rx="4"/><text class="t-c t-sm" x="480" y="156">0: k2</text>
+  <rect class="db" x="514" y="134" width="60" height="34" rx="4"/><text class="t-c t-sm" x="544" y="156">1: k5</text>
+  <rect class="db" x="578" y="134" width="60" height="34" rx="4"/><text class="t-c t-sm" x="608" y="156">2: k2</text>
+  <text class="t-b" x="450" y="214">Partition 2</text>
+  <rect class="db" x="450" y="222" width="60" height="34" rx="4"/><text class="t-c t-sm" x="480" y="244">0: k3</text>
+  <rect class="db" x="514" y="222" width="60" height="34" rx="4"/><text class="t-c t-sm" x="544" y="244">1: k3</text>
+  <path class="arrow" d="M370 130 L446 63"/><path class="arrow" d="M370 140 L446 151"/><path class="arrow" d="M370 150 L446 239"/>
+
+  <rect class="hit" x="680" y="70" width="200" height="150" rx="8"/>
+  <text class="t-b" x="692" y="94">What you get</text>
+  <text class="t-sm" x="692" y="116">Same key: same partition,</text>
+  <text class="t-sm" x="692" y="132">strict order by offset.</text>
+  <text class="t-sm" x="692" y="156">Different keys: no order</text>
+  <text class="t-sm" x="692" y="172">between partitions.</text>
+  <text class="t-sm" x="692" y="196">Need global order? One</text>
+  <text class="t-sm" x="692" y="212">partition (low throughput).</text>
+</svg>
+<figcaption>Per-key ordering via a partitioned log: the number in each cell is the offset within its partition, and the label is the key. Offsets 0, 1, 2 give a total order inside one partition only.</figcaption>
+</figure>
+
+<div class="callout tip"><b>Interview tip</b>
+When a requirement says "events must be processed in order", ask <b>"in order with respect to what?"</b> Almost always the answer is per user, per order or per account, not global. That lets you shard by that key and keep order for free, rather than paying for a global total order.
+</div>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="practice">12. Causality tracking in practice: Dynamo, Riak and CRDTs</h2>
+
+<h3>12.1 Dynamo-style stores</h3>
+<p>Amazon's original Dynamo paper (the system behind the shopping cart) chose availability: any replica accepts writes even when others are unreachable. That means concurrent versions of a key will arise, and Dynamo tracks them with <b>vector clocks</b> of <code>(node, counter)</code> pairs attached to each version. A read returns every version that is not dominated by another, together with the combined clock as context. The client merges them (for the cart, take the union of items) and writes back with that context, which collapses the siblings. The paper noted that a rare deleted item could reappear after a merge, which is the price of favouring "never lose an add". To bound growth, Dynamo truncated the oldest pairs once a clock exceeded a threshold, accepting a small risk of lost precision.</p>
+
+<h3>12.2 Riak and its evolution</h3>
+<p>Riak followed the Dynamo design. Early versions attached a vector clock keyed by <i>client</i> id, which let vectors grow with the number of clients and caused sibling explosion when clients reused or lacked ids. Riak 2.0 moved to <b>dotted version vectors</b> keyed by <i>server</i> id, and added built-in CRDT data types (counters, sets, maps) so the database could merge for you. Many other systems made a different choice: Cassandra, for example, uses per-cell LWW timestamps by default for simplicity, which is exactly the danger from section 6, and relies on careful client usage, lightweight transactions, or a time-ordered write model to stay safe.</p>
+
+<h3>12.3 CRDTs: making merge automatic</h3>
+<p>Vector clocks detect conflicts; they do not resolve them. A <b>conflict-free replicated data type (CRDT)</b> is a data structure whose merge operation is designed to be commutative, associative and idempotent, so replicas can apply updates in any order, any number of times, and still converge to the same state. Examples: a grow-only counter (each replica has its own slot, merge by max per slot, total is the sum), an observed-remove set (each add is tagged with a unique dot, and a remove only deletes the tags it observed, so a concurrent add survives), and sequence types for collaborative text. Notice that the unique dot is the same idea as a dotted version vector. CRDTs buy availability and convergence at the cost of restricted semantics: you cannot express "balance must stay at or above zero" without coordination. The full treatment, including sorted-set CRDTs, is in <a href="59-sorted-sets-crdt.html">Chapter 59</a>.</p>
+
+<table>
+<tr><th>Approach</th><th>Conflict handling</th><th>Cost</th><th>Used by</th></tr>
+<tr><td>LWW timestamp</td><td>Highest timestamp wins, loser silently dropped</td><td>None, but data loss under skew or concurrency</td><td>Cassandra (default), DynamoDB global tables, many caches</td></tr>
+<tr><td>Version vector + siblings</td><td>Detect concurrent versions, return all, application merges</td><td>Metadata per key, merge logic in app</td><td>Dynamo (paper), Riak</td></tr>
+<tr><td>CRDT</td><td>Merge function built into the type</td><td>Restricted data models, tombstones, metadata</td><td>Riak data types, Redis Enterprise, collaboration tools</td></tr>
+<tr><td>Single leader / consensus</td><td>No concurrency: one order, others wait</td><td>Latency, availability under partitions</td><td>Most relational databases, etcd, Spanner</td></tr>
+</table>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="widget">13. Try it: Lamport and vector clock stepper</h2>
+
+<p>Three processes, P1 to P3, each keep both a Lamport clock and a vector clock. Choose an action, apply it, and watch both clocks update. A message send is delivered immediately to the receiver. Then pick any two recorded events to compare: the vector clocks say exactly whether one happened before the other or they were concurrent, while the Lamport numbers can only say which number is smaller. Try this: do a local event on P1, a local event on P3, and compare them. Their Lamport values may suggest an order, but the vectors reveal they are concurrent.</p>
+
+<div class="widget">
+<h4>Clock stepper</h4>
+<div class="row">
+<label>Action <select id="st-kind"><option value="local">Local event</option><option value="msg">Send message (delivered at once)</option></select></label>
+<label>Process <select id="st-from"><option value="0">P1</option><option value="1">P2</option><option value="2">P3</option></select></label>
+<label>To <select id="st-to"><option value="0">P1</option><option value="1" selected>P2</option><option value="2">P3</option></select></label>
+<button id="st-go">Apply</button>
+<button id="st-reset">Reset</button>
+</div>
+<div class="row">
+<label>Compare event <select id="st-a"></select></label>
+<label>with event <select id="st-b"></select></label>
+<button id="st-cmp">Compare</button>
+</div>
+<div class="log" id="st-log" aria-live="polite"></div>
+<div class="log" id="st-state"></div>
+</div>
+
+<!-- ======================= 14 ======================= -->
+<h2 id="worked">14. Worked example: a lost update by LWW, and the fix</h2>
+
+<p>Consider an inventory counter for one product, replicated on two nodes, A and B, of a multi-leader database that resolves conflicts by last write wins. Node A's clock runs <b>200 ms ahead</b> of true time (NTP has not corrected it); node B's clock is accurate. The stock is 6.</p>
+
+<ol>
+<li>At real time 100 ms, a warehouse worker sells one unit through node A. The application reads stock 6 and writes <b>stock = 5</b>. Node A stamps the write with its own clock: <b>100 + 200 = 300</b>.</li>
+<li>At real time 250 ms (150 ms later, so truly <i>after</i>), another worker sells a second unit. This request is routed to node B, which has not yet received the first write. The application reads stock 6 (the old value, since replication has not arrived), and because this worker also sells one unit and fixes a counting error found earlier, it writes <b>stock = 4</b>. Node B stamps it <b>250</b>.</li>
+<li>The replicas exchange their updates. Both compare timestamps: 300 versus 250. The write stamped 300 is "later", so <b>stock = 5</b> wins on both nodes. The newer, correct write of 4 is discarded without any error.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Sequence showing LWW keeping an older write because node A's clock is ahead">
+  <rect class="ext" x="60"  y="20" width="150" height="38" rx="8"/><text class="t-c t-b" x="135" y="44">Clients</text>
+  <rect class="box" x="360" y="20" width="190" height="38" rx="8"/><text class="t-c t-b" x="455" y="44">Node A (clock +200 ms)</text>
+  <rect class="db"  x="690" y="20" width="170" height="38" rx="8"/><text class="t-c t-b" x="775" y="44">Node B (accurate)</text>
+  <line class="life" x1="135" y1="58" x2="135" y2="320"/><line class="life" x1="455" y1="58" x2="455" y2="320"/><line class="life" x1="775" y1="58" x2="775" y2="320"/>
+
+  <path class="arrow" d="M139 95 L451 95"/><text class="t-sm" x="150" y="88">real t=100: write stock=5</text>
+  <text class="t-sm" x="470" y="115">stamps it 300 (100 + 200 skew)</text>
+
+  <path class="arrow" d="M139 160 L771 160"/><text class="t-sm" x="150" y="153">real t=250: write stock=4 (truly later)</text>
+  <text class="t-sm" x="560" y="180">stamps it 250</text>
+
+  <path class="arrow dash" d="M459 220 L771 220"/><path class="arrow dash" d="M771 236 L459 236"/>
+  <text class="t-sm" x="520" y="212">replicate: A sends (5, ts 300), B sends (4, ts 250)</text>
+  <rect class="miss" x="260" y="256" width="520" height="50" rx="8"/>
+  <text class="t-b" x="276" y="278" style="fill:var(--bad)">LWW: 300 beats 250, so both nodes keep stock=5.</text>
+  <text class="t-sm" x="276" y="296">The truly newer write (4) is silently lost. Nothing reports an error.</text>
+</svg>
+<figcaption>Skew of just 200 ms was enough to reverse two writes that were 150 ms apart. The outcome is a lost update with no error and no trace.</figcaption>
+</figure>
+
+<p>Notice two separate bugs here. The first is the skew, as above. The second, deeper, is that a read-then-write of a counter is not safe under concurrency even with perfect clocks: if both workers had read 6 at nearly the same moment, each sale writes 5, and one sale is lost regardless of timestamps. Both are lost-update problems, and the fixes address different layers.</p>
+
+<h3>14.1 The fixes, from cheapest to strongest</h3>
+<ol>
+<li><b>Do not use timestamps to resolve conflicts on data that matters.</b> Switch the field to one of the approaches below.</li>
+<li><b>Make the operation commutative.</b> Instead of "set stock to 5", send "decrement stock by 1". Model stock as a PN-counter CRDT (<a href="59-sorted-sets-crdt.html">Chapter 59</a>): each replica tracks its own increments and decrements, merge takes the max per slot, and the value is the sum. Both sales are counted, in any order. This stays available during a partition, but cannot enforce "never below zero".</li>
+<li><b>Use causality tracking.</b> Each read returns a version vector; each write sends it back. Worker 1 reads <code>{}</code> and writes at A, producing <code>{A:1}</code>. Worker 2 read from A earlier (seeing <code>{A:1}</code>), writes to B, producing <code>{A:1,B:1}</code>, which dominates <code>{A:1}</code> and cleanly replaces it. If instead worker 2 never saw the first write, the vectors <code>{A:1}</code> and <code>{B:1}</code> are concurrent, and the store keeps both siblings for the application to merge (here: sum the deltas from the common base).</li>
+<li><b>Compare-and-set with a version number.</b> The write says "set stock to 4 only if the current version is 7". The database applies it atomically against one authoritative copy, and a stale writer gets a conflict error and must re-read and retry. This needs a single leader (or consensus) for the key, so it gives up availability across partitions.</li>
+<li><b>Single writer per key, or consensus.</b> Route every update for a product to one leader (per-key ordering, section 11). No concurrency on the key, no conflicts, and a total order for free; the cost is that the key is unavailable while its leader is being replaced. Add idempotency keys (<a href="32-idempotency-ids.html">Chapter 32</a>) so a retried decrement after a timeout is not applied twice.</li>
+</ol>
+
+<div class="callout good"><b>Rule of thumb</b>
+Pick the weakest mechanism that preserves the invariant. Independent, mergeable data (carts, counters, presence) is a fit for CRDTs or siblings. Invariants spanning values ("do not oversell") need a single authority for that key. LWW is acceptable only where losing a concurrent write is harmless, such as a cache entry, a last-seen timestamp, or sensor readings where only the newest matters.
+</div>
+
+<!-- ======================= 15 ======================= -->
+<h2 id="qa">15. Interview Q&amp;A</h2>
+
+<details><summary>Why can't a client tell whether a server crashed or is just slow, and what should it do about it?</summary>
+<p>In an asynchronous network there is no upper bound on message delay, so silence is consistent with a crash, a lost message, and an extremely slow reply. A timeout therefore does not detect failure, it only expresses a guess that waiting longer is not worth it. The client should treat a timeout as an unknown outcome, not as a failure: for reads it can safely retry, perhaps against another replica; for writes it should retry only with an idempotency key so the second attempt cannot double-apply, or first query the status of the earlier attempt. It should also use deadlines, exponential backoff with jitter, and a circuit breaker so retries do not overload a struggling server.</p></details>
+
+<details><summary>Explain the two generals problem and why it matters for real systems.</summary>
+<p>Two parties must agree to act simultaneously but can communicate only over a channel that may lose messages. Any acknowledgement can itself be lost, so neither side can ever be certain the other received the last message, and no finite protocol guarantees agreement. In real systems this means "exactly-once delivery" over an unreliable network is impossible as a pure network guarantee. We get the effect by combining at-least-once delivery (retry until acknowledged) with idempotent processing or deduplication, and we reach agreement in practice using consensus protocols that assume eventual message delivery and a majority of working nodes, rather than certainty.</p></details>
+
+<details><summary>What is the difference between a wall clock and a monotonic clock, and which would you use for a timeout?</summary>
+<p>A wall clock reports calendar time and can be adjusted by NTP, by an administrator, by leap-second handling, or by VM migration, so it can jump forward or backward. A monotonic clock only counts forward from an arbitrary start point on that machine, so differences between two readings are reliable durations, but the values cannot be compared across machines. A timeout, lease timer, or elapsed-time measurement should use the monotonic clock. Wall-clock time is for showing times to humans and for expiry timestamps stored in data, where you accept the skew.</p></details>
+
+<details><summary>Why is last-write-wins dangerous, and when is it still acceptable?</summary>
+<p>LWW picks a winner by timestamp, so correctness depends on clocks that are skewed, can step backward, and may tie. A write that truly happened later can lose to one stamped with a faster clock, and the loser is dropped silently with no error. Even with perfect clocks it destroys one of two genuinely concurrent updates that should have been merged. It is acceptable when losing a concurrent write is harmless: caches, last-seen markers, idempotent overwrites of the same value, or telemetry where only the freshest value matters. For anything with business meaning, use version vectors, CRDTs, compare-and-set, or a single writer.</p></details>
+
+<details><summary>How do Lamport clocks work, and what can't they tell you?</summary>
+<p>Each process keeps a counter. It increments before every local event and stamps outgoing messages with it, and on receipt it sets its counter to the maximum of its own value and the message's value, plus one. This ensures that if event A happened before B then L(A) is less than L(B). The converse fails: a smaller timestamp does not mean "happened before", because two concurrent events can have any relation between their numbers. So Lamport clocks give a consistent total order (with process id tie-breaks) but cannot detect concurrency. For that you need vector clocks.</p></details>
+
+<details><summary>How do vector clocks detect concurrent updates, and what is their cost?</summary>
+<p>A vector clock stores one counter per participant. Comparing two vectors: if every entry of A is at most the matching entry of B (and one is smaller), then A happened before B; the reverse means B before A; if each has some entry larger than the other, the events are concurrent. This lets a store distinguish a descendant update, which safely replaces its ancestor, from a sibling, which must be preserved and merged. The cost is metadata whose size grows with the number of writers, which is why systems key vectors by replica rather than by client, prune old entries, or use dotted version vectors to stay compact and avoid sibling explosion. Also, detecting a conflict does not resolve it; the application or a CRDT must merge.</p></details>
+
+<details><summary>What problem does a hybrid logical clock solve, and what does it not solve?</summary>
+<p>Pure logical clocks respect causality but carry no real-time meaning, so you cannot do "as of 3 pm" queries or time-based expiry; pure physical clocks have meaning but break causality under skew and backward steps. An HLC pairs the largest physical time seen with a small counter, which keeps the timestamp close to wall time, monotonic, and consistent with happens-before, in a compact fixed size. It does not detect concurrency, since it still yields a total order for concurrent events, and its closeness to real time is only as good as the bounded clock skew. Databases such as CockroachDB and MongoDB use it for causally consistent timestamps without special hardware.</p></details>
+
+<details><summary>Explain how Spanner's TrueTime and commit-wait provide external consistency.</summary>
+<p>TrueTime returns an interval guaranteed to contain true time, with a small uncertainty epsilon obtained from GPS and atomic clock references. To commit, the coordinator picks a timestamp s at least as large as the interval's latest bound, then waits until the interval's earliest bound exceeds s, so s is certainly in the past everywhere, before making the commit visible. Any transaction that starts after the client sees the acknowledgement therefore receives a larger timestamp, so timestamp order matches real-time order across the globe. The price is a commit latency of roughly twice epsilon, a few milliseconds to about ten, and the benefit is a global total order without extra coordination between unrelated transactions.</p></details>
+
+<details><summary>You need messages processed in order in a high-throughput pipeline. How do you get ordering without a global bottleneck?</summary>
+<p>First clarify what must be ordered; usually it is order per entity such as per user, per account or per order. Partition the stream by that key so all of its events go to one partition, and have a single consumer instance process each partition sequentially. This gives strict order per key and parallelism across keys, scaling by adding partitions. Add sequence numbers so consumers can detect gaps or reorder after retries, and idempotent handling so redelivery after a timeout is harmless. A true global order requires either a single partition (limited throughput) or a consensus-based sequencer, which is rarely worth it.</p></details>
+
+<details><summary>How does a system stay safe when its failure detector is wrong, for example a leader paused by garbage collection?</summary>
+<p>Assume the detector will sometimes be wrong, and make safety independent of it. Leadership is granted through a lease that expires, and each grant carries a monotonically increasing fencing token. The shared resource, such as a database or storage layer, remembers the highest token it has seen and rejects any request with a lower one. A paused old leader that wakes up and still believes it leads will be rejected, so no corruption occurs; at worst, the system sees a brief unavailability or a failed write. Liveness depends on timing, but safety depends only on the token check.</p></details>
+
+<!-- ======================= 16 ======================= -->
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">16. Recap</h2>
+<ul>
+<li>Distributed systems differ from single machines because of <b>partial failure</b>, an <b>unreliable network</b>, and <b>no shared clock or memory</b>. Design for what you cannot assume.</li>
+<li>Fault models range from crash and crash-recovery through omission and slowness to Byzantine. Most internal systems assume the first four. Partitions split a healthy cluster; majorities and fencing prevent split brain.</li>
+<li>The two generals problem shows certainty is impossible over a lossy channel. A timeout is only a guess because slow and dead look identical, so treat it as "unknown", retry with idempotency, backoff and jitter, and use deadlines.</li>
+<li>Failure detectors (heartbeat, phi accrual, gossip with indirect probes) produce suspicions, not facts. Protect against wrong suspicions with leases and fencing tokens.</li>
+<li>Physical clocks drift and skew; NTP steps can go backwards; leap seconds break assumptions. Use monotonic clocks for durations; never trust wall-clock timestamps for ordering, and remember GC and VM pauses make "now" stale.</li>
+<li>Happens-before defines causality. Lamport clocks give a causally consistent total order but cannot detect concurrency. Vector clocks (and version vectors, dotted version vectors) detect it exactly, at a metadata cost.</li>
+<li>Hybrid logical clocks give causal order plus real-time meaning in a compact form. TrueTime exposes bounded uncertainty and uses commit-wait to give external consistency.</li>
+<li>In practice choose a scope of order: per-key ordering via partitioning, sequence numbers, or a single log. Resolve conflicts with siblings, CRDTs, compare-and-set or a single writer; reserve LWW for data that can afford silent loss.</li>
+</ul>
+</div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="24-replication.html">Chapter 24</a> (replication and the conflicts that multi-leader and leaderless designs create) and <a href="25-sharding.html">Chapter 25</a> (partitioning gives per-key order). Leads to <a href="28-cap-consistency.html">Chapter 28</a> (what consistency can be kept under partitions), <a href="29-consensus.html">Chapter 29</a> (agreeing on one order despite failures), <a href="30-coordination-locks.html">Chapter 30</a> (leases and fencing), <a href="32-idempotency-ids.html">Chapter 32</a> (safe retries), <a href="33-gossip-merkle.html">Chapter 33</a> (gossip-based failure detection), <a href="34-queues-kafka.html">Chapter 34</a> (the log as an ordering device) and <a href="59-sorted-sets-crdt.html">Chapter 59</a> (CRDTs).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+<script>
+(function () {
+  function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+  function setParts(node, parts) { node.textContent = ''; parts.forEach(function (p) { if (typeof p === 'string') node.appendChild(document.createTextNode(p)); else node.appendChild(el('b', null, p.b)); }); }
+  const N = 3;
+  let lam, vec, events;
+  function reset() {
+    lam = [0, 0, 0];
+    vec = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    events = [];
+    render();
+    fillSelects();
+    document.getElementById('st-log').textContent = 'Clocks reset. Apply an action.';
+  }
+  function fmt(v) { return '[' + v.join(',') + ']'; }
+  function record(p, label) {
+    events.push({ id: events.length + 1, proc: p, label: label, lam: lam[p], vec: vec[p].slice() });
+  }
+  function apply() {
+    const kind = document.getElementById('st-kind').value;
+    const p = parseInt(document.getElementById('st-from').value, 10);
+    const q = parseInt(document.getElementById('st-to').value, 10);
+    const log = document.getElementById('st-log');
+    if (kind === 'local') {
+      lam[p] += 1; vec[p][p] += 1;
+      record(p, 'local on P' + (p + 1));
+      const e = events[events.length - 1];
+      setParts(log, ['Event e' + e.id + ': local on P' + (p + 1) + '. Lamport ', { b: String(e.lam) }, ', vector ', { b: fmt(e.vec) }, '.']);
+    } else {
+      if (p === q) { log.textContent = 'Choose a different receiver for a message.'; return; }
+      lam[p] += 1; vec[p][p] += 1;
+      record(p, 'send P' + (p + 1) + ' to P' + (q + 1));
+      const s = events[events.length - 1];
+      const mL = lam[p]; const mV = vec[p].slice();
+      lam[q] = Math.max(lam[q], mL) + 1;
+      for (let k = 0; k < N; k++) vec[q][k] = Math.max(vec[q][k], mV[k]);
+      vec[q][q] += 1;
+      record(q, 'receive on P' + (q + 1));
+      const r = events[events.length - 1];
+      setParts(log, ['Event e' + s.id + ': send from P' + (p + 1) + ', Lamport ', { b: String(s.lam) }, ', vector ', { b: fmt(s.vec) }, '. Event e' + r.id + ': receive on P' + (q + 1) + ', Lamport = max(old, ' + mL + ') + 1 = ', { b: String(r.lam) }, ', vector = ', { b: fmt(r.vec) }, '.']);
+    }
+    render();
+    fillSelects();
+  }
+  function render() {
+    const box = document.getElementById('st-state');
+    box.textContent = '';
+    for (let i = 0; i < N; i++) {
+      box.appendChild(el('div', null, 'P' + (i + 1) + ': Lamport ' + lam[i] + ', vector ' + fmt(vec[i])));
+    }
+    box.appendChild(el('div', null, 'Events so far: ' + events.length));
+  }
+  function fillSelects() {
+    ['st-a', 'st-b'].forEach(function (id) {
+      const s = document.getElementById(id);
+      const prev = s.value;
+      s.textContent = '';
+      events.forEach(function (e) {
+        const o = el('option', null, 'e' + e.id + ' (' + e.label + ')');
+        o.value = String(e.id - 1);
+        s.appendChild(o);
+      });
+      if (prev !== '' && parseInt(prev, 10) < events.length) s.value = prev;
+    });
+  }
+  function leq(a, b) { for (let k = 0; k < N; k++) if (a[k] > b[k]) return false; return true; }
+  function same(a, b) { for (let k = 0; k < N; k++) if (a[k] !== b[k]) return false; return true; }
+  function compare() {
+    const log = document.getElementById('st-log');
+    if (events.length < 2) { log.textContent = 'Record at least two events first.'; return; }
+    const a = events[parseInt(document.getElementById('st-a').value, 10)];
+    const b = events[parseInt(document.getElementById('st-b').value, 10)];
+    if (!a || !b) { log.textContent = 'Pick two events.'; return; }
+    let verdict;
+    if (a.id === b.id) verdict = 'the same event';
+    else if (same(a.vec, b.vec)) verdict = 'identical vectors';
+    else if (leq(a.vec, b.vec)) verdict = 'e' + a.id + ' HAPPENED BEFORE e' + b.id;
+    else if (leq(b.vec, a.vec)) verdict = 'e' + b.id + ' HAPPENED BEFORE e' + a.id;
+    else verdict = 'e' + a.id + ' and e' + b.id + ' are CONCURRENT';
+    let lamNote;
+    if (a.lam === b.lam) lamNote = 'Lamport values are equal (' + a.lam + '), so they give no order without a tie-break.';
+    else lamNote = 'Lamport says e' + (a.lam < b.lam ? a.id : b.id) + ' is smaller (' + Math.min(a.lam, b.lam) + ' versus ' + Math.max(a.lam, b.lam) + '), but that alone does not prove causality.';
+    setParts(log, ['Vector clocks ' + fmt(a.vec) + ' vs ' + fmt(b.vec) + ': ', { b: verdict }, '. ' + lamNote]);
+  }
+  document.getElementById('st-go').addEventListener('click', apply);
+  document.getElementById('st-reset').addEventListener('click', reset);
+  document.getElementById('st-cmp').addEventListener('click', compare);
+  reset();
+})();
+</script>
+</body>
+</html>

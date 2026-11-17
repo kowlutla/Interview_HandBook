@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 22: Search Engines (Elasticsearch) | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="22-search-engines">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+  </defs>
+</svg>
+
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+
+<main>
+<div class="kicker">Chapter 22 · Module 3 · The Data Layer</div>
+<h1>Search Engines (Elasticsearch)</h1>
+<p class="lead">A search engine answers questions such as "find the products that mention waterproof trail shoes, best matches first" in milliseconds across hundreds of millions of documents. This chapter explains why a normal database cannot do that well, how the inverted index makes it possible, how Elasticsearch and OpenSearch spread the index over a cluster, how to feed it from your real database, and what breaks in production.</p>
+
+<!-- ======================= 1 ======================= -->
+<h2 id="problem">1. Why databases are poor at full-text search</h2>
+
+<p>Suppose you run an online shop with 50 million products in a relational database. A user types <code>waterproof trail running shoes</code> into the search box. What does the database do with that?</p>
+
+<p>The obvious first attempt is a <code>LIKE</code> query: <code>WHERE description LIKE '%waterproof%'</code>. The leading <code>%</code> wildcard means "anything may come before the word", so a normal B-tree index (which keeps values sorted from their first character, see <a href="18-relational-internals.html">Chapter 18</a>) cannot be used. The database has to read every row and scan every description, character by character. At 50 million rows with an average description of 500 bytes that is 25 GB of text read for every keystroke-triggered search. This is a full table scan and it takes seconds to minutes, not milliseconds.</p>
+
+<p>Even if speed were fixed, <code>LIKE</code> is the wrong tool for quality reasons:</p>
+<ul>
+  <li><b>No language understanding.</b> Searching for <code>shoe</code> does not match <code>shoes</code>, and <code>running</code> does not match <code>run</code> or <code>ran</code>. Upper and lower case differ in some collations. Accents (<code>cafe</code> versus <code>café</code>) are different characters.</li>
+  <li><b>No ranking.</b> A row either matches or it does not. A product that mentions "waterproof" once in a long description and one named "Waterproof Trail Shoe" both just "match". Users expect the best match first, and with 20,000 matches only the first page matters.</li>
+  <li><b>No typo tolerance.</b> <code>wateproof</code> finds nothing.</li>
+  <li><b>Multi-word queries are awkward.</b> You must write one <code>LIKE</code> per word, combine them with <code>AND</code> or <code>OR</code>, and still get no notion of "these words close together matter more".</li>
+  <li><b>Faceting is expensive.</b> The side panel that says "Brand: Nike (1,204), Adidas (873) ... Price: $0-50 (3,400) ..." needs counts of the matching rows grouped by several fields at once, each a separate expensive query.</li>
+</ul>
+
+<p>Relational databases do offer built-in full-text features (PostgreSQL <code>tsvector</code> with GIN indexes, MySQL <code>FULLTEXT</code>). They use the same core idea this chapter explains, an inverted index, and they are a perfectly good answer for a small dataset (up to a few million rows) where search is a side feature. Reach for a dedicated search engine when you need richer relevance tuning, typo tolerance, faceting at scale, high query rates that you do not want to run on your primary database, or horizontal scaling of the index itself.</p>
+
+<div class="callout key"><b>Key idea</b>
+A database index answers "given this exact value, where is the row?" A search index answers "given these words, which documents contain them, and which are the best matches?" The trick is to do the expensive work (splitting text into words, normalizing them) once <b>at write time</b>, and store the result in a structure that is organized by word instead of by document. That structure is the <b>inverted index</b>.
+</div>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Comparison of a table scan with an inverted index lookup">
+  <text class="t-b" x="20" y="22">Database LIKE '%waterproof%'</text>
+  <rect class="miss" x="30" y="40" width="120" height="44" rx="8"/><text class="t-c t-sm" x="90" y="67">row 1: read all text</text>
+  <rect class="miss" x="165" y="40" width="120" height="44" rx="8"/><text class="t-c t-sm" x="225" y="67">row 2: read all text</text>
+  <rect class="miss" x="300" y="40" width="120" height="44" rx="8"/><text class="t-c t-sm" x="360" y="67">row 3: read all text</text>
+  <text class="t-c t-b" x="480" y="67">...</text>
+  <rect class="miss" x="520" y="40" width="150" height="44" rx="8"/><text class="t-c t-sm" x="595" y="67">row 50,000,000</text>
+  <text class="t-sm" x="690" y="67">Work grows with the number of rows.</text>
+
+  <text class="t-b" x="20" y="140">Inverted index lookup</text>
+  <rect class="box" x="30" y="158" width="180" height="50" rx="8"/><text class="t-c t-b" x="120" y="180">term: waterproof</text><text class="t-c t-sm" x="120" y="198">found in a sorted dictionary</text>
+  <path class="arrow-g" d="M210 183 L290 183"/>
+  <rect class="hit" x="294" y="158" width="330" height="50" rx="8"/><text class="t-c t-b" x="459" y="180">posting list: docs 2, 3, 9041, ...</text><text class="t-c t-sm" x="459" y="198">already the answer, no scanning of text</text>
+  <text class="t-sm" x="650" y="183">Work grows with the number</text><text class="t-sm" x="650" y="200">of matching documents.</text>
+</svg>
+<figcaption>A scan visits every row to find a word. An inverted index jumps straight from the word to the list of documents that contain it.</figcaption>
+</figure>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="inverted">2. The inverted index, step by step</h2>
+
+<p>Think of the index at the back of a textbook. It does not list pages and the words on them; it lists <b>words</b>, each followed by the pages where it appears. That is an inverted index: it inverts the "document contains words" relationship into "word appears in documents".</p>
+
+<p>We will build one from three tiny product documents. The same steps apply to three million.</p>
+<table>
+<tr><th>Doc ID</th><th>Text</th></tr>
+<tr><td>1</td><td>Running shoes for men</td></tr>
+<tr><td>2</td><td>Men's trail running shoe, waterproof</td></tr>
+<tr><td>3</td><td>Waterproof jacket for the trail</td></tr>
+</table>
+
+<h3>2.1 Step 1: tokenization</h3>
+<p><b>Tokenization</b> splits the raw text into tokens, usually words. A standard tokenizer splits on whitespace and punctuation, so <code>Men's trail running shoe, waterproof</code> becomes <code>Men's</code>, <code>trail</code>, <code>running</code>, <code>shoe</code>, <code>waterproof</code>. (The standard tokenizer follows Unicode text segmentation rules and keeps <code>Men's</code> as one token; later steps clean it up.) Each token gets a <b>position</b>, its index in the original text: for document 2 the positions are 0 to 4.</p>
+
+<h3>2.2 Step 2: normalization</h3>
+<p><b>Normalization</b> makes tokens comparable. The most common step is <b>lowercasing</b>, so <code>Running</code> and <code>running</code> become one term. Others include removing accents (<code>café</code> to <code>cafe</code>) and stripping possessives (<code>men's</code> to <code>men</code>).</p>
+
+<h3>2.3 Step 3: stop words</h3>
+<p><b>Stop words</b> are extremely common words such as <code>the</code>, <code>for</code>, <code>a</code>, <code>of</code> that carry little meaning. Dropping them shrinks the index and avoids huge posting lists. We drop <code>for</code> and <code>the</code>. Important detail: the positions of the remaining words are <b>not renumbered</b>, so the engine still knows there was a gap. Modern engines often keep stop words by default because scoring (section 5) already down-weights common words, and removing them breaks exact phrases such as "to be or not to be". Treat stop word removal as a tunable choice.</p>
+
+<h3>2.4 Step 4: stemming</h3>
+<p><b>Stemming</b> reduces words to a root form so that related forms match each other: <code>running</code> becomes <code>run</code>, <code>shoes</code> becomes <code>shoe</code>. A stemmer is a set of rules (the Porter and Snowball families are common), not a dictionary, so it is fast but sometimes imperfect: it may reduce <code>university</code> and <code>universe</code> to the same stem. A heavier alternative, <b>lemmatization</b>, uses a dictionary and part-of-speech information (<code>ran</code> to <code>run</code>), at higher cost.</p>
+
+<h3>2.5 Step 5: posting lists with positions</h3>
+<p>After analysis, each document is a list of (term, position) pairs. The engine now builds a <b>term dictionary</b>, a sorted list of every distinct term, and for each term a <b>posting list</b>: the documents that contain it, plus the positions within each document. Storing the term frequency (how many times it appears) and positions costs space, but positions are what make phrase queries possible.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 430" role="img" aria-label="Building an inverted index from three documents">
+  <text class="t-b" x="20" y="20">1. Documents</text>
+  <rect class="ext" x="20" y="32" width="250" height="52" rx="8"/><text class="t-b" x="32" y="54">Doc 1</text><text class="t-sm" x="32" y="73">Running shoes for men</text>
+  <rect class="ext" x="20" y="96" width="250" height="52" rx="8"/><text class="t-b" x="32" y="118">Doc 2</text><text class="t-sm" x="32" y="137">Men's trail running shoe, waterproof</text>
+  <rect class="ext" x="20" y="160" width="250" height="52" rx="8"/><text class="t-b" x="32" y="182">Doc 3</text><text class="t-sm" x="32" y="201">Waterproof jacket for the trail</text>
+
+  <text class="t-b" x="20" y="244">2. After analysis (term@position)</text>
+  <rect class="cache" x="20" y="256" width="250" height="44" rx="8"/><text class="t-sm" x="32" y="274">Doc 1: run@0 shoe@1 men@3</text><text class="t-sm" x="32" y="291">("for" removed, gap kept at 2)</text>
+  <rect class="cache" x="20" y="308" width="250" height="44" rx="8"/><text class="t-sm" x="32" y="326">Doc 2: men@0 trail@1 run@2</text><text class="t-sm" x="32" y="343">shoe@3 waterproof@4</text>
+  <rect class="cache" x="20" y="360" width="250" height="52" rx="8"/><text class="t-sm" x="32" y="378">Doc 3: waterproof@0 jacket@1</text><text class="t-sm" x="32" y="395">trail@4 ("for", "the" removed)</text>
+
+  <path class="arrow" d="M272 120 L338 120"/><path class="arrow" d="M272 280 L338 200"/>
+
+  <text class="t-b" x="350" y="20">3. Inverted index: sorted term dictionary and posting lists</text>
+  <rect class="db" x="350" y="32" width="530" height="30" rx="4"/>
+  <text class="t-b" x="362" y="52">Term</text><text class="t-b" x="480" y="52">Posting list: doc [positions]</text>
+  <rect class="box" x="350" y="68" width="530" height="42" rx="4"/><text class="t-b" x="362" y="94">jacket</text><text x="480" y="94">3 [1]</text>
+  <rect class="box" x="350" y="116" width="530" height="42" rx="4"/><text class="t-b" x="362" y="142">men</text><text x="480" y="142">1 [3]     2 [0]</text>
+  <rect class="box" x="350" y="164" width="530" height="42" rx="4"/><text class="t-b" x="362" y="190">run</text><text x="480" y="190">1 [0]     2 [2]</text>
+  <rect class="box" x="350" y="212" width="530" height="42" rx="4"/><text class="t-b" x="362" y="238">shoe</text><text x="480" y="238">1 [1]     2 [3]</text>
+  <rect class="box" x="350" y="260" width="530" height="42" rx="4"/><text class="t-b" x="362" y="286">trail</text><text x="480" y="286">2 [1]     3 [4]</text>
+  <rect class="box" x="350" y="308" width="530" height="42" rx="4"/><text class="t-b" x="362" y="334">waterproof</text><text x="480" y="334">2 [4]     3 [0]</text>
+  <rect class="hit" x="350" y="364" width="530" height="48" rx="8"/><text class="t-sm" x="362" y="384">Query "running shoes": both stem to run + shoe. Intersect lists: docs 1 and 2.</text><text class="t-sm" x="362" y="402">As a phrase: run at p and shoe at p+1 holds in doc 1 (0,1) and doc 2 (2,3).</text>
+</svg>
+<figcaption>Read left to right. Raw text is analyzed into terms with positions, then regrouped by term. A query looks up each of its own analyzed terms in the sorted dictionary and combines the posting lists.</figcaption>
+</figure>
+
+<h3>2.6 Answering a query</h3>
+<p>Take the query <code>waterproof trail</code>. It goes through the <b>same analysis</b> as the documents (this is critical, otherwise terms would not line up), giving <code>waterproof</code> and <code>trail</code>. The engine looks up each in the term dictionary (a binary search or a finite state transducer in Lucene, so the lookup is fast even with tens of millions of terms) and gets two posting lists: <code>[2, 3]</code> and <code>[2, 3]</code>. For an AND query it takes the <b>intersection</b>; for OR the <b>union</b>. Because posting lists are stored sorted by document ID, intersection is a fast merge, and Lucene uses skip pointers to jump over long runs. In this tiny example both documents match; ranking (section 5) decides the order.</p>
+
+<p>Beyond the postings, Lucene also keeps other structures per field, and knowing their names helps in interviews:</p>
+<ul>
+  <li><b>Stored fields</b>: the original document (the <code>_source</code> JSON), used to return results.</li>
+  <li><b>Doc values</b>: a column-oriented, per-field structure (document to value) used for sorting, aggregations and faceting. The inverted index is bad at "give me the price of doc 17", so doc values answer that.</li>
+  <li><b>Norms</b>: a small per-field number recording field length, used in scoring.</li>
+  <li><b>Points (BKD trees)</b>: used for numeric, date and geo range queries.</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b>
+Search is fast because the index is organized around the question being asked. The price is paid at write time (analysis, building structures) and in storage. This is why search engines are write-heavy per document, and why you rarely want one as your only copy of the data.
+</div>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="analyzers">3. Analyzers</h2>
+
+<p>The pipeline in section 2 is called an <b>analyzer</b>. An analyzer has three parts, run in order:</p>
+<ol>
+  <li><b>Character filters</b> work on the raw string before tokenization, for example stripping HTML tags or mapping <code>&amp;</code> to <code>and</code>.</li>
+  <li>A <b>tokenizer</b> (exactly one) splits the string into tokens and records positions and character offsets.</li>
+  <li><b>Token filters</b> transform the token stream: lowercase, stop words, stemming, synonyms, ASCII folding, edge n-grams (section 4.6).</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 260" role="img" aria-label="Analyzer pipeline">
+  <rect class="ext" x="20" y="90" width="150" height="70" rx="10"/><text class="t-c t-b" x="95" y="118">Raw text</text><text class="t-c t-sm" x="95" y="138">&lt;b&gt;Men's Shoes&lt;/b&gt;</text>
+  <path class="arrow" d="M170 125 L206 125"/>
+  <rect class="box" x="210" y="90" width="150" height="70" rx="10"/><text class="t-c t-b" x="285" y="118">Char filter</text><text class="t-c t-sm" x="285" y="138">strip HTML</text>
+  <path class="arrow" d="M360 125 L396 125"/>
+  <rect class="box" x="400" y="90" width="150" height="70" rx="10"/><text class="t-c t-b" x="475" y="118">Tokenizer</text><text class="t-c t-sm" x="475" y="138">Men's | Shoes</text>
+  <path class="arrow" d="M550 125 L586 125"/>
+  <rect class="cache" x="590" y="90" width="150" height="70" rx="10"/><text class="t-c t-b" x="665" y="118">Token filters</text><text class="t-c t-sm" x="665" y="138">lower, stem, synonyms</text>
+  <path class="arrow" d="M740 125 L776 125"/>
+  <rect class="db" x="780" y="90" width="100" height="70" rx="10"/><text class="t-c t-b" x="830" y="118">Terms</text><text class="t-c t-sm" x="830" y="138">men  shoe</text>
+  <rect class="hit" x="20" y="192" width="860" height="52" rx="8"/>
+  <text class="t-sm" x="34" y="214">Used at index time for each document field, and at query time for the query text (usually the same analyzer, sometimes a lighter one for queries).</text>
+  <text class="t-sm" x="34" y="233">If the two sides analyze differently, terms do not line up and matches silently disappear.</text>
+</svg>
+<figcaption>Every text field runs this pipeline. The output terms, not the original text, are what is stored in the inverted index.</figcaption>
+</figure>
+
+<h3>3.1 Choosing analyzers</h3>
+<p>Elasticsearch ships with a <code>standard</code> analyzer (Unicode tokenizer plus lowercase), <code>simple</code>, <code>whitespace</code>, <code>keyword</code> (the whole string as one token), and language analyzers (for example <code>english</code>, which adds stop words and stemming). You can compose a custom analyzer. Real systems often index the same field several ways using <b>multi-fields</b>: for instance <code>title</code> analyzed as English text for relevance, <code>title.exact</code> as a <code>keyword</code> for sorting and exact filters, and <code>title.autocomplete</code> with edge n-grams for type-ahead.</p>
+
+<h3>3.2 Synonyms</h3>
+<p>A synonym filter maps <code>sneakers</code>, <code>trainers</code> and <code>running shoes</code> to a shared meaning. It is usually applied at <b>query time</b>, because changing synonyms then needs no reindex (index-time synonyms bake the expansion into the stored terms, so each change forces a full reindex). Multi-word synonyms are a known source of subtle bugs because positions are shifted; test them.</p>
+
+<h3>3.3 text versus keyword</h3>
+<p>This distinction causes more production confusion than any other. A <code>text</code> field is analyzed and is meant for full-text search ("contains these words"). A <code>keyword</code> field is stored as a single untouched term and is meant for exact match, sorting and aggregations (a brand name, a SKU, a status). A match query on a <code>keyword</code> field for <code>nike</code> will not find the value <code>Nike</code>, because no lowercasing was done. Strings that you need both ways get both mappings.</p>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="queries">4. Query types</h2>
+
+<p>Elasticsearch queries are written as JSON (the "Query DSL"). They fall into two families: <b>full-text queries</b> (analyzed, scored) and <b>term-level / filter queries</b> (exact, not scored). Understanding which is which is the core skill.</p>
+
+<h3>4.1 Term query: exact and unanalyzed</h3>
+<p>A <code>term</code> query looks up one exact term in the index without analyzing the query. It is right for <code>keyword</code>, number, boolean and date fields: <code>{"term": {"brand": "Nike"}}</code>. It is a common mistake to run <code>term</code> against an analyzed <code>text</code> field: the indexed terms are lowercased and stemmed (<code>nike</code>), the query is not (<code>Nike</code>), and nothing matches.</p>
+
+<h3>4.2 Match query: analyzed full text</h3>
+<p>A <code>match</code> query analyzes the query string with the field's analyzer, then looks up each resulting term and combines the results, by default with OR. <code>{"match": {"title": "waterproof trail shoes"}}</code> finds documents containing <i>any</i> of <code>waterproof</code>, <code>trail</code>, <code>shoe</code>, and scores those with more (and rarer) terms higher. Setting <code>operator: and</code> demands all of them, and <code>minimum_should_match</code> (for example 75%) gives a middle path that is usually the best default for user queries. A <code>multi_match</code> query runs the match across several fields, such as title and description, with different weights.</p>
+
+<h3>4.3 Phrase query</h3>
+<p>A <code>match_phrase</code> query requires the terms to appear <b>adjacent and in order</b>, which it checks with the stored positions. "trail running" matches document 2 (positions 1 and 2) but a document with "running on a trail" does not. A <code>slop</code> value allows a few positions of looseness. Positions are the reason section 2.5 stored them.</p>
+
+<h3>4.4 Boolean query</h3>
+<p>The <code>bool</code> query combines clauses and is the workhorse of real search:</p>
+<ul>
+  <li><b>must</b>: the clause has to match, and it contributes to the score.</li>
+  <li><b>should</b>: optional; each match raises the score (or, with <code>minimum_should_match</code>, at least some must match).</li>
+  <li><b>must_not</b>: excludes documents; not scored.</li>
+  <li><b>filter</b>: has to match but does <b>not</b> affect the score, and the result can be cached as a bitset. Use filter for everything that is a yes/no condition: in stock, price range, category, tenant ID.</li>
+</ul>
+<p>A typical product search is a <code>bool</code> with a <code>must</code> match on the text, several <code>filter</code> clauses for facets the user selected, and a few <code>should</code> clauses that boost in-stock or popular items.</p>
+
+<h3>4.5 Fuzzy query: typo tolerance</h3>
+<p>A <code>fuzzy</code> query (or <code>fuzziness: "AUTO"</code> inside a match query) matches terms within a small <b>edit distance</b>: the number of single-character insertions, deletions, substitutions or swaps needed to turn one word into another. <code>wateproof</code> is one edit from <code>waterproof</code>. Lucene builds a small automaton of all strings within the allowed distance and walks the term dictionary with it, which is efficient. "AUTO" allows 0 edits for words up to 2 characters, 1 edit for 3 to 5, and 2 for longer words. Fuzziness costs CPU and can add noise, so many systems apply it only when the exact query returns few results.</p>
+
+<h3>4.6 Prefix and autocomplete with edge n-grams</h3>
+<p>A <code>prefix</code> query matches all terms starting with a string, found by a range scan over the sorted term dictionary. It works but is expensive for short prefixes on large dictionaries. For type-ahead the better approach is to <b>pay at index time</b> using an <b>edge n-gram</b> token filter. For the word <code>shoe</code> with min 1 and max 4 it emits <code>s</code>, <code>sh</code>, <code>sho</code>, <code>shoe</code>. At query time the user's partial input <code>sho</code> is looked up as an ordinary term and found at once. The tradeoff is a larger index. You index with the n-gram analyzer but search with a plain analyzer, so the user's input is not itself n-grammed (otherwise <code>sho</code> would match everything containing <code>s</code>). Alternatives are the <code>search_as_you_type</code> field type, which builds these sub-fields for you, and the <b>completion suggester</b>, an in-memory structure for very fast prefix suggestions. The dedicated design is in <a href="../case-studies/c11-autocomplete.html">the autocomplete case study</a>.</p>
+
+<h3>4.7 Range queries</h3>
+<p>A <code>range</code> query handles numbers and dates: <code>price between 50 and 120</code>, <code>created after 2025-01-01</code>. It uses the BKD-tree points structure rather than the inverted index and belongs in a <code>filter</code> clause.</p>
+
+<h3>4.8 Aggregations and facets</h3>
+<p>Aggregations compute summaries over the matching documents in the same request: counts per brand (<code>terms</code> aggregation), price histogram, min/max/average, percentiles, counts per day (<code>date_histogram</code>), and nested combinations. They read <b>doc values</b>, the columnar structure, not the inverted index. This is how a product page shows facet counts without a second system. Two cautions: aggregating on a high-cardinality field (user ID, URL) uses lots of memory, and <code>terms</code> aggregation counts across shards are <b>approximate</b> for the top N because each shard reports only its own top entries (the response includes an error bound you can inspect). You can raise <code>shard_size</code> to improve accuracy.</p>
+
+<table>
+<tr><th>Need</th><th>Query type</th><th>Scored?</th><th>Notes</th></tr>
+<tr><td>Exact value (SKU, brand, status)</td><td>term on keyword field</td><td>No (use inside filter)</td><td>Not analyzed; case sensitive</td></tr>
+<tr><td>Natural-language search box</td><td>match / multi_match</td><td>Yes</td><td>Analyzer applied; OR by default</td></tr>
+<tr><td>Exact phrase</td><td>match_phrase</td><td>Yes</td><td>Uses positions; slop optional</td></tr>
+<tr><td>Combine conditions</td><td>bool (must, should, must_not, filter)</td><td>Depends on clause</td><td>Put yes/no conditions in filter</td></tr>
+<tr><td>Typos</td><td>fuzzy / fuzziness AUTO</td><td>Yes</td><td>Edit distance; costs CPU</td></tr>
+<tr><td>Type-ahead</td><td>edge n-gram field, search_as_you_type, completion</td><td>Yes</td><td>Index larger; query cheap</td></tr>
+<tr><td>Price, date ranges</td><td>range</td><td>No (filter)</td><td>BKD tree</td></tr>
+<tr><td>Facet counts, stats</td><td>aggregations</td><td>n/a</td><td>Doc values; watch cardinality</td></tr>
+</table>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="relevance">5. Relevance scoring</h2>
+
+<p>For each matching document the engine computes a number, the <b>score</b>, and sorts descending. How is it chosen? Start from two intuitions.</p>
+
+<h3>5.1 TF-IDF intuition</h3>
+<p><b>Term frequency (TF)</b>: if a document mentions "waterproof" five times, it is probably more about waterproofing than one that mentions it once. <b>Inverse document frequency (IDF)</b>: a word found in nearly every document tells you nothing, while a rare word is a strong signal. In a shoe catalogue "shoe" is in 90 percent of documents and so carries little weight, while "gore-tex" is in 1 percent and carries a lot. Multiply them: a document scores high for a term that appears often in it and rarely elsewhere. This is TF-IDF. IDF is computed as roughly the logarithm of (total documents / documents containing the term), so it grows slowly for rarity and never explodes.</p>
+
+<h3>5.2 BM25: the modern default</h3>
+<p>Since Elasticsearch 5 and Lucene 6 the default is <b>BM25</b>, which improves TF-IDF in two ways that are easy to remember:</p>
+<ul>
+  <li><b>Term frequency saturates.</b> In plain TF-IDF, 20 mentions are worth four times 5 mentions. In BM25 the benefit flattens quickly: the first few mentions matter, later ones add little. This stops keyword stuffing from winning. A parameter <code>k1</code> (default 1.2) controls how fast it flattens.</li>
+  <li><b>Length normalization.</b> A word appearing once in a 5-word title is far more meaningful than once in a 5,000-word description. BM25 divides by the field length relative to the average length, with parameter <code>b</code> (default 0.75) controlling how strongly. This is why a match in a short title field outranks the same match in a long body.</li>
+</ul>
+<p>For a multi-term query, the per-term scores are added up. You never need to recite the formula in an interview; you do need to explain these three effects: rare terms count more, repeated terms help with diminishing returns, and shorter fields count more.</p>
+
+<h3>5.3 Boosting</h3>
+<p>Raw BM25 knows nothing about your business. You adjust with <b>boosts</b>. A field boost multiplies the score from a field: <code>title^3, description^1</code>. A <code>should</code> clause on <code>in_stock: true</code> adds to the score of in-stock items. A <code>function_score</code> (or <code>rank_feature</code> field) blends in numeric signals such as popularity, rating, recency or sales velocity, typically through a log or saturation function so one huge value cannot dominate. Decay functions reduce the score gradually with distance from a target such as "newer is better" or "closer is better".</p>
+
+<h3>5.4 Ranking signals in practice</h3>
+<table>
+<tr><th>Signal</th><th>Where it comes from</th><th>How it is used</th></tr>
+<tr><td>Text relevance</td><td>BM25 across title, brand, description</td><td>Base score, title boosted</td></tr>
+<tr><td>Popularity, sales</td><td>Analytics pipeline, written to a numeric field</td><td>Log-scaled boost</td></tr>
+<tr><td>Rating and review count</td><td>Product database</td><td>Saturating boost</td></tr>
+<tr><td>Availability</td><td>Inventory service</td><td>Boost in stock, demote out of stock</td></tr>
+<tr><td>Freshness</td><td>Created or updated date</td><td>Decay function</td></tr>
+<tr><td>Personalization</td><td>User history</td><td>Usually a second-stage re-ranker</td></tr>
+<tr><td>Click-through behaviour</td><td>Search logs</td><td>Offline learning, feeds a learning-to-rank model</td></tr>
+</table>
+<p>Large systems separate <b>retrieval</b> (cheaply fetch the top few hundred candidates with the inverted index) from <b>re-ranking</b> (run an expensive machine-learned model over just those candidates). Elasticsearch supports a learning-to-rank rescoring phase and a general <code>rescore</code> query for this pattern. Never evaluate an expensive model over all matches.</p>
+
+<div class="callout tip"><b>Interview tip</b>
+When asked "how would you improve relevance", answer with a loop: log queries and clicks, define a metric (click-through rate on the top results, or NDCG against labelled judgments), change one thing (analyzer, boost, synonym), compare offline against a judged query set, then A/B test. Relevance is tuned empirically, not guessed.
+</div>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="segments">6. Segments, refresh, flush and near-real-time search</h2>
+
+<p>Elasticsearch is built on <b>Apache Lucene</b>, a Java search library. Everything an Elasticsearch shard does at the storage level is a Lucene index, so Lucene's design decides how writes behave.</p>
+
+<h3>6.1 Immutable segments</h3>
+<p>A Lucene index is a collection of <b>segments</b>. A segment is a small, complete, self-contained inverted index (term dictionary, postings, stored fields, doc values) over some set of documents. The defining property: <b>a segment is immutable</b>. Once written it is never modified. This sounds restrictive but brings large benefits: no locking between readers and writers, the files can be cached aggressively by the operating system, compression is simple, and caches such as filter bitsets stay valid for the life of the segment. It is the same idea as the immutable sorted files of an LSM tree (see <a href="19-storage-engines.html">Chapter 19</a>).</p>
+<p>A search runs against every segment of the shard and merges the results. New documents never get added to an existing segment; they go into a new one.</p>
+
+<h3>6.2 The write path: buffer, translog, refresh</h3>
+<ol>
+  <li>An index request reaches the primary shard. The document is analyzed and added to an <b>in-memory indexing buffer</b>. It is not yet searchable.</li>
+  <li>The same operation is appended to the <b>translog</b> (transaction log), a write-ahead log on disk. By default Elasticsearch fsyncs the translog on every request (the <code>request</code> durability setting), so an acknowledged write survives a crash. The alternative <code>async</code> setting syncs every few seconds, trading durability for throughput.</li>
+  <li>A <b>refresh</b> happens by default every 1 second (if the index has been searched recently). Refresh writes the buffer out as a new small segment and opens it for search. The segment sits in the operating system's file cache and has not necessarily been fsynced to disk. After refresh the documents are searchable.</li>
+  <li>A <b>flush</b> is a Lucene <b>commit</b>: it fsyncs all segments to disk, writes a commit point listing them, and then trims the translog since those operations are now durable in segments. Flushes happen automatically when the translog grows large (by default 512 MB) or after a time interval. After a crash, Elasticsearch restarts from the last commit point and <b>replays the translog</b> to recover the operations since.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Write path: buffer and translog, refresh, flush, merge">
+  <rect class="ext" x="20" y="150" width="120" height="60" rx="10"/><text class="t-c t-b" x="80" y="176">Index</text><text class="t-c t-b" x="80" y="194">request</text>
+  <path class="arrow" d="M140 170 L216 110"/><path class="arrow" d="M140 190 L216 250"/>
+  <rect class="cache" x="220" y="70" width="190" height="80" rx="10"/><text class="t-c t-b" x="315" y="98">In-memory buffer</text><text class="t-c t-sm" x="315" y="118">analyzed docs, NOT</text><text class="t-c t-sm" x="315" y="134">searchable yet</text>
+  <rect class="db" x="220" y="220" width="190" height="80" rx="10"/><text class="t-c t-b" x="315" y="248">Translog on disk</text><text class="t-c t-sm" x="315" y="268">fsync per request:</text><text class="t-c t-sm" x="315" y="284">durable once acked</text>
+  <path class="arrow" d="M410 110 L506 110"/><text class="t-c t-sm" x="458" y="100">refresh</text><text class="t-c t-sm" x="458" y="136">~1 s</text>
+  <rect class="box" x="510" y="70" width="190" height="80" rx="10"/><text class="t-c t-b" x="605" y="98">New segment</text><text class="t-c t-sm" x="605" y="118">searchable, in OS</text><text class="t-c t-sm" x="605" y="134">file cache</text>
+  <path class="arrow" d="M605 150 L605 216"/><text class="t-sm" x="615" y="188">flush (commit)</text>
+  <rect class="db" x="510" y="220" width="190" height="80" rx="10"/><text class="t-c t-b" x="605" y="248">Segments fsynced</text><text class="t-c t-sm" x="605" y="268">commit point written,</text><text class="t-c t-sm" x="605" y="284">translog trimmed</text>
+  <path class="arrow dash" d="M410 260 L506 260"/><text class="t-c t-sm" x="458" y="250">trim</text>
+  <path class="arrow" d="M700 260 L766 260"/><text class="t-c t-sm" x="733" y="250">merge</text>
+  <rect class="hit" x="770" y="220" width="110" height="80" rx="10"/><text class="t-c t-b" x="825" y="252">Bigger</text><text class="t-c t-b" x="825" y="270">segment</text><text class="t-c t-sm" x="825" y="288">deletes purged</text>
+  <rect class="hit" x="20" y="330" width="860" height="52" rx="8"/>
+  <text class="t-sm" x="34" y="352">Refresh controls WHEN a write becomes searchable (about 1 s). Flush controls WHEN it is safely in segment files (translog keeps it safe until then).</text>
+  <text class="t-sm" x="34" y="371">Merge runs in the background to combine small segments and drop deleted documents.</text>
+</svg>
+<figcaption>Durability comes from the translog; searchability comes from refresh. These are separate steps, which is why a write is durable immediately but visible to search only after the next refresh.</figcaption>
+</figure>
+
+<h3>6.3 Near-real-time search</h3>
+<p>Because visibility waits for the next refresh, Elasticsearch is <b>near real time</b>, not real time: a just-indexed document typically appears within about a second. A get-by-ID request <i>is</i> real time (it can read from the translog), but a search is not. If you need read-your-writes in a test or a UI, the index API accepts <code>refresh=wait_for</code> (wait until the next scheduled refresh includes the document) or <code>refresh=true</code> (force one now; costly if used per document, since it creates many tiny segments). During large bulk loads, a common tuning is setting <code>refresh_interval</code> to <code>-1</code> (off) or 30 s, then restoring it, so the engine builds fewer, larger segments.</p>
+
+<h3>6.4 Merges</h3>
+<p>One new segment per second would soon mean thousands of segments, and every search must visit all of them. A background <b>merge</b> process picks several similar-sized segments and rewrites them into one larger segment, then deletes the old ones. Merging uses disk I/O and CPU, so it is throttled, and it is why heavy indexing can slow searches. The merge policy groups segments in tiers so the total count stays in the tens rather than thousands. A <b>force merge</b> down to one segment is an option for indices that will never be written again (such as yesterday's logs), giving the fastest searches.</p>
+
+<h3>6.5 Deletes and updates as tombstones</h3>
+<p>Because segments are immutable, you cannot remove a document from one. A delete only marks the document as deleted in a per-segment bitmap (a <b>tombstone</b>). Searches skip marked documents. The data is physically removed only when that segment is merged. An <b>update</b> is therefore a delete of the old version plus an index of a new version into a fresh segment. Consequences: updating a large document frequently is costly, a document being updated constantly creates a stream of tombstones, and disk usage can temporarily grow after bulk deletes until merges catch up. Elasticsearch also keeps a per-document <code>_version</code> and, for concurrency control, <code>_seq_no</code> and <code>_primary_term</code>, so that conflicting updates can be detected.</p>
+
+<div class="callout watch"><b>Watch out</b>
+Elasticsearch does not support multi-document transactions, and a "partial update" still rewrites the entire document internally. Design documents so that fields that change very frequently (a view counter, a live stock level) are not inside a huge document that otherwise never changes, or store them outside the index and apply them at rank time.
+</div>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="cluster">7. Cluster architecture</h2>
+
+<p>A single Lucene index lives on one machine. Elasticsearch (and its fork <b>OpenSearch</b>, which shares nearly all of this design) turns many machines into one distributed search service. The vocabulary:</p>
+<ul>
+  <li><b>Node</b>: one running server process. Nodes join a <b>cluster</b>, a named group that shares state.</li>
+  <li><b>Index</b>: a logical collection of documents with a shared mapping, roughly comparable to a database table (for example <code>products</code>).</li>
+  <li><b>Shard</b>: a slice of an index. Each shard is a complete Lucene index. An index with 6 primary shards stores its documents divided over 6 Lucene indices. The shard is the unit of distribution and parallelism.</li>
+  <li><b>Primary shard and replica shard</b>: every document belongs to exactly one primary shard. A <b>replica</b> is a copy of a primary, placed on a different node. Replicas serve two purposes: <b>high availability</b> (if a node dies, a replica is promoted to primary) and <b>read throughput</b> (searches can go to either copy).</li>
+</ul>
+
+<h3>7.1 Node roles</h3>
+<table>
+<tr><th>Role</th><th>What it does</th><th>Sizing note</th></tr>
+<tr><td>Master-eligible (cluster manager in OpenSearch)</td><td>One elected master maintains the <b>cluster state</b>: which indices exist, their mappings, where each shard lives. Handles creating indices and moving shards. Does not serve data requests.</td><td>Three dedicated, small master nodes is the standard production setup.</td></tr>
+<tr><td>Data (with tiers: hot, warm, cold, frozen)</td><td>Holds shards and does the indexing and search work.</td><td>Most of the cluster; heavy on disk, RAM and CPU.</td></tr>
+<tr><td>Ingest</td><td>Runs ingest pipelines to transform documents before indexing.</td><td>Optional; often combined with data.</td></tr>
+<tr><td>Coordinating (client)</td><td>Receives requests, fans them out, merges results. Any node can do this; a dedicated one has no data and no master role.</td><td>Useful when merging large aggregations is heavy.</td></tr>
+<tr><td>Machine learning, transform</td><td>Anomaly detection, rollups.</td><td>Specialized.</td></tr>
+</table>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Index with 3 primary shards and replicas spread over 3 data nodes plus 3 masters">
+  <text class="t-b" x="20" y="22">Index "products": 3 primary shards (P0, P1, P2), 1 replica each (R0, R1, R2)</text>
+  <rect class="box" x="30" y="40" width="250" height="150" rx="10"/><text class="t-c t-b" x="155" y="62">Data node A</text>
+  <rect class="db" x="55" y="80" width="90" height="46" rx="8"/><text class="t-c t-b" x="100" y="108">P0</text>
+  <rect class="hit" x="165" y="80" width="90" height="46" rx="8"/><text class="t-c t-b" x="210" y="108">R2</text>
+  <text class="t-c t-sm" x="155" y="160">primary of 0, replica of 2</text>
+
+  <rect class="box" x="325" y="40" width="250" height="150" rx="10"/><text class="t-c t-b" x="450" y="62">Data node B</text>
+  <rect class="db" x="350" y="80" width="90" height="46" rx="8"/><text class="t-c t-b" x="395" y="108">P1</text>
+  <rect class="hit" x="460" y="80" width="90" height="46" rx="8"/><text class="t-c t-b" x="505" y="108">R0</text>
+  <text class="t-c t-sm" x="450" y="160">primary of 1, replica of 0</text>
+
+  <rect class="box" x="620" y="40" width="250" height="150" rx="10"/><text class="t-c t-b" x="745" y="62">Data node C</text>
+  <rect class="db" x="645" y="80" width="90" height="46" rx="8"/><text class="t-c t-b" x="690" y="108">P2</text>
+  <rect class="hit" x="755" y="80" width="90" height="46" rx="8"/><text class="t-c t-b" x="800" y="108">R1</text>
+  <text class="t-c t-sm" x="745" y="160">primary of 2, replica of 1</text>
+
+  <rect class="cache" x="30" y="220" width="250" height="56" rx="10"/><text class="t-c t-b" x="155" y="244">3 dedicated master nodes</text><text class="t-c t-sm" x="155" y="262">cluster state, elections</text>
+  <rect class="ext" x="325" y="220" width="250" height="56" rx="10"/><text class="t-c t-b" x="450" y="244">Coordinating node(s)</text><text class="t-c t-sm" x="450" y="262">fan out, merge</text>
+  <rect class="ext" x="620" y="220" width="250" height="56" rx="10"/><text class="t-c t-b" x="745" y="244">Clients / app servers</text><text class="t-c t-sm" x="745" y="262">HTTP on port 9200</text>
+  <rect class="hit" x="30" y="298" width="840" height="46" rx="8"/><text class="t-sm" x="44" y="318">A replica is never placed on the same node as its primary. Lose any one node and every shard still has a live copy;</text><text class="t-sm" x="44" y="335">the cluster promotes a replica to primary and then builds a new replica elsewhere.</text>
+</svg>
+<figcaption>Shards are spread so each node carries a mix of primaries and replicas. The master node tracks the layout but does not touch documents.</figcaption>
+</figure>
+
+<h3>7.2 Routing: which shard owns a document?</h3>
+<p>When you index a document, Elasticsearch computes <code>shard = hash(_routing) mod number_of_primary_shards</code>, where <code>_routing</code> defaults to the document ID (a murmur3 hash is used). Every node can compute this, so any node can forward the request to the right primary without a lookup table. This is the classic hash-partitioning of <a href="25-sharding.html">Chapter 25</a>, and it has its classic consequence: <b>the number of primary shards is fixed at index creation</b>. If you changed it, the modulo would map existing IDs to different shards and you could not find your data. (Split and shrink APIs exist, but they create a new index with a compatible shard count; the fix in general is reindexing, section 11.)</p>
+<p>You can supply a custom <code>routing</code> value, such as a tenant ID, so all of a tenant's documents land on one shard and a tenant-scoped search touches one shard instead of all. The cost is risk of uneven shard sizes if one tenant is huge.</p>
+
+<h3>7.3 The indexing request path</h3>
+<p>A write goes to the coordinating node, which routes it to the primary shard. The primary indexes the document, then forwards the operation <b>in parallel to all in-sync replicas</b>, and replies success once the replicas have acknowledged. The cluster tracks an "in-sync" set of copies; a replica that falls behind is dropped from it and rebuilt. By default a write needs only the primary to be active (<code>wait_for_active_shards=1</code>), though you can require more. Replication is synchronous within the in-sync set, which gives strong per-document behaviour on writes, but the document is only searchable after the refresh on each copy. See <a href="24-replication.html">Chapter 24</a> for replication theory.</p>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="scatter">8. How a search executes: scatter-gather</h2>
+
+<p>A search cannot be answered from one shard, because the matching documents are spread across all of them. Elasticsearch uses a <b>scatter-gather</b> in two phases, called <b>query then fetch</b>.</p>
+
+<ol>
+  <li><b>Request.</b> The client sends the search to any node, which becomes the <b>coordinating node</b> for this request.</li>
+  <li><b>Query phase (scatter).</b> The coordinator sends the query to <b>one copy of every shard</b> of the index (primary or replica, chosen by adaptive replica selection, which prefers the faster, less loaded copy). Each shard runs the query locally against its segments and builds a priority queue of its top <code>from + size</code> hits. It returns only <b>document IDs and scores</b>, not the documents.</li>
+  <li><b>Merge (gather).</b> The coordinator merges the per-shard lists into one globally sorted list and picks the winning page.</li>
+  <li><b>Fetch phase.</b> The coordinator asks only those shards that own a winning document to return the full <code>_source</code> (and highlights) for exactly those IDs. It assembles the final response.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Sequence diagram of query then fetch with a coordinating node and three shards">
+  <rect class="ext" x="30" y="20" width="110" height="34" rx="8"/><text class="t-c t-b" x="85" y="42">Client</text>
+  <rect class="box" x="230" y="20" width="140" height="34" rx="8"/><text class="t-c t-b" x="300" y="42">Coordinator</text>
+  <rect class="db" x="480" y="20" width="110" height="34" rx="8"/><text class="t-c t-b" x="535" y="42">Shard 0</text>
+  <rect class="db" x="630" y="20" width="110" height="34" rx="8"/><text class="t-c t-b" x="685" y="42">Shard 1</text>
+  <rect class="db" x="780" y="20" width="100" height="34" rx="8"/><text class="t-c t-b" x="830" y="42">Shard 2</text>
+  <line class="life" x1="85" y1="54" x2="85" y2="390"/><line class="life" x1="300" y1="54" x2="300" y2="390"/><line class="life" x1="535" y1="54" x2="535" y2="390"/><line class="life" x1="685" y1="54" x2="685" y2="390"/><line class="life" x1="830" y1="54" x2="830" y2="390"/>
+
+  <path class="arrow" d="M85 84 L296 84"/><text class="t-sm" x="100" y="78">1. search, size=10</text>
+  <path class="arrow" d="M300 114 L531 114"/><path class="arrow" d="M300 124 L681 124"/><path class="arrow" d="M300 134 L826 134"/><text class="t-sm" x="310" y="108">2. query phase: ask every shard</text>
+  <rect class="cache" x="440" y="150" width="400" height="30" rx="6"/><text class="t-c t-sm" x="640" y="170">each shard searches its segments, keeps top 10 (id, score)</text>
+  <path class="arrow dash" d="M531 196 L304 196"/><path class="arrow dash" d="M681 206 L304 206"/><path class="arrow dash" d="M826 216 L304 216"/><text class="t-sm" x="316" y="190">3. 10 ids + scores each (30 total)</text>
+  <rect class="box" x="130" y="232" width="340" height="30" rx="6"/><text class="t-c t-sm" x="300" y="252">merge 30 candidates, keep global top 10</text>
+  <path class="arrow" d="M300 282 L531 282"/><path class="arrow" d="M300 292 L826 292"/><text class="t-sm" x="310" y="276">4. fetch phase: only shards owning winners</text>
+  <path class="arrow dash" d="M531 316 L304 316"/><path class="arrow dash" d="M826 326 L304 326"/><text class="t-sm" x="316" y="310">5. full documents for those ids</text>
+  <path class="arrow dash" d="M296 366 L89 366"/><text class="t-sm" x="100" y="360">6. final 10 results</text>
+</svg>
+<figcaption>Step 3 returns many more candidates than the user sees, and step 5 fetches only the few that won. The coordinator is a short-lived role, not a special machine.</figcaption>
+</figure>
+
+<h3>8.1 Why the cost grows with the number of shards</h3>
+<p>The query latency is determined by the <b>slowest shard</b> (the tail-latency effect described in <a href="08-scalability-concurrency.html">Chapter 8</a>): the coordinator has to wait for all of them. Adding shards parallelizes the per-shard work but adds coordination overhead and more chances for one slow shard. A search for 10 hits over 100 shards makes the coordinator merge 1,000 candidates; this is the root of the deep pagination problem in section 14.</p>
+
+<h3>8.2 A subtlety: scores are per shard</h3>
+<p>BM25's IDF uses document counts from the shard being searched, not the whole index. With small or unevenly filled shards, the same term may get slightly different IDF on different shards, producing odd rankings. On large indices the statistics converge and the effect vanishes. The <code>dfs_query_then_fetch</code> search type runs an extra step to gather global statistics first, which is worth it only for small datasets or testing.</p>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="shard-sizing">9. Shard sizing and the too-many-shards problem</h2>
+
+<p>The shard count is the most consequential decision you make for an index, and it cannot be changed cheaply. Each shard is a full Lucene index with its own open files, memory structures (term dictionary, caches), and cluster-state entry. Two opposite mistakes occur.</p>
+
+<h3>9.1 Too many shards (oversharding)</h3>
+<p>Teams frequently create an index per customer, per day, or give each index 10 shards "to be safe". The cluster ends up with tens of thousands of tiny shards. Problems: every shard costs heap memory on its node, even when idle; the master must store and publish a huge cluster state to every node on each change, making shard moves and index creation slow and risking master instability; each search fans out to every shard, so latency and thread-pool pressure grow; and recovery after a node loss involves many small shard copies. A widely quoted guideline is to keep no more than about 20 shards per GB of heap on a node, and the current guidance prefers fewer, larger shards.</p>
+
+<h3>9.2 Too few or too large shards</h3>
+<p>One giant shard cannot be spread across nodes, so search over it is single-threaded per shard and cannot use the whole cluster. Recovery and rebalancing of a 500 GB shard moves hundreds of gigabytes over the network and takes hours. Merges on huge shards are heavy.</p>
+
+<h3>9.3 Rules of thumb</h3>
+<ul>
+  <li>Target shard sizes of roughly <b>10 to 50 GB</b> for search workloads (up to around 50 GB for log-style data; Elastic's guidance is often 10 to 50 GB), and avoid exceeding about 200 million documents per shard.</li>
+  <li>Choose primary shards so the index reaches a few tens of GB per shard at its expected size, and so shard count is a small multiple of data node count to spread load evenly.</li>
+  <li>Plan from the data size: 300 GB of expected index at 30 GB per shard is 10 primary shards.</li>
+  <li>Replicas are changeable at any time; primary count is not. Start with 1 replica, add more for read-heavy load.</li>
+  <li>If you have many small tenants, do <b>not</b> make an index each. Put them into shared indices with a tenant ID field, a custom routing value, and filtered aliases (section 11), and give only the very large tenants their own index.</li>
+</ul>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="mappings">10. Mappings and dynamic mapping pitfalls</h2>
+
+<p>A <b>mapping</b> is the schema of an index: it lists every field, its type (<code>text</code>, <code>keyword</code>, <code>long</code>, <code>double</code>, <code>date</code>, <code>boolean</code>, <code>nested</code>, <code>dense_vector</code>, ...), and its analyzer and options. The mapping decides which structures are built (inverted index, doc values, points).</p>
+
+<h3>10.1 Dynamic mapping</h3>
+<p>By default Elasticsearch is schema-on-write: if you index a document with a field it has not seen, it guesses a type and adds the field to the mapping. A string becomes both a <code>text</code> field and a <code>keyword</code> sub-field (up to 256 characters), a whole number becomes <code>long</code>, a decimal becomes <code>float</code>, and a string that looks like a date becomes <code>date</code>. This is convenient for experiments and dangerous in production.</p>
+<ul>
+  <li><b>Wrong guesses are permanent.</b> You cannot change the type of an existing field. If the first document has <code>"price": "12"</code> (a string) and later ones have numbers, indexing errors follow. The fix is to create a new index with the right mapping and reindex.</li>
+  <li><b>Mapping explosion.</b> If you index arbitrary JSON keys (for example a map keyed by user ID or by log label), each new key becomes a new field. Tens of thousands of fields bloat the cluster state and heap and can destabilize the master. There is a safety limit (<code>index.mapping.total_fields.limit</code>, default 1,000), but raising it just moves the problem. Fix by modelling variable keys as a list of key/value objects, using the <code>flattened</code> type, or setting <code>dynamic: strict</code>.</li>
+  <li><b>Wasted indexing.</b> Every string becomes a text field and a keyword field, even when you only filter on it. That doubles storage.</li>
+</ul>
+<p>Best practice in production: define an <b>explicit mapping through an index template</b>, set <code>dynamic: strict</code> (reject unknown fields) or <code>false</code> (store but do not index them), disable indexing on fields you will never search (<code>index: false</code>), and turn off <code>doc_values</code> or <code>_source</code> overheads only with care.</p>
+
+<h3>10.2 Nested objects</h3>
+<p>Elasticsearch flattens JSON arrays of objects. A product with variants <code>[{color: red, size: S}, {color: blue, size: L}]</code> is stored as <code>color: [red, blue]</code> and <code>size: [S, L]</code>, so a query for "red and L" falsely matches. The <code>nested</code> type indexes each element as a hidden separate Lucene document so the correlation is kept, at the price of more documents and slower queries and updates. Prefer denormalizing into flat documents; use nested only when you truly need correlated sub-fields. Real SQL-style joins are limited (the <code>join</code> field type is slow and discouraged), so search documents should be <b>denormalized</b>: put the brand name and category name directly into the product document rather than referencing other indices.</p>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="reindex">11. Reindexing and aliases for zero-downtime changes</h2>
+
+<p>Since primary shard count and field types cannot change in place, you will need to reindex: create a new index with new settings or mapping, copy all data into it, and switch over. The <code>_reindex</code> API copies documents from one index to another (it reads from the source and bulk writes to the destination, optionally transforming), and it runs as a throttle-able background task.</p>
+<p>The switch is made safe with an <b>alias</b>: a name that points to one or more indices. Applications never use the real index name; they query and write to the alias <code>products</code>, which today points to <code>products_v1</code>. The change flow:</p>
+<ol>
+  <li>Create <code>products_v2</code> with the new mapping and shard count.</li>
+  <li>Reindex from <code>products_v1</code> to <code>products_v2</code> while v1 keeps serving traffic.</li>
+  <li>Keep v2 up to date with changes that arrived during the copy. Typically the indexing pipeline dual-writes to both, or you replay the change stream from the moment the copy started (section 13).</li>
+  <li>Verify counts and sample queries on v2.</li>
+  <li>Swap the alias in a single <b>atomic</b> call that removes <code>products</code> from v1 and adds it to v2. Readers see no gap.</li>
+  <li>Keep v1 for a while as a rollback, then delete it.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Alias swap from v1 to v2 index during reindex">
+  <rect class="ext" x="30" y="120" width="150" height="60" rx="10"/><text class="t-c t-b" x="105" y="146">Application</text><text class="t-c t-sm" x="105" y="164">uses name "products"</text>
+  <rect class="cache" x="300" y="120" width="150" height="60" rx="10"/><text class="t-c t-b" x="375" y="146">Alias</text><text class="t-c t-sm" x="375" y="164">products</text>
+  <path class="arrow" d="M180 150 L296 150"/>
+  <rect class="db" x="620" y="40" width="250" height="70" rx="10"/><text class="t-c t-b" x="745" y="68">products_v1</text><text class="t-c t-sm" x="745" y="88">old mapping, 5 shards</text>
+  <rect class="box" x="620" y="190" width="250" height="70" rx="10"/><text class="t-c t-b" x="745" y="218">products_v2</text><text class="t-c t-sm" x="745" y="238">new mapping, 10 shards</text>
+  <path class="arrow-g" d="M450 140 L616 85"/><text class="t-sm" x="470" y="100" style="fill:var(--good)">before</text>
+  <path class="arrow dash" d="M450 165 L616 220"/><text class="t-sm" x="470" y="215">after atomic swap</text>
+  <path class="arrow dash" d="M745 110 L745 186"/><text class="t-sm" x="755" y="154">_reindex copy</text>
+  <rect class="hit" x="30" y="284" width="840" height="34" rx="8"/><text class="t-sm" x="44" y="306">The alias swap is one atomic operation: no moment exists where the name points to nothing or to both.</text>
+</svg>
+<figcaption>Clients never see the version suffix. Rolling back is another alias swap.</figcaption>
+</figure>
+
+<p>Aliases have other uses: a <b>filtered alias</b> embeds a filter (for example <code>tenant_id: 42</code>) so a tenant's code can query only its own slice; a <b>write alias</b> designates one index among several as the write target (used by rollover, next section); and an alias may span several indices to search them as one.</p>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="ilm">12. Time-based indices and Index Lifecycle Management</h2>
+
+<p>Logs, metrics, events and other time-series data have a distinctive pattern: they are written once, mostly queried while recent, and eventually deleted. Putting them all into one growing index is a mistake, because deleting old documents leaves tombstones and needs expensive merges, and shards grow without bound. Instead, use <b>time-based indices</b>: <code>logs-2026.11.17</code>, or better, a <b>data stream</b>, a managed abstraction that routes writes to the current backing index and searches across all of them.</p>
+<p>Dropping old data then becomes <b>deleting a whole index</b>: a cheap metadata operation that frees disk at once, with no tombstones.</p>
+<p><b>Index Lifecycle Management (ILM)</b> (OpenSearch has the similar ISM) automates the phases by policy:</p>
+<table>
+<tr><th>Phase</th><th>Typical action</th><th>Hardware</th></tr>
+<tr><td>Hot</td><td>Receives writes; <b>rollover</b> to a new index when it reaches, say, 50 GB or 1 day old</td><td>Fast SSDs, many CPUs</td></tr>
+<tr><td>Warm</td><td>No more writes; shrink shard count, force merge to fewer segments</td><td>Cheaper disks</td></tr>
+<tr><td>Cold / frozen</td><td>Rarely searched; reduce replicas, or mount from a snapshot in object storage (<a href="21-object-storage.html">Chapter 21</a>) as a searchable snapshot</td><td>Large cheap storage</td></tr>
+<tr><td>Delete</td><td>Delete after the retention period (for example 90 days)</td><td>n/a</td></tr>
+</table>
+<p>Product catalogs are not time-series, so they use the alias-and-reindex pattern from section 11. Event and log data uses ILM. Snapshots to object storage are the backup mechanism for both.</p>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="pipeline">13. Indexing pipeline: keeping search in sync with the source of truth</h2>
+
+<p>The central architectural rule: <b>the search index is a derived view, not the system of record</b>. Your orders, products and users live in a primary database (see <a href="20-nosql.html">Chapter 20</a> and <a href="18-relational-internals.html">Chapter 18</a>). The search cluster holds a copy shaped for querying. If the index is lost or corrupted you must be able to rebuild it from the source. This has design consequences for how data gets in.</p>
+
+<h3>13.1 Options for feeding the index</h3>
+<table>
+<tr><th>Approach</th><th>How it works</th><th>Problem</th></tr>
+<tr><td>Dual write</td><td>The application writes to the DB and then to Elasticsearch in the same request.</td><td>Not atomic. If the second write fails or the process dies between them, the two stores silently diverge. Concurrent updates can land in opposite order in the two stores. Avoid.</td></tr>
+<tr><td>Periodic batch sync</td><td>A job queries "rows changed since last run" and bulk indexes them.</td><td>Delay equal to the schedule; hard-deleted rows are missed unless you use soft deletes; load on the DB.</td></tr>
+<tr><td>Transactional outbox</td><td>The app writes the business row and an "event" row in one DB transaction; a relay publishes the events to a queue.</td><td>Needs an extra table and relay, but is atomic and works with any DB.</td></tr>
+<tr><td><b>Change data capture (CDC)</b></td><td>A tool such as Debezium reads the database's own write-ahead log and emits an event per row change to Kafka. An indexer consumes them and updates the index.</td><td>Operational complexity, but no application changes, captures deletes, and keeps order per row.</td></tr>
+</table>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Pipeline from database through CDC and Kafka to indexer and Elasticsearch, with a backfill path">
+  <rect class="ext" x="20" y="60" width="130" height="60" rx="10"/><text class="t-c t-b" x="85" y="86">Application</text><text class="t-c t-sm" x="85" y="104">writes to DB only</text>
+  <rect class="db" x="190" y="60" width="130" height="60" rx="10"/><text class="t-c t-b" x="255" y="86">Primary DB</text><text class="t-c t-sm" x="255" y="104">source of truth</text>
+  <rect class="cache" x="360" y="60" width="120" height="60" rx="10"/><text class="t-c t-b" x="420" y="86">CDC</text><text class="t-c t-sm" x="420" y="104">reads DB log</text>
+  <rect class="cache" x="520" y="60" width="120" height="60" rx="10"/><text class="t-c t-b" x="580" y="86">Kafka topic</text><text class="t-c t-sm" x="580" y="104">keyed by row id</text>
+  <rect class="box" x="680" y="60" width="90" height="60" rx="10"/><text class="t-c t-b" x="725" y="86">Indexer</text><text class="t-c t-sm" x="725" y="104">bulk, idempotent</text>
+  <rect class="db" x="800" y="60" width="90" height="60" rx="10"/><text class="t-c t-b" x="845" y="86">Search</text><text class="t-c t-sm" x="845" y="104">index</text>
+  <path class="arrow" d="M150 90 L186 90"/><path class="arrow" d="M320 90 L356 90"/><path class="arrow" d="M480 90 L516 90"/><path class="arrow" d="M640 90 L676 90"/><path class="arrow" d="M770 90 L796 90"/>
+  <path class="arrow dash" d="M725 120 L725 190 L580 190 L580 124"/><text class="t-sm" x="600" y="184">failures: retry, then dead-letter queue</text>
+  <rect class="miss" x="190" y="220" width="200" height="50" rx="8"/><text class="t-c t-b" x="290" y="242">Backfill / reindex job</text><text class="t-c t-sm" x="290" y="260">scans DB, emits same events</text>
+  <path class="arrow dash" d="M390 245 L580 245 L580 124"/>
+  <rect class="hit" x="440" y="270" width="440" height="46" rx="8"/><text class="t-sm" x="452" y="290">Index lag is typically sub-second to a few seconds.</text><text class="t-sm" x="452" y="307">Search reads are eventually consistent with the DB.</text>
+</svg>
+<figcaption>The app never talks to the search cluster on the write path. A backfill job feeds the same topic as live changes, so there is only one indexing code path.</figcaption>
+</figure>
+
+<h3>13.2 Making the indexer correct</h3>
+<ul>
+  <li><b>Idempotent writes.</b> Queues deliver at least once, so the same event may arrive twice. Index the document using the database primary key as the document <code>_id</code>: replaying an event simply overwrites the same document with the same content.</li>
+  <li><b>Ordering and stale writes.</b> If events for one row are processed out of order, an old version could overwrite a newer one. Key the Kafka topic by row ID so one row's events are ordered within a partition, and use <b>external versioning</b>: index with <code>version_type=external</code> and the row's version or update timestamp, so Elasticsearch rejects any write whose version is not higher than what is stored.</li>
+  <li><b>Bulk requests.</b> Index through the <code>_bulk</code> API in batches of roughly 5 to 15 MB (or a few thousand documents), not one document at a time. Handle partial failures: a bulk response reports a status for each item, and a 429 means the cluster is overloaded and you must back off and retry.</li>
+  <li><b>Deletes.</b> Propagate deletes as events (CDC provides tombstone events). Otherwise deleted products linger in search.</li>
+  <li><b>Denormalization.</b> The search document usually joins data from several tables (product, brand, category, price). A change in a brand name must update every product of that brand; design the indexer to find and re-emit the affected documents, or tolerate brief staleness.</li>
+</ul>
+
+<h3>13.3 Backfill and reindex</h3>
+<p>You will need to rebuild the index: after a mapping change, after a bug in the indexer, or on first launch. Build the new index (<code>products_v2</code>) off to the side: record the current position of the change stream, scan the source table in primary-key ranges and index each row, then start consuming the change stream from the recorded position so edits made during the scan are applied on top. External versioning ensures a late-arriving old scan result never overwrites a newer change. When v2 has caught up, swap the alias (section 11). This pattern also appears in <a href="26-multi-region-migrations.html">Chapter 26</a> for data migrations.</p>
+
+<h3>13.4 Eventual consistency in the product</h3>
+<p>Between a database commit and the search index showing it there is lag: CDC delay, queue wait, indexing, and the refresh interval. It is usually one to a few seconds but grows under load, and you must design for it. A seller who edits a product and immediately searches for it may not see the change. Common mitigations: show the user's own edits from the database on the confirmation page, not from search; for key flows read the final state from the DB by ID after a search returns the ID (and filter out items that no longer exist); and monitor lag as a first-class metric. This is the same pattern as event-driven read models in <a href="36-event-driven.html">Chapter 36</a> and ties into <a href="46-microservice-data.html">Chapter 46</a>.</p>
+
+<!-- ======================= 14 ======================= -->
+<h2 id="pagination">14. Deep pagination and search_after</h2>
+
+<p>The simple pagination parameters are <code>from</code> and <code>size</code>: <code>from=10000, size=10</code> shows page 1,001. To honour it, <b>every shard</b> must collect its top <code>from + size</code> = 10,010 hits and send IDs and scores to the coordinator, which merges 10,010 &times; (number of shards) entries to pick 10. With 10 shards that is 100,100 entries held in memory for one page. Cost grows linearly with depth, and many queries at once can exhaust memory. Elasticsearch therefore refuses <code>from + size</code> beyond 10,000 by default (<code>index.max_result_window</code>). Raising the limit is the wrong fix.</p>
+
+<h3>14.1 Alternatives</h3>
+<ul>
+  <li><b>search_after</b>: each request returns a sort value for its last hit, and the next request passes it back: "give me the 10 documents that sort after this one". Each shard only needs to find the top 10 after that position, so cost is constant regardless of depth. You need a <b>deterministic total order</b>, so add a unique tiebreaker such as the document ID to the sort. Limits: you can only move forward, not jump to page 500.</li>
+  <li><b>Point in time (PIT)</b>: opens a frozen view of the index so that pages are consistent while documents are being indexed; combine PIT with <code>search_after</code>.</li>
+  <li><b>Scroll</b>: the older bulk-export mechanism, which holds a snapshot open. Now recommended only for big exports, not for user-facing paging.</li>
+</ul>
+<p>For user interfaces, the honest product answer is that nobody looks past page 10: cap the depth, show "refine your search" instead, and offer "next / previous" with <code>search_after</code>. Interviewers like to hear that "jump to page N" is intentionally unsupported at scale. The same trade-off, offset versus cursor, appears in <a href="05-api-design.html">Chapter 5</a>.</p>
+
+<!-- ======================= 15 ======================= -->
+<h2 id="consistency">15. Consistency and durability: why it is not a primary database</h2>
+
+<p>Elasticsearch is excellent at search and acceptable as a datastore for logs, but you should not make it the only home of data you cannot lose. Reasons to state clearly:</p>
+<ul>
+  <li><b>Near-real-time visibility.</b> Section 6.3: writes are searchable after a refresh, not immediately, and there is no read-your-writes guarantee for searches.</li>
+  <li><b>No multi-document transactions or constraints.</b> There are no foreign keys, no unique constraints beyond the document ID, and no atomic updates across documents. Updates to one document are atomic.</li>
+  <li><b>Replication is per-shard; the cluster is not a CP database in the strict sense.</b> Writes are acknowledged by the primary and in-sync replicas, and the cluster handles a node failure well, but historic split-brain bugs, mapping conflicts, and corruptions after a crash have meant that practice is "snapshot regularly and keep a rebuild path". With default settings and a single replica, losing two nodes that hold both copies of a shard loses that shard.</li>
+  <li><b>Translog durability is configurable.</b> If you set <code>async</code>, you may lose the last few seconds of acknowledged writes in a crash.</li>
+  <li><b>Schema pitfalls</b> (section 10) and reindex-only changes make it costly to correct mistakes.</li>
+  <li><b>Distributed counts.</b> Aggregation counts across shards can be approximate (section 4.8), and the total hit count is capped to 10,000 unless <code>track_total_hits</code> is requested because exact counting is expensive.</li>
+</ul>
+<p>Therefore: keep the source of truth in a database, treat the index as rebuildable, take snapshots to object storage, and rehearse a full rebuild. See <a href="28-cap-consistency.html">Chapter 28</a> for the vocabulary of consistency models.</p>
+
+<!-- ======================= 16 ======================= -->
+<h2 id="capacity">16. Scaling and a capacity sizing example</h2>
+
+<p>Scaling levers, in rough order of use: add <b>replicas</b> for read throughput and availability; add <b>data nodes</b> so shards spread out and each carries less; add <b>shards</b> through a reindex when a single shard is too big; separate <b>hot and warm tiers</b>; add <b>dedicated masters and coordinating nodes</b> as the cluster grows; and <b>cache</b> hot queries upstream (a filter cache lives inside; an application cache like <a href="15-redis.html">Redis</a> in front handles repeat top queries, see <a href="13-caching-patterns.html">Chapter 13</a>).</p>
+
+<h3>16.1 Worked sizing: product search for a marketplace</h3>
+<p>Requirements: 50 million products, average search document 2 KB of source; 5,000 searches per second at peak; 200 product updates per second on average (bursts to 2,000); p99 search latency under 200 ms; survive one node failure.</p>
+<ol>
+  <li><b>Raw data.</b> 50 M &times; 2 KB = 100 GB of source JSON. The index on disk is typically comparable to or somewhat larger than the source once inverted index, doc values and stored fields are included; we use a factor of about 1.3 and get roughly 130 GB of primary data. (Always measure with a sample; the factor varies widely.)</li>
+  <li><b>With one replica.</b> 130 GB &times; 2 copies = 260 GB. Add 15 to 25 percent of free-disk headroom for merges and watermarks (Elasticsearch stops allocating shards at about 85 percent full by default), giving about 340 GB of disk across the cluster.</li>
+  <li><b>Shard count.</b> At about 30 GB per shard, 130 GB gives about 4 to 5 primary shards. For growth (we expect 2x in two years) and even spread over 6 data nodes, pick <b>6 primary shards</b>, each starting around 22 GB. With one replica that is 12 shard copies, 2 per node.</li>
+  <li><b>Query load.</b> 5,000 searches per second, each fanning out to all 6 shards, means 30,000 shard-level searches per second spread over 6 nodes: 5,000 per node. A node with 16 cores, a good page cache and a well-formed bool-with-filters query can serve in the order of a few thousand simple shard queries per second, so this is near the edge. Add headroom: choose <b>6 data nodes of 16 vCPU / 64 GB RAM (about 31 GB heap, rest left for the OS page cache)</b> and a second replica if load tests show saturation, or reduce fan-out by caching the top queries (a 30 to 50 percent hit rate removes a large share of load).</li>
+  <li><b>Memory.</b> Give the JVM heap no more than half of RAM and no more than about 31 GB (to keep compressed object pointers). The rest of the RAM becomes the <b>OS file cache</b>, which is what makes search fast: ideally the hot parts of the 260 GB index fit in the cache across the cluster (6 &times; ~30 GB = 180 GB of cache), so most reads avoid disk. SSDs are mandatory.</li>
+  <li><b>Indexing load.</b> 200 updates per second average, 2,000 at burst, is trivial for bulk indexing (a node can ingest thousands to tens of thousands of small documents per second). The concern is merge and refresh pressure, not raw throughput. The CDC pipeline absorbs bursts in Kafka.</li>
+  <li><b>Masters and failures.</b> Add 3 small dedicated master nodes (2 vCPU / 8 GB). If one data node dies, its 2 shards' replicas on other nodes are promoted, then new replicas are copied (about 22 GB each over a 10 Gbps link takes a few minutes), so capacity should be planned for N-1 nodes: 5 nodes must still hold p99 under 200 ms.</li>
+</ol>
+<p>Result: roughly 9 nodes (6 data, 3 master) plus the Kafka consumers. The interview point is not the exact figure but the method: data size, then shard count from target shard size, then fan-out multiplication of query load, then memory split between heap and page cache, then failure headroom.</p>
+
+<!-- ======================= 17 ======================= -->
+<h2 id="alternatives">17. Alternatives and when to use what</h2>
+<table>
+<tr><th>Option</th><th>What it is</th><th>Choose it when</th></tr>
+<tr><td>Elasticsearch</td><td>Lucene-based distributed engine; rich query DSL, aggregations, broad ecosystem (Kibana, Beats). Source-available license.</td><td>Large-scale search plus analytics, log search, complex relevance.</td></tr>
+<tr><td>OpenSearch</td><td>Fork of Elasticsearch 7.10 maintained by AWS and community under Apache 2.0; managed by Amazon OpenSearch Service. APIs and architecture closely match.</td><td>You want a permissive license or AWS-managed service. Newer features diverge between the two.</td></tr>
+<tr><td>Apache Solr</td><td>Older Lucene-based server, mature, strong faceting, uses ZooKeeper in SolrCloud mode.</td><td>Existing Solr estates, document-centric enterprise search.</td></tr>
+<tr><td>Typesense</td><td>Small, fast, memory-resident engine focused on instant typo-tolerant search with simple setup.</td><td>Datasets that fit in RAM, developer-friendly site search, simple operations.</td></tr>
+<tr><td>Meilisearch</td><td>Rust-based engine with excellent out-of-the-box relevance and typo tolerance, simple API.</td><td>Small to mid datasets, instant search UX, little tuning.</td></tr>
+<tr><td>Managed SaaS (for example Algolia)</td><td>Hosted search with relevance tools.</td><td>You prefer to buy rather than operate; cost grows with volume.</td></tr>
+<tr><td>Database full-text (PostgreSQL GIN)</td><td>Inverted index inside the DB.</td><td>Small data, no extra system wanted, transactional consistency with the rows.</td></tr>
+<tr><td>Vector search</td><td>Finds items by meaning using embeddings and approximate nearest-neighbour indexes (HNSW). Elasticsearch, OpenSearch and dedicated vector stores all offer it.</td><td>Semantic queries ("shoes for muddy hikes"). Often combined with keyword search as <b>hybrid search</b>, merging both rankings.</td></tr>
+</table>
+<p>Vector search is introduced in <a href="23-other-stores.html">Chapter 23</a>; geographic and advanced text techniques are in <a href="58-geospatial-text.html">Chapter 58</a>. Keyword search remains better for exact identifiers, names and rare terms, while vectors help with vague, natural-language queries; production systems blend them.</p>
+
+<!-- ======================= 18 ======================= -->
+<h2 id="failures">18. Failure modes</h2>
+
+<h3>18.1 Split brain (historic) and the cluster manager</h3>
+<p>In old Elasticsearch (before version 7), master election was based on a setting <code>minimum_master_nodes</code> that operators had to set correctly to a majority. If it was misconfigured, a network partition could let two groups each elect a master, and each accepted writes: <b>split brain</b>, producing divergent data that could not be merged. Version 7 introduced a new coordination layer that automatically uses voting-configuration quorums (majority of master-eligible nodes), removing the manual setting. The lesson: run an <b>odd number (3) of master-eligible nodes</b> so a majority always exists on one side of a partition, the same principle as <a href="29-consensus.html">consensus protocols</a>. Never put master and heavy data roles on the same overloaded nodes.</p>
+
+<h3>18.2 Heap pressure and garbage collection</h3>
+<p>Elasticsearch runs on the JVM. Large aggregations, a huge number of shards, big <code>fielddata</code> on text fields, deep pagination, and giant bulk requests all use heap. When the heap fills, garbage collection pauses grow, a node stops responding to the master's pings, is considered dead, and is removed; its shards are reassigned, creating more load on other nodes, a possible <b>cascade</b>. Circuit breakers reject requests that would exceed memory limits. Mitigations: heap at or below 31 GB and half of RAM; avoid fielddata (use keyword with doc values); limit aggregation cardinality; fewer shards; monitor GC time and heap after collection.</p>
+
+<h3>18.3 Hot shards and hot nodes</h3>
+<p>If custom routing sends a big tenant's data to one shard, or time-based indices put all current writes on a few hot-tier nodes, one node's CPU and disk saturate while the rest idle, and the slowest-shard rule (section 8.1) drags every search down. Mitigations: even routing, more shards or splitting large tenants into their own indices, balancing of shard allocation by disk and load, and routing reads to the less loaded replica.</p>
+
+<h3>18.4 Mapping explosion</h3>
+<p>As described in section 10, unbounded dynamic field names inflate the cluster state until the master struggles and indexing slows. Prevent it with strict mappings and field-count limits and alert when field count rises.</p>
+
+<h3>18.5 Other incidents</h3>
+<ul>
+  <li><b>Disk watermarks.</b> At about 85 percent disk the node stops receiving new shards; at 90 percent shards are moved away; at 95 percent the index is made read-only to protect it. The first symptom is often "indexing suddenly fails". Alert at 70 percent.</li>
+  <li><b>Expensive queries.</b> Leading wildcards, regular expressions, script scoring over millions of documents, and huge <code>terms</code> filter lists can monopolize search threads. Set query timeouts and limit what clients may send.</li>
+  <li><b>Thread pool rejections (HTTP 429).</b> The search or write queue fills when load exceeds capacity; clients must back off with jitter (<a href="40-resilience.html">Chapter 40</a>) instead of retrying instantly.</li>
+  <li><b>Unassigned shards / red cluster.</b> A red cluster has a missing primary shard; yellow means a replica is unassigned. Use the allocation explain API to find why.</li>
+  <li><b>Node restarts causing rebalancing storms.</b> A brief restart triggers shard copying; set delayed allocation so the cluster waits a few minutes before rebuilding replicas.</li>
+</ul>
+
+<!-- ======================= 19 ======================= -->
+<h2 id="worked">19. Worked example: product search end to end</h2>
+
+<p>We design search for the 50 million product marketplace used in section 16. The user types <code>waterproof trail runing shoes</code>, then filters by brand and price.</p>
+
+<h3>19.1 Index design</h3>
+<p>Each product is one denormalized document: <code>id</code> (keyword), <code>title</code> (text with English analyzer, plus <code>title.autocomplete</code> using edge n-grams), <code>description</code> (text), <code>brand</code> and <code>category</code> (keyword, for facets), <code>price</code> (scaled float), <code>in_stock</code> (boolean), <code>rating</code>, <code>sales_30d</code> and <code>updated_at</code> (numbers/date), and <code>tenant_id</code> if sellers are separated. The mapping is explicit and <code>dynamic: strict</code>. Six primary shards and one replica, written through the alias <code>products</code>.</p>
+
+<h3>19.2 The query</h3>
+<p>The application builds one request: a <code>bool</code> query. The <code>must</code> clause is a <code>multi_match</code> over <code>title^3</code>, <code>brand^2</code>, <code>description</code> with <code>fuzziness: AUTO</code> and <code>minimum_should_match: 75%</code> (so <code>runing</code> still finds "running"). The <code>filter</code> clauses carry the chosen brand and the price range, plus <code>in_stock: true</code>; these are cached bitsets and are not scored. A <code>should</code> clause boosts <code>rating</code> above 4. A <code>function_score</code> adds <code>log1p(sales_30d)</code> as a gentle popularity boost. The request also asks for <code>terms</code> aggregations on brand and category and a price histogram to fill the facet sidebar, computed over the same hits. Results are sorted by score then by <code>id</code> as tiebreaker, and paging uses <code>search_after</code>.</p>
+
+<h3>19.3 What happens inside</h3>
+<ol>
+  <li>The query text passes through the English analyzer: <code>waterproof</code>, <code>trail</code>, <code>runing</code>, <code>shoe</code>. The fuzzy match expands <code>runing</code> to the dictionary term <code>run</code> within edit distance.</li>
+  <li>The coordinator sends the query to 6 shards (one copy each). Each shard intersects posting lists (filters first, as cheap bitsets), scores candidates with BM25 plus boosts, and returns its top 10 IDs, scores and its partial aggregation buckets.</li>
+  <li>The coordinator merges, runs the fetch phase for the 10 winners (and highlights matched words), and returns results with facet counts. Typical latency is tens of milliseconds.</li>
+</ol>
+
+<h3>19.4 Keeping it fresh</h3>
+<p>The catalog service writes to PostgreSQL. Debezium streams row changes to Kafka topic <code>product-changes</code> keyed by product ID. An indexer consumer groups changes into bulk requests with external versioning (<code>updated_at</code> as the version) and writes to the <code>products</code> alias. Inventory changes arrive on a separate topic and update only the <code>in_stock</code> field via a partial update. A nightly reconciliation job compares row counts and a sample checksum between DB and index and alerts on drift. Deletes arrive as tombstone events.</p>
+
+<h3>19.5 Changing the design later</h3>
+<p>When the team wants to add a new analyzer and double the shard count, it creates <code>products_v2</code>, backfills through the same Kafka pipeline, verifies, and swaps the alias with no downtime. Autocomplete is served by <code>title.autocomplete</code> plus a small cache for the top prefixes. Semantic search is added later as a vector field and a hybrid query that merges keyword and vector rankings. The result is a system where the database remains authoritative and the search cluster can be wiped and rebuilt on demand.</p>
+
+<!-- ======================= 20 ======================= -->
+<h2 id="qa">20. Interview Q&amp;A</h2>
+
+<details><summary>Why not just use LIKE or a database index for search?</summary>
+<p>A B-tree index sorts values from the first character, so a pattern with a leading wildcard cannot use it and the database scans every row. Even with a scan you get no stemming, no typo tolerance, and no relevance ranking, only match or no match. A search engine does the analysis once at index time and stores an inverted index mapping each term to the documents containing it, so a lookup costs time proportional to the matches rather than to the table size. For small datasets, database full-text indexes (such as PostgreSQL GIN) use the same idea and may be enough.</p></details>
+
+<details><summary>Explain the inverted index and how a multi-word query uses it.</summary>
+<p>The engine tokenizes each document, normalizes tokens (lowercasing, stemming, optionally dropping stop words), and records for every term the sorted list of document IDs containing it, plus term frequencies and positions. A query goes through the same analysis. The engine looks up each query term in the sorted term dictionary and gets its posting list, then intersects the lists for an AND query or unions them for an OR query, scoring each result. Positions let it verify phrases by checking that terms are adjacent and in order.</p></details>
+
+<details><summary>How does BM25 differ from TF-IDF, and why does a title match outrank a body match?</summary>
+<p>Both reward terms that are frequent in a document and rare across the collection. BM25 adds saturation, so repeating a word many times gives diminishing returns, and length normalization, so a match in a short field counts more than the same match in a long one. A title is short, so one occurrence there is a stronger signal than one in a long description. On top of that you usually apply explicit field boosts such as title^3 to encode that you trust titles more.</p></details>
+
+<details><summary>What happens between indexing a document and being able to search it? What if a node crashes?</summary>
+<p>The document is analyzed into an in-memory buffer and appended to the translog, which is fsynced on each request by default. About once a second a refresh turns the buffer into a new immutable segment and makes it searchable, which is why search is near real time. A flush later fsyncs segments to disk, writes a commit point and trims the translog. If a node crashes, it recovers from the last commit and replays the translog, so acknowledged writes are not lost with the default durability setting.</p></details>
+
+<details><summary>How are deletes and updates implemented, and what is the cost?</summary>
+<p>Segments are immutable, so a delete only flags the document as deleted in a bitmap and searches skip it. The space is reclaimed when background merges rewrite the segment. An update is a delete of the old version plus the indexing of a new full document, even if you changed one field. Workloads with constant updates to big documents therefore create many tombstones and merge pressure, so you should keep volatile fields small or out of the index.</p></details>
+
+<details><summary>Walk through how a distributed search is executed.</summary>
+<p>The client sends the request to any node, which acts as coordinator. In the query phase the coordinator forwards the query to one copy of every shard; each shard returns its top from+size document IDs and scores. The coordinator merges these into the global top results. In the fetch phase it asks only the shards owning the winning documents for the actual source. Latency is set by the slowest shard, and deep pages are costly because each shard must return from+size entries.</p></details>
+
+<details><summary>How do you choose the number of shards, and what goes wrong if you choose badly?</summary>
+<p>Estimate the final index size and divide by a target shard size of about 10 to 50 GB, then round to a number that spreads evenly across data nodes. The primary shard count is fixed at creation because documents are placed by hash mod shard count, so changing it requires a reindex. Too many tiny shards waste heap, bloat the cluster state and increase fan-out per search; too few giant shards cannot be parallelized or moved quickly. Many small tenants should share indices with routing or filtered aliases rather than get one index each.</p></details>
+
+<details><summary>How do you change a mapping or shard count with zero downtime?</summary>
+<p>Applications use an alias rather than the concrete index name. You create a new index with the desired mapping and settings, copy the data with the reindex API or by replaying from the source database through the normal indexing pipeline, and keep applying live changes during the copy. After validating counts and queries, you swap the alias to the new index in one atomic operation. Rollback is another swap, and the old index is deleted after a safe period.</p></details>
+
+<details><summary>How do you keep Elasticsearch in sync with the primary database?</summary>
+<p>Avoid dual writes from the application because failures between the two writes cause silent divergence. Use change data capture or a transactional outbox to produce an ordered change stream per row into Kafka, and a consumer that bulk-indexes using the row ID as document ID and external versioning so replays and out-of-order events are harmless. Include deletes, a backfill path that uses the same code, a dead-letter queue, and a reconciliation job. Accept and monitor eventual consistency of a few seconds.</p></details>
+
+<details><summary>Why is deep pagination a problem and what do you do instead?</summary>
+<p>With from and size, every shard must build and return from+size candidates, and the coordinator must merge shards times from+size entries, so memory and time grow with page depth. That is why there is a default cap of 10,000. Use search_after with a unique tiebreaker sort so each page costs the same, combined with a point in time for a consistent view. The trade-off is that you can only go to the next page, which suits infinite scroll and is fine because users rarely go deep.</p></details>
+
+<details><summary>Can Elasticsearch be the primary database? Why or why not?</summary>
+<p>It is usually a poor choice as the only copy. It offers near-real-time rather than immediate visibility, no multi-document transactions or constraints, schema changes that need reindexing, and a history of data issues under partitions and misconfiguration. The right pattern is a primary database as source of truth, the search index as a rebuildable derived view, and regular snapshots. For logs and metrics, where losing a little data is tolerable and retention is by time, using it as the main store is common and acceptable.</p></details>
+
+<details><summary>What are the common production failure modes?</summary>
+<p>Heap pressure from large aggregations, too many shards or fielddata causes long garbage collection pauses and nodes dropping out, which cascades. Hot shards from skewed routing or hot-tier concentration make the slowest shard dominate latency. Mapping explosion from unbounded dynamic field names overloads the master. Disk watermarks make indices read-only. Historically, a wrong minimum master setting could cause split brain; modern versions use quorum-based elections, and you should run three dedicated master-eligible nodes.</p></details>
+
+<!-- ======================= 21 ======================= -->
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">21. Recap</h2>
+<ul>
+  <li>Databases scan for substrings and cannot rank; a search engine builds an <b>inverted index</b> at write time from analyzed tokens (term to posting list with positions).</li>
+  <li>An <b>analyzer</b> (character filters, tokenizer, token filters) must match at index and query time. Use <code>text</code> for full-text and <code>keyword</code> for exact values, sorting and facets.</li>
+  <li>Use <code>bool</code> queries with scored <code>must</code>/<code>should</code> and unscored, cacheable <code>filter</code>; fuzzy for typos, edge n-grams for autocomplete, aggregations over doc values for facets.</li>
+  <li><b>BM25</b> rewards rare terms, saturates repeated terms and favours short fields; business signals are added through boosts and rescoring.</li>
+  <li>Lucene segments are immutable. Writes go to a buffer and translog; <b>refresh</b> (about 1 s) makes them searchable, <b>flush</b> commits them, <b>merge</b> compacts and purges tombstones.</li>
+  <li>An index has fixed primary shards (hash of ID mod N) and changeable replicas; a search is a <b>scatter-gather in query then fetch phases</b> through a coordinating node.</li>
+  <li>Size shards at roughly 10 to 50 GB; avoid oversharding; define mappings explicitly and use aliases plus reindex for zero-downtime changes; use data streams and ILM for time-based data.</li>
+  <li>Keep the database as the source of truth; feed the index with CDC or outbox through a queue using idempotent, versioned bulk writes; plan backfills; accept eventual consistency.</li>
+  <li>Use <code>search_after</code> for deep paging, treat the cluster as rebuildable with snapshots, and watch for heap pressure, hot shards, mapping explosion and disk watermarks.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="18-relational-internals.html">Chapter 18</a> (B-tree indexes and why they cannot serve substring search), <a href="19-storage-engines.html">Chapter 19</a> (immutable segments and merging resemble LSM trees) and <a href="25-sharding.html">Chapter 25</a> (hash partitioning of shards). Sync pipelines use <a href="34-queues-kafka.html">Chapter 34</a> and <a href="36-event-driven.html">Chapter 36</a>. Vector search is introduced in <a href="23-other-stores.html">Chapter 23</a>. It is applied in <a href="../case-studies/c11-autocomplete.html">the autocomplete case study</a> and <a href="../case-studies/c13-nearby-search.html">the nearby search case study</a>.</p>
+
+
+
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

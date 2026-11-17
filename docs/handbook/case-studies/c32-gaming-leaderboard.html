@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 32: Design a Gaming Leaderboard | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="c32-gaming-leaderboard">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 32 · Worked solutions</div>
+<h1>Design a Gaming Leaderboard</h1>
+<p class="lead">We design the ranking service behind a large online game: players finish matches, their scores change, and millions of people ask "what is my rank?", "who is in the top 100?" and "who is near me?" The interesting part is that a leaderboard is a database query (order everything by score) that has to answer in a few milliseconds while the data changes thousands of times per second. We build it on Redis sorted sets, then show what breaks when one sorted set is no longer enough.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt: "Design a leaderboard for an online game." A leaderboard looks trivial. In a relational database it is <code>SELECT player, score FROM scores ORDER BY score DESC LIMIT 100</code>. The trouble starts with the other queries. "What is the rank of player 7,412,090?" means counting how many players have a higher score, which on a table of 100 million rows is a scan or at best an index range count, repeated by millions of players who refresh their rank screen after every match. Before drawing anything, we ask questions that pin down the shape of the problem, and we state the answers we assume.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>How many players?</td><td>100 million registered, 30 million daily active (DAU), one global ranking per game mode plus regional rankings.</td></tr>
+<tr><td>What is a "score"?</td><td>A non-negative integer, at most about one billion, computed by the game server after a match. It accumulates over a season (for example ranked points). It is not sent by the client, because clients cannot be trusted.</td></tr>
+<tr><td>Which views are needed?</td><td>Top K (K up to 100, paged up to 1,000), my exact rank and score, an "around me" window (the 5 players above and below me), and a friends leaderboard.</td></tr>
+<tr><td>Which time windows?</td><td>All-time (per season), weekly, and daily. Weekly and daily boards reset on a schedule, and past winners must be retrievable.</td></tr>
+<tr><td>How fresh must it be?</td><td>A player's own rank must reflect the match they just finished within about one second. The public top 100 may lag by a few seconds.</td></tr>
+<tr><td>How are ties handled?</td><td>Players with equal scores are ordered by who reached the score first. Two players never share exactly the same position.</td></tr>
+<tr><td>Is exact rank required for everyone?</td><td>Exact for the top 10,000 and for any query inside one shard. For a player ranked 40 millionth, "top 40 percent" is acceptable (section 11).</td></tr>
+<tr><td>Is data loss acceptable?</td><td>A leaderboard can be rebuilt, but not from nothing. Scores are the product of matches and must not be silently lost, so a durable source of truth is required (section 14).</td></tr>
+</table>
+<div class="callout tip"><b>Interview tip</b> State the central insight in the first minutes: "Ranking is an order-statistic query. A sorted set backed by a skip list answers rank, top K and range in logarithmic time, so the whole design is about keeping that structure in memory, keeping it durable, and splitting it when it outgrows a machine." Then ask whether exact global rank is needed for every player, because that one answer decides whether sharding is easy or hard.</div>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li><b>Submit a score.</b> The game backend reports a result for a player. The leaderboard updates the player's total (or keeps their best score, depending on the game mode).</li>
+<li><b>Top K.</b> Return the first K entries (rank, player, score), with paging.</li>
+<li><b>My rank.</b> Return the exact rank and score of one player.</li>
+<li><b>Around me.</b> Return the window of players immediately above and below a given player.</li>
+<li><b>Friends board.</b> Return the player and their friends ordered by score.</li>
+<li><b>Windows.</b> Separate daily, weekly and season boards, with archived results of finished periods.</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Latency:</b> read endpoints p99 under 50 ms from the client's region; score update visible in the player's own rank within 1 second.</li>
+<li><b>Availability:</b> 99.95 percent for reads. A degraded leaderboard (slightly stale) is far better than an error page, because the game itself must not depend on it.</li>
+<li><b>Scale:</b> tens of thousands of writes per second at peak, with read traffic roughly twice the write traffic (section 3).</li>
+<li><b>Correctness:</b> every accepted match result is counted exactly once, even when events are retried or delivered twice.</li>
+<li><b>Durability:</b> a Redis node crash must not lose confirmed scores.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Matchmaking, the anti-cheat engine itself (we only note where it plugs in), and the in-game economy. We also exclude monetary prizes, which would demand stronger audit guarantees than a normal leaderboard. Real-time push of rank changes is covered briefly as an extension, not designed in full (the transport is in <a href="../chapters/06-realtime.html">Chapter 6</a>).</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>Technique reminder: start from users, derive average rates, multiply by a peak factor, then size memory and bandwidth (<a href="../chapters/02-estimation.html">Chapter 2</a>). Let us do it with real arithmetic.</p>
+<h3>3.1 Write rate</h3>
+<p>30 million DAU, each finishing about 10 scored matches a day, gives 30M x 10 = <b>300 million score events per day</b>. A day has 86,400 seconds, so the average is 300,000,000 / 86,400 = about <b>3,500 events per second</b>. Gaming traffic is peaky (evenings, weekends, a new season launch), so we take a peak factor of 4: about <b>14,000 events per second</b>. Each event produces one update per window (daily, weekly, season), so the leaderboard stores see 3 x 14,000 = <b>42,000 sorted set updates per second</b> at peak.</p>
+<h3>3.2 Read rate</h3>
+<p>Each active player opens a leaderboard screen about 20 times a day (after matches, from the menu), which is 30M x 20 = 600 million reads a day, or 600,000,000 / 86,400 = about 6,900 per second on average and about <b>28,000 per second</b> at peak (factor 4). Each screen typically triggers two backend calls: "my rank plus around me" and "top 100". The top 100 call is identical for every user, so it is cacheable (section 9). The personalised call is not.</p>
+<h3>3.3 Memory</h3>
+<p>A Redis sorted set stores each member in two structures: a hash table (member to score) and a skip list (ordered by score). With a short member string (an 8 to 16 byte player id), the total is roughly 80 to 120 bytes per member including pointers and allocator overhead. We use 100 bytes. For the season board, 100M members x 100 B = <b>10 GB</b>. The weekly board holds players active in the week, say 60M x 100 B = 6 GB. The daily board holds 30M x 100 B = 3 GB. Total: <b>about 19 GB</b> for one game mode. That fits on one machine with 32 to 64 GB of RAM for a single mode, but we have many modes and regions, and we must leave headroom for fork-based snapshots (section 14), so we plan on replicas plus sharding.</p>
+<h3>3.4 Storage and bandwidth</h3>
+<p>Durable score events: 300M x 100 B = 30 GB per day, about 11 TB per year if kept raw, which is why raw events live in cheap log storage with a retention window (30 days hot, then compressed archive). The current score table is only 100M rows x 50 B = 5 GB. Bandwidth is small: a top 100 response is about 100 x 40 B = 4 KB, so even 28,000 reads per second is about 112 MB/s if every response were uncached, and a cache removes most of it.</p>
+<table>
+<tr><th>Quantity</th><th>Value</th><th>Consequence</th></tr>
+<tr><td>Score events</td><td>3,500 / s average, 14,000 / s peak</td><td>Ingest through a queue; smooth bursts</td></tr>
+<tr><td>Sorted set updates</td><td>42,000 / s peak (3 windows)</td><td>Fits one Redis primary (roughly 100,000 simple ops/s) but with little headroom</td></tr>
+<tr><td>Reads</td><td>6,900 / s average, 28,000 / s peak</td><td>Replicas and caching for the top list</td></tr>
+<tr><td>Sorted set memory</td><td>about 19 GB per mode</td><td>Single node is possible, sharding is the escape hatch</td></tr>
+<tr><td>Raw events</td><td>30 GB / day</td><td>Log with retention, not Redis</td></tr>
+<tr><td>Read:write ratio</td><td>about 2:1 on requests, higher on backend calls</td><td>Unusually write-heavy for a "read" product</td></tr>
+</table>
+<p>Conclusion: this is not a huge system at 100M players. A single well-tuned Redis primary per board really can do the job, and an interview answer that starts with sharding is premature. But the same design at 1 billion players, or with 100 modes and regions, needs the techniques of sections 10 to 12. We design for the first and explain the second.</p>
+
+<h2 id="api">4. API design</h2>
+<p>The API is a small REST (or gRPC) surface. The write endpoint is internal (called by trusted game servers), the reads are public through the gateway (see <a href="../chapters/05-api-design.html">Chapter 5</a>).</p>
+<pre><code>POST /internal/v1/scores                      (game server only, mTLS)
+  { event_id, player_id, board: "ranked-eu", delta: 25, match_id, ts }
+  -> 202 { accepted: true }
+
+GET /v1/boards/{board}/top?window=weekly&amp;offset=0&amp;limit=100
+  -> { window_id: "2026-W46", as_of, entries: [ {rank, player_id, name, score}, ... ] }
+
+GET /v1/boards/{board}/me?window=season
+  -> { rank: 120345, score: 8421, percentile: 99.88, exact: true }
+
+GET /v1/boards/{board}/around?window=daily&amp;span=5
+  -> { me: {rank, score}, above: [ ...5 ], below: [ ...5 ] }
+
+GET /v1/boards/{board}/friends?window=weekly      (friend list from the social service)
+  -> { entries: [ {rank_among_friends, player_id, score}, ... ] }
+
+GET /v1/boards/{board}/archive?window=weekly&amp;window_id=2026-W45&amp;limit=100
+  -> frozen final standings of a finished period</code></pre>
+<p>Design notes. The write carries an <code>event_id</code>, a unique id per match result, which is the idempotency key (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>): the same event delivered twice must add its points once. We send a <code>delta</code> rather than an absolute score so that two matches finishing close together both count, but a game mode that keeps the best single score would send an absolute <code>score</code> and use "keep max" semantics. The write returns <code>202 Accepted</code>, because processing is asynchronous through a queue (section 7); the client learns about its new rank through the next read, or a push. Reads carry the <code>window</code> and return a <code>window_id</code> so a client rendering Monday's board knows it is not mixing it with Sunday's. The response states <code>exact: true/false</code> so the UI can show "top 40 percent" when only an estimate is available.</p>
+
+<h2 id="data-model">5. Data model and storage choice</h2>
+<p>We need two kinds of storage with different jobs. The first answers ranking questions fast. The second remembers the truth durably. Mixing the two jobs in one store is the common mistake.</p>
+<table>
+<tr><th>Store</th><th>Holds</th><th>Why this store</th></tr>
+<tr><td>Redis sorted sets (<a href="../chapters/15-redis.html">Chapter 15</a>, <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>)</td><td>One key per board and window: member = player id, score = encoded score</td><td>Rank, range and update are logarithmic and in memory. A relational index can also do it, but not at this update rate and read latency.</td></tr>
+<tr><td>Event log (Kafka, <a href="../chapters/34-queues-kafka.html">Chapter 34</a>)</td><td>Every score event, partitioned by player id</td><td>Durable, replayable. It absorbs bursts and lets us rebuild any board.</td></tr>
+<tr><td>Wide-column or relational store (<a href="../chapters/20-nosql.html">Chapter 20</a>)</td><td>Current score per (board, window, player), player profile (name, avatar), archived final standings</td><td>Durable source of truth for "what is this player's score"; cheap point reads; supports bulk rebuild by scanning.</td></tr>
+<tr><td>Dedupe store (a Redis set with TTL, or the score table itself)</td><td>Processed <code>event_id</code> values</td><td>Makes the consumer idempotent.</td></tr>
+<tr><td>Cache (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>)</td><td>Rendered top 100 per board and window</td><td>Identical for all users, so one computation serves millions of reads.</td></tr>
+</table>
+<h3>5.1 Key naming</h3>
+<pre><code>lb:{ranked-eu}:season:2026S4        sorted set, all-time for the season
+lb:{ranked-eu}:week:2026-W46        sorted set, expires 8 weeks after the week ends
+lb:{ranked-eu}:day:20261117         sorted set, expires 14 days after the day ends
+lb:{ranked-eu}:cnt:season:2026S4    small hash of per-shard counts (sharded mode only)
+player:{id}:profile                 name, avatar (a separate cache; never in the sorted set)</code></pre>
+<p>The sorted set member is only the player id, never a name or a JSON blob. Keeping members short keeps the 100 bytes per member estimate honest, and a rename does not touch the leaderboard. The names for the 100 rows of a page are fetched in a batch from the profile cache after ranking is known. The braces in <code>{ranked-eu}</code> are a Redis Cluster hash tag so that keys of one board land in the same slot when we want them together (for example to run one script over daily and weekly).</p>
+
+<h2 id="sorted-sets">6. How a Redis sorted set works, and why it fits</h2>
+<p>A sorted set (ZSET) holds unique members, each with a floating point score, kept ordered by score. Internally, once a ZSET grows beyond a small size (by default more than 128 entries, or a member longer than 64 bytes, it switches from a compact list to the full form), Redis stores two structures side by side.</p>
+<ul>
+<li>A <b>hash table</b> from member to score. It answers "what is player X's score?" in constant time, and detects whether a member exists.</li>
+<li>A <b>skip list</b> ordered by score (ties broken by member bytes). A skip list is a linked list with extra "express lane" pointers at several levels, built randomly so that each node appears at level 1 with probability 1, at level 2 with probability about 1/4, and so on (Redis uses p = 0.25 and a maximum of 32 levels). A search starts at the top lane, moves right while the next node is smaller, then drops down a lane. The expected number of steps is O(log N). Redis augments each forward pointer with a <b>span</b>, the number of bottom-level nodes it skips. Adding spans along the search path gives the rank of a node, which is how <code>ZRANK</code> is logarithmic and not linear.</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Skip list with spans used to compute rank">
+  <rect class="ext" x="20" y="20" width="90" height="34" rx="6"/><text class="t-c t-b" x="65" y="42">head</text>
+  <rect class="box" x="170" y="20" width="90" height="34" rx="6"/><text class="t-c t-sm" x="215" y="42">C 910 (span 3)</text>
+  <rect class="box" x="560" y="20" width="90" height="34" rx="6"/><text class="t-c t-sm" x="605" y="42">F 640 (span 3)</text>
+  <text class="t-sm" x="690" y="42">level 3: express lane</text>
+  <rect class="ext" x="20" y="90" width="90" height="34" rx="6"/><text class="t-c t-b" x="65" y="112">head</text>
+  <rect class="box" x="170" y="90" width="90" height="34" rx="6"/><text class="t-c t-sm" x="215" y="112">C 910 (1)</text>
+  <rect class="box" x="370" y="90" width="90" height="34" rx="6"/><text class="t-c t-sm" x="415" y="112">E 700 (2)</text>
+  <rect class="box" x="560" y="90" width="90" height="34" rx="6"/><text class="t-c t-sm" x="605" y="112">F 640 (1)</text>
+  <text class="t-sm" x="690" y="112">level 2</text>
+  <rect class="ext" x="20" y="160" width="90" height="34" rx="6"/><text class="t-c t-b" x="65" y="182">head</text>
+  <rect class="db" x="120" y="160" width="70" height="34" rx="6"/><text class="t-c t-sm" x="155" y="182">A 990</text>
+  <rect class="db" x="200" y="160" width="70" height="34" rx="6"/><text class="t-c t-sm" x="235" y="182">B 950</text>
+  <rect class="db" x="280" y="160" width="70" height="34" rx="6"/><text class="t-c t-sm" x="315" y="182">C 910</text>
+  <rect class="db" x="360" y="160" width="70" height="34" rx="6"/><text class="t-c t-sm" x="395" y="182">D 800</text>
+  <rect class="db" x="440" y="160" width="70" height="34" rx="6"/><text class="t-c t-sm" x="475" y="182">E 700</text>
+  <rect class="db" x="520" y="160" width="70" height="34" rx="6"/><text class="t-c t-sm" x="555" y="182">F 640</text>
+  <rect class="db" x="600" y="160" width="70" height="34" rx="6"/><text class="t-c t-sm" x="635" y="182">G 500</text>
+  <text class="t-sm" x="690" y="182">level 1: every node</text>
+  <path class="arrow" d="M110 37 L166 37"/><path class="arrow" d="M260 37 L556 37"/>
+  <path class="arrow" d="M110 107 L166 107"/><path class="arrow" d="M260 107 L366 107"/><path class="arrow" d="M460 107 L556 107"/>
+  <path class="arrow" d="M190 177 L196 177"/><path class="arrow" d="M270 177 L276 177"/>
+  <rect class="hit" x="20" y="230" width="850" height="90" rx="8"/>
+  <text class="t-sm" x="36" y="254">Rank of F (descending by score, A is rank 1): walk the top lane head to C (span 3), then C to F (span 3).</text>
+  <text class="t-sm" x="36" y="276">The spans add up: 3 + 3 = 6, so F is the 6th highest. Only 2 lane hops, not 6 node visits.</text>
+  <text class="t-sm" x="36" y="298">A search touches about log N nodes. Insert and delete also touch only the lanes along the search path.</text>
+</svg>
+<figcaption>Simplified skip list (ordered high to low). Each forward pointer remembers how many bottom-level nodes it skips, its span. Summing spans along the search path gives a rank without counting nodes one by one.</figcaption>
+</figure>
+<table>
+<tr><th>Command</th><th>Purpose</th><th>Cost</th></tr>
+<tr><td><code>ZADD key GT score member</code></td><td>Insert or update; the <code>GT</code> flag only updates when the new score is greater (keep-best semantics)</td><td>O(log N)</td></tr>
+<tr><td><code>ZINCRBY key delta member</code></td><td>Add points atomically (cumulative semantics)</td><td>O(log N)</td></tr>
+<tr><td><code>ZREVRANK key member</code></td><td>0-based rank counted from the highest score</td><td>O(log N)</td></tr>
+<tr><td><code>ZREVRANGE key start stop WITHSCORES</code></td><td>A slice by rank: top K, or the around-me window</td><td>O(log N + M) for M returned</td></tr>
+<tr><td><code>ZSCORE</code>, <code>ZMSCORE</code></td><td>Score of one member, or a batch (useful for friends)</td><td>O(1) each</td></tr>
+<tr><td><code>ZCOUNT key min max</code></td><td>How many members have scores in a range (used by the sharded rank)</td><td>O(log N)</td></tr>
+<tr><td><code>ZREMRANGEBYRANK</code></td><td>Trim the board, for example keep only the top 1,000,000</td><td>O(log N + M)</td></tr>
+</table>
+<p>Two properties make this the right primitive. First, <b>every ranking question is a logarithmic operation</b>: with N = 100 million, log2 N is about 27, so a rank lookup is a few dozen pointer hops, around 10 to 50 microseconds of CPU plus network. Second, <b>updates and reads touch the same structure atomically</b>. Redis executes commands one at a time on a single thread, so a <code>ZINCRBY</code> followed by a <code>ZREVRANK</code> inside one script cannot interleave with another client's command. The cost is that a single sorted set lives on a single node and is bounded by that node's memory and single-thread throughput, which is the thing we must engineer around at scale. The alternative of a relational table with an index on score is discussed in section 11.</p>
+<div class="callout watch"><b>Watch out</b> <code>ZREVRANGE</code> with a large range (say 1 million entries) blocks the single Redis thread for tens of milliseconds and stalls every other command on that node. Always cap <code>limit</code> at the API (we allow 1,000 per page), and never let an admin tool or analytics job run unbounded range reads against the live primary.</div>
+
+<h2 id="simple-design">7. A first simple design, then the scaled architecture</h2>
+<h3>7.1 First design: one service, one Redis</h3>
+<p>The simplest working version is a Leaderboard service in front of one Redis instance. The game server calls <code>POST /scores</code>, the service runs <code>ZINCRBY lb:season delta player</code>, and the read endpoints call <code>ZREVRANK</code>, <code>ZREVRANGE</code> and <code>ZSCORE</code>. This is perfectly adequate for a game with a million players, and a candidate who says so earns trust. It breaks in four ways at our scale, each of which drives one part of the final design.</p>
+<ol>
+<li><b>Durability.</b> Redis memory is the only copy. A crash with the default snapshot schedule loses the last minutes of scores, and a total loss loses everything. We add a durable event log and score table (section 14).</li>
+<li><b>Duplicates and retries.</b> If the game server times out and retries <code>POST /scores</code>, <code>ZINCRBY</code> adds the points twice. We add an event id and a deduplicating consumer (section 8).</li>
+<li><b>Bursts.</b> A season launch can multiply the write rate for minutes. Synchronous writes from game servers would push back into gameplay. We put a queue between them (section 8).</li>
+<li><b>Capacity and blast radius.</b> One primary holds everything. When memory or CPU runs out, or the node dies, every board is affected. We add replicas, then sharding (sections 10 to 12).</li>
+</ol>
+<h3>7.2 Scaled architecture</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 430" role="img" aria-label="High level architecture of the gaming leaderboard">
+  <rect class="ext" x="20" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="85" y="62">Game servers</text><text class="t-c t-sm" x="85" y="80">authoritative</text>
+  <rect class="ext" x="20" y="250" width="130" height="50" rx="8"/><text class="t-c t-b" x="85" y="272">Players</text><text class="t-c t-sm" x="85" y="290">apps and web</text>
+  <rect class="box" x="210" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="275" y="62">Score ingest</text><text class="t-c t-sm" x="275" y="80">validate, sign</text>
+  <rect class="db" x="390" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="455" y="62">Kafka</text><text class="t-c t-sm" x="455" y="80">partition by player</text>
+  <rect class="box" x="570" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="635" y="62">Ranker workers</text><text class="t-c t-sm" x="635" y="80">dedupe, apply</text>
+  <rect class="db" x="750" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="815" y="62">Score table</text><text class="t-c t-sm" x="815" y="80">source of truth</text>
+  <rect class="cache" x="570" y="160" width="310" height="110" rx="8"/><text class="t-c t-b" x="725" y="184">Redis boards (sharded, replicated)</text>
+  <rect class="cache" x="590" y="198" width="80" height="54" rx="6"/><text class="t-c t-sm" x="630" y="222">shard 1</text><text class="t-c t-sm" x="630" y="238">+ replica</text>
+  <rect class="cache" x="685" y="198" width="80" height="54" rx="6"/><text class="t-c t-sm" x="725" y="222">shard 2</text><text class="t-c t-sm" x="725" y="238">+ replica</text>
+  <rect class="cache" x="780" y="198" width="80" height="54" rx="6"/><text class="t-c t-sm" x="820" y="222">shard N</text><text class="t-c t-sm" x="820" y="238">+ replica</text>
+  <rect class="box" x="390" y="250" width="130" height="50" rx="8"/><text class="t-c t-b" x="455" y="272">Read API</text><text class="t-c t-sm" x="455" y="290">rank, top, around</text>
+  <rect class="cache" x="210" y="250" width="130" height="50" rx="8"/><text class="t-c t-b" x="275" y="272">Top-K cache</text><text class="t-c t-sm" x="275" y="290">1 to 2 s TTL</text>
+  <rect class="box" x="390" y="350" width="130" height="50" rx="8"/><text class="t-c t-b" x="455" y="372">Window manager</text><text class="t-c t-sm" x="455" y="390">rollover, archive</text>
+  <rect class="db" x="570" y="350" width="130" height="50" rx="8"/><text class="t-c t-b" x="635" y="372">Archive store</text><text class="t-c t-sm" x="635" y="390">final standings</text>
+  <rect class="ext" x="750" y="350" width="130" height="50" rx="8"/><text class="t-c t-b" x="815" y="372">Profile cache</text><text class="t-c t-sm" x="815" y="390">names, avatars</text>
+  <path class="arrow" d="M150 65 L206 65"/><path class="arrow" d="M340 65 L386 65"/><path class="arrow" d="M520 65 L566 65"/><path class="arrow" d="M700 65 L746 65"/>
+  <path class="arrow" d="M635 90 L635 156"/>
+  <path class="arrow" d="M150 275 L206 275"/><path class="arrow" d="M340 275 L386 275"/><path class="arrow" d="M520 262 L586 232"/>
+  <path class="arrow dash" d="M455 350 L455 304"/><path class="arrow dash" d="M520 375 L566 375"/><path class="arrow dash" d="M700 375 L746 375"/>
+  <path class="arrow dash" d="M455 350 C500 320 560 280 600 254"/>
+</svg>
+<figcaption>Writes flow left to right through a durable log into the rank workers, which update both the source-of-truth score table and the Redis boards. Reads go through a short-lived cache for the common top list and straight to Redis (replicas) for personal queries. A window manager rolls boards over and archives results.</figcaption>
+</figure>
+<p>Components in one line each. <b>Score ingest</b> authenticates the game server (mutual TLS, <a href="../chapters/55-security.html">Chapter 55</a>), validates the event schema and appends it to Kafka, partitioned by player id so that one player's events stay ordered. <b>Ranker workers</b> consume the log, drop duplicates, write the new total to the score table and apply the change to the Redis sorted sets. <b>Read API</b> is stateless and fans reads to Redis replicas, plus the profile cache for names. The <b>Window manager</b> creates the next period's keys ahead of time and archives the finished ones.</p>
+
+<h2 id="write-path">8. Request flow: submitting a score</h2>
+<ol>
+<li>A match ends. The authoritative game server computes the result and calls <code>POST /internal/v1/scores</code> with a unique <code>event_id</code> (for example the match id plus player id).</li>
+<li>Score ingest validates the schema and the signature, and appends the event to the Kafka topic, keyed by <code>player_id</code>. It replies <code>202</code> as soon as Kafka has acknowledged the write to its replicas. The game is never blocked on Redis.</li>
+<li>A ranker worker reads the event. It checks the dedupe set (<code>SET dedupe:{event_id} 1 NX EX 172800</code>); if the key already existed, the event is a duplicate and is skipped.</li>
+<li>The worker updates the durable score table: <code>score = score + delta</code> (a conditional update that also records the event id, so even a lost dedupe key cannot cause double counting).</li>
+<li>The worker updates Redis with one pipelined round trip containing three commands, one per window: <code>ZINCRBY</code> on the daily, weekly and season sets. For tie-breaking it sends the encoded score of section 9, computed from the new total.</li>
+<li>The worker commits its Kafka offset. If it crashes before committing, the event is processed again, and steps 3 and 4 make that harmless.</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="Sequence diagram of a score update">
+  <rect class="ext" x="20" y="20" width="110" height="32" rx="8"/><text class="t-c t-b" x="75" y="41">Game server</text>
+  <rect class="box" x="190" y="20" width="100" height="32" rx="8"/><text class="t-c t-b" x="240" y="41">Ingest</text>
+  <rect class="db" x="350" y="20" width="100" height="32" rx="8"/><text class="t-c t-b" x="400" y="41">Kafka</text>
+  <rect class="box" x="510" y="20" width="100" height="32" rx="8"/><text class="t-c t-b" x="560" y="41">Ranker</text>
+  <rect class="db" x="670" y="20" width="100" height="32" rx="8"/><text class="t-c t-b" x="720" y="41">Score table</text>
+  <rect class="cache" x="800" y="20" width="90" height="32" rx="8"/><text class="t-c t-b" x="845" y="41">Redis</text>
+  <line class="life" x1="75" y1="52" x2="75" y2="370"/><line class="life" x1="240" y1="52" x2="240" y2="370"/><line class="life" x1="400" y1="52" x2="400" y2="370"/><line class="life" x1="560" y1="52" x2="560" y2="370"/><line class="life" x1="720" y1="52" x2="720" y2="370"/><line class="life" x1="845" y1="52" x2="845" y2="370"/>
+  <path class="arrow" d="M75 82 L236 82"/><text class="t-sm" x="86" y="76">1. result + event_id</text>
+  <path class="arrow" d="M240 112 L396 112"/><text class="t-sm" x="250" y="106">2. append</text>
+  <path class="arrow-g dash" d="M396 138 L244 138"/><text class="t-sm" x="270" y="154">acked</text>
+  <path class="arrow-g dash" d="M236 168 L79 168"/><text class="t-sm" x="95" y="184">202 accepted</text>
+  <path class="arrow" d="M556 212 L404 212"/><text class="t-sm" x="420" y="206">3. poll batch</text>
+  <rect class="hit" x="500" y="224" width="120" height="30" rx="6"/><text class="t-c t-sm" x="560" y="244">dedupe check</text>
+  <path class="arrow" d="M560 272 L716 272"/><text class="t-sm" x="580" y="266">4. score += delta</text>
+  <path class="arrow" d="M560 304 L841 304"/><text class="t-sm" x="600" y="298">5. pipeline: ZINCRBY day, week, season</text>
+  <path class="arrow dash" d="M556 340 L404 340"/><text class="t-sm" x="420" y="334">6. commit offset</text>
+  <text class="t-sm" x="30" y="364">Crash between 4 and 6 means a replay; the dedupe key and the conditional update make the replay a no-op.</text>
+</svg>
+<figcaption>The game server only waits for the log append. Everything after it is asynchronous and idempotent. The visible delay between a match ending and the new rank appearing is the consumer lag, normally well under a second.</figcaption>
+</figure>
+<p>Why this ordering? The durable score table is written before Redis. If Redis is lost, the table can rebuild it. If the table write succeeds and the Redis write fails, the worker retries (the commit comes last), and Redis catches up. The opposite order (Redis first) could leave Redis ahead of the truth, with no record of why. The at-least-once delivery of a log plus idempotent apply gives the effect of exactly-once processing, the standard pattern from <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> and <a href="../chapters/35-messaging-patterns.html">Chapter 35</a>.</p>
+<p>One subtle point: <code>ZINCRBY</code> itself is not idempotent, so the guard must come before it. Where a mode keeps the best score, <code>ZADD key GT score member</code> is naturally idempotent (applying the same score twice leaves the same state), which is another reason to prefer "best score" semantics when the game design allows.</p>
+
+<h2 id="ties">9. Ties, score encoding and reading flows</h2>
+<h3>9.1 The tie problem</h3>
+<p>Two players with 8,421 points have no defined order in the score alone. Redis breaks the tie by comparing the member bytes lexicographically, so the tie-break would be by player id: arbitrary, and unfair to a player who reached 8,421 first. Products usually want one of three behaviours.</p>
+<table>
+<tr><th>Policy</th><th>Meaning</th><th>Example ranks for scores 900, 800, 800, 700</th><th>How to implement</th></tr>
+<tr><td>Earliest achiever first</td><td>Equal scores ordered by time reached; every player has a distinct rank</td><td>1, 2, 3, 4</td><td>Pack time into the low bits of the score (below)</td></tr>
+<tr><td>Competition ranking ("1224")</td><td>Equal scores share a rank; the next rank skips</td><td>1, 2, 2, 4</td><td>Rank = 1 + count of strictly higher scores (<code>ZCOUNT</code> on a pure score range)</td></tr>
+<tr><td>Dense ranking ("1223")</td><td>Equal scores share a rank; no gaps</td><td>1, 2, 2, 3</td><td>Needs a count of distinct scores above; keep a histogram of score to count</td></tr>
+</table>
+<p>We choose "earliest achiever first" for display (it is what players expect and it gives unique positions), and keep the pure score available for the percentile logic.</p>
+<h3>9.2 Packing score and time into one double</h3>
+<p>Redis scores are 64-bit IEEE doubles, which represent integers exactly up to 2^53 (about 9 x 10^15). We have room for two integers if their bit lengths sum to at most 53. Let the real score fit in 30 bits (maximum 2^30 = 1,073,741,824, above our one billion cap) and let the time component use the remaining 23 bits. A season lasts at most about 90 days; 90 x 86,400 = 7,776,000 seconds, which is below 2^23 = 8,388,608, so seconds since season start fit. We want a higher score to rank first and, for equal scores, an earlier time to rank first, so we store the time inverted:</p>
+<pre><code>encoded = score * 2^23 + (2^23 - 1 - seconds_since_season_start)
+
+score 8421 at second 100 -> 8421 * 8388608 + (8388607 - 100)
+score 8421 at second 900 -> 8421 * 8388608 + (8388607 - 900)    (lower, so ranks after)</code></pre>
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Bit layout of the encoded score">
+  <rect class="box" x="40" y="50" width="480" height="60" rx="8"/><text class="t-c t-b" x="280" y="76">score (30 bits)</text><text class="t-c t-sm" x="280" y="96">higher is better, up to 1,073,741,823</text>
+  <rect class="cache" x="520" y="50" width="340" height="60" rx="8"/><text class="t-c t-b" x="690" y="76">inverted time (23 bits)</text><text class="t-c t-sm" x="690" y="96">2^23 - 1 - seconds since season start</text>
+  <text class="t-sm" x="40" y="40">bit 52 (most significant)</text><text class="t-sm" x="740" y="40">bit 0</text>
+  <rect class="hit" x="40" y="140" width="820" height="90" rx="8"/>
+  <text class="t-sm" x="56" y="164">Total 30 + 23 = 53 bits, the exact-integer limit of a double. Comparison is numeric, so score dominates and time breaks ties.</text>
+  <text class="t-sm" x="56" y="186">To decode: score = floor(encoded / 2^23). The pure score is what the API shows and what ZCOUNT ranges use.</text>
+  <text class="t-sm" x="56" y="208">Caveat: time is the time of the last update that produced this exact score, so a tie is broken by who got there first.</text>
+</svg>
+<figcaption>Encoding score and time in one double. The score occupies the high bits so it dominates the ordering, and the inverted time occupies the low bits so earlier equal scores sort higher.</figcaption>
+</figure>
+<p>Two cautions. With cumulative <code>ZINCRBY</code> you cannot simply add a delta to an encoded value, because the time part would drift; the worker therefore reads the current pure score (from the score table, or <code>ZSCORE</code> then decode), computes the new total, and writes with <code>ZADD</code>, ideally inside a short Lua script so the read-modify-write is atomic. And a score that grows past 2^30 breaks the layout, so the cap is enforced at ingest.</p>
+<h3>9.3 Reading: top K, my rank, around me</h3>
+<p><b>Top K</b> is <code>ZREVRANGE key 0 K-1 WITHSCORES</code>. Because every client sees the same answer, we cache the rendered page. The Read API serves it from a local in-process cache refreshed at most once per second per (board, window); a request that finds the entry expired triggers one refresh while others use the old copy (the single-flight pattern in <a href="../chapters/14-caching-failures.html">Chapter 14</a> that prevents a stampede). With 28,000 reads per second at peak and a 1 second TTL, Redis sees about one top-K call per board per second per API instance, instead of tens of thousands.</p>
+<p><b>My rank</b> is <code>ZREVRANK key player</code> plus 1, together with <code>ZSCORE</code>. This is personalised, so it cannot share a cache entry across players; it goes to a replica. At 28,000 per second spread over replicas, each doing a call that costs roughly 20 microseconds of server time, a single replica could handle it, and we use several for availability.</p>
+<p><b>Around me</b> needs the rank first, then a slice around it. Doing it as two round trips races with updates: the rank may shift between them. We run both in one Lua script so they see the same state:</p>
+<pre><code>-- KEYS[1] = board key, ARGV[1] = player, ARGV[2] = span
+local r = redis.call('ZREVRANK', KEYS[1], ARGV[1])
+if not r then return nil end
+local lo = math.max(0, r - tonumber(ARGV[2]))
+local hi = r + tonumber(ARGV[2])
+return { r, redis.call('ZREVRANGE', KEYS[1], lo, hi, 'WITHSCORES') }</code></pre>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Around me window computation">
+  <rect class="box" x="40" y="40" width="300" height="250" rx="8"/><text class="t-c t-b" x="190" y="66">Sorted set (high to low)</text>
+  <text class="t-sm" x="60" y="94">rank 1      player 90311   9,950</text>
+  <text class="t-sm" x="60" y="116">...</text>
+  <text class="t-sm" x="60" y="146">rank 120,340  p 5521   8,430</text>
+  <text class="t-sm" x="60" y="168">rank 120,341  p 8802   8,428</text>
+  <rect class="hit" x="52" y="178" width="276" height="24" rx="4"/><text class="t-sm" x="60" y="195">rank 120,345  YOU 7,412,090  8,421</text>
+  <text class="t-sm" x="60" y="224">rank 120,346  p 3340   8,420</text>
+  <text class="t-sm" x="60" y="246">rank 120,350  p 7019   8,417</text>
+  <text class="t-sm" x="60" y="274">...</text>
+  <path class="arrow" d="M340 190 L440 190"/>
+  <rect class="cache" x="450" y="70" width="410" height="60" rx="8"/><text class="t-c t-b" x="655" y="94">Step 1: ZREVRANK -> index 120,344</text><text class="t-c t-sm" x="655" y="114">display rank = index + 1 = 120,345</text>
+  <rect class="cache" x="450" y="150" width="410" height="60" rx="8"/><text class="t-c t-b" x="655" y="174">Step 2: ZREVRANGE 120,339 .. 120,349</text><text class="t-c t-sm" x="655" y="194">5 above, me, 5 below (11 rows, one slice)</text>
+  <rect class="ext" x="450" y="230" width="410" height="60" rx="8"/><text class="t-c t-b" x="655" y="254">Step 3: batch-get names from profile cache</text><text class="t-c t-sm" x="655" y="274">ranking stays free of strings and rename churn</text>
+</svg>
+<figcaption>The window is a rank-based slice. Both steps run inside one script so a concurrent update cannot move the player between computing the rank and reading the neighbours. Names are attached afterwards from the profile cache.</figcaption>
+</figure>
+<p><b>Friends board.</b> The social service returns a friend list (typically up to a few hundred ids). We call <code>ZMSCORE key f1 f2 ...</code> (or a pipeline of <code>ZSCORE</code>) once, sort the few hundred results in the Read API, and return them. Using <code>ZINTERSTORE</code> against a friends set would cost time proportional to the smaller set but writes a temporary key and does not scale for players with big friend lists, so we avoid it on the hot path. The rank among friends is just the position in the small sorted list.</p>
+
+<h2 id="windows">10. Deep dive: daily, weekly and season windows</h2>
+<p>A leaderboard with resets is really several leaderboards. Players want "today", "this week" and "this season", each with its own winners and rewards, and finished periods must remain readable. The design question is how to keep them all up to date cheaply and roll them over safely.</p>
+<h3>10.1 Options compared</h3>
+<table>
+<tr><th>Option</th><th>How</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>A. Fan out on write (our choice)</td><td>Every event updates the daily, weekly and season sets (three <code>ZINCRBY</code> in one pipeline)</td><td>Reads are a single key lookup. Each window is independent and can expire on its own. Rollover is just "start writing a new key".</td><td>3x write amplification (42,000 ops/s at peak). 3x memory, though daily and weekly are smaller.</td></tr>
+<tr><td>B. Compute on demand with <code>ZUNIONSTORE</code></td><td>Weekly = union of seven daily sets, built when requested</td><td>Less steady memory and writes</td><td>Union of 30M-member sets costs seconds of single-thread time and blocks the node. Unusable on the hot path.</td></tr>
+<tr><td>C. One set, store a rolling score and subtract expired events</td><td>A background job subtracts points that fall out of the window</td><td>One set to read</td><td>Needs per event expiry bookkeeping, easy to get wrong, drifts if a job is missed.</td></tr>
+<tr><td>D. Time-bucketed sets with pre-merged weekly</td><td>Daily sets plus a weekly set refreshed from dailies at off-peak</td><td>Cheaper than B</td><td>Weekly board is stale between refreshes, which conflicts with our one-second freshness for the player's own rank.</td></tr>
+</table>
+<p>We choose A. The extra write cost is real but linear and predictable: 42,000 sorted-set updates per second is within one primary's budget, and if not, boards shard by key (section 11). Option B is tempting because it looks free, and the trap in it is the blocking cost, which an interviewer will probe.</p>
+<h3>10.2 Rollover and archival</h3>
+<ol>
+<li><b>Pre-create.</b> The window manager decides each window id from a configured calendar in UTC (for example <code>week:2026-W47</code>), and ingestion computes the target key from the event's <i>match end time</i>, not the processing time. A match that ends at 23:59:58 but is processed at 00:00:03 still counts for the old day.</li>
+<li><b>Grace.</b> The previous window remains writable for a short grace period (for example 10 minutes) to take late events from consumer lag, then it is sealed.</li>
+<li><b>Freeze and archive.</b> At seal time, a job reads the final top N (say the top 10,000 plus reward tiers) with a paged <code>ZREVRANGE</code> against a replica, writes it to the archive store, and publishes a <code>window_closed</code> event for the reward system.</li>
+<li><b>Expire.</b> The set gets a TTL (daily: 14 days; weekly: 8 weeks) so memory is reclaimed automatically. The archive store holds the permanent record of the final standings, so a hot key vanishing never loses history.</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Timeline of daily window rollover with grace period">
+  <line x1="40" y1="150" x2="860" y2="150" stroke="var(--fg)" stroke-width="2"/>
+  <rect class="hit" x="40" y="80" width="360" height="40" rx="6"/><text class="t-c t-sm" x="220" y="104">day 17: live, writes go here</text>
+  <rect class="cache" x="400" y="80" width="80" height="40" rx="6"/><text class="t-c t-sm" x="440" y="98">grace</text><text class="t-c t-sm" x="440" y="112">10 min</text>
+  <rect class="hit" x="400" y="170" width="460" height="40" rx="6"/><text class="t-c t-sm" x="630" y="194">day 18: live, new key from 00:00 UTC</text>
+  <text class="t-c t-sm" x="400" y="140">00:00</text>
+  <text class="t-c t-sm" x="480" y="140">00:10</text>
+  <rect class="miss" x="480" y="80" width="380" height="40" rx="6"/><text class="t-c t-sm" x="670" y="104">day 17: sealed, read-only, then archived</text>
+  <path class="arrow" d="M480 120 L480 232"/>
+  <rect class="db" x="400" y="232" width="260" height="40" rx="6"/><text class="t-c t-sm" x="530" y="256">archive final top N, emit window_closed</text>
+  <rect class="miss" x="700" y="232" width="160" height="40" rx="6"/><text class="t-c t-sm" x="780" y="256">key TTL: day 31</text>
+  <text class="t-sm" x="40" y="310">Events are routed by match end time, so late events for day 17 still land on day 17 during the grace period.</text>
+</svg>
+<figcaption>A daily window's life. The next window starts at midnight UTC, the old one stays writable briefly to accept late events, is then sealed and archived, and finally expires from memory.</figcaption>
+</figure>
+<p>Time zones: boards use one global UTC calendar so a ranking has a single meaning. A "local day" board per region is just another board key with its own boundaries, which the generic window manager already supports. Season reset (a new key, with an optional soft reset of ratings carried over from the last season) is the same mechanism with a longer period, and it is the moment of the biggest spike: 30M players touch the new key within hours. We pre-warm it and stagger client refreshes by a random delay.</p>
+
+<h2 id="sharding">11. Deep dive: sharded leaderboards at huge scale</h2>
+<h3>11.1 When one sorted set is not enough</h3>
+<p>At 100M players a single primary per board suffices, by the estimates of section 3. Scale the product to one billion players and 10x the event rate: the season set is 100 GB, which exceeds a node's practical memory (and a fork for a snapshot would need up to double in the worst case), and 420,000 sorted-set updates per second would saturate one thread. Redis Cluster does not help by itself, because a single key (one sorted set) always maps to a single slot and therefore a single node. We must split one logical leaderboard into several physical sorted sets ourselves. There are two natural ways, and the choice shapes every query. Sharding technique is covered in <a href="../chapters/25-sharding.html">Chapter 25</a> and hashing in <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>.</p>
+<h3>11.2 Option 1: shard by player id (hash)</h3>
+<p>Choose N shards, say 16. Shard of a player = <code>hash(player_id) mod N</code>. Each shard is its own sorted set holding about 1/N of the players, so the load and memory spread evenly and independent of the score distribution.</p>
+<ul>
+<li><b>Update:</b> one shard, one <code>ZADD</code>. Scales linearly with N.</li>
+<li><b>Top K:</b> ask every shard for its own top K, then merge the N lists of K and keep the K largest. This is correct, because the global top K must be inside the union of per-shard top K. Cost: N parallel calls, each returning K entries, then an in-memory merge of N x K items (16 x 100 = 1,600 items, trivial).</li>
+<li><b>Exact rank of one player:</b> the rank is 1 plus the number of players with a higher score across all shards. The player's own shard answers with <code>ZREVRANK</code>; each other shard answers <code>ZCOUNT key (score +inf</code> (count of strictly higher). Sum the counts. Cost: N parallel calls, each logarithmic.</li>
+<li><b>Around me:</b> hard. The neighbours in global order are spread over all shards. Computing the exact window needs a score-range query on every shard (<code>ZREVRANGEBYSCORE</code> around the player's score with a small limit) and a merge. It works, but costs N calls and the merge needs care with ties.</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Scatter gather over hash shards for top K and rank">
+  <rect class="box" x="30" y="150" width="130" height="60" rx="8"/><text class="t-c t-b" x="95" y="176">Read API</text><text class="t-c t-sm" x="95" y="196">scatter, gather</text>
+  <rect class="cache" x="330" y="30" width="170" height="60" rx="8"/><text class="t-c t-b" x="415" y="54">Shard 0</text><text class="t-c t-sm" x="415" y="74">hash(id) mod 16 = 0</text>
+  <rect class="cache" x="330" y="110" width="170" height="60" rx="8"/><text class="t-c t-b" x="415" y="134">Shard 1</text><text class="t-c t-sm" x="415" y="154">hash(id) mod 16 = 1</text>
+  <rect class="cache" x="330" y="190" width="170" height="60" rx="8"/><text class="t-c t-b" x="415" y="214">Shard 2</text><text class="t-c t-sm" x="415" y="234">...</text>
+  <rect class="cache" x="330" y="270" width="170" height="60" rx="8"/><text class="t-c t-b" x="415" y="294">Shard 15</text><text class="t-c t-sm" x="415" y="314">hash(id) mod 16 = 15</text>
+  <path class="arrow" d="M160 170 L326 60"/><path class="arrow" d="M160 175 L326 140"/><path class="arrow" d="M160 185 L326 220"/><path class="arrow" d="M160 195 L326 300"/>
+  <rect class="hit" x="580" y="40" width="290" height="130" rx="8"/><text class="t-c t-b" x="725" y="66">Top K = merge of 16 lists</text><text class="t-c t-sm" x="725" y="90">each shard returns its own top 100</text><text class="t-c t-sm" x="725" y="110">16 x 100 = 1,600 candidates</text><text class="t-c t-sm" x="725" y="130">sort in memory, keep the best 100</text><text class="t-c t-sm" x="725" y="150">global top 100 is inside the union</text>
+  <rect class="hit" x="580" y="190" width="290" height="140" rx="8"/><text class="t-c t-b" x="725" y="216">Exact rank = 1 + sum of counts</text><text class="t-c t-sm" x="725" y="240">own shard: ZREVRANK</text><text class="t-c t-sm" x="725" y="260">other 15 shards: ZCOUNT of higher</text><text class="t-c t-sm" x="725" y="280">16 parallel calls, p99 = slowest shard</text><text class="t-c t-sm" x="725" y="300">add timeouts and hedged requests</text>
+  <path class="arrow dash" d="M500 60 L576 90"/><path class="arrow dash" d="M500 300 L576 270"/>
+</svg>
+<figcaption>Hash sharding spreads load evenly. Writes touch one shard. Top K and rank touch all shards, so read latency is the slowest shard's latency, and the read cost grows linearly with the shard count.</figcaption>
+</figure>
+<h3>11.3 Option 2: shard by score range</h3>
+<p>Partition the score axis into contiguous ranges: for example shard A holds scores 0 to 999, shard B 1,000 to 4,999, and so on, with narrow ranges at the top where many queries land. A player lives in exactly the shard that covers their score and moves between shards when their score crosses a boundary.</p>
+<ul>
+<li><b>Top K:</b> read from the highest shard only, falling to the next if it holds fewer than K. One or two calls.</li>
+<li><b>Exact rank:</b> rank = (number of players in all higher-scored shards) + (rank within own shard). The first term comes from a small table of per-shard counts (<code>lb:...:cnt</code>) updated on every move; the second is a single <code>ZREVRANK</code>. Cost: one or two calls.</li>
+<li><b>Around me:</b> almost always inside one shard, one call.</li>
+<li><b>Costs:</b> a player changing score across a boundary needs a move: remove from the old set, add to the new one, update both counts. That is two keys, so it is not atomic and needs a careful ordering and a reconcile job. Distribution is skewed: scores cluster (most players have low scores), so low shards are huge and top shards are tiny, and the boundaries must be re-chosen as the distribution drifts. The shard that holds the currently active middle range receives most updates and becomes a hot spot.</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 900 320" role="img" aria-label="Score range sharding with counts table">
+  <rect class="cache" x="40" y="40" width="190" height="80" rx="8"/><text class="t-c t-b" x="135" y="66">Shard H</text><text class="t-c t-sm" x="135" y="86">scores 9,000 and up</text><text class="t-c t-sm" x="135" y="104">about 20,000 players</text>
+  <rect class="cache" x="260" y="40" width="190" height="80" rx="8"/><text class="t-c t-b" x="355" y="66">Shard M</text><text class="t-c t-sm" x="355" y="86">scores 3,000 to 8,999</text><text class="t-c t-sm" x="355" y="104">about 4,000,000 players</text>
+  <rect class="cache" x="480" y="40" width="190" height="80" rx="8"/><text class="t-c t-b" x="575" y="66">Shard L</text><text class="t-c t-sm" x="575" y="86">scores 0 to 2,999</text><text class="t-c t-sm" x="575" y="104">about 95,980,000 players</text>
+  <rect class="db" x="700" y="40" width="170" height="80" rx="8"/><text class="t-c t-b" x="785" y="66">Counts table</text><text class="t-c t-sm" x="785" y="86">H 20,000</text><text class="t-c t-sm" x="785" y="104">M 4,000,000  L 95.98M</text>
+  <rect class="hit" x="40" y="160" width="830" height="130" rx="8"/>
+  <text class="t-sm" x="56" y="184">Player with score 8,421 sits in shard M. Rank = count(H) + ZREVRANK in M = 20,000 + 100,345 = 120,345.</text>
+  <text class="t-sm" x="56" y="208">Top 100 comes from shard H alone. Around-me comes from shard M alone. Two small reads, not N reads.</text>
+  <text class="t-sm" x="56" y="232">A player crossing 9,000 is removed from M and added to H, and two counts change. This move is the hard part.</text>
+  <text class="t-sm" x="56" y="256">Skew: shard L is 24 times bigger than M, so it must itself be split by hash or finer score ranges.</text>
+  <text class="t-sm" x="56" y="276">Boundaries drift as scores inflate; re-balancing means bulk moves in the background.</text>
+</svg>
+<figcaption>Score range sharding makes reads cheap but makes writes more complex. The counts table turns "how many are above me" into an addition.</figcaption>
+</figure>
+<h3>11.4 Comparison and decision</h3>
+<table>
+<tr><th>Concern</th><th>Hash by player</th><th>Range by score</th></tr>
+<tr><td>Write cost</td><td>1 shard, simple</td><td>1 shard, or a 2-key move at boundaries</td></tr>
+<tr><td>Top K</td><td>N calls plus merge</td><td>1 to 2 calls</td></tr>
+<tr><td>Exact rank</td><td>N calls plus sum</td><td>1 call plus counts lookup</td></tr>
+<tr><td>Around me</td><td>N calls, tricky merge</td><td>Usually 1 call</td></tr>
+<tr><td>Load balance</td><td>Even by construction</td><td>Skewed; hot middle shard</td></tr>
+<tr><td>Rebalance</td><td>Resharding by consistent hashing</td><td>Boundary changes move many players</td></tr>
+<tr><td>Failure of one shard</td><td>Rank is wrong by about 1/N of players until it returns (answer is "approximate")</td><td>Failure of H or M makes the top or my own region unavailable</td></tr>
+</table>
+<p><b>Decision.</b> We use a hybrid that matches how people actually use leaderboards. The top end (say the top 100,000 players) is served from one dedicated small sorted set that is fed by a filter: when a score crosses the "top cutoff" it is also written into the <i>top set</i>. This gives exact top K and exact rank for the players who care most, with one call. Everyone else is on hash shards, where we avoid the N-way scatter by accepting an <b>approximate rank</b>: for a player outside the top set, we estimate rank from a <b>score histogram</b> (counts of players per score bucket, refreshed every few seconds from <code>ZCOUNT</code> on the shards, or maintained incrementally on write). Rank is the number of players in higher buckets plus an interpolation inside the bucket. The UI shows "Top 40 percent" for them, or an exact rank only when they open the screen explicitly (which runs the N-way count). Nobody in an interview or a product review needs to know they are exactly 40,118,201st, and nobody notices an error of a few hundred places at that depth. A related probabilistic tool is the t-digest or a count-min style summary (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>).</p>
+<div class="callout key"><b>Key idea</b> Leaderboard read patterns are extremely skewed: almost all attention goes to the top and to a window around the player. Exact answers matter at the top; approximate answers are fine at the bottom. Designing the precision to follow the attention is what makes the sharded design affordable.</div>
+<h3>11.5 Alternative: a relational database or a different structure</h3>
+<table>
+<tr><th>Option</th><th>Rank query</th><th>Update</th><th>Verdict</th></tr>
+<tr><td>SQL table with index on score</td><td><code>SELECT COUNT(*) WHERE score &gt; x</code>, O(log N) if the index counts, but typically O(range) in B-trees without order-statistic counts</td><td>Index maintenance and WAL, tens of thousands per second is hard</td><td>Fine for small boards, poor at 100M with frequent updates (<a href="../chapters/18-relational-internals.html">Chapter 18</a>)</td></tr>
+<tr><td>Redis sorted set</td><td>O(log N), spans in the skip list</td><td>O(log N), memory</td><td>Our choice for hot boards</td></tr>
+<tr><td>Periodic batch ranking (a nightly job sorts the table)</td><td>Lookup from a precomputed rank column</td><td>Cheap</td><td>Rank is up to a day old; acceptable for a "monthly Hall of Fame", not for live play (<a href="../chapters/37-batch-stream.html">Chapter 37</a>)</td></tr>
+<tr><td>Order-statistic tree or Fenwick tree over score buckets in a service</td><td>O(log M) over M buckets, exact for score-grouped rank</td><td>O(log M)</td><td>Excellent for the "count above" part of an approximate rank when scores are bounded</td></tr>
+</table>
+
+<h2 id="scaling">12. Scaling, bottlenecks and hot spots</h2>
+<ul>
+<li><b>Read replicas.</b> Reads of my rank, top K and around me go to Redis replicas (asynchronous replication, <a href="../chapters/24-replication.html">Chapter 24</a>). Replica lag, normally a few milliseconds, means a player who just finished a match might briefly see the old rank. For the "my own rank right after my match" screen, the Read API can send that one call to the primary (a read-your-writes route) or retry once if the returned score is older than the score the client reports having.</li>
+<li><b>Hot key.</b> The top-K key is read by all players. The in-process cache with a 1 second TTL, plus a shared cache tier, collapses this to a handful of Redis calls per second. The season key is written by everyone, and this is bounded by one primary's single thread: a Redis primary does roughly 100,000 simple commands per second, we use 42,000 at peak, so we have about 2.4x headroom. If a mode needs more, it moves to hash shards or fewer windows are fanned out on write.</li>
+<li><b>Write batching.</b> Ranker workers batch 100 to 500 events, collapse several events of the same player into one <code>ZADD</code> (only the final score matters for a keep-latest board), and send them in one pipeline. This cuts commands per second severalfold during bursts and is the cheapest scale lever.</li>
+<li><b>Partitioning workers.</b> Kafka is partitioned by player id, so one player's events are processed in order by one worker, and the number of partitions bounds the parallelism (for example 64 partitions for 64 workers).</li>
+<li><b>Network and CPU.</b> A Redis primary also spends CPU on replication to every replica, which scales with replica count. A tree of replicas (replicas of replicas) or limiting to 2 to 3 replicas per shard keeps the primary's load bounded.</li>
+<li><b>Regional boards.</b> Regional leaderboards (EU, NA, Asia) are separate boards in separate regional clusters, so most players read and write nearby. The global board is built by merging regional top lists (a periodic job) and is allowed to be a few seconds old. See <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>.</li>
+<li><b>Real-time push.</b> If the product wants live rank movement, a notification path publishes "your rank changed by more than X" over a WebSocket or push channel (<a href="../chapters/06-realtime.html">Chapter 6</a>), rate limited per player so a busy mode does not create 14,000 notifications per second to a single feed.</li>
+</ul>
+
+<h2 id="persistence">13. Persistence, rebuild and recovery</h2>
+<p>Redis is memory first. Persistence has two built-in mechanisms: <b>RDB snapshots</b> (a point-in-time dump written by a forked child process, compact and quick to load but loses everything since the last snapshot) and the <b>append-only file (AOF)</b> (every write logged, with <code>fsync</code> policy <code>always</code>, <code>everysec</code> or <code>no</code>). The usual production choice is AOF with <code>everysec</code> plus periodic RDB, which loses at most about one second of writes on a crash. Replicas add a second copy in another zone, with failover by Sentinel or a cluster manager (<a href="../chapters/41-ha-dr.html">Chapter 41</a>). A fork-based snapshot of a 10 GB set uses copy-on-write memory; under heavy writes, many pages are duplicated, so we keep memory headroom (for example allow the dataset to use 50 to 60 percent of RAM).</p>
+<p>But even with AOF and replicas, we treat Redis as a <b>derived view</b>, not the source of truth. The durable truth is the Kafka log plus the score table. This yields three recovery tools of increasing cost.</p>
+<table>
+<tr><th>Situation</th><th>Recovery</th><th>Time</th></tr>
+<tr><td>Primary crashes, replica is current within ms</td><td>Automatic failover to a replica; the few acknowledged writes not yet replicated are re-applied by the workers because their offsets were not yet committed, or are repaired by the reconciliation job</td><td>Seconds</td></tr>
+<tr><td>Whole shard lost, no good replica</td><td>Load the latest RDB if any, then replay Kafka from the snapshot's recorded offset forward</td><td>Minutes (10 GB load at about 1 GB/s of disk, plus replay of a few minutes of events)</td></tr>
+<tr><td>Corruption or a bug wrote wrong scores</td><td>Rebuild from the score table: scan it in key order, bulk load with pipelined <code>ZADD</code> into a new key, then atomically swap the key name with <code>RENAME</code></td><td>For 100M players at about 500,000 <code>ZADD</code> per second in pipelines: about 200 seconds plus the scan</td></tr>
+</table>
+<p>Because rebuild is cheap and the bulk-load path is the same code as the live path, we run it regularly: a nightly <b>reconciliation</b> samples random players and compares Redis scores with the score table, alarming on drift. A weekly full rebuild into a shadow key, compared to the live key by checksum, proves that recovery works before we need it. The rule to remember: <i>a backup you have never restored is not a backup</i>.</p>
+
+<h2 id="failures">14. Failure modes, consistency and idempotency</h2>
+<table>
+<tr><th>Failure</th><th>What happens</th><th>Mitigation</th></tr>
+<tr><td>Redis primary dies</td><td>Writes to that shard stall for the failover (seconds); reads continue from replicas</td><td>Queue buffers events; workers retry with backoff; no event is lost since the offset is only committed after success</td></tr>
+<tr><td>Failover loses recent writes (async replication)</td><td>Replica missing the last milliseconds of updates; rank slightly off</td><td>Workers' uncommitted offsets are replayed; reconciliation repairs the rest; scores in the table are correct</td></tr>
+<tr><td>Redis slow (large range read, fork stall, swap)</td><td>All commands on the node queue; p99 spikes</td><td>Cap range sizes; slow-log alerts; fork headroom; timeouts in Read API and serve cached top list when Redis is unhealthy</td></tr>
+<tr><td>Kafka unavailable</td><td>Ingest cannot append; the game server holds events or drops to a local spool</td><td>Game servers buffer to a local disk queue and retry with the same event id; the game continues without the leaderboard</td></tr>
+<tr><td>Ranker worker crashes mid-batch</td><td>Events reprocessed after restart</td><td>Dedupe key and conditional table update make it idempotent</td></tr>
+<tr><td>Duplicate delivery from the game server</td><td>Same <code>event_id</code> seen twice</td><td>Dedupe store with TTL longer than the maximum retry window (48 hours)</td></tr>
+<tr><td>Out-of-order events for one player</td><td>An older match arrives after a newer one</td><td>Keyed by player in one partition so order is preserved; for "best score" mode, order does not matter</td></tr>
+<tr><td>Dedupe store lost</td><td>A replayed event may be applied twice</td><td>The score table records the last applied event ids per player (a small ring), so the table update refuses repeats; Redis is later corrected by the reconciler</td></tr>
+<tr><td>Window rollover race</td><td>A late event lands in a sealed window</td><td>Route by match end time; short grace period; after the seal, late events are applied to the score table and reported in the archive correction log, not to the frozen board</td></tr>
+<tr><td>One shard of a hash-sharded board is down</td><td>Top K and rank omit about 1/N of players</td><td>Mark the response <code>exact:false</code> and show the partial result; the top set (section 11.4) is independent, so the top 100,000 remain exact</td></tr>
+<tr><td>Replica returns stale data</td><td>A stale rank for a few milliseconds</td><td>Acceptable; route "right after my match" to the primary or retry on version mismatch</td></tr>
+</table>
+<p>The consistency model is easy to state. The score table is <b>strongly consistent per player</b> (one row, conditional update). The Redis boards are <b>eventually consistent</b> with it, with a normal lag under a second. Reads of rank are therefore "read committed, possibly slightly stale", and we say so in the API contract (<code>as_of</code> timestamp). The model and its terms are in <a href="../chapters/28-cap-consistency.html">Chapter 28</a>; the patterns for surviving partial failure in <a href="../chapters/40-resilience.html">Chapter 40</a>.</p>
+
+<h2 id="security">15. Security, abuse, monitoring and cost</h2>
+<h3>15.1 Cheating and abuse</h3>
+<ul>
+<li><b>Trust boundary.</b> Only authoritative game servers can write scores, using mutual TLS and signed events. A client app never calls the write endpoint. This removes the largest class of cheating (a modified client posting a score of one billion).</li>
+<li><b>Plausibility checks.</b> Ingest rejects deltas outside the range possible for one match, and anomaly jobs flag players whose score velocity is a statistical outlier. Flagged players are shadow-listed: removed from the public sorted sets (<code>ZREM</code>) without notifying them, pending review. A ban removes the player from all windows and from the archive of the current season, which is why the archive is written from the live set only after a delay.</li>
+<li><b>Read abuse.</b> Scrapers pull the top 1,000 repeatedly. Per-client rate limits at the gateway (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>, <a href="c03-rate-limiter.html">Case study 3</a>) and the cached top list make this cheap. Paging depth is capped.</li>
+<li><b>Privacy.</b> Players can hide from public boards. Hidden players remain in the ranking for their own rank, but are filtered from public pages (display names only for players who opted in). See <a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>.</li>
+</ul>
+<h3>15.2 Monitoring and SLOs</h3>
+<ul>
+<li><b>SLIs:</b> read latency p50 and p99 per endpoint; consumer lag (seconds between event time and Redis apply); Redis command latency and slow-log counts; memory use and fork duration; replication lag; drift found by reconciliation; cache hit ratio of the top list.</li>
+<li><b>SLOs:</b> 99.95 percent of reads succeed over 30 days; p99 read under 50 ms; 99 percent of score events visible in Redis within 2 seconds; zero lost accepted events (checked by comparing log offsets to applied offsets).</li>
+<li><b>Alerts:</b> consumer lag above 10 seconds; Redis memory above 70 percent (fork risk); replication lag above 1 second; reconciliation mismatch above 0.01 percent. See <a href="../chapters/54-observability-slos.html">Chapter 54</a>.</li>
+</ul>
+<h3>15.3 Cost notes</h3>
+<p>Memory dominates the bill. For a mode with 19 GB of sorted sets, we need primary and two replicas, at about 64 GB each: three nodes per shard, and with a 16-shard fleet, about 48 memory-optimized nodes for one very large game. Cost levers: trim the board (<code>ZREMRANGEBYRANK</code> to keep only players with more than zero points or only those active in the last 30 days, with the long tail answered by the approximate percentile from the histogram), expire the daily and weekly sets aggressively, and use a short member id (a numeric id in binary-safe form, not a UUID string, saves roughly 30 bytes per member, a 30 percent reduction). Kafka retention (30 days) and the archive tier cost far less than Redis memory per gigabyte.</p>
+
+<h2 id="evolution">16. Evolution, phasing and alternatives not chosen</h2>
+<h3>16.1 What changes at 10x</h3>
+<p>At 300 million DAU: 140,000 events per second at peak, 420,000 sorted-set updates per second. We move from one primary per board to hash sharding (16 to 64 shards), adopt the hybrid top set plus histogram for approximate rank, scale Kafka to a few hundred partitions, shrink fan-out by writing the daily board only and deriving the weekly total from a counter-per-day table for non-competitive modes, and split boards by region as the default. Reads: the top list cache moves from per-process to a shared tier plus a CDN for public "season hall of fame" pages (<a href="../chapters/12-cdn.html">Chapter 12</a>).</p>
+<h3>16.2 What we build first</h3>
+<ol>
+<li><b>Phase 1:</b> one Redis primary with a replica, the score table, direct writes from workers fed by Kafka, the four read endpoints, top-K cache, and one window (season).</li>
+<li><b>Phase 2:</b> daily and weekly windows, the window manager with archive, dedupe, reconciliation job, dashboards and alerts.</li>
+<li><b>Phase 3:</b> friends board, tie-break encoding, regional boards, rate limits and anti-cheat integration.</li>
+<li><b>Phase 4:</b> sharding with the top set and histogram approximate rank, only when capacity numbers show it is needed.</li>
+</ol>
+<h3>16.3 Alternatives not chosen</h3>
+<ul>
+<li><b>Use the relational database for everything:</b> simplest to operate, but rank queries and write volume do not fit beyond a few million active players.</li>
+<li><b>Cassandra or DynamoDB counters with a sort key on score:</b> they scale writes, but rank requires counting, which these stores do not offer natively; useful as the durable score store, not as the ranking engine (<a href="../chapters/20-nosql.html">Chapter 20</a>).</li>
+<li><b>Stream processing (Flink) that continuously maintains the top K:</b> excellent for a global top K computed over a huge unsorted stream (see the heavy-hitters approach of <a href="c20-ad-click-aggregation.html">Case study 20</a>), but it does not answer "my rank" for an arbitrary player.</li>
+<li><b>Skip the leaderboard and use a social feed ranking:</b> a different problem (<a href="c06-news-feed.html">Case study 6</a>); ranking there is by a model score, not a monotone number.</li>
+<li><b>Exactly-once via distributed transactions across Kafka, table and Redis:</b> heavier than needed; idempotent consumers achieve the same effect.</li>
+</ul>
+
+<h2 id="qa">17. Interview Q&amp;A</h2>
+<details><summary>Why a Redis sorted set rather than a SQL table with an index on score?</summary>
+<p>The question a leaderboard asks most is "how many players have a higher score than me?", which is an order-statistic query. A Redis sorted set keeps a skip list whose pointers carry spans, so rank, insert and range are all O(log N) in memory, in tens of microseconds. A B-tree index in a relational database gives fast ordered scans, but a count of rows above a key usually walks the index range, which grows with N, and every update also pays for the write-ahead log and index maintenance. At 100 million players with 14,000 updates per second at peak, the SQL path needs heavy replication and caching to approximate what the sorted set gives natively. I would still keep SQL or a wide-column store as the durable score table, because Redis is memory first.</p></details>
+<details><summary>How do you break ties fairly, and what are the pitfalls?</summary>
+<p>Redis orders equal scores by member bytes, which would rank by player id, so I pack a time component into the score. Using a 30 bit score and a 23 bit inverted time (seconds since season start) totals 53 bits, the exact integer limit of a double, so a higher score ranks first and, among equal scores, the earlier achiever ranks first. The pitfalls are that you cannot use <code>ZINCRBY</code> with an encoded value because the time part would drift (read the pure score, add, re-encode, write with <code>ZADD</code> in a script), that scores above 2^30 overflow the layout so ingest must cap them, and that product might prefer shared ranks (competition ranking), which comes from counting strictly higher pure scores.</p></details>
+<details><summary>How do you serve the around-me view efficiently and consistently?</summary>
+<p>Take the player's rank with <code>ZREVRANK</code>, then read the slice from rank minus 5 to rank plus 5 with <code>ZREVRANGE</code>. Both steps run inside one Lua script, so no update can move the player between the two calls and make the window misaligned. The cost is two logarithmic operations plus eleven rows, a few tens of microseconds. Names and avatars are attached afterwards from the profile cache in one batch, which keeps the sorted set free of strings. On a hash-sharded board the neighbours are scattered, so I would use the hybrid design: exact around-me only in the top set, and score-bucket windows (approximate) for deep ranks.</p></details>
+<details><summary>A single leaderboard has outgrown one Redis node. What do you do?</summary>
+<p>Redis Cluster does not split one sorted set, so I split the leaderboard myself. Hash sharding by player id spreads load evenly and makes updates single-shard, but top K and exact rank need all N shards (merge of per-shard top K lists, sum of <code>ZCOUNT</code> results). Range sharding by score makes reads cheap with a counts table but creates hot shards, skew and multi-key moves across boundaries. I would combine them: a small exact top set for the top 100,000, hash shards for everyone, and an approximate rank from a score histogram for the deep tail. That matches where users actually look and keeps the common queries to one call.</p></details>
+<details><summary>How do you implement daily and weekly boards without tripling the cost?</summary>
+<p>I accept the amplification. Each score event updates three sorted sets (day, week, season) in one pipelined round trip, so reads are single-key lookups and each window expires independently. Computing the weekly board with <code>ZUNIONSTORE</code> of daily sets looks cheaper but would block a single-threaded Redis for seconds on tens of millions of members, so it is only acceptable for small or off-peak jobs. The real mitigations are batching and collapsing events per player before writing, smaller daily and weekly sets since only active players are present, and TTLs. Windows are chosen by match end time, with a short grace period to absorb late events before archiving.</p></details>
+<details><summary>What if Redis loses data or the whole cluster goes down?</summary>
+<p>Redis is a derived view of the durable record, which is the Kafka log plus a score table that holds each player's current total. For a node crash, a replica is promoted and workers re-apply any uncommitted events idempotently. For a lost shard, I load the last snapshot and replay Kafka from its offset. For corruption, I rebuild from the score table by scanning it and bulk loading with pipelined <code>ZADD</code> into a new key, then <code>RENAME</code> it into place; at roughly 500,000 adds per second that is a few minutes for 100 million players. I rehearse this rebuild regularly and run a reconciliation job that samples players and alerts on drift, because an untested recovery path is a hope, not a plan.</p></details>
+<details><summary>How do you make score updates exactly-once?</summary>
+<p>True exactly-once delivery across a network is not available, so I get the same effect with at-least-once delivery and idempotent processing. Each match result carries a unique event id. The worker first claims it with an atomic set-if-absent on a dedupe key with a TTL longer than the retry window, then applies a conditional update to the score table that also records the event id, and only then updates Redis and commits the Kafka offset. A replay after a crash hits the dedupe key or the conditional update and does nothing. Since <code>ZINCRBY</code> is not idempotent by itself, the guard must come first; for best-score modes, <code>ZADD GT</code> is naturally idempotent.</p></details>
+<details><summary>How do you detect and handle cheaters on the leaderboard?</summary>
+<p>First, remove the trust problem: only authoritative game servers can post scores, over mutual TLS with signed events, so a modified client cannot write. Second, validate plausibility at ingest, rejecting deltas outside what one match can award, and run offline anomaly detection on score velocity. Third, make removal cheap: a flagged player is taken out of the public sorted sets with <code>ZREM</code> (shadow listing) and, if banned, from all windows, and because ranks of everyone below shift automatically, no reordering is needed. I delay final archiving of a window slightly so that bans from the review queue are reflected in the permanent standings and rewards.</p></details>
+<details><summary>How do you show a friends leaderboard?</summary>
+<p>The social service gives me the friend ids, usually a few hundred. I fetch their scores in one call with <code>ZMSCORE</code> (or a pipeline of <code>ZSCORE</code>), sort the small result in the application and attach names from the profile cache. The rank among friends is simply the position in this list. I avoid <code>ZINTERSTORE</code> with a friends set on the hot path because it writes a temporary key and its cost grows with the larger set sizes. For a player with thousands of friends I cap the list or page it. On a sharded board, the batch is grouped by shard so each shard gets one call.</p></details>
+<details><summary>How would you provide live rank updates to the client?</summary>
+<p>I would not stream the whole leaderboard. After a player's score is applied, the worker can compute the new rank for that player only (one <code>ZREVRANK</code>), and push it over the existing push or WebSocket channel if it changed by more than a threshold, rate limited per player. For the public top 100, clients poll the cached endpoint every few seconds, or subscribe to a channel that publishes the diff once per second. This keeps the fan-out proportional to meaningful changes, rather than to the 14,000 events per second at peak.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">18. Recap</h2>
+<ul>
+<li>A leaderboard is an order-statistic problem. A Redis sorted set (hash table plus skip list with spans) gives rank, top K and range in O(log N), and updates atomically on a single thread.</li>
+<li>Numbers: 30M DAU, 300M events a day, 3,500 per second average and 14,000 at peak; three windows make 42,000 sorted-set updates per second; about 100 bytes per member gives roughly 19 GB per mode.</li>
+<li>Write path: game server, ingest, Kafka keyed by player, rank workers with dedupe, durable score table first, then pipelined updates to the day, week and season sets, then the offset commit. At-least-once plus idempotence gives exactly-once effect.</li>
+<li>Reads: cached top K, <code>ZREVRANK</code> for my rank, a Lua script for around-me, <code>ZMSCORE</code> for friends. Names come from a separate profile cache.</li>
+<li>Ties: pack inverted time into the low bits of the score (30 + 23 = 53 bits), or compute competition rank from counts of strictly higher scores.</li>
+<li>Windows: fan out on write, route by match end time, keep the old window open briefly, then seal, archive and expire.</li>
+<li>Beyond one node: hash shards need scatter-gather for top K and rank; score-range shards make reads cheap but move players across boundaries. The practical answer is an exact top set plus hash shards and an approximate rank for the deep tail.</li>
+<li>Redis is a derived view. The log and score table are the truth; rebuild is routine and rehearsed.</li>
+</ul></div>
+<p class="connects"><b>Connects to:</b> built on <a href="../chapters/15-redis.html">Chapter 15</a> (Redis data structures and persistence) and <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a> (sorted sets). Related: <a href="../chapters/02-estimation.html">Chapter 2</a> (estimation), <a href="../chapters/13-caching-patterns.html">Chapter 13</a> and <a href="../chapters/14-caching-failures.html">Chapter 14</a> (caching and stampedes), <a href="../chapters/24-replication.html">Chapter 24</a> (replication), <a href="../chapters/25-sharding.html">Chapter 25</a> (sharding), <a href="../chapters/28-cap-consistency.html">Chapter 28</a> (consistency), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotency), <a href="../chapters/34-queues-kafka.html">Chapter 34</a> (queues and Kafka), <a href="../chapters/41-ha-dr.html">Chapter 41</a> (high availability), <a href="../chapters/54-observability-slos.html">Chapter 54</a> (SLOs), <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a> (hashing and probabilistic structures). Compare with <a href="c03-rate-limiter.html">Case study 3</a>, <a href="c06-news-feed.html">Case study 6</a> and <a href="c20-ad-click-aggregation.html">Case study 20</a>.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

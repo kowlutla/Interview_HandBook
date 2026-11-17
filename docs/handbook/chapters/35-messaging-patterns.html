@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 35: Messaging Patterns | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="35-messaging-patterns">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Chapter 35 · Module 5 · Asynchronous Architecture</div>
+<h1>Messaging Patterns</h1>
+<p class="lead">A message broker moves bytes between services, but the interesting engineering is in the patterns built on top of it: how to fan a message out, share work among consumers, keep order, retry safely, quarantine bad messages, and survive duplicates. This chapter is the practical toolbox for designing asynchronous flows that keep working when things go wrong.</p>
+
+<h2 id="why">1. Why patterns: the broker is not the design</h2>
+
+<p><a href="34-queues-kafka.html">Chapter 34</a> explained what queues, logs, and brokers are: how messages are stored, how partitions and consumer groups work, and what delivery guarantees the products give. This chapter assumes that background and asks the next question: given a broker, how do you <b>design the conversation</b> between services so that it is correct, scalable, and operable?</p>
+
+<p>A broker alone does not solve the hard parts. It will happily deliver the same message twice, deliver messages out of order across partitions, fill up with a backlog nobody reads, or hold a malformed message that crashes every consumer that touches it. Each of these is a recurring problem with a well-known answer, and those answers are called <b>messaging patterns</b>. Knowing them lets you design in an interview by naming the problem, naming the pattern, and stating its cost.</p>
+
+<p>Some vocabulary used throughout:</p>
+<ul>
+  <li><b>Producer (publisher):</b> the service that sends a message.</li>
+  <li><b>Consumer (subscriber):</b> the service that receives and processes a message.</li>
+  <li><b>Queue:</b> a buffer where each message is processed by one consumer, then removed (SQS, RabbitMQ queues).</li>
+  <li><b>Topic:</b> a named channel that many independent subscribers can read (SNS, Kafka topics, Pub/Sub topics).</li>
+  <li><b>Acknowledgement (ack):</b> the consumer's signal to the broker that processing finished, so the message may be removed or the offset advanced.</li>
+  <li><b>Visibility timeout / lease:</b> in queue systems, the period after delivery during which the message is hidden from other consumers while the first one works on it. If no ack arrives in time, the message reappears and is delivered again.</li>
+  <li><b>Command vs event:</b> a command says "do this" and is addressed to one handler (<code>ChargeCard</code>). An event says "this happened" and has no particular addressee (<code>OrderPlaced</code>). Commands usually travel on queues, events on topics. <a href="36-event-driven.html">Chapter 36</a> covers event design itself.</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b>
+Almost every pattern in this chapter exists because of one fact: <b>a message system gives you at-least-once delivery, not exactly-once, and no global ordering</b>. Consumers must therefore tolerate duplicates, reordering, delays, and poison input. Design for that and the rest follows.
+</div>
+
+<h2 id="p2p-pubsub">2. Point-to-point versus publish/subscribe</h2>
+
+<h3>2.1 Point-to-point</h3>
+<p>In a <b>point-to-point</b> model, a message goes into a queue and exactly one consumer receives it. If ten consumers are attached to the queue, they share the messages: each message goes to one of them. This is the model for <b>work distribution</b>: "resize this image", "send this email", "charge this card". The sender usually expects that the work gets done exactly once by someone, and does not care who.</p>
+
+<h3>2.2 Publish/subscribe</h3>
+<p>In <b>publish/subscribe (pub/sub)</b>, the producer publishes to a topic and <b>every subscriber receives its own copy</b>. The producer does not know who the subscribers are, and adding a new subscriber needs no change in the producer. This is the model for <b>notification of facts</b>: "an order was placed", and billing, shipping, analytics, and email each react independently.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Point-to-point versus pub/sub">
+  <text class="t-b" x="20" y="22">Point-to-point: each message goes to ONE consumer</text>
+  <rect class="ext" x="20" y="60" width="110" height="46" rx="8"/><text class="t-c t-b" x="75" y="88">Producer</text>
+  <rect class="cache" x="190" y="50" width="160" height="66" rx="8"/><text class="t-c t-b" x="270" y="78">Queue</text><text class="t-c t-sm" x="270" y="98">m1 m2 m3 m4</text>
+  <rect class="box" x="420" y="30" width="110" height="36" rx="8"/><text class="t-c" x="475" y="53">Consumer A</text>
+  <rect class="box" x="420" y="92" width="110" height="36" rx="8"/><text class="t-c" x="475" y="115">Consumer B</text>
+  <path class="arrow" d="M130 83 L186 83"/><path class="arrow" d="M350 70 L416 50"/><path class="arrow" d="M350 96 L416 110"/>
+  <text class="t-sm" x="550" y="50">A gets m1, m3</text><text class="t-sm" x="550" y="112">B gets m2, m4</text>
+
+  <text class="t-b" x="20" y="170">Pub/sub: EVERY subscriber gets a copy</text>
+  <rect class="ext" x="20" y="212" width="110" height="46" rx="8"/><text class="t-c t-b" x="75" y="240">Publisher</text>
+  <rect class="cache" x="190" y="202" width="160" height="66" rx="8"/><text class="t-c t-b" x="270" y="230">Topic</text><text class="t-c t-sm" x="270" y="250">OrderPlaced</text>
+  <rect class="box" x="420" y="180" width="130" height="30" rx="8"/><text class="t-c" x="485" y="200">Billing</text>
+  <rect class="box" x="420" y="218" width="130" height="30" rx="8"/><text class="t-c" x="485" y="238">Shipping</text>
+  <rect class="box" x="420" y="256" width="130" height="30" rx="8"/><text class="t-c" x="485" y="276">Analytics</text>
+  <path class="arrow" d="M130 235 L186 235"/><path class="arrow" d="M350 222 L416 196"/><path class="arrow" d="M350 235 L416 233"/><path class="arrow" d="M350 248 L416 268"/>
+  <text class="t-sm" x="580" y="238">each gets m1, m2, m3, m4</text>
+</svg>
+<figcaption>Left: consumers on one queue split the stream (work sharing). Right: each subscriber has its own copy of the stream (broadcast). Real systems combine both: a topic fans out to several queues, and each queue has competing consumers.</figcaption>
+</figure>
+
+<table>
+<tr><th>Aspect</th><th>Point-to-point queue</th><th>Pub/sub topic</th></tr>
+<tr><td>Who gets a message</td><td>One consumer</td><td>All subscribers</td></tr>
+<tr><td>Message kind</td><td>Command ("do X")</td><td>Event ("X happened")</td></tr>
+<tr><td>Coupling</td><td>Producer knows the work exists</td><td>Producer ignorant of subscribers</td></tr>
+<tr><td>Adding a consumer</td><td>Shares load</td><td>Gets a full independent copy</td></tr>
+<tr><td>Failure isolation</td><td>One backlog</td><td>Each subscriber has its own backlog (if durable)</td></tr>
+<tr><td>Typical products</td><td>SQS, RabbitMQ queue, Azure Service Bus queue</td><td>SNS, Kafka topic + consumer groups, Google Pub/Sub, Service Bus topic</td></tr>
+</table>
+
+<p>Kafka blurs the line: a topic read by one consumer group behaves like a queue (partitions shared among members), while several groups each see every message, which is pub/sub. The group is the unit of independent subscription. See <a href="34-queues-kafka.html">Chapter 34</a>.</p>
+
+<div class="callout tip"><b>Interview tip</b>
+Say "a command has one owner and goes on a queue; an event has zero-to-many listeners and goes on a topic." It shows that you choose the model from the semantics, not from the product name.
+</div>
+
+<h2 id="fanout">3. Fan-out</h2>
+
+<p><b>Fan-out</b> means one incoming message causes many downstream deliveries. There are two levels to think about.</p>
+
+<h3>3.1 Topic fan-out</h3>
+<p>The simplest form is a topic with many subscribers, as above. With a log-based broker like Kafka, fan-out is cheap: the message is stored once and each consumer group reads it with its own offset. Ten groups cost ten reads, not ten writes.</p>
+
+<h3>3.2 SNS plus SQS: durable fan-out</h3>
+<p>A pure notification topic such as Amazon SNS pushes to subscribers but does not retain messages for slow ones. If a subscriber is down, delivery retries for a limited time and then the message may be lost to that subscriber. The standard fix is to give every subscriber its <b>own queue</b> and subscribe the queue to the topic. The topic does the broadcast, and each queue provides durability, buffering, retry, and a dead-letter queue for that one consumer.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="SNS topic fanning out to per-consumer SQS queues with DLQs">
+  <rect class="ext" x="20" y="130" width="120" height="50" rx="8"/><text class="t-c t-b" x="80" y="160">Order service</text>
+  <rect class="cache" x="200" y="125" width="130" height="60" rx="8"/><text class="t-c t-b" x="265" y="152">Topic</text><text class="t-c t-sm" x="265" y="171">order-events</text>
+
+  <rect class="cache" x="410" y="30" width="130" height="44" rx="8"/><text class="t-c" x="475" y="57">Queue: billing</text>
+  <rect class="cache" x="410" y="130" width="130" height="44" rx="8"/><text class="t-c" x="475" y="157">Queue: shipping</text>
+  <rect class="cache" x="410" y="230" width="130" height="44" rx="8"/><text class="t-c" x="475" y="257">Queue: email</text>
+
+  <rect class="box" x="620" y="30" width="110" height="44" rx="8"/><text class="t-c" x="675" y="57">Billing svc</text>
+  <rect class="box" x="620" y="130" width="110" height="44" rx="8"/><text class="t-c" x="675" y="157">Shipping svc</text>
+  <rect class="box" x="620" y="230" width="110" height="44" rx="8"/><text class="t-c" x="675" y="257">Email svc</text>
+
+  <rect class="miss" x="780" y="30" width="100" height="44" rx="8"/><text class="t-c t-sm" x="830" y="57">DLQ billing</text>
+  <rect class="miss" x="780" y="130" width="100" height="44" rx="8"/><text class="t-c t-sm" x="830" y="157">DLQ shipping</text>
+  <rect class="miss" x="780" y="230" width="100" height="44" rx="8"/><text class="t-c t-sm" x="830" y="257">DLQ email</text>
+
+  <path class="arrow" d="M140 155 L196 155"/>
+  <path class="arrow" d="M330 140 L406 56"/><path class="arrow" d="M330 155 L406 152"/><path class="arrow" d="M330 170 L406 250"/>
+  <path class="arrow" d="M540 52 L616 52"/><path class="arrow" d="M540 152 L616 152"/><path class="arrow" d="M540 252 L616 252"/>
+  <path class="arrow-r dash" d="M730 52 L776 52"/><path class="arrow-r dash" d="M730 152 L776 152"/><path class="arrow-r dash" d="M730 252 L776 252"/>
+  <text class="t-sm" x="20" y="310">Each subscriber owns a queue and a DLQ: a slow or broken consumer never affects the others.</text>
+</svg>
+<figcaption>Durable fan-out. The topic broadcasts; every subscriber has an independent queue with its own backlog, retry policy, and dead-letter queue. Adding a fourth consumer means creating a fourth queue and subscription, with no change to the publisher.</figcaption>
+</figure>
+
+<p>Two refinements are worth knowing. First, <b>subscription filters</b>: subscribers can declare attribute conditions (for example <code>region = EU</code>) so the topic only delivers matching messages, which saves consumer work. Second, with large fan-out the producer-side cost is small but the <b>total work</b> multiplies: a message fanned out to 20 subscribers causes 20 deliveries and 20 processing runs, so capacity planning must count them all.</p>
+
+<h3>3.3 Fan-out on write versus fan-out on read</h3>
+<p>A recurring design choice (it appears in news-feed case studies) is whether to copy a message into every recipient's mailbox at write time (fan-out on write: fast reads, expensive writes for celebrities) or to assemble the view at read time (fan-out on read: cheap writes, slower reads). Messaging systems implement the first; the second is a query pattern. Hybrid designs fan out on write for ordinary users and on read for very high-follower accounts.</p>
+
+<h2 id="competing">4. Competing consumers and scaling consumers</h2>
+
+<p>The <b>competing consumers</b> pattern attaches several identical consumer instances to one queue. Each message is given to one of them; they "compete" for work. This is how you scale throughput horizontally: if one worker handles 100 messages per second and you need 1,000, run about ten (plus headroom).</p>
+
+<h3>4.1 How it works in queue brokers</h3>
+<p>In SQS-style queues, a consumer receives a message and the broker starts the visibility timeout. The consumer processes the message and deletes it (the ack). If the consumer crashes, the timeout expires and the message becomes visible again for another worker. This is what makes the pattern <b>fault tolerant</b>: a dead worker's job is automatically retried by a live one. It is also why duplicates happen: a worker that is slow, not dead, may finish after the timeout expired, by which time another worker has already received the same message.</p>
+<p>Rule of thumb: set the visibility timeout to comfortably more than the p99 processing time, and for long jobs extend the lease (heartbeat) while still working.</p>
+
+<h3>4.2 How it works in logs (Kafka)</h3>
+<p>In Kafka, parallelism is capped by the <b>partition count</b>. A partition is read by at most one consumer in a group at a time, so a topic with 12 partitions supports at most 12 useful consumers in one group; a 13th sits idle. The partition count is therefore a long-lived capacity decision: you can add partitions, but that changes key-to-partition mapping and so disturbs per-key ordering for existing keys.</p>
+
+<h3>4.3 Scaling consumers</h3>
+<p>Scale on the signal that actually reflects need, which is <b>backlog</b>, not CPU. A practical formula:</p>
+<pre><code>consumers needed = arrival rate (msg/s) x average processing time (s) / target utilization
+
+Example: 2,000 msg/s x 0.050 s / 0.7 = about 143 concurrent handlers</code></pre>
+<p>Autoscalers commonly use "queue depth divided by consumers" or "age of oldest message" as the metric. Scale-out helps only if the bottleneck is the consumers. If every consumer calls the same database that is already saturated, adding consumers makes it worse. Cap concurrency to what the downstream can take (see backpressure, section 9).</p>
+
+<div class="callout watch"><b>Watch out</b>
+Competing consumers give up ordering. Two workers can finish messages in a different order from which they were read. If order matters, you need the per-key techniques in the next section, not just more workers.
+</div>
+
+<h2 id="ordering">5. Ordering</h2>
+
+<h3>5.1 Why order is lost</h3>
+<p>A single queue read by a single consumer, with no failures, is ordered. Order breaks when you add (a) multiple consumers, since processing speeds differ; (b) multiple partitions or shards, since there is no order across them; (c) retries, since a failed message is redelivered after later ones succeeded; and (d) multiple producers or network paths, since messages can arrive at the broker in a different order than they were created.</p>
+
+<h3>5.2 Do you need global order?</h3>
+<p>Almost never. What applications usually need is <b>order per entity</b>: all events for order 42 must be processed in sequence, but order 42's events and order 43's events are independent. That is much cheaper to provide.</p>
+
+<h3>5.3 Per-key partitioning</h3>
+<p>The standard solution: choose a <b>key</b> (order id, account id, device id), hash it to pick a partition, and let exactly one consumer read each partition. All messages with the same key go to the same partition, in publish order, to one consumer, so their order is preserved while different keys run in parallel. Kafka does this with the message key. SQS FIFO does it with a <b>message group id</b>: messages in one group are delivered in order and one at a time, while groups proceed in parallel. Kinesis uses the partition key; RabbitMQ can use consistent-hash exchange or single-active-consumer queues.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 320" role="img" aria-label="Per-key partitioning keeps order per key while consuming in parallel">
+  <rect class="ext" x="20" y="100" width="140" height="100" rx="8"/><text class="t-c t-b" x="90" y="130">Producer</text><text class="t-c t-sm" x="90" y="152">key = orderId</text><text class="t-c t-sm" x="90" y="170">hash(key) mod 3</text>
+  <rect class="cache" x="270" y="30" width="300" height="50" rx="8"/><text class="t-c t-sm" x="420" y="52">Partition 0:  A1  A2  A3   (key A)</text><text class="t-c t-sm" x="420" y="70">in order</text>
+  <rect class="cache" x="270" y="135" width="300" height="50" rx="8"/><text class="t-c t-sm" x="420" y="157">Partition 1:  B1  C1  B2  C2  (keys B, C)</text><text class="t-c t-sm" x="420" y="175">B1 before B2, C1 before C2</text>
+  <rect class="cache" x="270" y="240" width="300" height="50" rx="8"/><text class="t-c t-sm" x="420" y="262">Partition 2:  D1  D2   (key D)</text><text class="t-c t-sm" x="420" y="280">in order</text>
+  <rect class="box" x="670" y="30" width="170" height="50" rx="8"/><text class="t-c" x="755" y="60">Consumer 1</text>
+  <rect class="box" x="670" y="135" width="170" height="50" rx="8"/><text class="t-c" x="755" y="165">Consumer 2</text>
+  <rect class="box" x="670" y="240" width="170" height="50" rx="8"/><text class="t-c" x="755" y="270">Consumer 3</text>
+  <path class="arrow" d="M160 130 L266 60"/><path class="arrow" d="M160 150 L266 160"/><path class="arrow" d="M160 170 L266 262"/>
+  <path class="arrow" d="M570 55 L666 55"/><path class="arrow" d="M570 160 L666 160"/><path class="arrow" d="M570 265 L666 265"/>
+</svg>
+<figcaption>The key decides the partition; each partition has one reader. Order holds within a key, parallelism comes from having many keys. A hot key (one huge customer) lands on one partition and one consumer, which caps its throughput.</figcaption>
+</figure>
+
+<h3>5.4 Sequence numbers and resequencing</h3>
+<p>Sometimes the transport cannot guarantee order (multiple paths, multiple partitions, or retries). Then the producer stamps each message with a <b>sequence number per entity</b> (1, 2, 3 ...), and the consumer enforces order:</p>
+<ul>
+  <li>If the message's number equals expected next, process it and advance.</li>
+  <li>If it is lower than expected, it is a duplicate or stale message: ignore it (or acknowledge and skip).</li>
+  <li>If it is higher, there is a gap. Either <b>buffer it</b> (a resequencer holds early arrivals until the missing ones come, with a timeout) or <b>reject it for later redelivery</b>.</li>
+</ul>
+<p>For state-carrying events there is a cheaper trick: put a <b>version</b> on each entity update and apply a message only if its version is higher than the stored one ("last write wins by version"). Out-of-order older messages are then harmless. This works when each message contains the full new state, not a delta.</p>
+
+<h3>5.5 The ordering versus parallelism tradeoff</h3>
+<p>Strict ordering forces serial processing of the ordered group. If processing one message takes 50 ms, a single key can sustain at most 20 messages per second, no matter how many consumers you own. Retries make it worse: with strict order, a failing message <b>blocks everything behind it</b> in its partition (head-of-line blocking). You then must choose between blocking (keep order, halt progress), skipping to a retry queue (progress, but order broken for that key afterward), or dead-lettering. Many systems accept "order broken after a failure" and make handlers tolerant instead, by using versions or commutative updates.</p>
+
+<table>
+<tr><th>Need</th><th>Technique</th><th>Cost</th></tr>
+<tr><td>Order per entity</td><td>Key partitioning / FIFO group id</td><td>Hot keys; parallelism limited to key count</td></tr>
+<tr><td>Order despite retries</td><td>Block partition until success, or per-key retry state</td><td>Head-of-line blocking</td></tr>
+<tr><td>Order despite multiple paths</td><td>Sequence numbers plus resequencer</td><td>Buffering, timeouts, state</td></tr>
+<tr><td>Tolerate disorder</td><td>Versioned full-state events, idempotent and commutative handlers</td><td>Design discipline</td></tr>
+<tr><td>Global order</td><td>One partition, one consumer</td><td>Throughput of a single worker</td></tr>
+</table>
+
+<h2 id="retries">6. Retries</h2>
+
+<p>Consumers fail for two very different reasons, and the pattern depends on which one applies. A <b>transient</b> failure (database timeout, downstream 503, lock conflict) will probably succeed if tried again. A <b>permanent</b> failure (malformed payload, business rule violation, missing referenced record that will never appear) will fail forever. Retrying a permanent failure only burns resources, so the first job of the handler is to <b>classify</b> the error: retry the transient, dead-letter the permanent.</p>
+
+<h3>6.1 Immediate retry</h3>
+<p>Retry in-process a small, bounded number of times (say 2 or 3), with no waiting or a very short one. It handles blips such as a connection reset. It is cheap, but if the downstream is actually overloaded, immediate retries add load at the worst moment.</p>
+
+<h3>6.2 Delayed retry and visibility timeout</h3>
+<p>If the handler simply does not ack, a queue like SQS redelivers after the visibility timeout. That is a built-in delayed retry, but the delay is fixed and equal for everyone. Better is to <b>explicitly choose the delay</b>: change the message's visibility to a longer value on each failure, or publish it to a delay queue.</p>
+
+<h3>6.3 Exponential backoff with jitter</h3>
+<p><b>Exponential backoff</b> doubles the wait after each failed attempt: 1 s, 2 s, 4 s, 8 s, up to a cap. It gives a struggling dependency time to recover. Pure backoff has a flaw: if 10,000 messages failed at the same moment, they all retry at the same moments again, producing synchronized waves (a "thundering herd"). <b>Jitter</b> randomizes each delay. The common "full jitter" formula:</p>
+<pre><code>delay = random(0, min(cap, base x 2^attempt))
+Example: base 1 s, cap 60 s: attempt 3 gives a random delay between 0 and 8 s</code></pre>
+<p>The result spreads retries evenly over time. See <a href="40-resilience.html">Chapter 40</a> for the same idea on synchronous calls, including retry budgets.</p>
+
+<h3>6.4 Retry topics and tiers</h3>
+<p>Brokers such as Kafka have no per-message delay, and blocking a partition while waiting would stall every other message. The usual pattern is <b>retry tiers</b>: separate topics or queues, each representing a longer delay, such as <code>orders.retry.10s</code>, <code>orders.retry.1m</code>, <code>orders.retry.10m</code>, followed by the dead-letter topic. On failure the consumer publishes the message to the next tier (carrying an attempt counter and the original timestamp in headers) and commits the original, so the main topic keeps flowing. A retry-tier consumer waits (pauses its partition) until the message is old enough, then reprocesses it.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Retry tiers feeding a dead-letter queue">
+  <rect class="cache" x="20" y="120" width="130" height="56" rx="8"/><text class="t-c t-b" x="85" y="146">Main queue</text><text class="t-c t-sm" x="85" y="164">orders</text>
+  <rect class="box" x="210" y="120" width="120" height="56" rx="8"/><text class="t-c t-b" x="270" y="146">Consumer</text><text class="t-c t-sm" x="270" y="164">classify error</text>
+  <rect class="hit" x="210" y="20" width="120" height="44" rx="8"/><text class="t-c" x="270" y="47">Success: ack</text>
+  <rect class="cache" x="400" y="40" width="130" height="44" rx="8"/><text class="t-c" x="465" y="67">Retry 10 s</text>
+  <rect class="cache" x="400" y="115" width="130" height="44" rx="8"/><text class="t-c" x="465" y="142">Retry 1 min</text>
+  <rect class="cache" x="400" y="190" width="130" height="44" rx="8"/><text class="t-c" x="465" y="217">Retry 10 min</text>
+  <rect class="miss" x="640" y="190" width="130" height="56" rx="8"/><text class="t-c t-b" x="705" y="214">Dead-letter</text><text class="t-c t-sm" x="705" y="232">after N attempts</text>
+  <rect class="ext" x="640" y="60" width="200" height="60" rx="8"/><text class="t-c t-sm" x="740" y="84">Permanent error (bad schema)</text><text class="t-c t-sm" x="740" y="102">goes straight to dead-letter</text>
+  <path class="arrow" d="M150 148 L206 148"/><path class="arrow-g" d="M270 120 L270 68"/>
+  <path class="arrow-r" d="M330 135 L396 66"/><path class="arrow-r dash" d="M465 84 L465 111"/><path class="arrow-r dash" d="M465 159 L465 186"/>
+  <path class="arrow-r dash" d="M530 212 L636 215"/>
+  <path class="arrow dash" d="M400 62 C 340 10, 120 10, 85 116"/>
+  <text class="t-sm" x="150" y="12">after the delay, back to the consumer</text>
+  <path class="arrow-r dash" d="M740 120 L720 186"/>
+  <text class="t-sm" x="20" y="280">Each tier waits longer; attempt count travels in a header; the main queue is never blocked.</text>
+</svg>
+<figcaption>Transient failures climb the tiers (10 s, 1 min, 10 min) so the dependency gets progressively more time to recover. Permanent failures skip the tiers. After the last tier the message is dead-lettered for humans or tooling.</figcaption>
+</figure>
+
+<h3>6.5 Bounding retries</h3>
+<p>Retries must always have a limit, both in attempts and in total age. Unbounded retry is an anti-pattern (section 19): a message that can never succeed will circulate forever, consuming capacity and hiding the problem. Combine <b>max attempts</b> (for example 5), <b>max age</b> (give up after 24 h), and a <b>circuit breaker</b> so that, when a dependency is clearly down, consumers pause instead of retrying every message into a wall.</p>
+
+<h2 id="dlq">7. Dead-letter queues and poison messages</h2>
+
+<p>A <b>poison message</b> is one that a consumer cannot process successfully, no matter how often it is retried: corrupt JSON, an unknown enum value, a reference to deleted data, or a payload that triggers a bug and crashes the handler. In a naive setup it is delivered, fails, reappears, fails again, forever, and in an ordered partition it blocks every message behind it.</p>
+
+<p>A <b>dead-letter queue (DLQ)</b> is a separate queue where such messages are moved after the retry policy is exhausted. It converts an infinite loop into a quarantined record.</p>
+
+<h3>7.1 Detect</h3>
+<p>Detection is mostly counting. The broker or the consumer tracks the <b>delivery attempt count</b> (SQS has <code>maxReceiveCount</code> on the redrive policy; RabbitMQ dead-letter exchanges; Kafka needs an attempt header you maintain). When the count exceeds the limit, or when the handler throws a known non-retryable exception, the message is routed to the DLQ. Crashing handlers are the nasty case: the process dies before it can report anything, so the broker's delivery count is the only evidence.</p>
+
+<h3>7.2 Quarantine with context</h3>
+<p>A dead letter that loses its context is almost useless. Store the original payload unchanged plus metadata: the source queue or topic, partition and offset, first-failure and last-failure time, attempt count, exception class and message, stack trace summary, consumer version, and trace id. With that, an engineer can reproduce the failure without guessing.</p>
+
+<h3>7.3 Alert and triage</h3>
+<p>A DLQ nobody watches is a graveyard. Alert on <b>DLQ depth above zero</b> or on the rate of arrivals, and on the age of its oldest message. Each message in a DLQ represents a user action that did not complete, so treat it like a bug ticket: classify (bad data, code bug, dependency bug), fix, then redrive or discard.</p>
+
+<h3>7.4 Redrive tooling</h3>
+<p><b>Redrive</b> means moving dead letters back to the source queue after the cause is fixed. Good tooling provides: a way to inspect and search messages; redrive of all or a selected subset; a rate limit so the redrive does not overload the system (a thousand messages released at once is a spike); preservation of the original message id and idempotency key so consumers can dedup; and an audit log of who redrove what. SQS offers a console and API redrive to the source queue; for others you write a small tool. Because redriven messages are processed again, consumers must be idempotent (next section).</p>
+
+<div class="callout watch"><b>Watch out</b>
+Dead-lettering breaks order. If message 2 of key A is dead-lettered and message 3 proceeds, the later redrive of message 2 arrives after message 3. Either design handlers to tolerate it (versions), or for strictly ordered streams halt the key's partition until a human resolves the failure.
+</div>
+
+<div class="callout tip"><b>Interview tip</b>
+When you add a queue to a design, say in one breath: "with a retry policy, a DLQ with alerting, and idempotent consumers." That sentence covers most of what interviewers probe about failure handling.
+</div>
+
+<h2 id="idempotent">8. Idempotent consumers and deduplication</h2>
+
+<p>With at-least-once delivery, the same message can arrive more than once: lease expiry, a lost ack, a producer retry after a timeout, a redrive, or a replay. An <b>idempotent consumer</b> produces the same final state whether it processes a message once or five times. <a href="32-idempotency-ids.html">Chapter 32</a> covers idempotency keys and delivery semantics in depth; here is how they apply to messaging.</p>
+
+<h3>8.1 Techniques</h3>
+<ul>
+  <li><b>Naturally idempotent operations.</b> "Set status to SHIPPED" or "upsert row by id" can be repeated safely. "Add 10 to balance" cannot. Prefer designing messages as state assertions rather than deltas where you can.</li>
+  <li><b>Processed-message table (inbox).</b> Each message carries a unique id. The consumer, in the <b>same database transaction</b> as its business change, inserts the id into a table with a unique constraint. A duplicate violates the constraint, the transaction rolls back (or is skipped), and nothing changes twice. This is the strongest approach because the dedup record and the effect commit atomically.</li>
+  <li><b>Conditional update.</b> <code>UPDATE ... WHERE version = 6</code> succeeds once; a replay finds version 7 and does nothing.</li>
+  <li><b>Dedup cache with TTL.</b> Remember recent ids in Redis for, say, 24 h. It is cheap but leaky: if the entry expires or the cache loses data, a late duplicate gets through. Use it only where an occasional duplicate is tolerable.</li>
+  <li><b>Broker-side dedup.</b> SQS FIFO deduplicates by a deduplication id within a five-minute window, and Kafka's idempotent producer prevents producer-retry duplicates within a session. These protect only the producer-to-broker hop, not your consumer's side effects.</li>
+</ul>
+
+<h3>8.2 Side effects outside the database</h3>
+<p>If the handler calls an external API (send email, charge a card), a database inbox cannot make that call atomic. The usual answer is to pass the message id (or a derived key) to the external system as an <b>idempotency key</b> so it dedups on its side, as payment providers do. If the external system has no such feature, you must accept either at-most-once (mark done first, then call, risking a lost effect) or at-least-once (call, then mark, risking a duplicate), and pick according to which error is cheaper.</p>
+
+<div class="callout key"><b>Key idea</b>
+"Exactly-once" in practice means <b>at-least-once delivery plus idempotent processing</b>. The broker supplies the first half; you supply the second.
+</div>
+
+<h2 id="backpressure">9. Backpressure and consumer lag</h2>
+
+<p><b>Consumer lag</b> is the gap between what has been produced and what has been consumed: in Kafka, the difference between the latest offset and the group's committed offset; in SQS, the approximate number of visible messages, or better, the <b>age of the oldest message</b>. If producers outpace consumers for long enough, lag grows without bound. A queue only moves the pressure from the producer to the queue; it does not remove it.</p>
+
+<p><b>Backpressure</b> is any mechanism that pushes that pressure back so the system slows gracefully rather than collapsing. Options, from the consumer outwards:</p>
+<ol>
+  <li><b>Bounded in-flight work.</b> The consumer fetches only as many messages as it can process (prefetch count in RabbitMQ, <code>max.poll.records</code> in Kafka, a semaphore limiting concurrent handlers). It never accepts more than it can hold.</li>
+  <li><b>Pause and resume.</b> When a downstream database or API is failing, the consumer stops polling (Kafka <code>pause()</code>) rather than pulling messages it can only fail. A circuit breaker (<a href="40-resilience.html">Chapter 40</a>) can drive this.</li>
+  <li><b>Scale out consumers</b>, up to the partition count and what the downstream tolerates.</li>
+  <li><b>Shed or defer low-value work.</b> Drop or delay messages that are stale or less important (priority queues and TTL, section 10).</li>
+  <li><b>Throttle producers.</b> Where the producer is a service you control, rate-limit it or return 429 to its clients once the queue is too deep. This is the only option that truly stops growth.</li>
+  <li><b>Bound the queue.</b> Set a maximum size or retention. An infinite queue hides overload until it becomes an outage with a 6-hour recovery.</li>
+</ol>
+
+<h3>9.1 Lag as the key health metric</h3>
+<p>Alert on lag in <b>time</b>, not only count. A backlog of 1 million messages is fine if the group drains 50,000 per second; a backlog of 10,000 is a crisis if each takes a second and the SLA is a minute. Estimated drain time = backlog ÷ (consume rate − produce rate). If consume rate is not greater than produce rate, the backlog never drains and you must scale or shed.</p>
+
+<h3>9.2 Rebalances and lag spikes</h3>
+<p>In Kafka, consumers joining or leaving trigger a rebalance during which processing pauses. Frequent rebalances (caused by slow handlers exceeding <code>max.poll.interval</code>, or autoscaler flapping) look like sawtooth lag. Remedies are keeping handlers fast, using cooperative rebalancing and static membership, and smoothing autoscaling.</p>
+
+<h2 id="leveling">10. Load leveling, priority, delay and TTL</h2>
+
+<h3>10.1 Queue-based load leveling</h3>
+<p>Traffic is bursty. A flash sale may send 10,000 orders per second for two minutes against a baseline of 500. Sizing synchronous services for the peak is costly. Putting a queue between the front end and the worker tier lets the front end accept work at burst speed while the workers drain at a steady, affordable rate. The queue acts as a <b>shock absorber</b>. The cost is latency: work waits, so this applies only where the user does not need an immediate result (and where you can tell them "we received your order").</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Queue absorbs a traffic burst; workers drain at a steady rate">
+  <line x1="60" y1="250" x2="860" y2="250" stroke="var(--fg)"/><line x1="60" y1="40" x2="60" y2="250" stroke="var(--fg)"/>
+  <text class="t-sm" x="62" y="32">msgs per second</text><text class="t-sm" x="800" y="272">time</text>
+  <path d="M60 230 L240 230 L260 70 L440 70 L460 230 L860 230" fill="none" stroke="var(--bad)" stroke-width="2.5"/>
+  <text class="t-sm" x="270" y="62" style="fill:var(--bad)">arrivals: burst of 10,000/s</text>
+  <path d="M60 175 L860 175" fill="none" stroke="var(--good)" stroke-width="2.5" stroke-dasharray="6 4"/>
+  <text class="t-sm" x="600" y="168" style="fill:var(--good)">workers drain steadily at 2,000/s</text>
+  <rect class="cache" x="260" y="180" width="380" height="42" rx="6" style="opacity:.55"/>
+  <text class="t-c t-sm" x="450" y="205">backlog builds, then drains</text>
+  <text class="t-sm" x="60" y="292">Without the queue, workers would have to be sized for the peak, or requests would fail.</text>
+</svg>
+<figcaption>The red line is the incoming burst, the dashed green line is the fixed processing rate. The shaded region is the queue absorbing the difference. It is drained once arrivals fall below capacity.</figcaption>
+</figure>
+
+<p>Sizing check: a 120-second burst at 10,000/s against 2,000/s of capacity builds up (10,000 − 2,000) × 120 = 960,000 messages. After the burst, if arrivals return to 500/s, the net drain is 1,500/s, so clearing takes 960,000 ÷ 1,500 = 640 s, about 11 minutes. Decide if that wait is acceptable, or scale workers up during the burst.</p>
+
+<h3>10.2 Priority queues</h3>
+<p>Not all messages deserve equal waiting. A password-reset email should not sit behind a million marketing emails. Many brokers have no true per-message priority (SQS has none; RabbitMQ has priority queues with limited levels, which cost performance). The robust pattern is <b>separate queues per priority</b> (high, normal, low), with consumers that poll high first, or with dedicated capacity such as 70 percent of workers on high and 30 percent shared, so low priority is never completely starved. Pure strict priority starves the low tier whenever high traffic is constant, so give it a minimum share or an aging rule (a message waiting too long is promoted).</p>
+
+<h3>10.3 Delayed messages</h3>
+<p>Sometimes a message should not be processed until later: send a reminder in 24 hours, cancel an unpaid order in 30 minutes, retry after a backoff. Options: SQS delay seconds (up to 15 minutes per message); RabbitMQ delayed-message plugin or TTL plus dead-letter trick; Service Bus scheduled enqueue time; Kafka has no native delay, so use retry-tier topics or an external scheduler (a database table of due times polled by a timer, or a workflow engine). For long delays (days) a durable scheduler is more reliable than keeping messages hidden in a broker, and easier to cancel when the order gets paid.</p>
+
+<h3>10.4 Message TTL</h3>
+<p>A <b>time-to-live</b> says "if this message is not processed within T, it is worthless". A surge-pricing update from 10 minutes ago, an OTP code that expired, or a "driver nearby" notification for a ride already taken should be discarded rather than processed late. Set TTL on the message or queue, and decide what happens on expiry: silently drop, or route to a dead-letter queue to count how often it happens. The consumer should also check the message's timestamp itself, because TTL enforcement in brokers is often lazy (expired messages are removed only when they reach the head of the queue).</p>
+
+<h2 id="reqreply">11. Request-reply over messaging</h2>
+
+<p>Messaging is naturally one-way, but sometimes you need an answer, and want queue benefits (buffering, decoupling, retry) while doing so. <b>Request-reply</b> uses two channels: the requester sends a request message to a request queue, including a <b>reply-to</b> address (a queue only it listens on) and a <b>correlation id</b>. The responder processes it and publishes the response to the reply-to address, copying the correlation id. The requester matches responses to its outstanding requests by that id.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Request reply sequence with correlation id">
+  <rect class="ext" x="60" y="20" width="160" height="34" rx="8"/><text class="t-c t-b" x="140" y="42">Requester</text>
+  <rect class="cache" x="360" y="20" width="180" height="34" rx="8"/><text class="t-c t-b" x="450" y="42">Request / reply queues</text>
+  <rect class="box" x="680" y="20" width="160" height="34" rx="8"/><text class="t-c t-b" x="760" y="42">Responder</text>
+  <line class="life" x1="140" y1="54" x2="140" y2="290"/><line class="life" x1="450" y1="54" x2="450" y2="290"/><line class="life" x1="760" y1="54" x2="760" y2="290"/>
+  <path class="arrow" d="M140 90 L446 90"/><text class="t-sm" x="150" y="84">1. send request (corrId=77, replyTo=q-A)</text>
+  <path class="arrow" d="M450 135 L756 135"/><text class="t-sm" x="470" y="129">2. deliver to a responder</text>
+  <rect class="hit" x="700" y="145" width="120" height="30" rx="6"/><text class="t-c t-sm" x="760" y="165">do the work</text>
+  <path class="arrow dash" d="M756 205 L454 205"/><text class="t-sm" x="470" y="199">3. reply to q-A (corrId=77)</text>
+  <path class="arrow dash" d="M446 250 L144 250"/><text class="t-sm" x="160" y="244">4. requester matches corrId=77, completes</text>
+  <text class="t-sm" x="150" y="278">If no reply before the timeout, the requester gives up; a late reply is ignored.</text>
+</svg>
+<figcaption>The correlation id ties a reply to its request, since replies may be late, duplicated, or out of order. Each requester instance usually has its own reply queue (or a filtered shared one) so replies reach the instance holding the waiting call.</figcaption>
+</figure>
+
+<p>Rules that matter: always set a <b>timeout</b>, because a missing reply is a normal event; make the request idempotent, since a timed-out request may still have been executed; and treat late replies as expected. If you find the whole system turning into synchronous request-reply over a broker, ask whether plain HTTP or gRPC (<a href="40-resilience.html">Chapter 40</a> for the resilience side) would be simpler. Request-reply over messaging earns its place when the responder is a slow or bursty worker pool, or when you want the buffering during spikes.</p>
+
+<h3>11.1 Correlation ids in general</h3>
+<p>The correlation id is useful beyond request-reply. Stamp a <b>correlation id</b> (the business flow, such as the order id) and a <b>trace id</b> (the distributed trace) on every message in a flow, and copy them to every message a handler produces. That is what allows you to reconstruct a flow that hops through six queues (section 18).</p>
+
+<h2 id="claimcheck">12. Claim check for large payloads</h2>
+
+<p>Brokers are built for small messages. SQS caps at 256 KB, Kafka's default is about 1 MB, and even where larger sizes are permitted, big messages hurt: they inflate broker memory and replication traffic, slow every consumer in the partition behind them, and make retries and DLQs expensive. The <b>claim check</b> pattern stores the large payload (a video, a PDF, a 5 MB JSON document) in object storage such as S3, and puts only a small <b>reference</b> in the message. The consumer presents the reference to fetch the payload, as one presents a ticket to claim luggage.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 260" role="img" aria-label="Claim check pattern">
+  <rect class="ext" x="20" y="100" width="120" height="50" rx="8"/><text class="t-c t-b" x="80" y="130">Producer</text>
+  <rect class="db" x="300" y="20" width="200" height="60" rx="8"/><text class="t-c t-b" x="400" y="46">Object store</text><text class="t-c t-sm" x="400" y="64">large payload, 40 MB</text>
+  <rect class="cache" x="300" y="170" width="200" height="60" rx="8"/><text class="t-c t-b" x="400" y="196">Queue</text><text class="t-c t-sm" x="400" y="214">{ id, s3://bucket/key, size, sha256 }</text>
+  <rect class="box" x="680" y="100" width="130" height="50" rx="8"/><text class="t-c t-b" x="745" y="130">Consumer</text>
+  <path class="arrow" d="M140 112 L296 60"/><text class="t-sm" x="150" y="70">1. upload</text>
+  <path class="arrow" d="M140 140 L296 195"/><text class="t-sm" x="150" y="190">2. send reference</text>
+  <path class="arrow" d="M500 200 L676 140"/><text class="t-sm" x="560" y="196">3. receive</text>
+  <path class="arrow dash" d="M676 112 L504 60"/><text class="t-sm" x="560" y="72">4. fetch by reference</text>
+</svg>
+<figcaption>The payload travels once, to cheap bulk storage. The queue carries a few hundred bytes, so throughput, retries, and DLQ inspection stay fast.</figcaption>
+</figure>
+
+<p>Operational details: upload the object <b>before</b> sending the message (otherwise a consumer may follow a dangling reference); include size and a checksum so the consumer can verify; give the object a lifecycle rule that deletes it after the retention period of the message plus a margin, since nothing cleans it automatically; and make the reference immutable (never overwrite the same key) so replays see the same bytes. Access control matters too: the consumer needs read permission, or the message carries a short-lived pre-signed URL. Some SDKs (the SQS extended client) implement this pattern for you.</p>
+
+<h2 id="envelope">13. Envelopes, schema registry and evolution</h2>
+
+<p>A message outlives the code that wrote it. It may sit in a queue for hours, or in a log for months, and consumers deployed at different times read it. So its structure must be explicit and evolvable. Serialization formats and compatibility rules are covered in <a href="07-serialization.html">Chapter 7</a>; this section is how they apply to messaging.</p>
+
+<h3>13.1 The envelope</h3>
+<p>Wrap every business payload in a standard <b>envelope</b> of metadata, so that infrastructure (routers, DLQ tools, tracers) can work without understanding the payload:</p>
+<pre><code>{
+  "id":            "0f8c...-uuid",        // unique message id, for dedup
+  "type":          "order.placed",        // what it is
+  "schemaVersion": 3,                     // payload version
+  "source":        "order-service",
+  "time":          "2026-11-17T10:15:30Z",
+  "correlationId": "ord-8841",
+  "traceId":       "4bf9...",
+  "partitionKey":  "ord-8841",
+  "payload":       { ... business data ... }
+}</code></pre>
+<p>The CloudEvents specification standardizes such fields. The point is consistency across teams.</p>
+
+<h3>13.2 Schema registry</h3>
+<p>A <b>schema registry</b> (Confluent Schema Registry, AWS Glue, Apicurio) stores the schemas for each topic with versions. Producers register or look up a schema and send only a small schema id with each binary message (Avro or Protobuf); consumers fetch the schema by id. The registry can also <b>enforce compatibility</b> when a new schema is registered, rejecting a change that would break existing readers, which moves breakage from a production incident to a failed CI build.</p>
+
+<h3>13.3 Evolution rules</h3>
+<ul>
+  <li><b>Backward compatible:</b> new consumers can read old messages. Adding an optional field with a default is safe.</li>
+  <li><b>Forward compatible:</b> old consumers can read new messages. They must ignore unknown fields.</li>
+  <li>Never reuse or change the meaning or type of a field. Add a new field and deprecate the old.</li>
+  <li>Removing a required field, renaming, or changing a type is a <b>breaking change</b>: publish a new event type or a new topic version (<code>order.placed.v2</code>) and run both until consumers migrate.</li>
+  <li>Upgrade <b>consumers first</b>, then producers, so consumers are ready for the new fields before they appear.</li>
+  <li>Consumers should be tolerant readers: ignore the unknown, default the missing, and send unparseable messages to the DLQ rather than crashing in a loop.</li>
+</ul>
+
+<h2 id="outbox">14. Transactional outbox and inbox</h2>
+
+<p>A service often needs to change its database and publish a message, for example insert an order row and publish <code>OrderPlaced</code>. These are two systems with no shared transaction. If you write the row and then publish, a crash between them loses the message. If you publish first, a crash leaves a message about an order that does not exist. <a href="31-distributed-transactions.html">Chapter 31</a> explains why two-phase commit across a database and a broker is usually avoided; the <b>transactional outbox</b> is the standard answer.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 310" role="img" aria-label="Transactional outbox and inbox">
+  <rect class="box" x="20" y="100" width="140" height="70" rx="8"/><text class="t-c t-b" x="90" y="130">Order service</text><text class="t-c t-sm" x="90" y="150">one local txn</text>
+  <rect class="db" x="230" y="40" width="180" height="50" rx="8"/><text class="t-c" x="320" y="70">orders table</text>
+  <rect class="db" x="230" y="120" width="180" height="50" rx="8"/><text class="t-c" x="320" y="150">outbox table</text>
+  <rect class="box" x="230" y="210" width="180" height="50" rx="8"/><text class="t-c t-b" x="320" y="232">Relay / CDC</text><text class="t-c t-sm" x="320" y="250">polls or tails the log</text>
+  <rect class="cache" x="480" y="120" width="130" height="50" rx="8"/><text class="t-c t-b" x="545" y="150">Broker</text>
+  <rect class="box" x="680" y="100" width="130" height="70" rx="8"/><text class="t-c t-b" x="745" y="128">Consumer</text><text class="t-c t-sm" x="745" y="148">checks inbox</text>
+  <rect class="db" x="680" y="210" width="130" height="50" rx="8"/><text class="t-c" x="745" y="240">inbox table</text>
+  <path class="arrow" d="M160 125 L226 70"/><path class="arrow" d="M160 145 L226 145"/>
+  <path class="arrow dash" d="M320 170 L320 206"/><path class="arrow" d="M410 235 L500 172"/>
+  <path class="arrow" d="M610 145 L676 140"/><path class="arrow" d="M745 170 L745 206"/>
+  <text class="t-sm" x="20" y="290">Left: business row and outbox row commit atomically. Right: message id in the inbox makes redelivery harmless.</text>
+</svg>
+<figcaption>The service writes its state and an outbox row in one local transaction. A separate relay publishes outbox rows to the broker and marks them sent, so a crash only causes a re-publish (a duplicate), never a loss. On the consuming side, an inbox table of processed message ids, written in the same transaction as the effect, removes the duplicate.</figcaption>
+</figure>
+
+<p>The relay is either a <b>polling publisher</b> (a loop selecting unsent rows, simple, adds latency and database load) or <b>change data capture</b> (Debezium tails the database log and emits outbox rows to Kafka, low latency, more infrastructure; see <a href="36-event-driven.html">Chapter 36</a>). Either way the guarantee is at-least-once, so the inbox on the consumer closes the loop, giving effectively-once results. Practical notes: add a periodic cleanup of old outbox and inbox rows, publish in per-key order so ordering is preserved, and index unsent rows so the poller is cheap.</p>
+
+<h2 id="replay">15. Replay and reprocessing</h2>
+
+<p>Sometimes you need to process old messages again: a bug corrupted a downstream table, a new consumer needs history, or a DLQ has been fixed. How easy that is depends on the broker.</p>
+<ul>
+  <li><b>Log-based (Kafka, Kinesis):</b> messages stay for the retention period (days to forever with compaction or tiered storage). Replay means <b>resetting the consumer group's offset</b> to an earlier point or timestamp. A new consumer group can read from the start. This is a major advantage of logs.</li>
+  <li><b>Queue-based (SQS, RabbitMQ):</b> messages are deleted after ack, so there is nothing to replay unless you archive. Common practice is to also write every message to durable storage (an archive subscription to S3), and re-inject from there when needed.</li>
+</ul>
+<p>Replay rules: (1) the consumer must be idempotent, because replay re-delivers messages it has already handled; (2) replay into a <b>separate topic or group</b> where possible, so the live flow is not disturbed; (3) <b>rate limit</b> the replay so downstream systems are not flooded; (4) be careful with side effects: replaying an <code>OrderPlaced</code> event must not send customers a second confirmation email, so separate pure state rebuilding from outbound side effects, or add a replay flag that suppresses them; (5) record what was replayed and why.</p>
+
+<h2 id="compose">16. Routing and composition patterns</h2>
+
+<p>Small, single-purpose messaging components can be assembled into larger flows. These patterns come from the classic <i>Enterprise Integration Patterns</i> catalogue and still describe what stream processors and workflow tools do.</p>
+
+<h3>16.1 Content-based routing</h3>
+<p>A <b>router</b> inspects a message and sends it to one of several destinations: orders over 10,000 dollars go to the manual review queue, EU orders to the EU processor, <code>type = refund</code> to the refunds queue. Implement with broker features (RabbitMQ topic and headers exchanges, SNS filter policies, Kafka routing in a small stream processor) rather than hard-coding in every producer. Keep routing rules in one place, since scattered rules become unreadable.</p>
+
+<h3>16.2 Splitter and aggregator</h3>
+<p>A <b>splitter</b> breaks one message into many: an order with 20 line items becomes 20 item messages for parallel processing. An <b>aggregator</b> collects related messages back into one, using a correlation id and a completion rule: "all 20 items processed", or "wait at most 30 seconds". The aggregator needs <b>state</b> (which parts have arrived), a <b>timeout</b> (what to do with partial results), and idempotent handling (a duplicated part must not count twice).</p>
+
+<h3>16.3 Scatter-gather</h3>
+<p><b>Scatter-gather</b> sends one request to several recipients in parallel and gathers their replies into one result: ask five shipping carriers for a quote and pick the cheapest, or query several shards. It is a splitter (scatter) plus an aggregator (gather) with a correlation id and a deadline. Choose the completion policy deliberately: wait for all, wait for the first N, or take whatever arrived at the deadline. Tail latency is set by the slowest participant, so the deadline matters (see <a href="40-resilience.html">Chapter 40</a>).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 280" role="img" aria-label="Scatter-gather with splitter and aggregator">
+  <rect class="ext" x="20" y="105" width="110" height="50" rx="8"/><text class="t-c t-b" x="75" y="135">Request</text>
+  <rect class="box" x="180" y="105" width="120" height="50" rx="8"/><text class="t-c t-b" x="240" y="128">Scatter</text><text class="t-c t-sm" x="240" y="145">corrId=9</text>
+  <rect class="box" x="400" y="20" width="130" height="40" rx="8"/><text class="t-c" x="465" y="45">Carrier A</text>
+  <rect class="box" x="400" y="110" width="130" height="40" rx="8"/><text class="t-c" x="465" y="135">Carrier B</text>
+  <rect class="box" x="400" y="200" width="130" height="40" rx="8"/><text class="t-c" x="465" y="225">Carrier C (slow)</text>
+  <rect class="cache" x="640" y="95" width="140" height="70" rx="8"/><text class="t-c t-b" x="710" y="122">Aggregator</text><text class="t-c t-sm" x="710" y="142">state by corrId</text><text class="t-c t-sm" x="710" y="156">deadline 800 ms</text>
+  <rect class="hit" x="810" y="105" width="80" height="50" rx="8"/><text class="t-c t-sm" x="850" y="135">best quote</text>
+  <path class="arrow" d="M130 130 L176 130"/><path class="arrow" d="M300 120 L396 45"/><path class="arrow" d="M300 130 L396 130"/><path class="arrow" d="M300 140 L396 215"/>
+  <path class="arrow" d="M530 40 L636 110"/><path class="arrow" d="M530 130 L636 130"/><path class="arrow-r dash" d="M530 220 L636 150"/>
+  <path class="arrow" d="M780 130 L806 130"/>
+  <text class="t-sm" x="540" y="262">C misses the deadline, so the result uses A and B.</text>
+</svg>
+<figcaption>One request is scattered to three carriers under a shared correlation id. The aggregator waits until all replies arrive or the deadline passes, then emits the best result it has.</figcaption>
+</figure>
+
+<h3>16.4 Pipes and filters</h3>
+<p><b>Pipes and filters</b> decomposes processing into a chain of small stages (filters), connected by queues or topics (pipes): validate, enrich, price, persist. Each stage can be scaled, deployed, and tested independently, and the queues buffer between stages of different speeds. The costs are extra latency per hop, more moving parts to monitor, and the need to handle failure at every stage. Stream processors (Kafka Streams, Flink) are essentially a managed way to build these chains.</p>
+
+<h2 id="sagas">17. Sagas via messages</h2>
+
+<p>When a business process spans several services, each with its own database, you cannot use one ACID transaction. A <b>saga</b> splits the process into local transactions, each followed by a message that triggers the next, with <b>compensating actions</b> (refund, release stock) when a later step fails. In a <b>choreographed</b> saga, services react to each other's events with no central controller. In an <b>orchestrated</b> saga, a coordinator sends commands and tracks state. All of the patterns in this chapter are the plumbing a saga relies on: each step must be reliably published (outbox), delivered at least once (retries), safe on repeat (idempotent consumer), and compensatable, with timeouts for missing replies and a DLQ for steps that cannot proceed. The overview is in <a href="31-distributed-transactions.html">Chapter 31</a> and the full treatment in <a href="48-sagas.html">Chapter 48</a>.</p>
+
+<h2 id="observability">18. Testing and observability of async flows</h2>
+
+<p>Asynchronous flows are harder to debug than call stacks: the cause and the failure are separated by queues and time. Plan for it from the start.</p>
+
+<h3>18.1 Observability</h3>
+<ul>
+  <li><b>Propagate context.</b> Put the trace id and correlation id in message headers, and continue the trace in the consumer (as a linked span, since the producer's span has already ended). Then one trace id shows the whole path.</li>
+  <li><b>Queue metrics:</b> depth, age of oldest message, publish rate, consume rate, in-flight count, redelivery count, and DLQ depth. Age of oldest message and lag in time are the most meaningful.</li>
+  <li><b>Handler metrics:</b> processing latency percentiles, success, retry, and dead-letter rates, grouped by message type and error class.</li>
+  <li><b>End-to-end latency:</b> measure from the message's creation time to the completion of processing, not just handler time. It includes queue wait.</li>
+  <li><b>Structured logs</b> with message id, type, key, attempt number, and outcome, so you can answer "what happened to message X?".</li>
+  <li><b>Alerts</b> on lag age beyond SLA, DLQ non-empty, consumer count zero, and poison-loop signs (the same message id with a growing attempt count).</li>
+</ul>
+
+<h3>18.2 Testing</h3>
+<ul>
+  <li><b>Unit-test handlers as pure functions</b> with the same message delivered twice, and delivered out of order, to prove idempotency and order tolerance.</li>
+  <li><b>Contract tests</b> between producer and consumer on the schema (consumer-driven contracts, or registry compatibility checks in CI).</li>
+  <li><b>Integration tests</b> with a real broker in a container (Testcontainers) to exercise acks, visibility timeouts, and redelivery.</li>
+  <li><b>Fault injection:</b> kill a consumer mid-message, drop acks, delay the downstream, send a malformed message, send a duplicate, and verify the system recovers and the DLQ receives the right things.</li>
+  <li><b>Load tests</b> that include a burst and a recovery, to verify lag drains within SLA.</li>
+  <li><b>Asserting async outcomes:</b> poll with a timeout for the expected final state rather than sleeping a fixed time.</li>
+</ul>
+
+<h2 id="antipatterns">19. Anti-patterns</h2>
+
+<table>
+<tr><th>Anti-pattern</th><th>Why it hurts</th><th>Do this instead</th></tr>
+<tr><td>Queue as a database</td><td>Querying, updating, or looking up by field is impossible or slow; retention is limited; messages are meant to be consumed, not stored. Teams start to peek and filter, and rely on a message staying.</td><td>Store state in a database; use the queue to carry work or events. For event history, use a log with compaction deliberately.</td></tr>
+<tr><td>Giant messages</td><td>Break size limits, slow partitions, bloat retries and the DLQ.</td><td>Claim check (section 12).</td></tr>
+<tr><td>Unbounded retries</td><td>A permanent failure loops forever, consumes capacity, and hides the bug; retry storms amplify outages.</td><td>Classify errors, cap attempts and age, backoff with jitter, DLQ, circuit breaker.</td></tr>
+<tr><td>Shared queues across teams</td><td>One team's poison message, slow consumer, or schema change harms others; unclear ownership; cannot change the queue safely.</td><td>One queue per consumer (SNS plus SQS), with a contract and one owner. Topics may be shared as published interfaces.</td></tr>
+<tr><td>Assuming exactly-once or ordering</td><td>Duplicates and reordering appear in production under failure and corrupt data.</td><td>Idempotent, order-tolerant handlers; per-key ordering where needed.</td></tr>
+<tr><td>Dual write (DB then publish)</td><td>Crash between them loses or invents events.</td><td>Transactional outbox (section 14).</td></tr>
+<tr><td>No DLQ monitoring</td><td>Silent data loss of user actions.</td><td>Alert on DLQ depth and age; runbook plus redrive tool.</td></tr>
+<tr><td>Fire-and-forget with no timeout on replies</td><td>Requesters hang or leak memory waiting.</td><td>Timeouts, correlation ids, ignore late replies.</td></tr>
+<tr><td>Everything async</td><td>Added latency and complexity where a simple call suffices; hard-to-trace flows.</td><td>Use messaging when you need buffering, decoupling, fan-out, or retry; keep simple queries synchronous.</td></tr>
+</table>
+
+<h2 id="worked">20. Worked example: an order processing pipeline</h2>
+
+<p>An e-commerce site takes orders. Requirements: normal load 300 orders/s, flash-sale peak 3,000 orders/s for 5 minutes, accept the order in under 200 ms, then payment, inventory, shipping, email, and analytics must follow reliably. No order lost, no double charge.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Order pipeline with outbox, topic, per-service queues and DLQs">
+  <rect class="ext" x="10" y="130" width="100" height="50" rx="8"/><text class="t-c t-b" x="60" y="160">Checkout API</text>
+  <rect class="db" x="150" y="125" width="110" height="60" rx="8"/><text class="t-c" x="205" y="150">orders +</text><text class="t-c" x="205" y="168">outbox (DB)</text>
+  <rect class="box" x="300" y="130" width="90" height="50" rx="8"/><text class="t-c" x="345" y="160">Relay</text>
+  <rect class="cache" x="430" y="125" width="100" height="60" rx="8"/><text class="t-c t-b" x="480" y="150">Topic</text><text class="t-c t-sm" x="480" y="168">order-events</text>
+  <rect class="cache" x="590" y="20" width="110" height="40" rx="8"/><text class="t-c" x="645" y="45">q-payment</text>
+  <rect class="cache" x="590" y="85" width="110" height="40" rx="8"/><text class="t-c" x="645" y="110">q-inventory</text>
+  <rect class="cache" x="590" y="150" width="110" height="40" rx="8"/><text class="t-c" x="645" y="175">q-shipping</text>
+  <rect class="cache" x="590" y="215" width="110" height="40" rx="8"/><text class="t-c" x="645" y="240">q-email</text>
+  <rect class="cache" x="590" y="280" width="110" height="40" rx="8"/><text class="t-c" x="645" y="305">q-analytics</text>
+  <rect class="miss" x="750" y="20" width="130" height="40" rx="8"/><text class="t-c t-sm" x="815" y="45">workers + DLQ</text>
+  <rect class="box" x="750" y="85" width="130" height="40" rx="8"/><text class="t-c t-sm" x="815" y="110">workers + DLQ</text>
+  <rect class="box" x="750" y="150" width="130" height="40" rx="8"/><text class="t-c t-sm" x="815" y="175">workers + DLQ</text>
+  <rect class="box" x="750" y="215" width="130" height="40" rx="8"/><text class="t-c t-sm" x="815" y="240">workers + DLQ</text>
+  <rect class="box" x="750" y="280" width="130" height="40" rx="8"/><text class="t-c t-sm" x="815" y="305">workers + DLQ</text>
+  <path class="arrow" d="M110 155 L146 155"/><path class="arrow" d="M260 155 L296 155"/><path class="arrow" d="M390 155 L426 155"/>
+  <path class="arrow" d="M530 140 L586 42"/><path class="arrow" d="M530 148 L586 105"/><path class="arrow" d="M530 158 L586 170"/><path class="arrow" d="M530 168 L586 232"/><path class="arrow" d="M530 176 L586 296"/>
+  <path class="arrow" d="M700 40 L746 40"/><path class="arrow" d="M700 105 L746 105"/><path class="arrow" d="M700 170 L746 170"/><path class="arrow" d="M700 235 L746 235"/><path class="arrow" d="M700 300 L746 300"/>
+</svg>
+<figcaption>The checkout API writes the order and an outbox row in one transaction and returns. The relay publishes to a topic, which fans out to one queue per service, each with its own workers, retries, and DLQ.</figcaption>
+</figure>
+
+<h3>20.1 Sizing the burst</h3>
+<ul>
+  <li>Checkout writes 3,000 orders/s at peak to a partitioned database; the response returns after the commit, around 50 ms. The user sees "order received".</li>
+  <li>Fan-out: 3,000 events/s into 5 queues = 15,000 deliveries/s at peak.</li>
+  <li>Payment is the slowest: 150 ms average per call to the payment provider, which is limited to 800 requests/s. Needed concurrency by Little's law: 800 × 0.15 = 120 workers at the cap. The payment queue is therefore drained at 800/s, not 3,000/s.</li>
+  <li>Backlog from the 5-minute peak: (3,000 − 800) × 300 = 660,000 messages in q-payment. Baseline arrival 300/s leaves net drain of 500/s, so clearing takes 660,000 ÷ 500 = 1,320 s, about 22 minutes. Is 22 minutes of payment delay acceptable? If not, negotiate a higher provider limit, or prioritize (below). Meanwhile checkout stays fast because the queue absorbs the burst.</li>
+  <li>Email, analytics, and shipping have no hard external limit: scale each to clear in under 2 minutes after the burst.</li>
+</ul>
+
+<h3>20.2 Correctness choices</h3>
+<ul>
+  <li><b>Partitioning and order:</b> events keyed by order id, so an order's <code>Placed</code>, <code>Paid</code>, and <code>Shipped</code> events stay in order for each consumer. With 24 partitions on the topic and 8 per-queue-group consumers per partition-set, throughput comes from the many orders.</li>
+  <li><b>Idempotency:</b> the payment worker sends the order id as the provider's idempotency key, and records the message id in an inbox row in the same transaction as the payment record. A redelivered message becomes a no-op, so a double charge cannot occur.</li>
+  <li><b>Retries:</b> payment provider 503s retry at 5 s, 30 s, and 5 min with jitter, then DLQ. A declined card is a permanent business outcome, not an error: it emits <code>PaymentFailed</code>, and the saga cancels the order and releases stock (<a href="48-sagas.html">Chapter 48</a>).</li>
+  <li><b>Priority:</b> a separate q-payment-priority for orders from customers with express shipping, which gets 30 percent of payment capacity.</li>
+  <li><b>TTL:</b> the email queue drops "your order is on its way" messages older than 24 hours.</li>
+  <li><b>Schema:</b> the envelope carries <code>schemaVersion</code>; the registry enforces backward compatibility; consumers are deployed before producers.</li>
+  <li><b>Claim check:</b> the invoice PDF is stored in object storage and only its reference travels in the shipping message.</li>
+</ul>
+
+<h3>20.3 Failure walk-through</h3>
+<ol>
+  <li>The relay crashes after publishing 100 rows but before marking them sent. On restart it republishes them. Duplicates reach the consumers, which dedup by message id. No loss.</li>
+  <li>The inventory service is down for 10 minutes. Its queue grows to 1.8 million messages at 3,000/s; other consumers are unaffected, which is the benefit of one queue per consumer. When it returns, it drains at its own capacity; alerts fired on age of the oldest message at 2 minutes.</li>
+  <li>A deploy introduces a bug that crashes on orders with an empty address. Those messages hit max receive count (5) and land in q-shipping-DLQ. Alert fires. The team fixes the bug and uses the redrive tool at 100 messages/s. Because the handler is idempotent, redriven messages that had partly succeeded are safe.</li>
+</ol>
+
+<h2 id="qa">21. Interview Q&amp;A</h2>
+
+<details><summary>When would you choose a queue versus a topic with subscribers?</summary>
+<p>Choose a queue when the message is a command with one logical owner: "resize this image" should be done once by one worker out of a pool. Choose a topic when the message is a fact that several independent parties might care about and the producer should not know who they are. In practice you combine them: publish the event to a topic and give each subscribing service its own queue, which gives broadcast plus per-consumer buffering, retry, and DLQ. The deciding question is who must act and whether the sender needs to know.</p></details>
+
+<details><summary>How do you preserve message order while still scaling consumers?</summary>
+<p>Do not seek global order; require order per entity. Choose a key such as order id, hash it to a partition (or use a FIFO group id), and have one consumer own each partition. Messages for one key stay ordered, while different keys process in parallel across partitions and consumers. The limits are that parallelism cannot exceed the number of partitions, a hot key throttles one partition, and a failing message blocks its partition. If the transport cannot guarantee order, add per-entity sequence numbers or versions and have the consumer buffer, skip stale messages, or apply versioned state so that disorder is harmless.</p></details>
+
+<details><summary>Design the retry strategy for a consumer calling a flaky downstream service.</summary>
+<p>First classify errors: transient (timeouts, 503) are retried, permanent (validation, bad data) go straight to the DLQ. For transient errors, do one or two quick in-process retries, then use delayed retries with exponential backoff and full jitter, implemented via retry tiers (10 s, 1 min, 10 min topics) so the main queue is not blocked. Cap attempts and total age, and after the last tier dead-letter the message. Add a circuit breaker so that when the downstream is clearly down the consumer pauses instead of cycling every message through the tiers. Jitter matters because otherwise a burst of failures synchronizes into repeated retry waves.</p></details>
+
+<details><summary>What is a poison message and how do you handle one in an ordered stream?</summary>
+<p>A poison message is one that can never be processed successfully, for example malformed data or a payload that triggers a handler bug, so every retry fails. Left alone it blocks its partition or loops forever. You detect it with a delivery-attempt counter or a non-retryable error type, move it to a DLQ with full context (payload, error, offsets, attempts), alert, and then fix and redrive at a controlled rate. In a strictly ordered stream, skipping it means later messages for that key run first, so you either accept that and make handlers version-aware, or halt that key until a human resolves it. The choice depends on whether correctness or availability matters more for that data.</p></details>
+
+<details><summary>How can you achieve exactly-once processing when the broker is at-least-once?</summary>
+<p>You cannot make the network deliver exactly once, but you can make the effect happen once. Combine at-least-once delivery with an idempotent consumer: give every message a unique id, and in the same database transaction as the business change insert that id into an inbox table with a unique constraint, so a duplicate is rejected and rolled back. For external side effects, pass the id as an idempotency key to the other service. On the producing side, use the transactional outbox so the event is published if and only if the state change committed. Kafka transactions give exactly-once within Kafka read-process-write pipelines, but they do not extend to side effects in other systems.</p></details>
+
+<details><summary>Your consumer lag is growing. How do you diagnose and respond?</summary>
+<p>First determine whether production rose or consumption fell. Check the produce and consume rates, handler latency, error and retry rates, rebalance frequency, and downstream health. If handlers are slow because a dependency is slow, adding consumers may worsen things, so throttle concurrency and fix or protect the dependency. If the consumers are the bottleneck and the partitions allow it, scale out. If lag is only a burst, estimate the drain time (backlog divided by consume rate minus produce rate) and decide if it is within the SLA. Long term, apply backpressure to producers, shed low-value or expired work with TTL, and alert on age of the oldest message rather than raw depth.</p></details>
+
+<details><summary>Why does the transactional outbox exist, and what are its costs?</summary>
+<p>A service that updates its database and then publishes to a broker can crash between the two, losing the event, and publishing first risks announcing something that never committed. Two-phase commit across a database and a broker is usually unavailable or too fragile. The outbox writes the event into a table in the same local transaction as the state change, and a relay (poller or change-data-capture) publishes it afterwards. The costs are an extra table and relay to operate, added publishing latency, at-least-once publishing (so consumers need an inbox or idempotency), and cleanup of old rows. In exchange the system never loses or invents events.</p></details>
+
+<details><summary>When would you use the claim check pattern, and what can go wrong with it?</summary>
+<p>Use it when payloads are large relative to broker limits and efficiency, such as documents, images, or big JSON: store the payload in object storage and send a small reference with a checksum. This keeps messages small, so throughput, retries, and DLQ handling stay cheap. Failure modes include sending the message before the upload completes (a dangling reference), objects deleted before the message is processed or replayed (so lifecycle rules must outlive message retention), overwritten objects that change replay results (use immutable keys), and permission gaps for consumers. Also remember the storage is a second system whose availability and cost you now depend on.</p></details>
+
+<details><summary>How would you implement request-reply over a message queue, and when is it a bad idea?</summary>
+<p>The requester sends a message to a request queue with a reply-to address and a correlation id, the responder processes it and publishes the answer to the reply-to queue with the same correlation id, and the requester matches it to the pending call. It needs a timeout, idempotent requests (a timed-out request may still run), and tolerance for late or duplicate replies. It is a good fit when the responders are a slow or bursty worker pool and you want buffering. It is a bad idea as a general replacement for synchronous calls on a hot path, since it adds latency and operational complexity, and a plain RPC with timeouts and retries is simpler.</p></details>
+
+<details><summary>Why is "one shared queue for several teams" a problem, and what is the alternative?</summary>
+<p>A shared queue couples the teams: one team's slow consumer or poison message delays everyone, a schema change breaks unrelated readers, nobody owns capacity or the DLQ, and competing consumers from different teams would each steal messages meant for others. The alternative is a published topic or event stream owned by the producing team, with each consuming team given its own queue or consumer group, its own retry policy and DLQ, and a documented schema contract checked in a registry. Each team can then deploy, scale, and fail independently.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">22. Recap</h2>
+<ul>
+  <li>Brokers give at-least-once delivery and partial ordering; patterns exist to make consumers correct anyway.</li>
+  <li>Queues carry commands to one consumer; topics carry events to many. SNS plus SQS (or Kafka groups) gives durable fan-out with per-consumer isolation.</li>
+  <li>Competing consumers scale throughput, bounded by partitions and downstream capacity; scale on backlog age.</li>
+  <li>Require order per key, not globally: key partitioning, sequence numbers, or versioned state; ordering costs parallelism and invites head-of-line blocking.</li>
+  <li>Retry only transient errors, with bounded attempts, exponential backoff with jitter, and retry tiers; dead-letter the rest with context, alert, and redrive at a controlled rate.</li>
+  <li>Idempotent consumers (inbox table, conditional updates, idempotency keys) turn at-least-once into effectively-once.</li>
+  <li>Handle load with backpressure, bounded queues, queue-based load leveling, separate priority queues, delays, and TTL.</li>
+  <li>Use correlation ids for request-reply and tracing, claim check for big payloads, envelopes plus a schema registry for evolution, and the outbox for atomic state-plus-publish.</li>
+  <li>Compose flows with routers, splitters, aggregators, scatter-gather, and pipes and filters; sagas rely on all of the above.</li>
+  <li>Test duplicates, reordering, and crashes; observe lag age, DLQ depth, and end-to-end latency; avoid queue-as-database, giant messages, unbounded retries, and shared queues.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="34-queues-kafka.html">Chapter 34</a> (brokers, partitions, consumer groups), <a href="32-idempotency-ids.html">Chapter 32</a> (idempotency and delivery semantics), <a href="31-distributed-transactions.html">Chapter 31</a> (outbox, inbox, sagas), and <a href="07-serialization.html">Chapter 7</a> (schemas and evolution). Leads to <a href="36-event-driven.html">Chapter 36</a> (event-driven design, CQRS, CDC), <a href="40-resilience.html">Chapter 40</a> (timeouts, retries, circuit breakers), and <a href="48-sagas.html">Chapter 48</a> (sagas in depth).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

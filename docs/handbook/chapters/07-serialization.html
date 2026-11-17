@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 7: Serialization, Compression and Batching | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="07-serialization">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+  </defs>
+</svg>
+
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+
+<main>
+<div class="kicker">Chapter 7 · Module 1 · Networking and communication</div>
+<h1>Serialization, Compression and Batching</h1>
+<p class="lead">Every byte that crosses a network or lands on disk was produced by some encoding, and every encoding is a bet about CPU, size, readability, and how the data will change over the years. This chapter explains how data is turned into bytes, how those bytes are shrunk and grouped, and how to choose well in a design interview.</p>
+
+<!-- ======================= 1 ======================= -->
+<h2 id="why">1. Why serialization matters</h2>
+
+<p>Inside a running program, data lives as objects: a <code>User</code> with an integer id, a string name, and a list of orders. These objects are made of pointers, memory addresses, and language-specific layouts. None of that can be sent over a network cable or written to a disk file as it is. A pointer that is valid in one process means nothing in another. So before data leaves a process, it must be converted into a flat sequence of bytes, and the receiver must convert those bytes back into objects. The first step is called <b>serialization</b> (also <b>encoding</b> or <b>marshalling</b>), and the second is <b>deserialization</b> (<b>decoding</b>, <b>unmarshalling</b>, or <b>parsing</b>).</p>
+
+<p>This looks like plumbing, and many engineers treat it as an afterthought: "we just use JSON". But the choice of format quietly controls three large properties of a system.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 200" role="img" aria-label="Serialization path from object to bytes to network to bytes to object">
+  <rect class="box" x="10"  y="40" width="140" height="56" rx="8"/><text class="t-c t-b" x="80" y="64">In-memory</text><text class="t-c t-sm" x="80" y="82">object (service A)</text>
+  <path class="arrow" d="M150 68 L196 68"/>
+  <rect class="cache" x="200" y="40" width="110" height="56" rx="8"/><text class="t-c t-b" x="255" y="64">Encoder</text><text class="t-c t-sm" x="255" y="82">CPU cost</text>
+  <path class="arrow" d="M310 68 L356 68"/>
+  <rect class="ext" x="360" y="40" width="180" height="56" rx="8"/><text class="t-c t-b" x="450" y="64">Bytes on the wire</text><text class="t-c t-sm" x="450" y="82">size = bandwidth + latency</text>
+  <path class="arrow" d="M540 68 L586 68"/>
+  <rect class="cache" x="590" y="40" width="110" height="56" rx="8"/><text class="t-c t-b" x="645" y="64">Decoder</text><text class="t-c t-sm" x="645" y="82">CPU cost</text>
+  <path class="arrow" d="M700 68 L746 68"/>
+  <rect class="box" x="750" y="40" width="140" height="56" rx="8"/><text class="t-c t-b" x="820" y="64">In-memory</text><text class="t-c t-sm" x="820" y="82">object (service B)</text>
+  <rect class="hit" x="200" y="120" width="500" height="56" rx="8"/>
+  <text class="t-c t-b" x="450" y="144">Evolution: A and B are deployed at different times</text>
+  <text class="t-c t-sm" x="450" y="162">the bytes must stay readable when the two sides disagree about the shape of the data</text>
+</svg>
+<figcaption>Every hop pays for encoding CPU, for the bytes it produces, and for surviving schema changes between independently deployed services.</figcaption>
+</figure>
+
+<h3>1.1 CPU</h3>
+<p>Encoding and decoding are real work. A text format like JSON must walk every character, find quotes and braces, convert the text "12345" into the integer 12345, unescape strings, and allocate many small objects. In a service that does little else besides receive a request, call a database, and answer, parsing and building JSON is often one of the top entries in a CPU profile. Binary formats usually decode several times faster because they do not scan for delimiters: lengths are written first, and integers are already in a form the machine can read quickly. At small scale this does not matter. At 50,000 requests per second it can be the difference between three servers and ten (section 14 works through numbers). It also matters for garbage collection: a format that creates fewer temporary objects causes fewer pauses, which improves tail latency (<a href="40-resilience.html">Chapter 40</a>).</p>
+
+<h3>1.2 Bytes</h3>
+<p>Size affects three things at once. First, network bandwidth, which you pay for in cloud egress fees and in saturated links. Second, latency: a payload that fits in one TCP segment (about 1,460 bytes of data on a typical path) can arrive in one round trip, while a larger one needs more segments, and during TCP's early slow-start phase each extra window of data can cost another round trip (see <a href="03-networking-essentials.html">Chapter 3</a>). Third, storage: the same events written to Kafka or to object storage take disk space for as long as retention lasts, and replication multiplies it. If a 1 KB record shrinks to 300 bytes, you store, replicate, and read 70 percent less data forever.</p>
+
+<h3>1.3 Evolution</h3>
+<p>The third property is the one that bites longest. In a real system, the sender and the receiver are deployed independently, often by different teams, and data written years ago is still sitting in a log or a database. When you add a field to a message, some readers will not know about it yet; when you remove one, some old data will still have it. A format must give clear rules for what happens in these cases. Formats differ enormously here: some tolerate change by design, and some silently corrupt data. Section 5 covers this in depth.</p>
+
+<div class="callout key"><b>Key idea</b>
+Choosing a serialization format is choosing a point in a three-way tradeoff between <b>CPU time</b>, <b>bytes</b>, and <b>human and evolutionary friendliness</b>. Text formats like JSON are easy to read and debug but larger and slower. Binary schema-based formats like Protocol Buffers and Avro are small, fast, and evolve by explicit rules, but you cannot read them with your eyes and you must manage schemas.
+</div>
+
+<p>Two more ideas frame the rest of the chapter. <b>Compression</b> is a separate, optional step applied to the encoded bytes to make them smaller at the cost of more CPU (sections 8 and 9). <b>Batching</b> is the practice of grouping many small items into one bigger unit so that fixed per-message costs, such as a network round trip, a system call, or a disk seek, are paid once instead of many times (sections 10 and 11). Together, the three techniques are how high-throughput systems such as Kafka, Cassandra, and gRPC services move large volumes of data cheaply.</p>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="text">2. Text formats: JSON, XML, CSV</h2>
+
+<p>A <b>text format</b> encodes data as characters (usually UTF-8) that a person can read in an editor. The main ones are JSON, XML, and CSV.</p>
+
+<h3>2.1 JSON</h3>
+<p><b>JSON</b> (JavaScript Object Notation) represents objects (key/value maps), arrays, strings, numbers, booleans, and null. It dominates web APIs because browsers parse it natively, every language has a library, and a developer can read a response with <code>curl</code>. It is <b>self-describing</b>: each value carries its field name, so a reader needs no external schema to make sense of it. That is also its main cost, because the field names are repeated in every single record. A list of one million users will contain the string <code>"name"</code> one million times.</p>
+<p>JSON also has weak typing. There is one number type with no distinction between integer and float, no date type, no binary type (binary must be base64 encoded, which inflates it by a third), and no comment syntax. Section 13 shows the practical traps that follow from this. JSON has no built-in schema either, although JSON Schema and OpenAPI can describe it, and nothing forces a producer to follow them at runtime.</p>
+<p>A useful JSON variant for streams is <b>NDJSON</b> or <b>JSON Lines</b>: one complete JSON value per line, separated by newline characters. It lets you append records to a file, process a huge file line by line without loading it, and split logs easily. Many log pipelines use it.</p>
+
+<h3>2.2 XML</h3>
+<p><b>XML</b> uses opening and closing tags, attributes, and namespaces. It has mature schema languages (XSD), transformation (XSLT), and query (XPath), and it was the standard for enterprise integration and SOAP web services. It is more verbose than JSON because every element name appears twice, once in the open tag and once in the close tag. It is still common in older enterprise systems, document formats, and configuration, but new APIs rarely choose it. Parsers also need care: XML allows entity expansion, which has been abused for the "billion laughs" attack, a tiny document that expands to gigabytes (section 9.4 returns to this idea for compression).</p>
+
+<h3>2.3 CSV</h3>
+<p><b>CSV</b> (comma-separated values) is rows of values separated by commas, optionally with a header row. It is compact for flat tables because field names appear once, and spreadsheets and databases import it everywhere. But it has no types (everything is text), no nesting, and a famously loose standard: how to escape commas and newlines inside a value, which character set, and how to represent null all vary by tool. It is good for data export and simple bulk loads and poor for anything that needs structure or safe evolution, because adding a column in the middle silently shifts everything after it.</p>
+
+<h3>2.4 When text wins</h3>
+<p>Text formats win when humans are in the loop: public APIs where third-party developers must experiment with <code>curl</code>, browser clients, configuration files, logs you will grep, and low-volume service calls where CPU and bandwidth are not the bottleneck. A good default in an interview is: "JSON for the external, public API, because clients can use it without any tooling; a binary format between internal services if the volume or latency justifies it." Interviewers like hearing you separate the <i>edge</i> format from the <i>internal</i> format, because the two audiences have different needs. The API gateway (<a href="11-api-gateway.html">Chapter 11</a>) is frequently where a JSON request from outside is translated into binary calls inside.</p>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="binary">3. Binary formats and how they differ</h2>
+
+<p>A <b>binary format</b> encodes data in a compact byte layout designed for machines. Most use a <b>schema</b>, a separate definition of which fields exist and what types they have, so the bytes do not need to carry field names. The main formats you should know:</p>
+
+<table>
+<tr><th>Format</th><th>Schema</th><th>Self-describing?</th><th>Key characteristic</th><th>Typical home</th></tr>
+<tr><td><b>Protocol Buffers</b> (Protobuf)</td><td>.proto file, compiled to code</td><td>No (needs schema to interpret)</td><td>Field numbers identify fields; varint integers; excellent evolution rules; wide tooling</td><td>gRPC, internal service APIs, Google-style systems</td></tr>
+<tr><td><b>Apache Avro</b></td><td>JSON schema, resolved at read time</td><td>Schema travels with file or via registry ID</td><td>No field tags at all, so smallest records; reader and writer schemas are reconciled</td><td>Kafka with a schema registry, Hadoop data files</td></tr>
+<tr><td><b>Apache Thrift</b></td><td>.thrift IDL, compiled</td><td>No</td><td>Like Protobuf with field ids; includes its own RPC framework; several protocols (binary, compact)</td><td>Facebook-originated systems, Cassandra's old interface, HBase</td></tr>
+<tr><td><b>MessagePack</b></td><td>None</td><td>Yes</td><td>"Binary JSON": same data model, compact type markers; still carries field names</td><td>Redis scripting, caches, drop-in JSON replacement</td></tr>
+<tr><td><b>FlatBuffers</b> (and Cap'n Proto)</td><td>.fbs file, compiled</td><td>No</td><td>Zero-copy: the buffer is laid out so it can be read in place without a parsing step</td><td>Games, mobile, latency-critical or memory-mapped data</td></tr>
+</table>
+
+<h3>3.1 What makes them smaller and faster</h3>
+<p>Three techniques explain most of the gain over JSON. First, <b>field identification by number rather than name</b>: instead of writing <code>"active"</code> (8 bytes with quotes), Protobuf writes a one-byte tag that stands for "field 3". Avro goes even further and writes no identification at all, relying on the schema to say that the third thing in the record is the boolean. Second, <b>compact integers</b>: a number like 150 takes 3 characters in JSON but a variable-length binary encoding can store small numbers in 1 byte (section 4). Third, <b>length-prefixed strings</b>: the decoder reads a length, then copies exactly that many bytes, instead of scanning forward for a closing quote and handling escape characters.</p>
+
+<h3>3.2 Zero-copy formats</h3>
+<p>FlatBuffers and Cap'n Proto take a different approach. Instead of making the encoding compact, they make it <b>directly usable</b>. The serialized buffer is laid out in memory exactly the way the program wants to read it, with offsets instead of pointers, so "decoding" is nothing more than following offsets inside the buffer. There is no parse step and often no allocation. The tradeoff is that the buffers are somewhat larger than Protobuf's (alignment padding is added) and the API is slightly more awkward. They shine when you have a very large message and want only a few fields from it, or when loading a file from disk by memory mapping it, which is why games and mobile apps like them.</p>
+
+<h3>3.3 Self-describing versus schema-required</h3>
+<p>A format is <b>self-describing</b> if the bytes contain enough information to be decoded without any external definition. JSON and MessagePack are self-describing: you can parse them and see names and types. Protobuf, Thrift, and FlatBuffers are <b>schema-required</b> in the sense that, without the .proto file, you can still split the bytes into (field number, value) pairs, but you do not know field names or whether a length-delimited chunk is a string, bytes, or a nested message. Avro is the extreme case: without the exact writer schema, the bytes are meaningless, because there are no tags at all.</p>
+<p>The tradeoff is direct. Self-describing formats cost more bytes but are easy to debug and forgiving about tooling. Schema-required formats are smaller and enforce a contract, but you must distribute schemas to every reader, keep versions straight, and have a way to look up the right schema for old data. This is exactly the problem that <b>schema registries</b> solve (section 6). Files can solve it a different way: an Avro container file or a Parquet file stores its schema once in the header or footer, so the file is self-describing even though each record is not.</p>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="protobuf">4. Inside Protocol Buffers: bytes, varints, tags</h2>
+
+<p>It is worth understanding one binary format at the byte level, because it shows concretely where savings come from and why evolution rules look the way they do. Protobuf is the best choice for this because it is widely used and its encoding is simple.</p>
+
+<p>Take this schema:</p>
+<pre><code>syntax = "proto3";
+message User {
+  int32  id     = 1;
+  string name   = 2;
+  bool   active = 3;
+}</code></pre>
+
+<p>and the record <code>id = 150, name = "Ada", active = true</code>. The JSON form <code>{"id":150,"name":"Ada","active":true}</code> is 37 bytes. The Protobuf encoding is 10 bytes:</p>
+<pre><code>08 96 01   12 03 41 64 61   18 01</code></pre>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Protobuf byte layout for a User message of 10 bytes">
+  <text class="t-b" x="20" y="22">The 10 bytes of the User record (hexadecimal)</text>
+  <text class="t-c t-sm" x="135" y="58">tag</text><text class="t-c t-sm" x="205" y="58">varint low</text><text class="t-c t-sm" x="275" y="58">varint high</text><text class="t-c t-sm" x="345" y="58">tag</text><text class="t-c t-sm" x="415" y="58">length</text><text class="t-c t-sm" x="485" y="58">'A'</text><text class="t-c t-sm" x="555" y="58">'d'</text><text class="t-c t-sm" x="625" y="58">'a'</text><text class="t-c t-sm" x="695" y="58">tag</text><text class="t-c t-sm" x="765" y="58">value</text>
+  <rect class="box"   x="100" y="68" width="70" height="44" rx="4"/><text class="t-c t-b" x="135" y="96">08</text>
+  <rect class="box"   x="170" y="68" width="70" height="44" rx="4"/><text class="t-c t-b" x="205" y="96">96</text>
+  <rect class="box"   x="240" y="68" width="70" height="44" rx="4"/><text class="t-c t-b" x="275" y="96">01</text>
+  <rect class="cache" x="310" y="68" width="70" height="44" rx="4"/><text class="t-c t-b" x="345" y="96">12</text>
+  <rect class="cache" x="380" y="68" width="70" height="44" rx="4"/><text class="t-c t-b" x="415" y="96">03</text>
+  <rect class="cache" x="450" y="68" width="70" height="44" rx="4"/><text class="t-c t-b" x="485" y="96">41</text>
+  <rect class="cache" x="520" y="68" width="70" height="44" rx="4"/><text class="t-c t-b" x="555" y="96">64</text>
+  <rect class="cache" x="590" y="68" width="70" height="44" rx="4"/><text class="t-c t-b" x="625" y="96">61</text>
+  <rect class="db"    x="660" y="68" width="70" height="44" rx="4"/><text class="t-c t-b" x="695" y="96">18</text>
+  <rect class="db"    x="730" y="68" width="70" height="44" rx="4"/><text class="t-c t-b" x="765" y="96">01</text>
+  <rect class="box"   x="100" y="130" width="210" height="64" rx="8"/><text class="t-c t-b" x="205" y="154">field 1 (id)</text><text class="t-c t-sm" x="205" y="174">tag 08, varint 96 01 = 150</text>
+  <rect class="cache" x="310" y="130" width="350" height="64" rx="8"/><text class="t-c t-b" x="485" y="154">field 2 (name)</text><text class="t-c t-sm" x="485" y="174">tag 12, length 03, bytes "Ada"</text>
+  <rect class="db"    x="660" y="130" width="140" height="64" rx="8"/><text class="t-c t-b" x="730" y="154">field 3 (active)</text><text class="t-c t-sm" x="730" y="174">tag 18, value 01</text>
+  <text class="t-sm" x="100" y="230">Field names never appear. The decoder uses the schema to map field number 1 to "id", 2 to "name", 3 to "active".</text>
+  <text class="t-sm" x="100" y="250">Field order on the wire is usually ascending by number, but decoders must accept any order.</text>
+</svg>
+<figcaption>Read left to right: each field is a tag byte that says which field and what kind of value follows, then the value itself. Colours group the bytes by field.</figcaption>
+</figure>
+
+<h3>4.1 Tags: field number plus wire type</h3>
+<p>Every field begins with a <b>tag</b>, a varint holding two pieces of information packed together: <code>(field_number &lt;&lt; 3) | wire_type</code>. The low three bits are the <b>wire type</b>, which tells the decoder how to find the end of the value without knowing the schema. The remaining bits are the <b>field number</b> you chose in the .proto file. For field 1 with wire type 0, the tag is (1 &lt;&lt; 3) | 0 = 8 = 0x08. For field 2 with wire type 2 it is (2 &lt;&lt; 3) | 2 = 18 = 0x12. For field 3 with wire type 0 it is 24 = 0x18. Because the tag uses 3 bits for the type, field numbers 1 to 15 fit in a single tag byte, which is why Protobuf advice says to give your most frequent fields small numbers.</p>
+
+<table>
+<tr><th>Wire type</th><th>Name</th><th>Used for</th><th>How the decoder finds the end</th></tr>
+<tr><td>0</td><td>VARINT</td><td>int32, int64, uint32, uint64, sint32, sint64, bool, enum</td><td>Read bytes until one has its high bit clear</td></tr>
+<tr><td>1</td><td>I64</td><td>fixed64, sfixed64, double</td><td>Exactly 8 bytes</td></tr>
+<tr><td>2</td><td>LEN</td><td>string, bytes, nested messages, packed repeated fields</td><td>Read a varint length, then that many bytes</td></tr>
+<tr><td>5</td><td>I32</td><td>fixed32, sfixed32, float</td><td>Exactly 4 bytes</td></tr>
+</table>
+
+<p>The wire type is what makes forward compatibility possible. A decoder that meets a field number it does not recognise still knows, from the wire type, how many bytes to skip, so it can ignore the unknown field safely and move on (and many implementations even preserve it to write back out).</p>
+
+<h3>4.2 Varints: small numbers in few bytes</h3>
+<p>A <b>varint</b> (variable-length integer) stores a number in one to ten bytes, using 7 bits of the number per byte. The eighth, high bit of each byte is a <b>continuation flag</b>: 1 means "more bytes follow", 0 means "this is the last byte". The groups are written least significant group first. Numbers below 128 take exactly one byte; numbers below 16,384 take two; and so on. Since most integers in real data are small (counts, ids in the thousands, enum values), the typical cost is one or two bytes instead of the 4 or 8 of a fixed-width integer, or the 1 to 10 characters of text.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Varint encoding of 150 into bytes 96 01">
+  <rect class="ext" x="20" y="20" width="250" height="46" rx="8"/><text class="t-c t-b" x="145" y="40">150 in binary</text><text class="t-c t-sm" x="145" y="58">1001 0110 (8 bits)</text>
+  <path class="arrow" d="M270 43 L330 43"/>
+  <rect class="box" x="334" y="20" width="250" height="46" rx="8"/><text class="t-c t-b" x="459" y="40">split into 7-bit groups</text><text class="t-c t-sm" x="459" y="58">0000001 | 0010110</text>
+  <path class="arrow" d="M584 43 L644 43"/>
+  <rect class="cache" x="648" y="20" width="232" height="46" rx="8"/><text class="t-c t-b" x="764" y="40">low group goes first</text><text class="t-c t-sm" x="764" y="58">0010110 then 0000001</text>
+  <rect class="box" x="140" y="110" width="250" height="60" rx="8"/><text class="t-c t-b" x="265" y="134">byte 1: 1 0010110</text><text class="t-c t-sm" x="265" y="154">continuation 1, data 0x16 = 0x96</text>
+  <rect class="db" x="510" y="110" width="250" height="60" rx="8"/><text class="t-c t-b" x="635" y="134">byte 2: 0 0000001</text><text class="t-c t-sm" x="635" y="154">continuation 0, data 0x01 = 0x01</text>
+  <path class="arrow" d="M390 140 L506 140"/>
+  <text class="t-c t-sm" x="450" y="208">Decoder: (0x01 &lt;&lt; 7) + 0x16 = 128 + 22 = 150</text>
+  <text class="t-c t-sm" x="450" y="230">A value under 128 would need only the first byte, with its high bit clear.</text>
+</svg>
+<figcaption>Varint encoding turns 150 into two bytes, 96 01. The high bit of each byte says whether another byte follows.</figcaption>
+</figure>
+
+<p>Varints have a catch with <b>negative numbers</b>. A negative int32 such as -1 is stored in two's complement, where all the high bits are 1, so as a varint it always takes the full 10 bytes (the value is sign-extended to 64 bits). For fields that are often negative, Protobuf offers <code>sint32</code> and <code>sint64</code>, which use <b>ZigZag encoding</b>: it maps signed numbers to unsigned ones so that small magnitudes stay small, using the rule 0 becomes 0, -1 becomes 1, 1 becomes 2, -2 becomes 3, and so on. A field declared <code>int32</code> holding -1 costs 10 bytes; declared <code>sint32</code> it costs 1. Conversely, when values are typically huge and uniformly spread, such as hashes or random 64-bit ids, a varint wastes a byte or two, and <code>fixed64</code> (always 8 bytes) is better.</p>
+
+<h3>4.3 Length-delimited fields and defaults</h3>
+<p>A string is written as its tag, a varint byte length, and the UTF-8 bytes. A nested message is encoded exactly the same way: tag, length, and then the nested message's own bytes. This recursive structure is why you can skip a whole sub-message without understanding it. A <b>repeated</b> numeric field is by default <b>packed</b> in proto3: one tag, one total length, then the values back to back, so a list of 100 small integers costs about 102 bytes, not 200.</p>
+<p>In proto3, a field that equals its default value (0, empty string, false) on a plain field is <b>not written at all</b>. That makes records smaller again, but it also means the reader cannot tell "field was set to 0" from "field was never set" unless you declare the field <code>optional</code>, which adds explicit presence tracking. This distinction matters for partial updates: if you send an update message where <code>age = 0</code> is omitted, does that mean "set age to zero" or "do not change age"? Use <code>optional</code> or a field mask to be explicit.</p>
+
+<h3>4.4 Size comparison for the same record</h3>
+<p>Here is the same logical record, <code>id 150, name "Ada", active true</code>, in several formats. The numbers are exact byte counts for the encodings shown (CSV excludes its header row, and the XML has no whitespace).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Bar chart of encoded size in bytes for the same record in seven formats">
+  <text class="t-b" x="20" y="22">Encoded size of one small record (bytes)</text>
+  <text class="t-b" x="20" y="64">XML</text><rect class="miss" x="180" y="48" width="496" height="26" rx="4"/><text class="t-sm" x="684" y="66">62</text>
+  <text class="t-b" x="20" y="98">JSON</text><rect class="miss" x="180" y="82" width="296" height="26" rx="4"/><text class="t-sm" x="484" y="100">37</text>
+  <text class="t-b" x="20" y="132">MessagePack</text><rect class="cache" x="180" y="116" width="184" height="26" rx="4"/><text class="t-sm" x="372" y="134">23</text>
+  <text class="t-b" x="20" y="166">CSV (no header)</text><rect class="cache" x="180" y="150" width="96" height="26" rx="4"/><text class="t-sm" x="284" y="168">12</text>
+  <text class="t-b" x="20" y="200">Thrift compact</text><rect class="hit" x="180" y="184" width="80" height="26" rx="4"/><text class="t-sm" x="268" y="202">10</text>
+  <text class="t-b" x="20" y="234">Protobuf</text><rect class="hit" x="180" y="218" width="80" height="26" rx="4"/><text class="t-sm" x="268" y="236">10</text>
+  <text class="t-b" x="20" y="268">Avro</text><rect class="hit" x="180" y="252" width="56" height="26" rx="4"/><text class="t-sm" x="244" y="270">7</text>
+  <text class="t-sm" x="20" y="308">Scale: 8 pixels per byte. CSV is small only because its names live in a separate header row and it has no types.</text>
+</svg>
+<figcaption>The text formats pay for repeating field names. Protobuf and Thrift replace names with one-byte tags. Avro has no tags at all, so it is smallest, at the price of needing the exact writer schema to read.</figcaption>
+</figure>
+
+<p>Two cautions on interpreting this. First, the gap shrinks as records get larger and values get longer: a record whose bulk is a 2 KB text description will be nearly the same size in every format, because the string bytes dominate. The big wins appear for records with many small numeric fields and long field names, which describes most event, metric, and RPC traffic. Second, JSON <i>compressed</i> with gzip closes much of the size gap (repeated field names compress extremely well), but not the CPU gap. Section 8 returns to this: "use a binary format" and "compress your JSON" are separate levers that stack.</p>
+
+<div class="callout tip"><b>Interview tip</b>
+When asked "why is Protobuf smaller than JSON?", give the mechanism in one breath: "No field names on the wire, just small numeric tags; integers as varints so small numbers take one byte; strings are length-prefixed instead of quoted and escaped; and defaults are omitted." Then add the cost: "You give up readability and need schema management." That shows you know the tradeoff, not just the slogan.
+</div>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="evolution">5. Schema evolution and compatibility</h2>
+
+<p>Schemas change. Business adds a field, a team renames a concept, an old field is retired. In a monolith deployed all at once, you change both sides in one commit. In a distributed system you cannot, because three things are true simultaneously: services are deployed gradually (rolling upgrades mean old and new versions run side by side for minutes or days), mobile apps in the field stay on old versions for years, and persisted data (Kafka topics, files, database columns) lives far longer than any code version. Therefore, readers will meet data written by other versions of the schema, and the format and your discipline must make that safe.</p>
+
+<h3>5.1 The vocabulary: backward, forward, full</h3>
+<p>These terms are easy to mix up, so define them by <i>who reads whose data</i>:</p>
+<ul>
+  <li><b>Backward compatible:</b> a <b>new</b> reader (new code) can read data written by an <b>old</b> writer. You can upgrade readers first and old data still works. This is the property you need for reading old rows from a database or replaying an old Kafka topic from the beginning.</li>
+  <li><b>Forward compatible:</b> an <b>old</b> reader can read data written by a <b>new</b> writer. You can upgrade writers first, and old consumers that have not been updated yet keep functioning. This is what you need when producers deploy before consumers, or when old mobile apps receive responses from a new server.</li>
+  <li><b>Full compatible:</b> both directions hold. It is the safest and the most restrictive, and it is what you want when you do not control the order of deployment.</li>
+</ul>
+<p>Schema registries add <b>transitive</b> variants (for example backward transitive), which check the new schema against <i>all</i> previous versions rather than only the latest one. This matters when old data is retained for a long time, because a change that is compatible with version 5 might not be compatible with version 2.</p>
+
+<div class="two">
+<figure class="diagram">
+<svg viewBox="0 0 400 270" role="img" aria-label="Backward compatibility: new reader old data">
+  <text class="t-c t-b" x="200" y="18">Backward compatible</text>
+  <rect class="box" x="20" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="85" y="62">Writer v1</text><text class="t-c t-sm" x="85" y="79">fields: id, name</text>
+  <path class="arrow" d="M150 65 L250 65"/><text class="t-c t-sm" x="200" y="58">old bytes</text>
+  <rect class="cache" x="254" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="319" y="62">Reader v2</text><text class="t-c t-sm" x="319" y="79">id, name, email</text>
+  <rect class="hit" x="20" y="120" width="364" height="56" rx="8"/>
+  <text class="t-sm" x="30" y="142">The new reader finds no "email" in the data,</text>
+  <text class="t-sm" x="30" y="162">so it fills in the field's declared default.</text>
+  <text class="t-sm" x="20" y="208">Rule: new fields must have defaults.</text>
+  <text class="t-sm" x="20" y="228">Safe to upgrade readers before writers.</text>
+</svg>
+<figcaption>Backward compatible: a new reader copes with old data by applying defaults. Upgrade readers first.</figcaption>
+</figure>
+<figure class="diagram">
+<svg viewBox="0 0 400 270" role="img" aria-label="Forward compatibility: old reader new data">
+  <text class="t-c t-b" x="200" y="18">Forward compatible</text>
+  <rect class="box" x="20" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="85" y="62">Writer v2</text><text class="t-c t-sm" x="85" y="79">id, name, email</text>
+  <path class="arrow" d="M150 65 L250 65"/><text class="t-c t-sm" x="200" y="58">new bytes</text>
+  <rect class="cache" x="254" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="319" y="62">Reader v1</text><text class="t-c t-sm" x="319" y="79">fields: id, name</text>
+  <rect class="hit" x="20" y="120" width="364" height="56" rx="8"/>
+  <text class="t-sm" x="30" y="142">The old reader meets an unknown "email" field</text>
+  <text class="t-sm" x="30" y="162">and skips it without failing.</text>
+  <text class="t-sm" x="20" y="208">Rule: readers must ignore unknown fields.</text>
+  <text class="t-sm" x="20" y="228">Safe to upgrade writers before readers.</text>
+</svg>
+<figcaption>Forward compatible: an old reader copes with new data by skipping unknown fields. Upgrade writers first.</figcaption>
+</figure>
+</div>
+<p>Backward compatibility protects new code reading old data; forward compatibility protects old code reading new data. A rolling deploy needs both at once.</p>
+
+<h3>5.2 The rules for common changes</h3>
+<p>The details differ per format, but for Protobuf (and similarly Thrift) the working rules are these.</p>
+<ul>
+  <li><b>Adding a field:</b> safe. Give it a new, never-used field number. Old readers skip the unknown tag (forward compatible), and new readers see the default when it is absent (backward compatible).</li>
+  <li><b>Removing a field:</b> safe only if you never reuse its number or name. Mark the number <code>reserved</code> in the schema so nobody can assign it again. If a future field reused number 5 with a different type, old stored data with the old field 5 would be silently misread as the new one, which is data corruption with no error.</li>
+  <li><b>Renaming a field:</b> safe in the binary format, because names are not on the wire, only numbers. But it is <b>not</b> safe for the JSON mapping or for any text format, where the name is the identity. It also breaks source-level code that uses the generated accessor. Treat a rename in a text API as "add new, deprecate old, remove later".</li>
+  <li><b>Changing a field's type:</b> mostly unsafe. A few conversions are wire-compatible, for example int32, int64, uint32, uint64, and bool all share the varint wire type and can be read as each other (with truncation if the value does not fit), but changing int to string is not. When in doubt, add a new field instead.</li>
+  <li><b>Changing the field number:</b> never. The number is the field's identity.</li>
+  <li><b>Making a field required:</b> a trap, covered next.</li>
+</ul>
+
+<h3>5.3 Required fields and why they are harmful</h3>
+<p>Protobuf version 2 had a <code>required</code> keyword, meaning a message without the field is invalid. In practice it caused outages and was removed from proto3, and Google's own guidance is to never use it. The reason is that "required" is permanent: once a field is required, you can never remove it (old readers would reject messages without it) and never add one (old writers' messages would be rejected by new readers). It makes every schema change a coordinated, flag-day operation, which is exactly what independently deployed services cannot do. The better pattern is to make every field optional at the wire level and enforce business rules in application code or in a separate validation step, which can evolve independently of the format.</p>
+
+<h3>5.4 Avro: writer schema and reader schema</h3>
+<p>Avro takes a different approach to evolution. Because the encoded bytes have no field identifiers, a reader needs the exact schema the data was <b>written</b> with (the <b>writer schema</b>) and also has its own <b>reader schema</b> (what it wants). Avro's resolution rules reconcile the two: fields are matched <b>by name</b>; a field in the writer but not in the reader is skipped; a field in the reader but not in the writer takes its declared default; and certain type promotions (int to long, for example) are allowed. This gives powerful evolution, but it means every reader must be able to obtain the writer schema. For a single file, the schema sits in the file header. For a stream of independent messages in Kafka, it is looked up from a registry using an identifier (section 6). Renaming a field in Avro uses <code>aliases</code> to tell the resolver that the old name maps to the new one. Removing or adding fields with defaults follows the rules above: a field you might later delete should be given a default now, because a field without a default can never be removed safely in a backward-compatible way.</p>
+
+<h3>5.5 JSON evolution</h3>
+<p>With JSON there is no machine-enforced rule, only convention, but the same discipline applies. Readers should ignore unknown fields (a property sometimes called the "tolerant reader" pattern), producers should only add optional fields within a version, and anything breaking (removing or retyping a field, changing meaning) should require a new API version (<a href="05-api-design.html">Chapter 5</a>). A large share of production incidents in microservices are caused by a deserializer configured to fail on unknown properties, which turns a harmless new field into an outage. Turn that setting off for inbound data you do not control.</p>
+
+<div class="callout watch"><b>Watch out</b>
+The two most expensive schema mistakes are <b>reusing a retired field number or name</b> (silent corruption of old data) and <b>changing the meaning of an existing field without changing its name or number</b> (for example from seconds to milliseconds). No compatibility checker catches the second, because the types still match. Treat semantic changes as new fields.
+</div>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="registry">6. Schema registries and distributing schemas</h2>
+
+<p>If the format requires a schema to read, then every reader needs a reliable way to get the right one. For a handful of services you can share a Git repository of .proto files and generate code from it, and for gRPC this is the normal practice: the schema is compiled into both client and server, and field numbers keep old and new versions compatible. But the problem is harder for <b>event streams and data lakes</b>, where thousands of producers and consumers, written in many languages, exchange data through a shared log such as Kafka, and where a record written last year must still be readable today.</p>
+
+<p>A <b>schema registry</b> is a small service that stores versioned schemas and gives each one a numeric id. The best-known implementation is Confluent Schema Registry, with equivalents from AWS (Glue Schema Registry), Apicurio, and others. It supports Avro, Protobuf, and JSON Schema. It does two jobs.</p>
+<ol>
+  <li><b>Lookup by id.</b> Instead of embedding the schema in every message, the producer writes a few bytes of header, and the consumer fetches the schema once and caches it. In the Confluent wire format a message value starts with one <b>magic byte</b> (zero), then a <b>four-byte schema id</b> (big endian), then the encoded payload. That is 5 bytes of overhead identifying a schema that may be several kilobytes.</li>
+  <li><b>Compatibility enforcement.</b> When a producer registers a new schema version under a <b>subject</b> (typically the topic name plus <code>-value</code>), the registry compares it with earlier versions under the configured compatibility mode (backward, forward, full, or their transitive forms, or none) and <b>rejects an incompatible one</b>. A breaking change is therefore stopped at the producer's CI or startup instead of discovered later as broken consumers.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Sequence: producer registers schema, writes message with schema id, consumer fetches schema by id">
+  <rect class="box"   x="40"  y="20" width="120" height="32" rx="8"/><text class="t-c t-b" x="100" y="41">Producer</text>
+  <rect class="cache" x="270" y="20" width="120" height="32" rx="8"/><text class="t-c t-b" x="330" y="41">Registry</text>
+  <rect class="db"    x="500" y="20" width="120" height="32" rx="8"/><text class="t-c t-b" x="560" y="41">Kafka topic</text>
+  <rect class="ext"   x="730" y="20" width="120" height="32" rx="8"/><text class="t-c t-b" x="790" y="41">Consumer</text>
+  <line class="life" x1="100" y1="52" x2="100" y2="390"/><line class="life" x1="330" y1="52" x2="330" y2="390"/><line class="life" x1="560" y1="52" x2="560" y2="390"/><line class="life" x1="790" y1="52" x2="790" y2="390"/>
+  <path class="arrow" d="M100 85 L326 85"/><text class="t-sm" x="110" y="78">1. register schema v3 (compat check)</text>
+  <path class="arrow dash" d="M326 120 L104 120"/><text class="t-sm" x="150" y="113">2. OK, schema id = 17</text>
+  <path class="arrow" d="M100 165 L556 165"/><text class="t-sm" x="170" y="158">3. send [00][00 00 00 11][payload bytes]</text>
+  <path class="arrow" d="M560 215 L786 215"/><text class="t-sm" x="590" y="208">4. consumer reads message</text>
+  <path class="arrow" d="M790 260 L334 260"/><text class="t-sm" x="400" y="253">5. fetch schema for id 17 (first time only)</text>
+  <path class="arrow dash" d="M330 295 L786 295"/><text class="t-sm" x="440" y="288">6. schema returned, cached locally</text>
+  <rect class="hit" x="560" y="320" width="300" height="50" rx="8"/><text class="t-sm" x="572" y="342">7. decode with writer schema 17,</text><text class="t-sm" x="572" y="360">resolve into the consumer's reader schema</text>
+</svg>
+<figcaption>The registry is consulted at registration time and once per schema id per consumer. The hot path of sending and reading messages never calls it, because schemas are cached.</figcaption>
+</figure>
+
+<p>Operationally, the registry is a critical dependency at <b>startup and on new schema ids</b>, not on every message. Run it replicated (it stores its data in a Kafka topic or a database), cache schemas in the clients, and decide what producers do if it is unreachable (usually they fail to register but can still send with cached ids). Compatibility mode choice follows deployment order. For a Kafka topic where consumers may need to replay history from the start, <b>backward</b> (and usually backward-transitive) is the default and the right choice: upgrade consumers first, then producers. If you cannot control consumer upgrades and producers must go first, you need <b>forward</b>, and if both orders can happen, <b>full</b>.</p>
+
+<div class="callout key"><b>Key idea</b>
+A schema registry turns "schema agreement" from a social process (a wiki page and good intentions) into an enforced one (a gate that rejects incompatible changes). The price is one more piece of infrastructure and a 5-byte header on every message.
+</div>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="columnar">7. Columnar formats: Parquet and ORC</h2>
+
+<p>Everything so far describes <b>row-oriented</b> encodings, where all the fields of one record sit together. That layout is right for transactional work: to fetch an order you read one contiguous record. It is wrong for analytics. A query like "average order value by country over one billion orders" needs only two fields (amount and country) out of perhaps fifty. A row layout forces the engine to read and discard the other forty-eight fields of every row.</p>
+
+<p>A <b>columnar format</b> stores all the values of one column together. <b>Apache Parquet</b> and <b>Apache ORC</b> are the standard on-disk columnar file formats for data lakes, warehouses, and engines such as Spark, Trino, Hive, and Snowflake external tables. (<a href="23-other-stores.html">Chapter 23</a> covers warehouses; <a href="37-batch-stream.html">Chapter 37</a> covers the processing engines that read these files.) Their benefits come from three properties.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 310" role="img" aria-label="Row layout versus column layout for three records with three fields">
+  <text class="t-b" x="20" y="22">Row-oriented (good for fetching whole records)</text>
+  <rect class="box" x="20"  y="34" width="270" height="44" rx="6"/><text class="t-c t-b" x="155" y="62">1 | Ada | US</text>
+  <rect class="box" x="290" y="34" width="270" height="44" rx="6"/><text class="t-c t-b" x="425" y="62">2 | Bo | DE</text>
+  <rect class="box" x="560" y="34" width="270" height="44" rx="6"/><text class="t-c t-b" x="695" y="62">3 | Cy | US</text>
+  <text class="t-sm" x="20" y="100">Reading only the country still has to skip over the ids and names.</text>
+  <text class="t-b" x="20" y="146">Column-oriented (good for scanning a few columns)</text>
+  <rect class="db"    x="20"  y="158" width="270" height="44" rx="6"/><text class="t-c t-b" x="155" y="186">id: 1, 2, 3</text>
+  <rect class="cache" x="290" y="158" width="270" height="44" rx="6"/><text class="t-c t-b" x="425" y="186">name: Ada, Bo, Cy</text>
+  <rect class="ext"   x="560" y="158" width="270" height="44" rx="6"/><text class="t-c t-b" x="695" y="186">country: US, DE, US</text>
+  <text class="t-sm" x="20" y="224">Reading only the country touches one block. Values of one type compress very well together.</text>
+  <text class="t-sm" x="20" y="262">Parquet file: many row groups (for example 128 MB); inside each, one column chunk per column; inside each, pages.</text>
+  <text class="t-sm" x="20" y="282">A footer at the end of the file holds the schema and, for every chunk, min and max values and counts.</text>
+</svg>
+<figcaption>The same three records laid out two ways. Analytic queries that touch few columns read far fewer bytes in the columnar layout.</figcaption>
+</figure>
+
+<ul>
+  <li><b>Column pruning.</b> A query reads only the column chunks it names. If you select 2 of 50 columns, you read roughly 4 percent of the file.</li>
+  <li><b>Better compression and encoding.</b> Within a column, values share a type and are often similar. A country column with five distinct values can be stored with <b>dictionary encoding</b> (a small table plus tiny integer codes), then <b>run-length encoding</b> for repeated codes, then a general compressor on top. Timestamps stored sorted compress with <b>delta encoding</b> (store the difference from the previous value). Columnar files commonly compress several times better than the same data in rows.</li>
+  <li><b>Predicate pushdown and skipping.</b> Each chunk records its minimum and maximum value. A query with <code>WHERE date = '2026-01-05'</code> can skip every row group whose min and max range excludes that date without reading it. Combined with partitioning files by date in directories, a query over one day of a year of data reads about 0.3 percent of it.</li>
+</ul>
+
+<p>The tradeoffs: columnar files are poor at single-record lookups and at frequent small writes, because to assemble a row you gather pieces from many column chunks, and because the encodings assume large immutable batches. That is why the usual pattern is to write events to a row-oriented log (Kafka with Avro or Protobuf) and then <b>batch them into Parquet files</b> every few minutes or hours, which also illustrates the batching theme of this chapter. Parquet and ORC are close cousins (ORC grew out of the Hive world and uses "stripes" where Parquet uses "row groups"; Parquet has wider cross-engine adoption). <b>Apache Arrow</b> is related but different: it is a columnar layout for <i>in-memory</i> data and zero-copy exchange between processes, not a storage format.</p>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="compression">8. Compression: algorithms and tradeoffs</h2>
+
+<p><b>Compression</b> re-encodes bytes into a smaller form by removing redundancy, and <b>decompression</b> restores the original exactly (this is <b>lossless</b> compression, the only kind appropriate for structured data and text; JPEG and MP3 are lossy and handled elsewhere). Compression works because real data is repetitive: JSON repeats field names, logs repeat prefixes, text repeats common words. Most general-purpose algorithms combine two ideas. <b>LZ77-style matching</b> replaces a repeated sequence with a short reference to where it appeared earlier ("go back 200 bytes and copy 12"). <b>Entropy coding</b> (Huffman or finite-state entropy coding) then spends fewer bits on frequent symbols and more on rare ones. Fast algorithms such as LZ4 and Snappy do only the matching with a simple format; slower, stronger ones such as gzip, Brotli, and Zstandard add entropy coding and search harder for matches.</p>
+
+<h3>8.1 The three-way tradeoff</h3>
+<p>Every algorithm trades <b>compression ratio</b> (original size divided by compressed size; higher is better), <b>compression speed</b>, and <b>decompression speed</b>. Most can be tuned with a <b>level</b>: higher levels search more and compress smaller but take much longer to compress, while decompression speed usually stays about the same. That asymmetry matters: for data compressed once and read many times (a static file served from a CDN, a Parquet file), pay for a high level at write time. For data compressed on every request (a dynamic API response), you need a fast level.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Qualitative chart of compression speed versus compression ratio for LZ4, Snappy, Zstandard, gzip, Brotli">
+  <line x1="80" y1="30" x2="80" y2="310" stroke="var(--fg)"/><line x1="80" y1="310" x2="860" y2="310" stroke="var(--fg)"/>
+  <text class="t-sm" x="20" y="24">Faster</text><text class="t-sm" x="20" y="330">Slower</text>
+  <text class="t-sm" x="80" y="346">Lower ratio (bigger output)</text><text class="t-sm" x="690" y="346">Higher ratio (smaller output)</text>
+  <circle cx="170" cy="60"  r="8" fill="var(--good)"/><text class="t-b" x="188" y="64">LZ4</text><text class="t-sm" x="228" y="64">fastest both ways, ratio about 2x</text>
+  <circle cx="200" cy="95"  r="8" fill="var(--good)"/><text class="t-b" x="218" y="99">Snappy</text><text class="t-sm" x="278" y="99">similar to LZ4, slightly lower speed</text>
+  <circle cx="330" cy="135" r="8" fill="var(--accent)"/><text class="t-b" x="348" y="139">Zstd level 1-3</text><text class="t-sm" x="448" y="139">fast, ratio better than gzip</text>
+  <circle cx="450" cy="190" r="8" fill="var(--accent)"/><text class="t-b" x="468" y="194">gzip / deflate level 6</text><text class="t-sm" x="618" y="194">ubiquitous, mid speed</text>
+  <circle cx="620" cy="250" r="8" fill="var(--bad)"/><text class="t-b" x="638" y="254">Zstd level 19</text>
+  <circle cx="700" cy="285" r="8" fill="var(--bad)"/><text class="t-b" x="718" y="289">Brotli level 11</text>
+  <text class="t-sm" x="560" y="60">Qualitative picture, not benchmark data.</text>
+  <text class="t-sm" x="560" y="80">Decompression is much faster than compression</text>
+  <text class="t-sm" x="560" y="100">for all of these, and roughly level-independent.</text>
+</svg>
+<figcaption>Moving right buys smaller output, moving down costs CPU time. Real numbers depend on the data; benchmark on your own payloads before choosing.</figcaption>
+</figure>
+
+<h3>8.2 The main algorithms</h3>
+<table>
+<tr><th>Algorithm</th><th>Typical character</th><th>Where it is used</th></tr>
+<tr><td><b>gzip</b> (DEFLATE in a gzip wrapper)</td><td>Ratio around 3 to 4x on mixed text and often 5 to 10x on repetitive JSON; compression roughly tens of MB/s per core at the common level; decompression a few hundred MB/s. Supported everywhere.</td><td>HTTP <code>Content-Encoding: gzip</code>, log files, tar archives, default for many tools</td></tr>
+<tr><td><b>deflate</b> (zlib)</td><td>Same core algorithm as gzip with a smaller header. Historically inconsistent in HTTP, so most servers use gzip instead.</td><td>PNG, ZIP, zlib streams inside other protocols</td></tr>
+<tr><td><b>Brotli</b></td><td>Best ratio for web text at high levels, partly because it ships a built-in dictionary of common HTML, CSS, and JavaScript strings. Very slow to compress at top levels, decompresses quickly.</td><td>HTTP <code>br</code> for static assets, precompressed at build time or at the CDN</td></tr>
+<tr><td><b>Zstandard</b> (zstd)</td><td>Wide range of levels. Level 3 is usually faster than gzip while compressing better; high levels approach Brotli; decompression stays fast (often well over a GB/s). Supports trained dictionaries and long-range matching.</td><td>Kafka, databases (RocksDB, MySQL, PostgreSQL options), Linux kernel and package formats, increasingly HTTP <code>zstd</code></td></tr>
+<tr><td><b>LZ4</b></td><td>Extremely fast compression (hundreds of MB/s to GB/s) and decompression (multiple GB/s), ratio around 2x. Cheap enough to be almost free in CPU terms.</td><td>Kafka, Cassandra, ClickHouse, filesystems (ZFS), in-memory compression</td></tr>
+<tr><td><b>Snappy</b></td><td>Comparable to LZ4: very fast, modest ratio, designed at Google for throughput over ratio.</td><td>Parquet and ORC defaults in many setups, Bigtable-style stores, Kafka, Cassandra</td></tr>
+</table>
+
+<p>These numbers vary with data, hardware, and library version, so treat them as orders of magnitude. The point to remember is the ordering: LZ4 and Snappy are for "make it somewhat smaller at nearly no CPU cost", gzip is for "works everywhere", Zstandard is the modern general-purpose choice because it can sit at either end, and Brotli at a high level is for "compress once, serve a million times".</p>
+
+<h3>8.3 Compression stacks with the encoding choice</h3>
+<p>Compression and a compact format are independent levers and they overlap. JSON compresses spectacularly well because of repeated keys, so gzipped JSON may end up within 1.5 to 2 times the size of gzipped Protobuf, even though raw JSON is 3 times larger. Protobuf compresses less because it has already removed the redundancy, but it still benefits when strings or repeated records dominate. A rule of thumb: <b>compress when the bytes cross a slow or metered link or sit on disk for a long time; choose a binary format when parsing CPU or tail latency is the problem.</b> The CPU part of the story does not go away with compression: gzip adds CPU on both sides on top of JSON parsing, so a gzipped JSON API spends more CPU per request than plain JSON, and only wins on network.</p>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="when-compress">9. When and where to compress</h2>
+
+<h3>9.1 Decision by location</h3>
+<ul>
+  <li><b>HTTP responses.</b> The browser sends <code>Accept-Encoding: gzip, br</code>; the server (or the CDN, <a href="12-cdn.html">Chapter 12</a>) replies with <code>Content-Encoding: br</code> or similar. This is almost always worth it for text such as HTML, CSS, JavaScript, JSON, and SVG, and a waste for already-compressed content such as JPEG, PNG, MP4, and ZIP (it burns CPU and can slightly grow the output). Static assets should be precompressed at the highest Brotli level during build; dynamic responses use gzip or Brotli at a low level. Compressing the <i>request</i> body is rarer, since clients are less likely to send it and servers must opt in to accept it.</li>
+  <li><b>Kafka.</b> The producer compresses a whole <b>batch</b> of records (setting <code>compression.type</code> to lz4, snappy, zstd, or gzip). The broker stores the batch compressed and, if the codec matches, does not recompress; consumers decompress. This saves network between producer and broker, between brokers for replication, disk, and consumer fetch traffic, all with one compression step. Because compression works on the batch, larger batches compress better (section 10). A common production choice is lz4 or zstd.</li>
+  <li><b>Storage (databases, object storage, files).</b> Compress at rest with a block-level or column-level codec. Snappy or LZ4 for hot data where CPU matters, zstd for colder or larger data, and a high zstd level for archival data that is written once. Columnar files layer encodings and a codec (section 7).</li>
+  <li><b>Caches (Redis, Memcached).</b> Memory is the expensive resource, so compressing large values (tens of kilobytes of JSON, rendered HTML fragments) with LZ4 or zstd can double effective capacity at a cost of microseconds per access. Do not compress small values: the CPU and the header overhead outweigh the savings, and you lose the ability to inspect values by eye. See <a href="13-caching-patterns.html">Chapter 13</a> for caching patterns.</li>
+  <li><b>Service-to-service RPC.</b> gRPC supports per-message compression (gzip by default, others pluggable). Inside a data center with ample bandwidth it is often off; across regions or over metered links it is often on.</li>
+</ul>
+
+<h3>9.2 Compressing small payloads</h3>
+<p>Compression has a fixed overhead: headers (gzip adds an 18-byte wrapper), and, more importantly, an empty <b>history window</b>. The algorithm finds savings by pointing back at earlier data, and in a 200-byte message there is almost no earlier data. A 200-byte JSON object might compress to 160 bytes, a saving of 20 percent for a real CPU cost, and some tiny inputs even grow. Compression becomes worthwhile from roughly a kilobyte upward, and really pays off at tens of kilobytes. Below about 150 to 200 bytes, many servers skip it entirely (nginx's <code>gzip_min_length</code> and similar settings exist for this reason).</p>
+
+<h3>9.3 Dictionaries</h3>
+<p>The small-payload problem has a clever fix: give the compressor a <b>shared dictionary</b>, a block of typical content that both sides already have. The first bytes of a message can then refer into the dictionary instead of starting from nothing. Zstandard has a <b>dictionary training</b> tool: you feed it thousands of sample messages (for example 100,000 small JSON events), it extracts the commonly shared strings (field names, common values), and it produces a dictionary file of, say, 100 KB. Compressing 300-byte messages with that dictionary can reach ratios of 3 to 5x where plain compression gives 1.2x. Brotli does the same thing for the web with its built-in static dictionary, and the HTTP community is standardising negotiated shared dictionaries so a site can ship its own. The costs are operational: the dictionary becomes part of your <b>schema</b>. Every message must record which dictionary version compressed it, and old dictionaries must be kept as long as old data exists, which is the same discipline as schema evolution. Dictionary compression is therefore most useful for stores of many small, similar records such as session blobs, small events, and rows in RocksDB-style stores.</p>
+
+<h3>9.4 Compression bombs and security</h3>
+<p>A <b>compression bomb</b> (a "zip bomb") is a small input that expands to an enormous output, designed to exhaust memory or disk on whatever decompresses it. DEFLATE can reach a ratio of about 1,032 to 1, so a 1 MB upload can claim to be a gigabyte, and nested archives do far worse. Any service that decompresses data it did not produce (uploaded files, gzip-encoded request bodies, messages from the internet) must defend itself: set a <b>hard limit on decompressed size</b> and stop reading when it is exceeded; stream the output instead of buffering it; limit nesting depth for archives; check the declared uncompressed size but do not trust it; and apply timeouts and memory limits per request. The related idea applies to parsers: deeply nested JSON or XML entity expansion can have the same effect without any compression, so cap the document size and depth.</p>
+<p>A second security caution is that compression can <b>leak secrets</b> when an attacker can influence part of the plaintext. The BREACH and CRIME attacks measure the compressed size of responses that contain both a secret (a CSRF token) and attacker-chosen text, and infer the secret from size changes. The mitigations are to avoid compressing responses that mix secrets with reflected user input, to randomise or mask tokens, and to disable TLS-level compression (which is now off by default).</p>
+
+<div class="callout watch"><b>Watch out</b>
+Do not double-compress. Gzipping a Parquet file whose pages are already Snappy-compressed, or a JPEG, spends CPU for roughly nothing. Also remember that compression changes latency twice: it adds CPU time on both ends and subtracts transfer time. On a fast local network with large CPUs the subtraction can be smaller than the addition.
+</div>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="batching">10. Batching</h2>
+
+<p><b>Batching</b> means collecting several small items and handling them together as one operation. It is among the most powerful and most general performance techniques in systems, and it appears in nearly every component in this handbook. The reason is that most operations have a <b>fixed cost</b> that does not depend on how much data they carry:</p>
+<ul>
+  <li>A network round trip (half a millisecond inside a data center, 100 ms or more across continents) plus per-request headers and TLS record framing.</li>
+  <li>A system call, a context switch, a lock acquisition.</li>
+  <li>A disk operation: a seek on a spinning disk, or an <code>fsync</code> to make data durable on any disk, which can take about a millisecond on an SSD.</li>
+  <li>A transaction commit, which in a database means flushing the write-ahead log.</li>
+</ul>
+<p>If you send 1,000 records one at a time, you pay the fixed cost 1,000 times. If you send them as one batch, you pay it once and the per-record cost is only the marginal bytes. Batching also helps compression (more history to match against), and it lets a server amortise parsing, authentication, and logging.</p>
+
+<h3>10.1 The cost: latency</h3>
+<p>Batching has one unavoidable price. The first item in a batch must <b>wait</b> for others to arrive, or for a timer. You trade <b>per-item latency</b> for <b>throughput and efficiency</b>. This is why systems expose two knobs rather than one.</p>
+
+<h3>10.2 Size and time triggers</h3>
+<p>A batch is flushed when <b>either</b> condition is met: a <b>size trigger</b> (the batch has reached N items or N bytes) or a <b>time trigger</b> (the oldest item has waited T milliseconds). The size trigger bounds memory and gives the efficiency; the time trigger bounds latency when traffic is light. Without the time trigger, a quiet period leaves a half-full batch waiting forever. Without the size trigger, a burst makes a single enormous batch.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Timeline showing a batch flushed on size and another flushed on a timer">
+  <line x1="40" y1="170" x2="870" y2="170" stroke="var(--fg)"/><text class="t-sm" x="40" y="196">time</text>
+  <circle cx="70" cy="170" r="6" fill="var(--accent)"/><circle cx="100" cy="170" r="6" fill="var(--accent)"/><circle cx="125" cy="170" r="6" fill="var(--accent)"/><circle cx="150" cy="170" r="6" fill="var(--accent)"/><circle cx="170" cy="170" r="6" fill="var(--accent)"/><circle cx="188" cy="170" r="6" fill="var(--accent)"/><circle cx="205" cy="170" r="6" fill="var(--accent)"/><circle cx="220" cy="170" r="6" fill="var(--accent)"/>
+  <rect class="hit" x="55" y="100" width="180" height="50" rx="8"/><text class="t-c t-b" x="145" y="122">Batch 1: 8 items</text><text class="t-c t-sm" x="145" y="140">flushed: size limit reached</text>
+  <path class="arrow-g" d="M235 125 L290 125"/><text class="t-c t-sm" x="262" y="116">send</text>
+  <circle cx="480" cy="170" r="6" fill="var(--accent)"/><circle cx="560" cy="170" r="6" fill="var(--accent)"/><circle cx="630" cy="170" r="6" fill="var(--accent)"/>
+  <rect class="cache" x="460" y="100" width="260" height="50" rx="8"/><text class="t-c t-b" x="590" y="122">Batch 2: 3 items</text><text class="t-c t-sm" x="590" y="140">flushed: timer (linger) expired</text>
+  <path class="arrow" d="M720 125 L780 125"/><text class="t-c t-sm" x="750" y="116">send</text>
+  <path class="arrow dash" d="M480 210 L720 210"/><text class="t-c t-sm" x="600" y="228">first item waits up to the linger time</text>
+  <text class="t-sm" x="40" y="262">Under heavy load the size trigger fires first and latency is small. Under light load the timer fires and each item pays the full wait.</text>
+  <text class="t-sm" x="40" y="282">Choosing the timer is choosing the worst-case added latency.</text>
+</svg>
+<figcaption>Two flush triggers working together. Dots are arriving items, boxes are the batches they ended up in.</figcaption>
+</figure>
+
+<p>A useful way to size them is <b>Little's law</b> intuition: if items arrive at rate R per second and you want batches of B items, then a batch fills in about B / R seconds. At 10,000 messages per second, a batch of 100 fills in 10 ms, so a 5 ms linger rarely fires and the size trigger rules. At 100 messages per second, the same batch needs a full second, so the time trigger will always fire first with about 1 item and 5 ms of latency, in which case batching hardly helps and costs 5 ms. Batching is a high-throughput technique and gives little at low load.</p>
+
+<h3>10.3 Batching in Kafka producers</h3>
+<p>The Kafka producer (<a href="34-queues-kafka.html">Chapter 34</a>) is the textbook case. Calling <code>send()</code> does not send anything immediately. It places the record in an in-memory buffer for the destination <b>partition</b>, and a background sender thread ships a batch per partition when ready. The relevant settings are <code>batch.size</code> (maximum bytes per partition batch, default 16 KB) and <code>linger.ms</code> (how long to wait for the batch to fill, historically 0 by default, which means "send as soon as the sender is free" but still batches records that arrive while a request is in flight; newer versions raise the default to a few milliseconds). Raising <code>linger.ms</code> to 5 to 20 ms and <code>batch.size</code> to 64 to 256 KB usually multiplies throughput for a modest latency cost. Compression is applied per batch (<code>compression.type</code>), so bigger batches also shrink better. Related knobs include <code>buffer.memory</code> (total buffered, beyond which <code>send()</code> blocks or fails: this is backpressure) and <code>max.in.flight.requests.per.connection</code> (how many unacknowledged requests may be pipelined, section 11). The durability setting <code>acks</code> interacts with batching: waiting for all in-sync replicas makes each batch slower, which makes large batches even more attractive.</p>
+<p>On the consumer side, <code>fetch.min.bytes</code> and <code>fetch.max.wait.ms</code> are the same pair of triggers in reverse: the broker holds a fetch request until enough bytes are available or the wait expires, and <code>max.poll.records</code> controls how many records the application receives per call.</p>
+
+<h3>10.4 Database bulk writes</h3>
+<p>Imagine inserting 10,000 rows from an application to a database 0.5 ms away. One insert per statement, each in its own transaction, costs at least 0.5 ms of network plus a commit with a log flush each time, so around 10,000 x (0.5 + ~1) ms = 15 seconds. Sending the same rows as multi-row <code>INSERT ... VALUES (...), (...), ...</code> statements of 500 rows, inside one transaction, makes about 20 round trips and a single commit, which finishes in well under a second. Other forms of the same idea: JDBC <code>addBatch</code>/<code>executeBatch</code> (and driver options such as <code>rewriteBatchedStatements</code> for MySQL, or <code>reWriteBatchedInserts</code> for PostgreSQL), PostgreSQL's <code>COPY</code> for bulk load, and bulk APIs in Elasticsearch (<code>_bulk</code>) and DynamoDB (<code>BatchWriteItem</code>, which accepts up to 25 items). Databases themselves batch internally: <b>group commit</b> lets many concurrent transactions share one log flush. Limits to respect: huge batches hold locks longer, produce giant transactions that are slow to roll back and replicate, and risk hitting statement or packet size limits. Typical sweet spots are hundreds to a few thousand rows per batch. Handle failure explicitly: if row 4,000 violates a constraint, does the whole batch fail? Many bulk APIs return per-item results, and you must check them rather than assuming that an HTTP 200 means every item succeeded.</p>
+
+<h3>10.5 Request batching across services</h3>
+<p>Batching also applies to service calls. A client that needs data for 100 ids should send one <code>GET /users?ids=1,2,...,100</code> or a <code>POST /users:batchGet</code>, not 100 requests, which is the N+1 problem across a network. GraphQL servers use a <b>DataLoader</b> pattern: within one request, individual lookups for different ids are collected for a very short moment (one tick of the event loop) and then issued as a single batched query. Clients can also batch <i>writes</i> such as analytics events, queuing them locally and uploading every 30 seconds or when 50 are queued. Design batch APIs with care: set a maximum batch size, define partial-failure semantics (per-item status codes in the response body), keep the operation <b>idempotent</b> so a retried batch does not double-apply (<a href="32-idempotency-ids.html">Chapter 32</a>), and make sure one very slow item cannot hold the rest hostage. At the TCP level the same idea shows up as <b>Nagle's algorithm</b>, which delays small writes to coalesce them into larger segments; latency-sensitive applications disable it with <code>TCP_NODELAY</code> and do their own explicit batching instead.</p>
+
+<div class="callout tip"><b>Interview tip</b>
+When you add batching to a design, always say both halves out loud: "I batch for throughput by flushing at N items or T milliseconds, whichever comes first, which adds at most T of latency, and the batch needs idempotent handling because retries resend the whole batch." Interviewers listen for the latency cost and the failure semantics.
+</div>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="pipelining">11. Pipelining, framing and length-prefixing</h2>
+
+<h3>11.1 Pipelining</h3>
+<p><b>Pipelining</b> is a different way to amortise round trips: instead of waiting for the response to request 1 before sending request 2, you send several requests back to back and read the responses as they arrive. The batch is not one bigger message but many requests in flight at once. Redis clients pipeline commands: sending 1,000 <code>GET</code> commands in one write and reading 1,000 replies takes roughly one round trip instead of 1,000 (<a href="15-redis.html">Chapter 15</a>). Kafka's <code>max.in.flight.requests.per.connection</code> is the same idea. The danger is ordering and failure: if request 3 fails and requests 4 and 5 were already sent, a retry of 3 may land after 4 and 5, so strict ordering needs the idempotent-producer or sequence-number features. In HTTP/1.1, pipelining existed but was almost never used because responses had to come back in request order, so one slow response blocked all the ones behind it (<b>head-of-line blocking</b>). HTTP/2 replaced this with <b>multiplexing</b>: many independent streams share one connection and responses may interleave (<a href="03-networking-essentials.html">Chapter 3</a>).</p>
+
+<h3>11.2 Framing: where does one message end?</h3>
+<p>TCP is a <b>byte stream</b>, not a message stream. If a sender writes two 100-byte messages, the receiver might read 200 bytes at once, or 60 then 140, or 100 then 100. The protocol on top must therefore define <b>message boundaries</b>, called <b>framing</b>. There are three common ways.</p>
+<ul>
+  <li><b>Delimiter-based:</b> a special byte or sequence marks the end, such as the newline in NDJSON and in many text protocols, or <code>\r\n\r\n</code> ending HTTP headers. Simple and human friendly, but the delimiter must never appear inside the data, so you need escaping, and the reader has to scan every byte to find the end.</li>
+  <li><b>Length-prefixed:</b> each message starts with a fixed-size field stating how many bytes follow, such as a 4-byte unsigned big-endian integer. The reader reads 4 bytes, learns the length N, then reads exactly N bytes. No scanning, no escaping, binary-safe, and the reader can allocate the right buffer in advance. This is the default for binary protocols.</li>
+  <li><b>Fixed-size or type-length-value (TLV):</b> every record has a type tag, a length, and a value, as Protobuf fields do internally (section 4).</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="Length-prefixed framing of a byte stream and the gRPC message frame">
+  <text class="t-b" x="20" y="22">Length-prefixed stream: two messages back to back</text>
+  <rect class="cache" x="20"  y="36" width="100" height="44" rx="4"/><text class="t-c t-b" x="70" y="55">length</text><text class="t-c t-sm" x="70" y="72">00 00 00 05</text>
+  <rect class="box"   x="120" y="36" width="200" height="44" rx="4"/><text class="t-c t-b" x="220" y="62">5 payload bytes</text>
+  <rect class="cache" x="320" y="36" width="100" height="44" rx="4"/><text class="t-c t-b" x="370" y="55">length</text><text class="t-c t-sm" x="370" y="72">00 00 00 03</text>
+  <rect class="box"   x="420" y="36" width="120" height="44" rx="4"/><text class="t-c t-b" x="480" y="62">3 bytes</text>
+  <text class="t-sm" x="560" y="62">... next length ...</text>
+  <text class="t-sm" x="20" y="108">The reader loops: read 4 bytes, decode N, read N bytes, hand the message to the decoder. Partial reads simply continue.</text>
+  <text class="t-b" x="20" y="154">gRPC message frame (inside an HTTP/2 stream)</text>
+  <rect class="ext"   x="20"  y="168" width="150" height="50" rx="4"/><text class="t-c t-b" x="95" y="188">compressed?</text><text class="t-c t-sm" x="95" y="206">1 byte, 0 or 1</text>
+  <rect class="cache" x="170" y="168" width="170" height="50" rx="4"/><text class="t-c t-b" x="255" y="188">length</text><text class="t-c t-sm" x="255" y="206">4 bytes, big endian</text>
+  <rect class="box"   x="340" y="168" width="400" height="50" rx="4"/><text class="t-c t-b" x="540" y="198">Protobuf message bytes (length bytes)</text>
+  <text class="t-sm" x="20" y="250">Protobuf is not self-delimiting, so a stream of messages needs this outer length (the Java and C++ libraries offer "delimited" helpers).</text>
+  <text class="t-sm" x="20" y="270">Kafka, Redis RESP bulk strings, PostgreSQL, and MySQL wire protocols all use length-prefixed frames as well.</text>
+</svg>
+<figcaption>With a length prefix, the receiver always knows exactly how many bytes to read next, regardless of how TCP chopped the stream.</figcaption>
+</figure>
+
+<p>Length-prefixing has two details worth knowing. First, <b>always cap the length</b>: a malicious or corrupted prefix claiming 3 GB would make a naive reader allocate 3 GB, which is a cheap denial-of-service attack (the same defence as for compression bombs). Second, agree on <b>byte order</b> (network byte order, big endian, is the convention) because a multi-byte length written on one CPU architecture must be read identically on another. Framing is also what lets batching and compression compose cleanly: a batch is a frame whose payload is a list of frames, optionally compressed as a unit, which is precisely how Kafka's record batch format is built.</p>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="mobile">12. Payload design for mobile and constrained clients</h2>
+
+<p>Mobile clients stress every theme of this chapter at once. Networks have high and variable latency (a cellular round trip of 100 to 300 ms is common), bandwidth can be poor or metered, battery drain is dominated by how often the radio wakes up, and the app code may be years out of date, so evolution rules are not theoretical. The design principles follow.</p>
+<ul>
+  <li><b>Fewer, fatter requests.</b> Since latency, not bandwidth, usually dominates, return everything a screen needs in one response instead of making ten calls. A backend-for-frontend or an API gateway (<a href="11-api-gateway.html">Chapter 11</a>) composes the screen payload server-side. GraphQL pursues the same goal by letting the client name the fields it wants.</li>
+  <li><b>Send only what the screen needs.</b> A list screen needs thumbnails, titles, and ids; the detail comes on tap. Avoid returning the 60 fields of a full entity to a view that displays four. Field selection (sparse fieldsets, GraphQL, field masks) and list-versus-detail representations are the main tools.</li>
+  <li><b>Paginate and use cursors</b> so the first screen loads fast (<a href="05-api-design.html">Chapter 5</a>). Prefetch the next page while the user reads.</li>
+  <li><b>Compact encoding.</b> Protobuf (or FlatBuffers for very large payloads that are read lazily) cuts bytes and parse CPU, which also saves battery. Where JSON must stay, enable gzip or Brotli and shorten gratuitously long keys only if you can measure a benefit; compression handles most of the repetition for you.</li>
+  <li><b>Delta and conditional requests.</b> Use ETags and <code>If-None-Match</code> so an unchanged resource costs a tiny 304 response, or sync using a cursor ("give me everything changed since version 9,812") so the app downloads only differences.</li>
+  <li><b>Batch and defer uploads.</b> Queue analytics and non-urgent writes locally and send them together, ideally while the radio is already awake or when on Wi-Fi. Each separate transmission keeps the radio in a high-power state for seconds afterwards (the "radio tail"), so many tiny uploads cost far more battery than one bigger one.</li>
+  <li><b>Tolerate old clients.</b> Because you cannot force upgrades, treat every field as optional on the client, ignore unknown fields, keep old endpoints alive for a published support window, and use enums that have an "unknown" default so a new value in a response does not crash an old app.</li>
+  <li><b>Right-size media.</b> Images usually dominate payload bytes. Serve responsive sizes and efficient formats (WebP, AVIF) from a CDN (<a href="12-cdn.html">Chapter 12</a>) rather than inflating API responses with embedded base64 images.</li>
+</ul>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="pitfalls">13. Numeric, time and ID pitfalls</h2>
+
+<p>Many bugs that look like "the network corrupted our data" are really data-model mismatches between serializers. These are the ones that come up repeatedly.</p>
+
+<h3>13.1 64-bit integers in JSON</h3>
+<p>JSON the format has just one numeric syntax and puts no limit on digits. But most JSON parsers, notably JavaScript's, convert numbers to <b>IEEE 754 double-precision floating point</b>, which has a 53-bit significand. Integers are exact only up to 2<sup>53</sup> - 1 = 9,007,199,254,740,991. Above that, nearby integers collapse into the same double. A 64-bit id like 1234567890123456789 becomes 1234567890123456800 after a trip through JavaScript, and two different ids can become identical. Snowflake-style ids and database bigints are routinely this large (<a href="32-idempotency-ids.html">Chapter 32</a>). The fixes: <b>send 64-bit ids as strings</b> in JSON (Twitter's API adds an <code>id_str</code> field for this reason; Protobuf's standard JSON mapping encodes int64 as a string for exactly this reason), or use a typed binary format, or use a parser that supports big integers. Do the same for any value that must not lose precision.</p>
+
+<h3>13.2 Floating point and money</h3>
+<p>Binary floating point cannot represent most decimal fractions exactly: 0.1 + 0.2 equals 0.30000000000000004 in doubles. Float32 holds only about 7 significant decimal digits. JSON also has no representation for NaN or Infinity, so a library may emit invalid output or null. For <b>money</b>, never use floats: store integer minor units (cents, as an integer 1999 for 19.99) together with a currency code, or use a decimal string, and agree on rounding rules. For measurements, document the unit in the field name (<code>duration_ms</code>, <code>size_bytes</code>) so nobody has to guess.</p>
+
+<h3>13.3 Timestamps and time zones</h3>
+<p>Time is the most common source of silent disagreement. Options: <b>Unix epoch numbers</b> (seconds or milliseconds since 1970-01-01 UTC), compact and unambiguous but unreadable, and with the seconds-versus-milliseconds confusion (the same number can mean 1970 or 2026, and a field in the wrong unit is a classic bug); <b>ISO 8601 / RFC 3339 strings</b> like <code>2026-11-17T09:30:00Z</code>, readable and sortable when in UTC with a fixed format. Practical rules: store and transmit instants in <b>UTC</b>, always include the zone designator (<code>Z</code> or an offset), never send local times without a zone, convert to the user's zone only at the display edge, keep a time zone <i>name</i> (like <code>Europe/Berlin</code>) separately if you must schedule future local-time events (offsets change with daylight saving rules), and note that clock skew between servers means timestamps are not a reliable order of events (<a href="27-failure-time-ordering.html">Chapter 27</a>). Protobuf has a <code>google.protobuf.Timestamp</code> (seconds plus nanoseconds) to avoid the ambiguity.</p>
+
+<h3>13.4 Other traps</h3>
+<ul>
+  <li><b>Null versus missing versus default.</b> In JSON, <code>{"x": null}</code>, a missing <code>x</code>, and <code>"x": 0</code> are three different statements; in proto3 a zero value and an absent one look the same unless the field is marked <code>optional</code>. Partial update APIs (PATCH) need explicit rules, for example a field mask.</li>
+  <li><b>Enums.</b> A client that sees an enum value it does not know should not crash. Keep a meaningful zero value such as UNKNOWN, and never reorder or reuse numeric values.</li>
+  <li><b>Strings and encoding.</b> Always use UTF-8; be aware that the same visible text can be written with different Unicode normalisation forms, so compare after normalising; and that "length" may mean bytes or characters depending on the API.</li>
+  <li><b>Binary data in JSON</b> must be base64 encoded (a 33 percent size increase) and is a sign you probably want a binary format or a separate blob upload.</li>
+  <li><b>Duplicate keys and ordering.</b> JSON objects with repeated keys are handled differently by different parsers, and key order is not guaranteed; so never sign or hash a JSON document without first putting it in a canonical form.</li>
+  <li><b>Endianness and alignment</b> only matter if you hand-roll a binary protocol, which is a reason to use an established format rather than writing one.</li>
+</ul>
+
+<div class="callout watch"><b>Watch out</b>
+A design that serves browser clients with large numeric ids will be wrong in JSON unless the ids are strings. This is a favourite "did you notice" probe in interviews, and the answer is one sentence: "Ids go over the wire as strings because JavaScript numbers lose precision above 2^53."
+</div>
+
+<!-- ======================= 14 ======================= -->
+<h2 id="worked">14. Worked example: JSON versus Protobuf at 50,000 requests per second</h2>
+
+<p>Suppose an internal pricing service receives 50,000 requests per second. Each response carries a list of about 20 line items with ids, quantities, and prices. We will compare plain JSON, gzipped JSON, Protobuf, and Protobuf compressed with Zstandard. All the per-message numbers below are <b>illustrative assumptions</b> consistent with typical measurements; in a real design you would benchmark with your own payloads.</p>
+
+<h3>14.1 Assumptions</h3>
+<ul>
+  <li>JSON response: 1,200 bytes on average. The same data in Protobuf: about 480 bytes (40 percent, because field names vanish and numbers become varints).</li>
+  <li>gzip on the JSON: about 300 bytes (ratio 4 on repetitive JSON). Zstd on the Protobuf: about 300 bytes (the more compact data compresses less, so the two compressed versions end up close).</li>
+  <li>CPU per request on the server for decoding the request and encoding the response: JSON about 60 microseconds, Protobuf about 15 microseconds. Compression adds about 40 microseconds for gzip on this payload, and about 10 for zstd at a fast level.</li>
+  <li>Egress is priced at an illustrative $0.05 per GB, and a month is 30 days (2,592,000 seconds).</li>
+</ul>
+
+<h3>14.2 Bandwidth</h3>
+<table>
+<tr><th>Encoding</th><th>Bytes per response</th><th>Bandwidth at 50k rps</th><th>Per month</th><th>Egress cost per month</th></tr>
+<tr><td>JSON</td><td>1,200</td><td>60 MB/s (480 Mbit/s)</td><td>155.5 TB</td><td>about $7,800</td></tr>
+<tr><td>JSON + gzip</td><td>300</td><td>15 MB/s (120 Mbit/s)</td><td>38.9 TB</td><td>about $1,900</td></tr>
+<tr><td>Protobuf</td><td>480</td><td>24 MB/s (192 Mbit/s)</td><td>62.2 TB</td><td>about $3,100</td></tr>
+<tr><td>Protobuf + zstd</td><td>300</td><td>15 MB/s (120 Mbit/s)</td><td>38.9 TB</td><td>about $1,900</td></tr>
+</table>
+<p>The arithmetic for the first row: 50,000 x 1,200 bytes = 60,000,000 bytes per second = 60 MB/s, which is 480 megabits per second; over 2,592,000 seconds that is 155.5 x 10<sup>12</sup> bytes = 155.5 TB; at $0.05 per GB (155,500 GB) it is about $7,775. Notice two things. A 480 Mbit/s stream already uses about half of a 1 Gbit/s network interface on one host, so at this rate the response size genuinely affects how many load balancer and server network cards you need. And gzip alone closes most of the cost gap, because the compressed outputs are similar in size.</p>
+
+<h3>14.3 CPU</h3>
+<table>
+<tr><th>Encoding</th><th>CPU per request</th><th>Total CPU at 50k rps</th><th>Cores (at 100 percent)</th><th>Servers at 8 usable cores and 50 percent target utilisation</th></tr>
+<tr><td>JSON</td><td>60 µs</td><td>3.0 core-seconds per second</td><td>3.0</td><td>about 1 (only for serialization)</td></tr>
+<tr><td>JSON + gzip</td><td>100 µs</td><td>5.0</td><td>5.0</td><td>about 1.3</td></tr>
+<tr><td>Protobuf</td><td>15 µs</td><td>0.75</td><td>0.75</td><td>about 0.2</td></tr>
+<tr><td>Protobuf + zstd</td><td>25 µs</td><td>1.25</td><td>1.25</td><td>about 0.3</td></tr>
+</table>
+<p>The serialization-only CPU looks modest: 3 cores versus 0.75 core. But this is only the encode and decode part of request handling. Real services in managed runtimes often spend 20 to 40 percent of their CPU on serialization and the garbage collection it triggers, because the JSON path allocates many temporary strings and maps. If a request's total budget is 300 microseconds of CPU, shaving 45 microseconds is a 15 percent gain, which at 50,000 rps frees several servers and reduces tail latency. The compressed JSON row also demonstrates the point from section 8.3: gzip lowers bandwidth but <i>raises</i> CPU by two thirds compared with plain JSON.</p>
+
+<h3>14.4 Conclusions and recommendation</h3>
+<ul>
+  <li>If this is a <b>public API</b> consumed by browsers and third parties, keep JSON, enable Brotli or gzip at the edge (or in the CDN), and spend the effort on pagination and payload trimming. Savings from a binary format would not reach external clients.</li>
+  <li>If this is an <b>internal, high-volume service-to-service</b> call, use Protobuf over gRPC. The gain is not dramatic in cores at this scale, but it is a 60 percent cut in bytes, a 4x cut in parse CPU, schema enforcement, generated clients in every language, and clean evolution rules. Add compression only if the link is metered or cross-region.</li>
+  <li>For <b>events landing in Kafka</b>, use Avro or Protobuf with a schema registry, compress batches with lz4 or zstd, and batch into Parquet for analytics.</li>
+  <li>Cost ranking depends on scale: at 500 rps all of this is noise and JSON wins on simplicity; at 500,000 rps it is a major line item. Say the scale before choosing.</li>
+</ul>
+
+<div class="widget">
+<h4>Try it: payload cost calculator</h4>
+<p>Change the request rate and the JSON response size, then pick an encoding. The ratios and CPU figures are the assumptions from section 14.1, scaled by payload size.</p>
+<div class="row"><label for="w-rps">Requests per second</label> <input id="w-rps" type="number" value="50000" min="1" step="1000"></div>
+<div class="row"><label for="w-size">JSON bytes per response</label> <input id="w-size" type="number" value="1200" min="50" step="100"></div>
+<div class="row"><label for="w-fmt">Encoding</label>
+<select id="w-fmt">
+  <option value="json">JSON</option>
+  <option value="jsongz">JSON + gzip</option>
+  <option value="pb">Protobuf</option>
+  <option value="pbzstd">Protobuf + zstd</option>
+</select></div>
+<div class="log" id="w-out" aria-live="polite"></div>
+</div>
+
+<!-- ======================= 15 ======================= -->
+<h2 id="qa">15. Interview Q&amp;A</h2>
+
+<details><summary>Why would you choose Protobuf over JSON for internal services, and when would you not?</summary>
+<p>Protobuf gives smaller messages (no field names, varint integers), faster encode and decode, a machine-checked schema that generates typed clients in many languages, and explicit evolution rules based on field numbers. It pairs naturally with gRPC. I would choose it for high-volume or latency-sensitive internal calls and for long-lived data like event logs. I would not choose it for a public API aimed at browsers and third-party developers, where being able to try the API with curl and read it by eye matters more than a few hundred bytes, or for tiny-scale systems where the tooling and schema management cost outweighs the saving. The usual answer is to keep JSON at the edge and Protobuf inside, with the gateway translating between them.</p></details>
+
+<details><summary>Explain how Protobuf encodes a field, and why field numbers must never be reused.</summary>
+<p>Each field is written as a tag followed by a value. The tag is a varint equal to (field number shifted left by 3) OR the wire type, so it tells the decoder both which field this is and how to find the end of the value: varint, fixed 32 or 64 bit, or length-delimited. Field names are not on the wire; the schema maps numbers to names. Because the number is the field's only identity, reusing a retired number for a new field means that old stored records, or old writers still running, will have their old data interpreted as the new field, possibly with a different type, producing silent corruption. That is why removed fields are marked reserved in the schema so no one can reuse the number.</p></details>
+
+<details><summary>What is the difference between backward and forward compatibility, and which do you need in a Kafka pipeline?</summary>
+<p>Backward compatible means new readers can read data written by old writers; forward compatible means old readers can read data written by new writers. In a Kafka pipeline topics retain history and consumers may replay it from the start, so new consumer code must read old records, which is backward compatibility, and the registry default and usual recommendation is backward (often transitive so that all old versions are checked). The deployment order is consumers first, then producers. If producers may be upgraded before some consumers, as with many independent teams, you additionally need forward compatibility, and the safest setting is full compatibility, which restricts you to adding or removing optional fields with defaults.</p></details>
+
+<details><summary>How does a schema registry work and what are its failure modes?</summary>
+<p>The registry stores versioned schemas under subjects and assigns each a global id. Producers register their schema, the registry checks it against earlier versions using the configured compatibility mode and rejects breaking changes, and the producer then prefixes each message with a magic byte and the four-byte schema id. Consumers read the id, fetch the schema once, cache it, and decode with the writer schema resolved against their own reader schema. The registry is not on the per-message path, so a short outage mostly affects new producers or new schema ids; clients with cached schemas continue. The real failure modes are an unreplicated registry (a single point of failure at startup), a too-permissive compatibility mode that lets breaking changes through, and semantic changes that no checker can catch, such as changing a field from seconds to milliseconds.</p></details>
+
+<details><summary>You have a service that compresses all responses with gzip and CPU usage is high. What do you look at?</summary>
+<p>First, find out what is being compressed: already-compressed content like images, or tiny responses under a few hundred bytes, waste CPU for nothing, so I would add a content-type allow list and a minimum size. Second, check the compression level; levels above 6 cost a lot more CPU for small ratio gains, so dynamic responses should use a low level, while static assets should be compressed once at build time at a high level and cached. Third, consider moving compression to the CDN or load balancer, or switching to Zstandard or Brotli at a low level, which give better ratios per CPU. Finally, I would verify that bandwidth savings actually matter on that path; inside a data center it is often better to turn compression off and rely on a compact format.</p></details>
+
+<details><summary>What is a compression bomb and how do you defend against it?</summary>
+<p>It is a small compressed input that expands into a huge output, such as a 1 MB upload that inflates to a gigabyte or more, intended to exhaust memory, disk, or CPU of the service that decompresses it. DEFLATE can reach about a thousand to one, and nested archives are far worse. The defence is to enforce a hard cap on decompressed bytes and stop as soon as it is exceeded, stream the decompression instead of loading it all into memory, limit archive nesting and file counts, set CPU and time limits per request, and not trust the size declared in a header. The same principle of capping sizes and depth applies to parsers for JSON, XML, and length-prefixed frames.</p></details>
+
+<details><summary>How do Kafka producers batch, and how would you tune them for throughput versus latency?</summary>
+<p>A producer appends records to a per-partition in-memory batch and a sender thread ships a batch when it reaches batch.size bytes or has waited linger.ms, whichever happens first. Compression is applied to the whole batch, so a larger batch also compresses better, and the broker stores it compressed. For throughput I would raise linger.ms to roughly 5 to 20 ms, raise batch.size to tens or hundreds of kilobytes, and enable lz4 or zstd. For latency I would keep linger.ms near zero, accept smaller batches, and watch that acks and in-flight request settings do not serialize sends. The tradeoff is that linger directly adds up to that many milliseconds to each record at low load, so the benefit only appears when traffic is high enough for batches to fill.</p></details>
+
+<details><summary>Why can a JSON API corrupt 64-bit ids and how do you prevent it?</summary>
+<p>JSON allows arbitrarily long numbers, but many parsers, including every JavaScript engine, read numbers as 64-bit floating point doubles, which represent integers exactly only up to 2 to the 53 minus 1. A Snowflake-style or bigint id above that value is rounded to a nearby representable number, so two distinct ids may become equal or an id may no longer match the database. The prevention is to transmit such ids as strings in JSON, which is what Protobuf's JSON mapping does for int64, to use a binary format with real 64-bit types for service-to-service traffic, and to add contract tests that round-trip large ids through the browser client.</p></details>
+
+<details><summary>How would you design the payload for a mobile feed screen?</summary>
+<p>I would optimise for fewer round trips and fewer bytes, because mobile latency and radio power dominate. One request returns the first page of the feed, composed server-side by a backend-for-frontend, containing only the fields the list needs (ids, titles, small thumbnail URLs), with a cursor for the next page and an ETag or sync token so unchanged data costs a tiny response. I would use Protobuf or compressed JSON, serve images separately from a CDN in responsive sizes and efficient formats, and batch analytics events to upload together later. Because old app versions linger, every field is optional on the client, unknown fields and enum values are tolerated, and I keep old API versions alive for a published support window.</p></details>
+
+<details><summary>When is batching a bad idea?</summary>
+<p>Batching is a bad fit when load is low, because the time trigger always fires first and every item simply pays the added wait with none of the efficiency gain. It is also unsuitable when per-item latency is a hard requirement, such as an interactive keystroke or a payment confirmation the user is staring at, unless the batch window is tiny. Large batches also raise failure cost: a failed batch must be retried as a whole or handled with per-item results, retries need idempotency to avoid duplicates, and huge database batches hold locks and bloat transactions. Finally, a batch that grows without bound causes memory pressure and head-of-line delays, so every batcher needs a size cap and backpressure.</p></details>
+
+<details><summary>How do columnar formats like Parquet make analytic queries faster?</summary>
+<p>They store each column's values together, so a query reads only the columns it names (column pruning), and similar values stored together compress and encode very well through dictionary, run-length, and delta encoding. Each chunk keeps min and max statistics in the file footer, so the engine can skip whole row groups that cannot match a filter (predicate pushdown), and partitioning files by date skips whole files. The cost is that fetching or updating a single full record is slow and files are best written in large immutable batches, so they suit data lakes and warehouses rather than transactional lookups.</p></details>
+
+<!-- ======================= 16 ======================= -->
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">16. Recap</h2>
+<ul>
+  <li>Serialization turns in-memory objects into bytes; the format decides CPU cost, size, and how safely data can change over time.</li>
+  <li>Text formats (JSON, XML, CSV) are readable and self-describing but large and slower; binary formats (Protobuf, Avro, Thrift, MessagePack, FlatBuffers) are compact and fast, usually needing a schema.</li>
+  <li>Protobuf encodes each field as a tag (field number and wire type) plus a value; integers are varints; defaults are omitted. The 37-byte JSON record became 10 bytes.</li>
+  <li>Schema evolution: add fields with new numbers and defaults, never reuse numbers (reserve them), avoid required fields, and treat meaning changes as new fields. Backward means new readers read old data; forward means old readers read new data.</li>
+  <li>Schema registries store versioned schemas, hand out ids carried in a 5-byte header, and reject incompatible changes before they ship.</li>
+  <li>Parquet and ORC store data by column, enabling column pruning, strong compression, and min/max skipping for analytics.</li>
+  <li>Compression trades ratio against CPU: LZ4 and Snappy for speed, gzip for compatibility, Zstandard as the flexible modern choice, Brotli at high levels for static web assets. Skip it for small or already-compressed data, use dictionaries for small similar messages, and cap decompressed size against bombs.</li>
+  <li>Batching amortises fixed per-operation costs; flush on size or time, whichever first; it adds latency and needs idempotent, partial-failure-aware handling. Kafka batches per partition and compresses per batch.</li>
+  <li>Pipelining keeps many requests in flight; TCP is a stream, so protocols need framing, usually a length prefix with a size cap.</li>
+  <li>Mobile payloads: fewer requests, only needed fields, deltas and ETags, batched uploads, tolerance of old clients.</li>
+  <li>Pitfalls: 64-bit ids as strings in JSON, no floats for money, UTC timestamps with explicit units, careful null versus default semantics.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="03-networking-essentials.html">Chapter 3</a> (TCP streams, HTTP/2 multiplexing) and <a href="05-api-design.html">Chapter 5</a> (REST, gRPC, pagination, versioning). Leads to <a href="34-queues-kafka.html">Chapter 34</a> (Kafka batching and compression in context), <a href="32-idempotency-ids.html">Chapter 32</a> (idempotent retries and ID generation), <a href="23-other-stores.html">Chapter 23</a> (columnar warehouses), and <a href="12-cdn.html">Chapter 12</a> (edge compression).</p>
+
+
+</main>
+</div>
+
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+
+<script>
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+(function () {
+  var F = {
+    json:   { name: 'JSON',            size: 1.0,  cpu: 60 },
+    jsongz: { name: 'JSON + gzip',     size: 0.25, cpu: 100 },
+    pb:     { name: 'Protobuf',        size: 0.4,  cpu: 15 },
+    pbzstd: { name: 'Protobuf + zstd', size: 0.25, cpu: 25 }
+  };
+  var rps = document.getElementById('w-rps'), sz = document.getElementById('w-size'), fm = document.getElementById('w-fmt'), out = document.getElementById('w-out');
+  function update() {
+    var r = Math.max(1, Number(rps.value) || 1), s = Math.max(1, Number(sz.value) || 1), f = F[fm.value];
+    var bytes = s * f.size, bps = r * bytes, mbit = bps * 8 / 1e6;
+    var tb = bps * 2592000 / 1e12, cost = tb * 1000 * 0.05;
+    var cpu = r * f.cpu * (s / 1200) / 1e6;
+    out.textContent = '';
+    [f.name + ': ' + Math.round(bytes) + ' bytes per response',
+     'Bandwidth: ' + (bps / 1e6).toFixed(1) + ' MB/s (' + mbit.toFixed(0) + ' Mbit/s)',
+     'Per 30 days: ' + tb.toFixed(1) + ' TB, about $' + Math.round(cost).toLocaleString() + ' egress at $0.05/GB',
+     'Serialization CPU: about ' + cpu.toFixed(2) + ' cores'].forEach(function (line) { out.appendChild(el('div', null, line)); });
+  }
+  rps.addEventListener('input', update); sz.addEventListener('input', update); fm.addEventListener('change', update);
+  update();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 30: Coordination Services and Distributed Locks | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="30-coordination-locks">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Chapter 30 · Module 4 · Component deep dive</div>
+<h1>Coordination Services and Distributed Locks</h1>
+<p class="lead">Many servers sometimes need to agree on a small fact: who is the leader, which servers are alive, what the current configuration is, who holds a lock. This chapter explains the services built for that job (ZooKeeper, etcd, Consul), how they behave when things fail, and why a distributed lock is far harder, and far less often needed, than it looks.</p>
+
+<h2 id="why">1. The problem: small facts that everyone must agree on</h2>
+
+<p>Most of the data in a large system is bulky and tolerates some disagreement: millions of user rows, billions of log lines, cached pages that may be a few seconds stale. A different, much smaller category of data has the opposite requirements. It is tiny (a few bytes to a few kilobytes), but every server must see the <b>same</b> value, and a wrong or stale answer causes real damage. Examples:</p>
+<ul>
+  <li><b>Who is the leader?</b> A database cluster has one primary that accepts writes. If two servers both believe they are the primary, they accept conflicting writes and the data diverges (a situation called <i>split-brain</i>).</li>
+  <li><b>Who is alive?</b> A scheduler needs to know which workers are up, so it can reassign the work of a dead worker. Guessing wrong in either direction is costly: reassigning work of a live worker duplicates it, and not reassigning work of a dead worker loses it.</li>
+  <li><b>What is the current configuration?</b> A fleet of 500 servers must all switch from one feature setting to another in a controlled way, and a newly started server must read the right value immediately.</li>
+  <li><b>Who holds this lock?</b> Two workers must not both rebuild the same report, charge the same customer, or compact the same storage shard at the same time.</li>
+</ul>
+
+<p>Every team could implement these agreements itself, and many tried. The result was usually subtle bugs: a leader election built on a database row that breaks under a network partition, a heartbeat scheme whose timeouts are wrong under load, a lock that two clients both think they own. The correct implementations all rest on a <b>consensus protocol</b> (a protocol that lets a group of machines agree on a value even when some of them crash or messages are lost; <a href="29-consensus.html">Chapter 29</a> explains the algorithms, Raft and Paxos, in detail). Consensus is hard to implement correctly, and an application should not embed it.</p>
+
+<p>The industry's answer is a <b>coordination service</b>: a small, dedicated cluster (typically 3 or 5 machines) that runs consensus internally and exposes a simple, higher-level API such as "store this small value under this name, tell me when it changes, and delete it automatically if I disappear". Application servers use that API to build leader election, locks, membership lists, and configuration distribution, without ever touching a consensus protocol themselves. This chapter covers the three well-known services (<b>Apache ZooKeeper</b>, <b>etcd</b>, and <b>HashiCorp Consul</b>), then spends considerable time on the most requested and most misunderstood thing built on top of them: the <b>distributed lock</b>.</p>
+
+<div class="callout key"><b>Key idea</b>
+A coordination service is a tiny, strongly consistent, highly available key-value store with two special features: <b>change notifications</b> (watches) and <b>automatic cleanup of the data owned by a client that disappears</b> (ephemeral nodes or leases). Almost every coordination pattern, including locks and leader election, is built from those two features plus the guarantee that all clients see one consistent order of changes.
+</div>
+
+<p>Before going further, a note on prerequisites. This chapter assumes you know that machines fail independently, that messages can be delayed or lost, and that clocks on different machines disagree. If those ideas are new, read <a href="27-failure-time-ordering.html">Chapter 27</a> first. Nearly every pitfall in the lock sections below is a consequence of those three facts.</p>
+
+<h2 id="what">2. What a coordination service is, and how it uses consensus</h2>
+
+<h3>2.1 The shape of the system</h3>
+<p>A coordination service runs as a cluster of <b>servers</b> (often called an <b>ensemble</b> in ZooKeeper, a <b>cluster</b> in etcd, a set of <b>server agents</b> in Consul). Exactly one server is the <b>leader</b> at any moment, and the others are <b>followers</b>. The application processes are <b>clients</b>; each client connects to one server, sends requests over a long-lived connection, and receives notifications on the same connection.</p>
+
+<p>Two kinds of request exist, and they follow different paths:</p>
+<ul>
+  <li><b>Writes</b> (create a node, set a value, delete a key, acquire a lease) are forwarded to the leader. The leader appends the change to its log, sends it to the followers, and when a <b>majority</b> (a quorum) has durably recorded it, the change is <i>committed</i> and applied to every server's in-memory state. Only then is the client told "success". This is the consensus protocol at work: ZooKeeper uses its own protocol called ZAB (ZooKeeper Atomic Broadcast), while etcd and Consul use Raft. Both achieve the same guarantee: a committed write survives the crash of any minority of servers and is applied in the same order everywhere.</li>
+  <li><b>Reads</b> can be served by the follower the client is connected to, from its local copy of the state, which makes reads cheap and scalable. The catch is that a follower may be slightly behind the leader, so a plain read can return a slightly stale value. Each system offers a way to demand a fresher read, at higher cost (section 2.3).</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Coordination cluster: clients, followers, leader, replicated log">
+  <rect class="ext" x="20" y="40" width="150" height="44" rx="8"/><text class="t-c t-b" x="95" y="67">Client A</text>
+  <rect class="ext" x="20" y="150" width="150" height="44" rx="8"/><text class="t-c t-b" x="95" y="177">Client B</text>
+  <rect class="ext" x="20" y="260" width="150" height="44" rx="8"/><text class="t-c t-b" x="95" y="287">Client C</text>
+
+  <rect class="box" x="330" y="30" width="190" height="64" rx="10"/><text class="t-c t-b" x="425" y="56">Follower 1</text><text class="t-c t-sm" x="425" y="76">serves reads locally</text>
+  <rect class="cache" x="330" y="140" width="190" height="64" rx="10"/><text class="t-c t-b" x="425" y="166">Leader</text><text class="t-c t-sm" x="425" y="186">orders and replicates writes</text>
+  <rect class="box" x="330" y="250" width="190" height="64" rx="10"/><text class="t-c t-b" x="425" y="276">Follower 2</text><text class="t-c t-sm" x="425" y="296">serves reads locally</text>
+
+  <rect class="db" x="700" y="130" width="180" height="84" rx="10"/><text class="t-c t-b" x="790" y="156">Replicated log</text><text class="t-c t-sm" x="790" y="176">same order on every server</text><text class="t-c t-sm" x="790" y="194">commit = majority has it</text>
+
+  <path class="arrow" d="M170 62 L326 62"/>
+  <path class="arrow" d="M170 172 L326 172"/>
+  <path class="arrow" d="M170 282 L326 282"/>
+  <path class="arrow-g dash" d="M425 94 L425 136"/><text class="t-sm" x="436" y="120">forward write</text>
+  <path class="arrow-g dash" d="M425 250 L425 208"/>
+  <path class="arrow" d="M520 172 L696 172"/>
+  <text class="t-sm" x="20" y="340">Clients reconnect to another server if theirs dies. Session state survives because it is itself replicated.</text>
+</svg>
+<figcaption>Clients talk to any server. Writes are funneled to the leader and committed by majority; reads are answered locally. Every server holds the full data set in memory.</figcaption>
+</figure>
+
+<h3>2.2 Why the data must be small</h3>
+<p>Every server keeps the <i>entire</i> data set in memory (ZooKeeper and Consul) or in a single memory-mapped file (etcd), because the consensus log is replicated to all members and applied identically on all of them. Adding more servers does <b>not</b> add capacity: a 5-server cluster stores no more than a 3-server cluster, and each write needs to reach a majority of servers, so more members make writes slightly slower. The cluster exists for fault tolerance, not for scale-out. This is the single most important sizing fact, and section 6 turns it into numbers.</p>
+
+<h3>2.3 Consistency guarantees to know</h3>
+<p>These systems give strong guarantees about <i>ordering</i>. All writes are totally ordered (every server applies them in the same sequence), and each system exposes that order as a number: ZooKeeper's <b>zxid</b>, etcd's <b>revision</b>, Consul's <b>raft index</b>. Clients can use this number to detect change and, as section 12 shows, to build fencing tokens.</p>
+<p>The read guarantees differ. ZooKeeper gives <i>sequential consistency</i> by default: a client never sees time go backwards on its own connection, but a follower read can lag other clients' writes, so a client that needs the latest value first issues a <code>sync</code> call. etcd defaults to <i>linearizable reads</i> (the read goes through the leader and confirms leadership via a quorum round, so it reflects every committed write), with an optional cheaper <i>serializable</i> mode that reads local state and may be stale. Consul offers <i>default</i> (leader serves, may be briefly stale if the leader was just deposed), <i>consistent</i> (confirmed with a quorum), and <i>stale</i> (any server) modes. Knowing which mode your code uses is a classic interview probe: a leader-election check that uses a stale read is a bug.</p>
+
+<h3>2.4 What they are for</h3>
+<table>
+<tr><th>Use</th><th>How the primitives are used</th></tr>
+<tr><td>Configuration</td><td>Store the config under a key. Clients read it at start and watch it for changes. Everyone sees one consistent version.</td></tr>
+<tr><td>Service registry</td><td>Each instance registers an ephemeral entry under its service name. Consumers list the children and watch them. Dead instances vanish automatically. (<a href="49-discovery-config.html">Chapter 49</a> covers discovery in depth.)</td></tr>
+<tr><td>Leader election</td><td>Candidates race to create the same ephemeral node, or enqueue sequential nodes and the lowest wins. The others watch.</td></tr>
+<tr><td>Group membership</td><td>Each member holds an ephemeral node in a group directory. Listing the directory returns the live members.</td></tr>
+<tr><td>Distributed lock</td><td>A lock is an ephemeral node or a leased key. Whoever holds it owns the resource until release or expiry.</td></tr>
+<tr><td>Barriers and queues</td><td>A barrier waits until N participants have registered, then releases them together. A queue uses sequential nodes for order.</td></tr>
+</table>
+
+<h2 id="zookeeper">3. ZooKeeper: znodes, ephemeral and sequential nodes, watches</h2>
+
+<p>ZooKeeper, created at Yahoo and later donated to Apache, is the oldest and most widely deployed of the three. It was designed as "a file system for coordination". Hadoop, HBase, Kafka (in its older architecture), Solr, and many internal systems have used it.</p>
+
+<h3>3.1 The data model</h3>
+<p>ZooKeeper's data is a tree, like a file system, of <b>znodes</b>. Each znode has a path such as <code>/services/orders/instance-7</code>, a small byte payload (limited by default to about 1 MB, and in practice you keep it to kilobytes), a version number, and metadata including creation and modification zxids. Unlike a file system, <b>every znode can have both data and children</b>.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Znode tree with persistent, ephemeral and sequential nodes">
+  <rect class="cache" x="380" y="20" width="140" height="40" rx="8"/><text class="t-c t-b" x="450" y="45">/ (root)</text>
+  <rect class="box" x="60" y="110" width="170" height="44" rx="8"/><text class="t-c t-b" x="145" y="137">/config</text>
+  <rect class="box" x="370" y="110" width="160" height="44" rx="8"/><text class="t-c t-b" x="450" y="137">/election</text>
+  <rect class="box" x="660" y="110" width="170" height="44" rx="8"/><text class="t-c t-b" x="745" y="137">/services/orders</text>
+
+  <rect class="db" x="30" y="220" width="230" height="52" rx="8"/><text class="t-c t-b" x="145" y="243">/config/limits</text><text class="t-c t-sm" x="145" y="261">persistent, data = rate=500</text>
+
+  <rect class="hit" x="290" y="220" width="170" height="52" rx="8"/><text class="t-c t-b" x="375" y="243">n_0000000007</text><text class="t-c t-sm" x="375" y="261">ephemeral + sequential</text>
+  <rect class="hit" x="470" y="220" width="170" height="52" rx="8"/><text class="t-c t-b" x="555" y="243">n_0000000008</text><text class="t-c t-sm" x="555" y="261">ephemeral + sequential</text>
+
+  <rect class="hit" x="660" y="220" width="200" height="52" rx="8"/><text class="t-c t-b" x="760" y="243">instance-7</text><text class="t-c t-sm" x="760" y="261">ephemeral, data = 10.0.3.9:8080</text>
+
+  <path class="arrow" d="M420 60 L160 108"/><path class="arrow" d="M450 60 L450 108"/><path class="arrow" d="M480 60 L730 108"/>
+  <path class="arrow" d="M145 154 L145 216"/><path class="arrow" d="M420 154 L375 216"/><path class="arrow" d="M480 154 L555 216"/><path class="arrow" d="M745 154 L760 216"/>
+  <text class="t-sm" x="30" y="310">Green = vanishes when the owning session ends. Sequential nodes get a monotonically increasing suffix from the parent.</text>
+</svg>
+<figcaption>A znode tree. The persistent config node stays until someone deletes it. The ephemeral nodes disappear if the client session that created them ends. Sequential nodes receive an increasing counter appended by ZooKeeper.</figcaption>
+</figure>
+
+<p>Three flavours of znode matter:</p>
+<ul>
+  <li><b>Persistent:</b> exists until explicitly deleted. Used for configuration and for directories such as <code>/election</code>.</li>
+  <li><b>Ephemeral:</b> exists only as long as the <b>session</b> of the client that created it. When the session ends (the client disconnects and does not return within its timeout, or closes cleanly), ZooKeeper deletes the node automatically. Ephemeral nodes cannot have children. This is the core primitive for liveness: "this node exists" means "the client that made it is still alive, as far as the cluster can tell".</li>
+  <li><b>Sequential:</b> when created, ZooKeeper appends a ten-digit, ever-increasing counter, maintained by the parent, to the name. Two clients that create <code>/election/n_</code> at the same time get <code>n_0000000007</code> and <code>n_0000000008</code>, and the order is decided by the cluster, not by clocks. Ephemeral and sequential are combined for locks and leader election (section 11).</li>
+</ul>
+
+<h3>3.2 Watches</h3>
+<p>Polling a coordination service to see whether something changed would waste its precious write-and-read capacity. Instead a client sets a <b>watch</b>: "tell me when this znode's data changes, or when its set of children changes, or when it is deleted". ZooKeeper delivers a notification to the client over its connection. Two details trip people up. First, a ZooKeeper watch is <b>one-shot</b>: it fires once, and the client must re-register it (after re-reading the data) if it wants to keep watching. Between the notification and the re-registration further changes can occur, so the correct pattern is "read the current state and set the watch in the same call, and treat the notification as a hint to reread, not as the new value". Second, the notification says <i>what kind</i> of change happened but not the new content; the client reads it separately. The guarantee ZooKeeper gives is that a client sees a watch event before it sees the new state, which prevents acting on stale data after being told it changed.</p>
+
+<h3>3.3 Versions and conditional updates</h3>
+<p>Every znode carries a version counter. A write may specify "apply only if the version is still N". This is <b>compare-and-set</b> (CAS) at the znode level, and it gives optimistic concurrency without a lock: two clients read version 4, both try to write version 4's successor, and only one succeeds; the loser rereads and retries. This is also the right building block for anything that can be expressed as a small atomic update.</p>
+
+<h3>3.4 Sessions</h3>
+<p>A client connects and receives a <b>session</b> with a negotiated <b>timeout</b> (typically 10 to 40 seconds in production; the server enforces bounds relative to its tick time). The client sends heartbeats (pings) on its connection. If the cluster sees no traffic or ping from the session for the timeout duration, it <i>expires</i> the session and deletes the session's ephemeral nodes. If the client's connection to one server breaks but it reconnects to another server within the timeout, the session survives, because session state is replicated. Section 7 examines what this means for correctness.</p>
+
+<h2 id="etcd">4. etcd: keys, revisions, leases, watches, transactions</h2>
+
+<p>etcd is the coordination store behind Kubernetes: the entire cluster state (every pod, service, secret) lives in it. It is written in Go, uses Raft for consensus, and exposes a gRPC API. Its design is a deliberate modernisation of the ZooKeeper ideas.</p>
+
+<h3>4.1 Flat keys with a revision</h3>
+<p>etcd's data model is a flat ordered key space (keys are byte strings; hierarchy is by convention, such as <code>/services/orders/7</code>) rather than a tree. Range queries by prefix make "list the children" easy. The central concept is the <b>revision</b>: a single global 64-bit counter that increases with every committed write transaction. Each key records its <code>create_revision</code>, <code>mod_revision</code>, and a <code>version</code> (how many times it was changed since creation). etcd keeps old revisions until they are compacted, so a client can read the state <i>as of</i> a past revision, which makes consistent snapshots and gap-free watching possible.</p>
+
+<h3>4.2 Leases</h3>
+<p>Where ZooKeeper ties ephemeral nodes to a client session, etcd uses <b>leases</b>. A client asks for a lease with a time to live (TTL), say 15 seconds, and receives a lease ID. It can attach any number of keys to that lease. The client must periodically send <b>keep-alive</b> requests to refresh the TTL. If keep-alives stop, the lease expires after the TTL, and all keys attached to it are deleted. A lease is thus a generalised, explicit version of a session, and it can be shared by many keys or revoked deliberately. Importantly, the lease TTL countdown is managed by the cluster leader, not by the clock of the client.</p>
+
+<h3>4.3 Watches as streams</h3>
+<p>An etcd watch is a long-lived <b>stream</b>, not one-shot. A client says "watch this key or prefix starting at revision R" and receives every subsequent event in order, including events that happened since R, so no change is missed even if the client was briefly disconnected: it reconnects and resumes from the last revision it processed. (If R has been compacted away, the watch fails and the client must re-list and restart; this is why Kubernetes controllers use the "list then watch from the list's revision" pattern.) This streaming design is generally easier to use correctly than one-shot watches.</p>
+
+<h3>4.4 Transactions</h3>
+<p>etcd offers a <b>transaction</b>: an atomic "if / then / else" made of comparisons and operations. For example: <i>if</i> the key <code>/locks/report</code> has <code>create_revision == 0</code> (it does not exist), <i>then</i> put it with my lease, <i>else</i> read it to see who owns it. The comparison and the action happen atomically on the leader. This is more expressive than a single CAS and is how etcd's lock and election recipes are implemented.</p>
+
+<h2 id="consul">5. Consul: coordination with a service-discovery focus</h2>
+
+<p>HashiCorp Consul also uses Raft for its server cluster, but its main purpose is <b>service discovery and health checking</b>, with a key-value store as a supporting feature. Its distinctive pieces:</p>
+<ul>
+  <li><b>Agents on every node.</b> Each machine runs a Consul agent. Servers (3 or 5) run Raft; client agents forward requests to the servers and run local health checks.</li>
+  <li><b>Gossip layer.</b> Agents learn who is alive using a gossip protocol (Serf, based on SWIM) running between all agents. Failure detection is distributed and cheap, so thousands of nodes can be tracked without every node sending heartbeats to the servers. Gossip is not consensus; the servers' Raft log holds the authoritative catalog.</li>
+  <li><b>Sessions and locks.</b> Consul KV supports <b>sessions</b> with a TTL and optional health-check linkage. A key can be acquired by a session (<code>acquire</code>), and it is released if the session is invalidated. This supports locks and leader election in the same style as the other two.</li>
+  <li><b>Services, health, DNS.</b> Services register with health checks; clients discover healthy instances via an HTTP API or a DNS interface. (See <a href="49-discovery-config.html">Chapter 49</a>.)</li>
+</ul>
+
+<h3>5.1 Choosing among the three</h3>
+<table>
+<tr><th>Aspect</th><th>ZooKeeper</th><th>etcd</th><th>Consul</th></tr>
+<tr><td>Consensus</td><td>ZAB</td><td>Raft</td><td>Raft (servers) + gossip (agents)</td></tr>
+<tr><td>Data model</td><td>Tree of znodes</td><td>Flat key space with revisions</td><td>KV store plus service catalog</td></tr>
+<tr><td>Liveness primitive</td><td>Session + ephemeral node</td><td>Lease + attached keys</td><td>Session (TTL / health-check bound)</td></tr>
+<tr><td>Watches</td><td>One-shot triggers</td><td>Resumable streams from a revision</td><td>Blocking queries (long poll on an index)</td></tr>
+<tr><td>Typical home</td><td>Hadoop/Kafka-era systems, JVM ecosystem</td><td>Kubernetes and cloud-native control planes</td><td>Service mesh and discovery</td></tr>
+<tr><td>Strength</td><td>Mature, well-understood recipes</td><td>Simple API, strong watch semantics</td><td>Built-in health checks and DNS</td></tr>
+</table>
+<p>In an interview, the honest answer is that the choice is usually dictated by the ecosystem you already run: use etcd if you are on Kubernetes, ZooKeeper if a dependency (such as an older Kafka or Hadoop stack) already requires it, Consul if discovery and health checking are the main need. All three give the same core guarantee: consistent small data with ephemeral ownership and change notification.</p>
+
+<h2 id="sizing">6. Sizing and limits: not a general database</h2>
+
+<p>A coordination service is a precision instrument, and the most common mistake is treating it as a general-purpose database. Its limits follow directly from the design in section 2.</p>
+
+<h3>6.1 Cluster size: 3 or 5, never even</h3>
+<p>A consensus cluster of N members needs a majority, floor(N/2) + 1, to commit. With 3 members the majority is 2, so it tolerates 1 failure. With 5, the majority is 3, so it tolerates 2. With 4 members the majority is 3, so it still tolerates only 1 failure, the same as 3, while costing more and being slower; with 6 it tolerates 2, the same as 5. That is why you run an <b>odd</b> number. Three is common for most systems, five for critical ones where you want to survive one planned maintenance <i>and</i> one unplanned failure at the same moment. Seven is rare, because each extra member slows every write and adds little. If members are spread across failure domains, three zones with one or two servers each is the standard layout, so that losing one zone leaves a majority.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Quorum sizes and failure tolerance">
+  <text class="t-b" x="20" y="24">Servers in cluster, majority needed, failures tolerated</text>
+  <rect class="box" x="30" y="44" width="150" height="70" rx="8"/><text class="t-c t-b" x="105" y="72">3 servers</text><text class="t-c t-sm" x="105" y="92">majority 2, survives 1</text>
+  <rect class="miss" x="210" y="44" width="150" height="70" rx="8"/><text class="t-c t-b" x="285" y="72">4 servers</text><text class="t-c t-sm" x="285" y="92">majority 3, survives 1</text>
+  <rect class="box" x="390" y="44" width="150" height="70" rx="8"/><text class="t-c t-b" x="465" y="72">5 servers</text><text class="t-c t-sm" x="465" y="92">majority 3, survives 2</text>
+  <rect class="miss" x="570" y="44" width="150" height="70" rx="8"/><text class="t-c t-b" x="645" y="72">6 servers</text><text class="t-c t-sm" x="645" y="92">majority 4, survives 2</text>
+  <rect class="box" x="750" y="44" width="120" height="70" rx="8"/><text class="t-c t-b" x="810" y="72">7 servers</text><text class="t-c t-sm" x="810" y="92">survives 3</text>
+  <text class="t-sm" x="30" y="150">Red cells give no extra tolerance over the odd size just below them, and every write waits on more machines.</text>
+  <rect class="cache" x="30" y="170" width="840" height="56" rx="8"/>
+  <text class="t-sm" x="46" y="194">Capacity does not grow with members. Every server holds all data and sees every write.</text>
+  <text class="t-sm" x="46" y="212">Need more read capacity? Add read-only observers/learners, or cache in the clients. Need more write capacity? Shard by using several clusters.</text>
+</svg>
+<figcaption>Even-sized clusters waste a machine. More members buy fault tolerance only, never throughput.</figcaption>
+</figure>
+
+<h3>6.2 Limits to remember</h3>
+<ul>
+  <li><b>Data size.</b> The whole data set fits in memory on each server. Typical guidance is megabytes to a few gigabytes (etcd recommends keeping its database to roughly 8 GB or less; ZooKeeper's per-znode limit is about 1 MB, and designs keep values under a few kilobytes). Store pointers (an S3 key) rather than blobs.</li>
+  <li><b>Write throughput.</b> Every write is a consensus round that includes a durable disk sync on a majority of servers. A well-provisioned cluster on SSDs reaches on the order of thousands to low tens of thousands of writes per second; real deployments are far below that. The disk fsync latency of the slowest majority member is the dominant factor, so these services want fast, dedicated disks and a low-latency network (usually one region, spread over zones; multi-region clusters pay cross-region latency on every write).</li>
+  <li><b>Read throughput.</b> Much higher than writes since followers serve reads locally, but linearizable reads still involve the leader.</li>
+  <li><b>Number of watches and clients.</b> Tens of thousands of clients with watches are feasible; hundreds of thousands put pressure on the servers. Use caching proxies or a hierarchy (Consul's agents, ZooKeeper observers, a "config sidecar" that watches once per host) to fan out.</li>
+  <li><b>Not for high-churn data.</b> Counters, user sessions, rate-limit state, and job queues with millions of items belong in Redis, a database, or a real queue. Put into the coordination service only the data whose <i>correctness</i> depends on strong consistency and that changes rarely.</li>
+</ul>
+
+<div class="callout watch"><b>Watch out</b>
+A coordination cluster is a shared dependency of everything built on it. If it slows down, leader elections time out, sessions expire, services deregister, and you can turn a small hiccup into a fleet-wide outage. Treat it as critical infrastructure: dedicated machines, fast disks, monitoring of commit latency and leader changes, and strict quotas so one tenant cannot flood it with writes.
+</div>
+
+<h2 id="expiry">7. Sessions, leases and expiry: the failure semantics that matter</h2>
+
+<p>The feature that makes coordination services powerful is automatic cleanup: if a client dies, its ephemeral nodes or leased keys vanish and others can take over. But the cluster cannot distinguish "the client crashed" from "the client is alive but slow or partitioned". It can only observe that it has not heard from the client for the timeout. This section spells out what that implies.</p>
+
+<h3>7.1 The timeline of an expiry</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Timeline of a lease expiry while client is paused">
+  <text class="t-b" x="20" y="22">Client C holds a lock (lease TTL 10 s, refreshed every 3 s)</text>
+  <line x1="40" y1="110" x2="860" y2="110" stroke="var(--fg)" stroke-width="2"/>
+  <text class="t-sm" x="30" y="132">t=0</text><text class="t-sm" x="190" y="132">t=3</text><text class="t-sm" x="350" y="132">t=6</text><text class="t-sm" x="510" y="132">t=9</text><text class="t-sm" x="670" y="132">t=16</text><text class="t-sm" x="800" y="132">t=19</text>
+  <circle cx="40" cy="110" r="5" fill="var(--good)"/><circle cx="200" cy="110" r="5" fill="var(--good)"/><circle cx="360" cy="110" r="5" fill="var(--good)"/>
+  <text class="t-sm" x="30" y="92">lock</text><text class="t-sm" x="190" y="92">renew</text><text class="t-sm" x="350" y="92">renew</text>
+  <rect class="miss" x="380" y="150" width="400" height="40" rx="8"/><text class="t-c t-b" x="580" y="175">C paused (GC, VM freeze, partition)</text>
+  <rect class="cache" x="510" y="205" width="160" height="40" rx="8"/><text class="t-c t-sm" x="590" y="230">lease expires, key deleted</text>
+  <rect class="hit" x="680" y="205" width="190" height="40" rx="8"/><text class="t-c t-sm" x="775" y="230">D acquires lock, starts</text>
+  <circle cx="510" cy="110" r="5" fill="var(--bad)"/><circle cx="800" cy="110" r="5" fill="var(--bad)"/>
+  <text class="t-sm" x="30" y="272">At t=19 client C wakes up, still believing it owns the lock, and both C and D now act on the resource.</text>
+</svg>
+<figcaption>The service is correct: C missed its renewals and was expired. The danger is that C does not know yet. The gap between expiry and C noticing is the window in which two owners exist.</figcaption>
+</figure>
+
+<h3>7.2 What each side knows</h3>
+<ul>
+  <li>The <b>cluster</b> knows exactly one thing: it has or has not received a renewal within the TTL. It is consistent about this: all members agree that the lease is expired and that the key is deleted.</li>
+  <li>The <b>client</b> knows that its last successful renewal was at some local time. It can estimate when its lease will expire, but it cannot be sure: its clock might run fast or slow, and it might be paused between checking the time and acting.</li>
+  <li>The <b>client library</b> typically tells the application about connection trouble. ZooKeeper clients surface states <i>Disconnected</i> (connection lost, session may still be alive; do <b>not</b> assume you lost the lock yet, but stop acting as owner if you require safety) and <i>Expired</i> (session definitely gone; locks are lost). Handling "disconnected" conservatively is the core of using these services correctly: a careful client treats the moment it loses contact as the moment it must stop doing protected work, rather than waiting to hear it has expired.</li>
+</ul>
+
+<h3>7.3 Choosing the timeout</h3>
+<p>A short timeout (2 to 5 seconds) detects real failures quickly, but a brief garbage-collection pause or network blip expires healthy sessions, causing needless leader changes ("flapping") and, if the client does not react correctly, split ownership. A long timeout (30 to 60 seconds) is stable but slows recovery: after a leader crashes, nobody else becomes leader until the timeout passes. A typical production compromise is 10 to 30 seconds with a client heartbeat interval of one third of the timeout. The important design conclusion is that <b>no timeout makes expiry perfectly safe</b>; it only trades unavailability against the probability of overlap. Safety must come from elsewhere, namely fencing (section 12).</p>
+
+<h2 id="locks-why">8. Distributed locks: why you need them, and what they promise</h2>
+
+<p>A <b>lock</b> on a single machine is a familiar idea: before touching shared data, a thread acquires the lock; other threads wait; the holder releases it. The operating system makes this reliable, because the threads share one memory and one clock, and a crashed process's locks are cleaned up with it.</p>
+
+<p>A <b>distributed lock</b> tries to give the same promise to processes on different machines: at most one holder at a time. It is wanted for two quite different reasons, and distinguishing them is the most useful thing a candidate can do:</p>
+<ul>
+  <li><b>Efficiency.</b> The lock avoids doing the same work twice. For example, two workers both about to generate the same expensive daily report. If the lock occasionally fails and both run, the cost is some wasted computation, but the result is still correct. For this purpose a simple, approximate lock is fine.</li>
+  <li><b>Correctness.</b> The lock protects data from corruption. For example, two clients both updating the same file or the same account balance as read-modify-write. If the lock fails and both proceed, data is lost or corrupted. For this purpose the lock must be <i>truly</i> safe, and, as we will see, a lock alone cannot be: it must be paired with a fencing token checked by the resource itself.</li>
+</ul>
+
+<p>The properties we want from a distributed lock are:</p>
+<ol>
+  <li><b>Mutual exclusion (safety):</b> at most one client holds the lock at a time.</li>
+  <li><b>Deadlock freedom (liveness):</b> if the holder crashes, the lock is eventually released so others can proceed. This is why every distributed lock needs a time limit or a session tied to liveness.</li>
+  <li><b>Fault tolerance:</b> as long as a majority of the lock service is up, clients can acquire and release locks.</li>
+</ol>
+<p>Property 2 directly collides with property 1: to release the lock of a crashed client you must declare it dead based on silence, but silence is also what a paused or partitioned client looks like. This tension is the root of every problem in this chapter.</p>
+
+<h2 id="ttl-lock">9. Locks with a TTL, and the Redis SET NX PX lock</h2>
+
+<h3>9.1 The TTL lock idea</h3>
+<p>The simplest design that satisfies deadlock freedom: store a key representing the lock in some shared store, with an expiry time. A client acquires the lock by creating the key only if it does not exist. If it crashes, the key expires on its own. If the work is longer than expected, the client extends the expiry (renews the lease). The store can be a coordination service (etcd lease, Consul session, ZooKeeper ephemeral node) or a plain cache such as Redis.</p>
+
+<h3>9.2 The Redis lock in detail</h3>
+<p>Redis is single-threaded per instance and executes each command atomically, so it is popular for quick locks. The standard single-instance pattern is:</p>
+<pre><code>SET lock:report:2026-11-17  &lt;random-token&gt;  NX  PX 30000</code></pre>
+<p><code>NX</code> means "set only if the key does not exist", so exactly one client succeeds. <code>PX 30000</code> sets a 30,000 ms expiry, so a crashed holder's lock disappears. The value is a <b>random token unique to this acquisition</b> (such as a UUID). The token matters for release. A naive client that simply deletes the key could delete a lock that now belongs to someone else: client A's lock expired, client B acquired it, then A finishes and deletes B's lock. To prevent that, release must be "delete only if the value is still my token", and that check-and-delete must be atomic, so it is done with a small server-side Lua script:</p>
+<pre><code>if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+else
+  return 0
+end</code></pre>
+
+<p>This is perfectly reasonable as an <b>efficiency</b> lock. What it does <i>not</i> do, even in the single-instance version, is guarantee exclusion in the face of pauses and failures:</p>
+<ul>
+  <li>If the Redis instance is the single point, its failure means no one can acquire locks (availability loss), and if it restarts without persistence, locks are forgotten and a second client can acquire a lock the first still believes it holds.</li>
+  <li>If Redis is replicated asynchronously to a replica and the primary dies right after granting a lock, the promoted replica may not have the key, and a second client acquires the "same" lock. This is a real, documented hazard of asynchronous replication.</li>
+  <li>The holder can still stall after acquiring (section 13), so the TTL expires while it believes it is working.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Redis lock acquire and release flow with token check">
+  <rect class="ext" x="30" y="30" width="150" height="40" rx="8"/><text class="t-c t-b" x="105" y="55">Client A</text>
+  <rect class="cache" x="370" y="30" width="160" height="40" rx="8"/><text class="t-c t-b" x="450" y="55">Redis</text>
+  <rect class="ext" x="720" y="30" width="150" height="40" rx="8"/><text class="t-c t-b" x="795" y="55">Client B</text>
+  <line class="life" x1="105" y1="70" x2="105" y2="320"/><line class="life" x1="450" y1="70" x2="450" y2="320"/><line class="life" x1="795" y1="70" x2="795" y2="320"/>
+  <path class="arrow" d="M105 100 L446 100"/><text class="t-sm" x="120" y="94">SET lock tokA NX PX 30000</text>
+  <path class="arrow-g dash" d="M446 125 L109 125"/><text class="t-sm" x="240" y="119">OK (A holds the lock)</text>
+  <path class="arrow" d="M795 155 L454 155"/><text class="t-sm" x="520" y="149">SET lock tokB NX PX 30000</text>
+  <path class="arrow-r dash" d="M454 180 L791 180"/><text class="t-sm" x="560" y="174">nil (B must retry or give up)</text>
+  <text class="t-sm" x="120" y="215">A works ... finishes in time</text>
+  <path class="arrow" d="M105 240 L446 240"/><text class="t-sm" x="120" y="234">EVAL: if get==tokA then del</text>
+  <path class="arrow-g dash" d="M446 265 L109 265"/><text class="t-sm" x="240" y="259">1 (released)</text>
+  <text class="t-sm" x="470" y="300">If A had been slow and the TTL had fired, B's SET would succeed and A's EVAL would return 0.</text>
+</svg>
+<figcaption>A single-instance Redis lock: acquire atomically with NX and a TTL, release only if the stored token is still yours.</figcaption>
+</figure>
+
+<h3>9.3 Renewal (the watchdog)</h3>
+<p>Because the protected work may take longer than any fixed TTL you can choose, libraries start a background <b>watchdog</b> thread that periodically extends the TTL while the owner is still working (for example, Redisson renews every third of the TTL). This lessens expiry mid-work in normal operation, but note what it does <i>not</i> fix: if the whole process is frozen, the watchdog is frozen with it, and the lease expires anyway. Also, a lock renewed forever by a stuck-but-alive thread blocks everyone; give work an upper bound.</p>
+
+<h2 id="redlock">10. The Redlock debate, explained fairly</h2>
+
+<p>To remove the single-point-of-failure problem of one Redis instance, Salvatore Sanfilippo (known as antirez, the creator of Redis) proposed an algorithm called <b>Redlock</b>. The idea: run <b>N independent Redis masters</b> (typically 5; not replicas of each other, no shared failure). A client acquires the lock by:</p>
+<ol>
+  <li>Recording the current time.</li>
+  <li>Trying to <code>SET key token NX PX ttl</code> on each of the N instances in turn, using a small per-instance timeout so a dead instance does not stall it.</li>
+  <li>Computing how long acquisition took. The lock is considered acquired only if the client got it on a <b>majority</b> (at least 3 of 5) <i>and</i> the elapsed time is less than the lock's TTL. The remaining <i>validity time</i> is TTL minus elapsed time (minus a small allowance for clock drift).</li>
+  <li>If acquisition failed, release on all instances (even ones where it seemed to fail) and retry after a random delay.</li>
+</ol>
+<p>The reasoning mirrors consensus: a majority of independent nodes agreeing makes it unlikely that two clients both hold a majority.</p>
+
+<h3>10.1 Martin Kleppmann's critique</h3>
+<p>Martin Kleppmann (author of <i>Designing Data-Intensive Applications</i>) published an analysis arguing that Redlock is unsuitable for correctness-critical locking. His points, summarised:</p>
+<ul>
+  <li><b>It depends on timing assumptions that real systems violate.</b> Redlock assumes bounded network delay, bounded process pauses, and bounded clock error. Real systems have unbounded stalls: a long garbage-collection pause, a VM migration, a page fault, a congested network. A client can acquire the lock, stall past the TTL, wake up, and act as if it still held it, while another client now holds a valid lock.</li>
+  <li><b>It relies on wall-clock time.</b> The TTL on each Redis node is measured with that node's clock. If a node's clock jumps forward (an NTP adjustment, an administrator changing the time), the key can expire early, and two clients could each hold a majority. (Antirez's counter: use of a monotonic clock source and sane operational practice make large jumps unlikely.)</li>
+  <li><b>It provides no fencing token.</b> Redlock gives you a random string, not a monotonically increasing number. Without a number that the storage layer can compare, you cannot reject a stale writer. A fencing token (section 12) is the only way to make a lock safe against pauses, and Redlock has no natural way to produce one, because the independent instances do not share a counter.</li>
+</ul>
+<p>His conclusion: if you want the lock for efficiency, Redlock is heavier than needed (a single Redis node is enough); if you want it for correctness, Redlock is not safe enough, and you should use a real consensus-based system (ZooKeeper, etcd) <i>with fencing tokens</i>.</p>
+
+<h3>10.2 Antirez's response</h3>
+<p>Antirez replied that the critique was partly aimed at a different bar than Redlock claims. His arguments:</p>
+<ul>
+  <li>Redlock's validity-time check does account for delays <i>during acquisition</i>, and a client can check remaining validity <i>before using the resource</i> to guard against some delays. A pause that occurs <i>after</i> the last check and before the write is a problem for <i>every</i> lock, including ZooKeeper's, not specific to Redlock.</li>
+  <li>The fencing-token argument applies equally to any lock service: if the storage layer cannot check tokens, none of them are safe. So it is not a defect unique to Redlock.</li>
+  <li>The clock concerns are manageable: Redlock only needs the clocks to advance at <i>roughly</i> the same rate (bounded drift) over a short period, not to be synchronised to each other.</li>
+  <li>Many applications want exactly the "efficiency" level of protection, and Redlock is pragmatic for them.</li>
+</ul>
+
+<h3>10.3 How to read the debate</h3>
+<p>The two positions are less opposed than they sound. Both agree that no lock based on timeouts is safe against an arbitrarily long pause unless the protected resource participates. They disagree about how bad the failure modes are in practice and what the algorithm claims. The takeaway an interviewer wants to hear is the decision rule: <b>use a lock for efficiency freely, but if mutual exclusion protects correctness, you need a fencing token validated by the resource, and a lock service that can issue monotonic tokens</b> (ZooKeeper's zxid or sequential node number, etcd's revision, a database sequence).</p>
+
+<div class="callout tip"><b>Interview tip</b>
+If asked "is Redlock safe?", do not take a side with a slogan. Say: it is fine for efficiency locks; for correctness, no timeout-based lock is safe by itself, and Redlock additionally lacks a fencing token and leans on clock assumptions, so I would use etcd or ZooKeeper plus fencing, or avoid the lock entirely using a conditional write.
+</div>
+
+<h2 id="recipes">11. Lock recipes on ZooKeeper and etcd</h2>
+
+<h3>11.1 ZooKeeper: ephemeral sequential nodes</h3>
+<p>The naive ZooKeeper lock is: everyone tries to create <code>/lock</code> as an ephemeral node; the one that succeeds holds the lock; the others watch <code>/lock</code> and retry when it is deleted. It works but has the <b>herd effect</b>: when the lock is released, <i>all N waiting clients</i> get a notification and all rush to create the node, causing a burst of N requests of which N-1 fail. With hundreds of waiters this wastes cluster capacity and increases latency.</p>
+<p>The standard recipe removes the herd:</p>
+<ol>
+  <li>Each client creates an <b>ephemeral, sequential</b> node under the lock directory: <code>/lock/c_</code> becomes <code>/lock/c_0000000041</code>, <code>/lock/c_0000000042</code>, and so on.</li>
+  <li>The client lists the children of <code>/lock</code>. If its node has the <b>lowest</b> number, it holds the lock.</li>
+  <li>Otherwise it sets a watch on the node with the <b>next lower</b> number (its predecessor only) and waits.</li>
+  <li>When the predecessor is deleted (released or its client's session expired), the watcher is notified, re-lists the children, and checks again whether it is now lowest. Usually it is.</li>
+  <li>To release, the client deletes its node.</li>
+</ol>
+<p>Only one client is woken per release, so there is no herd, and the waiters form a fair <b>FIFO queue</b> in the order the sequence numbers were assigned. If a waiter in the middle of the queue dies, its node disappears and its successor wakes, rechecks, finds it is still not lowest (someone ahead of it exists), and re-watches the new predecessor. Note the subtle case: a client that creates its node but whose create call reports a connection failure may not know whether the node exists; robust recipes embed a unique client ID in the node name so the client can look for its own node after reconnecting, preventing a "ghost" node that blocks the queue until the session expires.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="ZooKeeper lock queue with predecessor watches">
+  <text class="t-b" x="20" y="24">/lock children, sorted by sequence number</text>
+  <rect class="hit" x="40" y="50" width="190" height="56" rx="8"/><text class="t-c t-b" x="135" y="74">c_0000000041</text><text class="t-c t-sm" x="135" y="94">Client A: HOLDS the lock</text>
+  <rect class="box" x="270" y="50" width="190" height="56" rx="8"/><text class="t-c t-b" x="365" y="74">c_0000000042</text><text class="t-c t-sm" x="365" y="94">Client B: waits</text>
+  <rect class="box" x="500" y="50" width="190" height="56" rx="8"/><text class="t-c t-b" x="595" y="74">c_0000000043</text><text class="t-c t-sm" x="595" y="94">Client C: waits</text>
+  <rect class="box" x="730" y="50" width="140" height="56" rx="8"/><text class="t-c t-b" x="800" y="74">c_...44</text><text class="t-c t-sm" x="800" y="94">Client D: waits</text>
+  <path class="arrow-r dash" d="M300 130 Q 265 150 232 112"/><text class="t-sm" x="240" y="168">B watches 41</text>
+  <path class="arrow-r dash" d="M530 130 Q 495 150 462 112"/><text class="t-sm" x="470" y="168">C watches 42</text>
+  <path class="arrow-r dash" d="M760 130 Q 725 150 692 112"/><text class="t-sm" x="700" y="168">D watches 43</text>
+  <rect class="cache" x="40" y="200" width="830" height="100" rx="8"/>
+  <text class="t-sm" x="56" y="226">Release: A deletes 41 (or A's session expires and ZooKeeper deletes it). Only B is notified.</text>
+  <text class="t-sm" x="56" y="248">B lists children, sees 42 is now lowest, and proceeds. C and D are not woken: no herd effect, strict FIFO fairness.</text>
+  <text class="t-sm" x="56" y="270">If C dies instead, 43 disappears, D is notified, re-lists, finds 42 still ahead, and watches 42.</text>
+</svg>
+<figcaption>Each waiter watches only its immediate predecessor, so a release wakes exactly one client and the queue stays ordered.</figcaption>
+</figure>
+
+<h3>11.2 etcd: lease-attached key with revision ordering</h3>
+<p>etcd's lock recipe has the same structure using different primitives. A client obtains a lease and writes a key such as <code>/locks/report/&lt;lease-id&gt;</code> attached to that lease. The write's <code>create_revision</code> is globally ordered. The client lists all keys under the prefix; if its key has the smallest create revision it owns the lock; otherwise it watches the key with the next-smaller revision (the same predecessor trick) and waits until that key is deleted. Releasing is deleting the key; a crashed client's lease expires and the key is removed. Because the transaction machinery in section 4.4 can express "create the key only if no key with a lower revision exists", the check is atomic. The ownership key's <b>revision is a ready-made monotonically increasing fencing token</b>, which is one reason etcd is well suited to the correctness-grade lock.</p>
+
+<h3>11.3 Consul: session-bound key</h3>
+<p>Consul's lock is simpler: create a session (TTL plus optional health-check linkage), then <code>PUT /kv/lock?acquire=&lt;session&gt;</code>. The call succeeds only if no other live session holds the key. Waiters use a blocking query on the key's index to learn about release. The <code>ModifyIndex</code> of the key can serve as the token. There is no built-in fair queue, so contention on a popular lock produces some herd behaviour.</p>
+
+<h2 id="fencing">12. Fencing tokens: making a lock safe against pauses</h2>
+
+<p>Section 7 showed that a lock holder can lose the lock without knowing it. For an efficiency lock that is tolerable. For a correctness lock it is a disaster: a paused client wakes up and overwrites data that the new lock holder has since changed. The cure is to make the <b>resource itself</b> refuse stale clients, rather than trusting clients to know they are stale.</p>
+
+<p>A <b>fencing token</b> is a number issued by the lock service that increases every time the lock is granted. Client A gets token 33; after A's lease expires, client B gets token 34. Every request that a client makes to the protected resource includes its token. The resource remembers the highest token it has seen, and <b>rejects any request carrying a lower token</b>. So after B writes with token 34, a late write from A with token 33 is refused, even though A is convinced it still holds the lock.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 470" role="img" aria-label="Sequence diagram: paused client rejected by storage using fencing token">
+  <rect class="ext" x="30" y="20" width="130" height="38" rx="8"/><text class="t-c t-b" x="95" y="44">Client A</text>
+  <rect class="cache" x="250" y="20" width="150" height="38" rx="8"/><text class="t-c t-b" x="325" y="44">Lock service</text>
+  <rect class="ext" x="490" y="20" width="130" height="38" rx="8"/><text class="t-c t-b" x="555" y="44">Client B</text>
+  <rect class="db" x="730" y="20" width="140" height="38" rx="8"/><text class="t-c t-b" x="800" y="44">Storage</text>
+  <line class="life" x1="95" y1="58" x2="95" y2="460"/><line class="life" x1="325" y1="58" x2="325" y2="460"/><line class="life" x1="555" y1="58" x2="555" y2="460"/><line class="life" x1="800" y1="58" x2="800" y2="460"/>
+
+  <path class="arrow" d="M95 85 L321 85"/><text class="t-sm" x="110" y="79">1. acquire lock</text>
+  <path class="arrow-g dash" d="M321 108 L99 108"/><text class="t-sm" x="110" y="124">2. granted, token 33</text>
+  <rect class="miss" x="30" y="140" width="130" height="64" rx="8"/><text class="t-c t-sm" x="95" y="164">3. A pauses</text><text class="t-c t-sm" x="95" y="182">(long GC / freeze)</text>
+  <text class="t-sm" x="338" y="170">4. A's lease expires</text>
+  <path class="arrow" d="M555 195 L329 195"/><text class="t-sm" x="360" y="189">5. acquire lock</text>
+  <path class="arrow-g dash" d="M329 218 L551 218"/><text class="t-sm" x="360" y="234">6. granted, token 34</text>
+  <path class="arrow" d="M555 262 L796 262"/><text class="t-sm" x="580" y="256">7. write(X, token 34)</text>
+  <rect class="hit" x="676" y="272" width="190" height="34" rx="8"/><text class="t-c t-sm" x="771" y="294">8. accepts, max token = 34</text>
+  <text class="t-sm" x="30" y="330">9. A wakes, still believes it holds the lock</text>
+  <path class="arrow-r" d="M95 354 L796 354"/><text class="t-sm" x="360" y="348">10. write(X, token 33)</text>
+  <rect class="miss" x="590" y="366" width="276" height="48" rx="8"/><text class="t-c t-sm" x="728" y="387">11. REJECT: 33 &lt; 34 (stale)</text><text class="t-c t-sm" x="728" y="405">data from B is protected</text>
+  <path class="arrow-r dash" d="M796 436 L99 436"/><text class="t-sm" x="360" y="430">12. error: stale token, A must stop</text>
+</svg>
+<figcaption>The lock service issues token 33 to A and 34 to B. The storage layer remembers the highest token it has accepted and rejects the late write from the paused client A, so correctness does not depend on A noticing that its lease expired.</figcaption>
+</figure>
+
+<h3>12.1 Where the token comes from</h3>
+<ul>
+  <li><b>ZooKeeper:</b> the sequence number of the lock node, or the zxid (<code>czxid</code>) of its creation. Both strictly increase.</li>
+  <li><b>etcd:</b> the <code>create_revision</code> or <code>mod_revision</code> of the lock key.</li>
+  <li><b>Consul:</b> the <code>LockIndex</code> / <code>ModifyIndex</code> of the key.</li>
+  <li><b>A database:</b> a sequence or an incrementing integer on a lock row, updated in the same transaction that grants the lock.</li>
+  <li><b>Redis:</b> <code>INCR</code> on a counter next to the lock can produce a token, but the guarantee degrades with Redis failover (the counter may roll back after an asynchronous failover); this is one reason Redis is used for efficiency locks.</li>
+</ul>
+
+<h3>12.2 What the resource must do</h3>
+<p>This is the part people forget: <b>the protected resource must be able to check and store the token</b>. A database can do it with a conditional update (<code>UPDATE ... SET data=?, last_token=? WHERE id=? AND last_token &lt;= ?</code>, checking the row count). A storage service might accept a token as a request header and compare it with the stored maximum. A file or an external API that you do not control cannot enforce it; then you cannot get correctness from a lock, and must rely on idempotency or a different design (section 14). If every write is also idempotent, then even a stale write that slips through does no harm.</p>
+
+<div class="callout key"><b>Key idea</b>
+A lock tells you who <i>should</i> be working. A fencing token lets the resource verify who <i>is allowed</i> to write at the moment of the write. Only the second is safe against pauses, clock errors, and lease expiry.
+</div>
+
+<h2 id="pitfalls">13. Lock pitfalls</h2>
+
+<h3>13.1 Garbage-collection and other pauses</h3>
+<p>A process can stop executing for seconds, with no way for it to notice. Causes include stop-the-world garbage collection in a managed runtime, the operating system swapping the process, a virtual machine being paused or live-migrated, a laptop being suspended, a container being CPU-throttled by its cgroup limit, or the process being stopped by a debugger or <code>SIGSTOP</code>. Pauses of many seconds have been measured in production. The pattern "check I still hold the lock, then act" has a window between the check and the act in which a pause turns the check false. No amount of checking inside the client closes the window; only a token verified by the resource does.</p>
+
+<h3>13.2 Clock drift and jumps</h3>
+<p>Lock expiry with TTLs depends on clocks. Each machine's clock drifts (typically up to some tens of parts per million), and synchronisation (NTP) can step the clock forward or backward. If the lock service computes expiry using its own clock and the client computes its remaining validity using a different one, they will disagree. Practical rules: measure durations with a <b>monotonic clock</b> (not wall-clock time-of-day) on the client; let the <i>service</i> own the expiry decision; have the client treat its lock as lost <i>earlier</i> than the nominal expiry (a safety margin of drift plus network delay); and never compare timestamps from different machines to decide who holds a lock. <a href="27-failure-time-ordering.html">Chapter 27</a> covers clock behaviour in depth.</p>
+
+<h3>13.3 Lease expiry in the middle of work</h3>
+<p>If the job may take longer than the lease, the client must renew while working, which requires a thread that can run during the job, and a plan for the case when renewal fails (network lost): the client must <b>abort</b> the protected work promptly, rather than finish and hope. Design work in small steps with a lock check (and token) at each step, or make the work resumable and idempotent so that being preempted halfway is harmless.</p>
+
+<h3>13.4 Lost unlock</h3>
+<p>If a client crashes or its release call is lost, the lock stays held until its lease expires. This is acceptable and is the whole reason for TTLs; but choose the TTL to match how long you can tolerate the resource being blocked. The opposite bug is a release that deletes <i>someone else's</i> lock after expiry; that is why release checks the token (section 9.2). Also release in a <code>finally</code> block so exceptions do not leak locks.</p>
+
+<h3>13.5 Reentrancy</h3>
+<p>A local mutex in many languages is <i>reentrant</i>: the same thread can acquire it again without deadlocking itself. A naive distributed lock is not: if method <code>a()</code> takes the lock and calls <code>b()</code>, which tries to take the same lock, it waits for itself forever (until the TTL expires). Reentrant locks track the owner identity (client ID plus thread ID) and a hold count in the lock value. Recommended practice is to avoid needing reentrancy by taking the lock at one clear boundary and passing a "I already hold it" context inward.</p>
+
+<h3>13.6 Deadlock</h3>
+<p>With a TTL, a true permanent deadlock cannot occur, but <i>stalls</i> can: client A holds lock X and waits for lock Y, client B holds Y and waits for X; both stall until a TTL fires, then retry, possibly colliding again (livelock). Prevent it as in local code: acquire multiple locks in a global, consistent order; acquire with a bounded wait and back off with random jitter; prefer one coarse lock to many fine ones when possible.</p>
+
+<h3>13.7 Other traps</h3>
+<ul>
+  <li><b>Thundering herd on release</b> (fixed by the queue recipe, section 11).</li>
+  <li><b>Too-fine granularity.</b> A lock per record at 100,000 requests per second would overwhelm the coordination service. Locks are for coarse, infrequent decisions.</li>
+  <li><b>Treating a failed acquire as success</b> when the service times out. A timeout means "unknown", not "got it": the grant may have happened, so check or release.</li>
+  <li><b>Lock service unavailable.</b> Decide in advance whether the work should proceed (risking duplication) or stop (risking an outage). For correctness locks the answer is stop.</li>
+</ul>
+
+<h2 id="no-lock">14. When you do not need a lock</h2>
+
+<p>The best distributed lock is the one you avoid. Locks add a dependency, a failure mode, and subtle bugs. Ask first whether the problem can be solved by a mechanism that is naturally safe.</p>
+
+<table>
+<tr><th>Technique</th><th>How it removes the need for a lock</th></tr>
+<tr><td>Idempotency</td><td>Make the operation safe to run twice, usually with an idempotency key so the second run is recognised and ignored. Then "two workers both did it" is harmless. See <a href="32-idempotency-ids.html">Chapter 32</a>. This turns a correctness lock into an efficiency lock, which is cheap.</td></tr>
+<tr><td>CAS / optimistic concurrency</td><td>Read a value and its version, compute, then write "only if the version is unchanged". Conflicting writers see a failure and retry. No lock is held across the computation, and no lease can expire mid-work. Works in SQL (<code>WHERE version = ?</code>), DynamoDB (conditional writes), ZooKeeper and etcd (version or revision comparison).</td></tr>
+<tr><td>Single consumer queue</td><td>If all work for an entity goes through one queue partition read by one consumer at a time, ordering and exclusion are by construction. Kafka partitions assigned to one consumer in a group, or a FIFO queue with a message group, give "one at a time per key" without an explicit lock.</td></tr>
+<tr><td>Database row locks</td><td>If the data lives in a relational database, <code>SELECT ... FOR UPDATE</code> or a unique constraint uses the database's own lock manager and transaction, which already cleans up on disconnect and ties the lock to the data. See <a href="18-relational-internals.html">Chapter 18</a>. The lock and the data are in the same system and the same transaction, so there is nothing to fence.</td></tr>
+<tr><td>Unique constraints</td><td>"Only one of these may exist" is an insert that fails on duplicate. The first inserter wins. Often this is all a leader election or dedupe needs.</td></tr>
+<tr><td>Partitioning / sharding</td><td>Assign each entity to exactly one owner (consistent hashing, partition assignment). Within a shard there is only one writer, so no lock is required; coordination happens only when ownership changes.</td></tr>
+</table>
+
+<div class="callout tip"><b>Interview tip</b>
+When an interviewer says "add a distributed lock here", a strong answer first states what the lock is protecting and whether it is for efficiency or correctness, then proposes whether a conditional write or idempotency key would remove the need. Only then, if it is really required, describe the lease, the fencing token, and the failure behaviour.
+</div>
+
+<h2 id="leader">15. Leader election and lease renewal</h2>
+
+<p><b>Leader election</b> picks one member of a group to perform a role that must have a single performer: the primary of a database, the scheduler, the coordinator of a rebalance, the single writer of an index. It is a distributed lock held for a long time, with the added requirement that the others find out quickly when leadership changes.</p>
+
+<h3>15.1 The recipe</h3>
+<ol>
+  <li>Every candidate attempts to create the same key (or enqueue a sequential node, as in the lock recipe), attached to its session or lease. Exactly one wins and becomes leader. It writes its own address into the node so others can find it.</li>
+  <li>The others watch the leader node (or only their predecessor, to avoid a herd) and wait as <b>followers</b> or <b>standby</b>.</li>
+  <li>The leader keeps its session alive or <b>renews its lease</b> every fraction of the TTL (typically every TTL/3). Renewal is the proof of liveness.</li>
+  <li>If the leader crashes or can no longer reach the coordination service, renewals stop, the lease expires, the key disappears, the watchers fire, and a new election runs. The recovery time is roughly the TTL plus a small election time.</li>
+  <li>If the leader finds it <b>cannot renew</b> (service unreachable, renewal rejected), it must <b>immediately step down</b>: stop doing leader work before its lease can expire at the service. Because of clock error, it should step down a safety margin <i>early</i>, for example after 2/3 of the TTL passes without a successful renewal.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 320" role="img" aria-label="Leader election timeline with lease renewals and failover">
+  <text class="t-b" x="20" y="22">Lease TTL 9 s, renew every 3 s. Leader A crashes at t=7.</text>
+  <text class="t-sm" x="20" y="64">Node A</text>
+  <rect class="hit" x="90" y="48" width="330" height="26" rx="6"/><text class="t-c t-sm" x="255" y="66">A is leader (renews at 3, 6)</text>
+  <rect class="miss" x="420" y="48" width="440" height="26" rx="6"/><text class="t-c t-sm" x="640" y="66">A is dead</text>
+  <text class="t-sm" x="20" y="124">Lease</text>
+  <rect class="cache" x="90" y="108" width="470" height="26" rx="6"/><text class="t-c t-sm" x="325" y="126">lease valid until last renew + 9 s = t=15</text>
+  <rect class="box" x="560" y="108" width="300" height="26" rx="6"/><text class="t-c t-sm" x="710" y="126">expired, key deleted</text>
+  <text class="t-sm" x="20" y="184">Node B</text>
+  <rect class="box" x="90" y="168" width="470" height="26" rx="6"/><text class="t-c t-sm" x="325" y="186">standby, watching leader key</text>
+  <rect class="hit" x="560" y="168" width="300" height="26" rx="6"/><text class="t-c t-sm" x="710" y="186">B wins election, becomes leader</text>
+  <line x1="90" y1="230" x2="860" y2="230" stroke="var(--fg)" stroke-width="1.5"/>
+  <text class="t-sm" x="86" y="250">t=0</text><text class="t-sm" x="236" y="250">t=3</text><text class="t-sm" x="390" y="250">t=6</text><text class="t-sm" x="420" y="270">t=7 crash</text><text class="t-sm" x="548" y="250">t=15</text>
+  <text class="t-sm" x="20" y="300">Gap of about 8 s with no leader. A shorter TTL shrinks the gap but raises the risk of needless failovers.</text>
+</svg>
+<figcaption>Failover time is dominated by how long the old lease must run out. During the gap the system has no leader, which is the price of never having two.</figcaption>
+</figure>
+
+<h3>15.2 Safety of the leader</h3>
+<p>The leader has the same pause problem as any lock holder: a leader that stalls can wake up after a new leader has been elected and still act as leader (a "zombie leader"). Therefore leader election is also paired with a fencing token, often called an <b>epoch</b> or <b>term</b> (the same concept as the term number in Raft). Every action the leader takes on shared state carries the epoch, and followers or storage reject messages from older epochs. Most databases and queue systems do exactly this internally; if you build your own leader-based service, include an epoch in every write.</p>
+
+<h3>15.3 Do you need to build this?</h3>
+<p>Often the answer is no. Kubernetes offers a lease-based leader election object that controllers use through client libraries. Libraries such as Apache Curator (ZooKeeper), the etcd <code>concurrency</code> package, and Consul's lock helper implement the recipe, including the awkward reconnection cases. Use them rather than writing your own, and remember that if your whole service is stateful and replicated, the better design may be to embed Raft rather than delegate to an external service. <a href="29-consensus.html">Chapter 29</a> covers how leaders are chosen inside consensus protocols.</p>
+
+<h2 id="config">16. Config distribution, membership, and the rate of watch events</h2>
+
+<h3>16.1 Config distribution and dynamic config</h3>
+<p>Storing configuration in a coordination service gives three benefits over files baked into images: all servers see one consistent version, changes take effect without a redeploy, and a changed value can be pushed instantly through watches. The pattern:</p>
+<ol>
+  <li>At startup the application reads the config key (with a consistent read) and keeps it in memory.</li>
+  <li>It watches the key. On a change event it rereads the value, validates it, and swaps it in atomically (replace a reference to an immutable config object, rather than mutating fields in place, so request threads see either the whole old or the whole new config).</li>
+  <li>It keeps a <b>local copy on disk</b> as a fallback, so a server restarting while the coordination service is down can still start with the last known good configuration.</li>
+</ol>
+<p>Practical advice: keep each value small; version the whole config document and allow rollback; roll out risky changes gradually (a per-cell key or percentage) rather than to all servers in the same second; and distinguish dynamic <i>operational</i> settings (rate limits, feature flags, timeouts) from secrets, which need a proper secret store with access control and rotation. <a href="49-discovery-config.html">Chapter 49</a> goes into central configuration, secrets, and the client-side caches that make this resilient.</p>
+
+<h3>16.2 Group membership</h3>
+<p>For membership, each member creates an ephemeral node under a group path, with its address as data. The member list is the list of children; a watch on the children tells interested parties when someone joins or leaves. This gives an authoritative, consistent view, which is different from gossip-based membership (Consul's Serf, Cassandra's gossip), which is eventually consistent but scales to thousands of nodes without loading a central cluster. Choose consensus-based membership when exact agreement matters (who is in the current voting group), and gossip when approximate liveness suffices.</p>
+
+<h3>16.3 The rate of watch events</h3>
+<p>Watches look free but are a load multiplier. Suppose 10,000 clients watch one config key and it changes once. That single write produces 10,000 notifications, and each client then rereads the value, so 10,000 reads arrive within a short window. If a misbehaving job rewrites the key every second, the service pushes 10,000 notifications per second. With a one-shot watch, a client that is slow to re-register can miss intermediate states, which is fine for config (only the latest matters) but not for an event log.</p>
+<p>Mitigations: put a <b>hierarchy</b> in the middle (one agent per host or per rack watches the key and republishes locally, so the cluster sees hundreds of watchers, not tens of thousands); <b>coalesce</b> changes by writing config as one key rather than many keys changed in a burst; apply <b>rate limits and quotas</b> on writers; add random jitter to client rereads so they do not stampede; and watch a <b>version key</b> that points to a payload stored elsewhere when the payload is large.</p>
+
+<h2 id="alternatives">17. Alternatives and neighbours</h2>
+
+<table>
+<tr><th>Option</th><th>What it offers</th><th>Caveats</th></tr>
+<tr><td>Database advisory locks</td><td>Postgres <code>pg_advisory_lock</code> and MySQL <code>GET_LOCK</code> give named locks tied to a connection or transaction, released automatically on disconnect. Simple if you already run the database and the protected work is database work.</td><td>The lock is tied to a connection, so a connection pool or proxy can confuse ownership; lock service and data are one single point of failure; a stalled client with a still-open connection holds the lock indefinitely. Does not issue tokens by itself (use a row version).</td></tr>
+<tr><td>DynamoDB conditional writes</td><td>A <code>PutItem</code> with <code>attribute_not_exists</code> or a version condition is an atomic compare-and-set on a managed, highly available service. AWS offers a lock client library built on it with lease durations and heartbeats. The item version serves as a fencing value.</td><td>Lease expiry has the same pause hazard; the library's lock is again only safe with fencing; per-request cost; clocks inside the lease logic are local.</td></tr>
+<tr><td>Cloud object store conditional writes</td><td>Several object stores now support create-if-absent or compare-and-swap on an object, which is enough for simple leader election files.</td><td>Latency and rate limits; semantics differ by vendor.</td></tr>
+<tr><td>Chubby (Google)</td><td>The internal lock service described in Google's 2006 paper: a coarse-grained lock service with small files, advisory locks, and event notifications, built on Paxos. It strongly influenced ZooKeeper. Chubby locks are intended to be held for hours or days, not milliseconds, and the paper recommends sequencers (fencing tokens) validated by servers.</td><td>Internal to Google; useful as the conceptual ancestor and an interview reference.</td></tr>
+<tr><td>Embedded Raft</td><td>Libraries (such as those used by etcd and Consul themselves) let a stateful service run consensus directly, removing the external dependency.</td><td>Harder to build and operate correctly; only worthwhile for core infrastructure.</td></tr>
+</table>
+
+<p>Chubby's design philosophy is a good summary of how to think about all of this: provide a small number of strongly consistent, coarse-grained locks and files that applications use for election and for publishing small facts, and make applications that need fine-grained locking build that on top using their own data stores. Coarse (held for minutes or longer, acquired rarely) works well with a consensus-backed service. Fine (held for milliseconds, acquired thousands of times per second) does not.</p>
+
+<h2 id="worked">18. Worked example: a single-active cron scheduler</h2>
+
+<p><b>Problem.</b> A platform runs a recurring job scheduler. Jobs such as "send daily invoices at 02:00" must fire exactly once per scheduled time, even though the scheduler runs on 3 instances for availability. Running a job twice sends duplicate invoices. Missing a run is also unacceptable, but a few seconds of delay is fine. (Chapter <a href="38-scheduling-workflows.html">38</a> covers scheduling and workflow engines more broadly; here we focus on the coordination part.)</p>
+
+<h3>18.1 Design</h3>
+<ol>
+  <li><b>Single-active leader.</b> The three scheduler instances run leader election through a 3-node etcd cluster. A lease of 15 seconds, renewed every 5 seconds, backs the key <code>/scheduler/leader</code>. Only the leader scans the schedule table and enqueues due jobs. The two standbys watch the key.</li>
+  <li><b>Epoch as fencing token.</b> The leader's lease revision at election is its <b>epoch</b> (for instance, 9812). It is stored with every job it enqueues.</li>
+  <li><b>Exactly-once enqueue by conditional write.</b> For each due job, the leader inserts a row into a <code>job_runs</code> table with a unique key <code>(job_id, scheduled_time)</code>, plus the epoch. If a zombie leader or an overlapping failover tries to insert the same run, the unique constraint rejects it. The database insert is the real mutual exclusion; the leader election merely reduces contention and duplication of effort.</li>
+  <li><b>Epoch check on writes.</b> The insert is conditioned on <code>epoch &gt;= (SELECT max(epoch) FROM scheduler_state)</code>, and each new leader first writes its epoch to <code>scheduler_state</code>. A stale leader's writes fail the check once the new leader has announced itself.</li>
+  <li><b>Workers are idempotent.</b> Workers consume runs from a queue and execute them using the run's ID as an idempotency key, so even a rare double delivery does not send two invoices.</li>
+  <li><b>Catch-up.</b> A new leader scans for runs whose scheduled time has passed and have no <code>job_runs</code> row (a gap from the failover) and enqueues them, so nothing is missed.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="Single-active scheduler architecture with etcd, database and workers">
+  <rect class="box" x="30" y="30" width="170" height="60" rx="10"/><text class="t-c t-b" x="115" y="56">Scheduler 1</text><text class="t-c t-sm" x="115" y="76">LEADER, epoch 9812</text>
+  <rect class="box" x="30" y="150" width="170" height="60" rx="10"/><text class="t-c t-b" x="115" y="176">Scheduler 2</text><text class="t-c t-sm" x="115" y="196">standby (watching)</text>
+  <rect class="box" x="30" y="270" width="170" height="60" rx="10"/><text class="t-c t-b" x="115" y="296">Scheduler 3</text><text class="t-c t-sm" x="115" y="316">standby (watching)</text>
+
+  <rect class="cache" x="350" y="130" width="180" height="100" rx="10"/><text class="t-c t-b" x="440" y="162">etcd (3 nodes)</text><text class="t-c t-sm" x="440" y="184">/scheduler/leader</text><text class="t-c t-sm" x="440" y="204">lease 15 s, renew 5 s</text>
+
+  <rect class="db" x="650" y="30" width="220" height="90" rx="10"/><text class="t-c t-b" x="760" y="56">job_runs table</text><text class="t-c t-sm" x="760" y="76">UNIQUE (job_id, sched_time)</text><text class="t-c t-sm" x="760" y="96">stores epoch per run</text>
+  <rect class="ext" x="650" y="230" width="220" height="90" rx="10"/><text class="t-c t-b" x="760" y="256">Queue + workers</text><text class="t-c t-sm" x="760" y="276">idempotent by run ID</text><text class="t-c t-sm" x="760" y="296">executes the job</text>
+
+  <path class="arrow" d="M200 60 L346 160"/><text class="t-sm" x="240" y="94">acquire + renew</text>
+  <path class="arrow dash" d="M200 180 L346 180"/><path class="arrow dash" d="M200 300 L346 205"/>
+  <path class="arrow" d="M200 50 L646 60"/><text class="t-sm" x="360" y="48">insert run (if not exists)</text>
+  <path class="arrow" d="M760 120 L760 226"/><text class="t-sm" x="770" y="178">enqueue run</text>
+  <text class="t-sm" x="230" y="360">Failover: lease expires, a standby wins, writes a higher epoch, catches up missed runs.</text>
+</svg>
+<figcaption>Leader election reduces duplicate work, the unique constraint and epoch guarantee a run is created once, and idempotent workers make a rare duplicate delivery harmless. Three layers, each cheap.</figcaption>
+</figure>
+
+<h3>18.2 Numbers</h3>
+<ul>
+  <li><b>Load on etcd:</b> one lease renewal per 5 seconds from one leader, plus watches from 2 standbys. That is 0.2 writes per second, trivial, so a small 3-node cluster with default settings is ample (and it could be shared with other tenants without strain).</li>
+  <li><b>Failover time:</b> the old lease runs up to 15 seconds after the last renewal; the standby is notified immediately when it expires, and the election takes a few tens of milliseconds. Expect roughly 10 to 16 seconds without a leader after a crash. Jobs due in that window run late by at most that amount plus catch-up time, which is acceptable by the requirements.</li>
+  <li><b>Leader self-fence:</b> the leader steps down if it has not renewed successfully for 10 seconds (two thirds of the TTL), so a partitioned old leader stops before the new one starts at 15.</li>
+  <li><b>Throughput:</b> if there are 20,000 jobs and the busiest minute has 3,000 due, the leader inserts 3,000 rows (about 50 per second), which any relational database handles easily.</li>
+</ul>
+
+<h3>18.3 Failure walkthrough</h3>
+<ul>
+  <li><b>Leader crashes at 01:59:58.</b> Lease expires by about 02:00:13; scheduler 2 wins, writes epoch 9813, scans runs scheduled up to now, finds the 02:00 invoices missing, inserts them. Invoices go out roughly 15 seconds late, once.</li>
+  <li><b>Leader pauses for 40 seconds (GC), wakes at 02:00:30.</b> Meanwhile scheduler 2 has become leader and inserted the 02:00 runs. The old leader tries to insert the same runs: the unique key rejects them, and its epoch check fails; it sees its lease is gone and steps down. No duplicates.</li>
+  <li><b>etcd cluster loses quorum.</b> No one can renew. After the safety margin the leader steps down; no jobs are started until quorum returns. This is a deliberate choice of consistency over availability: it is better to run late than to run twice. After recovery the catch-up scan runs the missed jobs.</li>
+  <li><b>Network partition isolates the leader from etcd only.</b> Same as the previous case for that node; another scheduler on the majority side takes over.</li>
+</ul>
+
+<div class="callout good"><b>Good design note</b>
+Notice that the correctness guarantee does not rest on the lock. It rests on a unique constraint in the database, which is a conditional write. The election exists for efficiency and tidy operation. This "lock for efficiency, constraint for correctness" layering is the pattern to reach for.
+</div>
+
+<h2 id="qa">19. Interview questions and answers</h2>
+
+<details><summary>Why not just use a database table or a Redis key for leader election instead of ZooKeeper or etcd?</summary>
+<p>You can, and for low-stakes cases it is fine, but a coordination service gives you things that are hard to build correctly yourself. It is replicated by consensus, so the lock state survives the loss of a minority of its servers without forgetting who the leader was. It ties ownership to a session or lease so that a crashed owner is cleaned up automatically, and it provides watches so followers learn about changes promptly without polling. A single database row or a single Redis node is a single point of failure, and an asynchronously replicated Redis can lose the lock record on failover, letting two nodes believe they are leader. If the data store you already run offers a conditional write or a unique constraint, that is often enough, and it avoids a new dependency.</p></details>
+
+<details><summary>Why do coordination clusters use 3 or 5 servers, and why not 4 or 100?</summary>
+<p>Consensus needs a majority to commit, so a cluster of N tolerates floor((N-1)/2) failures. Three servers tolerate one failure, and five tolerate two. Four servers still tolerate only one failure (majority is three), so the extra machine adds cost and write latency without more tolerance. A hundred servers would be slower, not bigger, because every server stores all data and every write must be acknowledged by a majority of them. Capacity does not scale with members; for more throughput you shard across separate clusters or reduce the load placed on the cluster by caching and hierarchy.</p></details>
+
+<details><summary>What is an ephemeral node or a lease, and what happens when a client is merely slow rather than dead?</summary>
+<p>An ephemeral znode (ZooKeeper) or a lease-attached key (etcd) exists only while the owning client keeps proving it is alive through heartbeats or renewals. If the proofs stop for longer than the timeout, the service deletes the node. The service cannot tell dead from slow, so a client that is paused, garbage-collecting, or partitioned will be expired just like a crashed one, while still believing it is the owner. That is why the client must stop protected work as soon as it loses contact, and why correctness-critical resources must verify a fencing token, because the lease alone cannot prevent a stale client from acting after it wakes.</p></details>
+
+<details><summary>Explain the herd effect in a ZooKeeper lock and how the standard recipe avoids it.</summary>
+<p>If all waiters watch a single lock node, then when it is released every waiter is notified at once and they all race to acquire it, producing a burst of requests of which all but one fail. With hundreds of waiters this can overload the ensemble. The recipe has each client create an ephemeral sequential node and watch only the node immediately before its own. Release then notifies exactly one client, which checks whether it is now lowest. The result is a fair first-in-first-out queue with constant work per release, and it also handles a waiter dying in the middle of the queue gracefully.</p></details>
+
+<details><summary>What is a fencing token and why is a lock without one unsafe?</summary>
+<p>A fencing token is a number that the lock service increases each time it grants the lock. The client attaches it to every write to the protected resource, and the resource rejects any write with a token lower than the highest it has seen. Without it, a client that paused past its lease expiry can wake up and overwrite data written by the new owner, because nothing tells the resource that this client is stale. A lock only reduces the chance of overlap; the token makes the resource itself enforce exclusion, which is the only approach that holds up under arbitrary pauses and clock errors. It requires the resource to be able to compare and store the token, such as a conditional database update.</p></details>
+
+<details><summary>Summarise the Redlock debate. Would you use Redlock?</summary>
+<p>Redlock acquires a lock on a majority of several independent Redis instances within a time bound. Kleppmann argued that it is unsafe for correctness locking because it assumes bounded pauses, delays and clock drift, and it provides no fencing token, so a stalled client can still act on an expired lock. Antirez answered that the validity-time check handles delays during acquisition, that clock requirements are modest, and that the fencing objection applies to every lock service equally. Both agree no timeout-based lock is safe against an unbounded pause without resource-side checks. I would use a single Redis lock for efficiency purposes, and for correctness I would use etcd or ZooKeeper with fencing tokens or, better, a conditional write that avoids the lock.</p></details>
+
+<details><summary>When would you not use a distributed lock at all?</summary>
+<p>When the operation can be made idempotent, a duplicate execution is harmless and the lock is unnecessary. When the data lives in a database, a compare-and-set on a version column, a unique constraint, or a row lock inside a transaction gives exclusion that is tied to the data and cleaned up on disconnect. When work can be routed so that a single consumer handles all events for a key (a partitioned queue, or sharding by owner), exclusion comes from the structure. I would add a distributed lock only when work has side effects on a resource that cannot enforce a condition itself, and even then I would pair it with a fencing token and a bounded lease.</p></details>
+
+<details><summary>How does leader election work with leases, and how do you handle a leader that cannot renew?</summary>
+<p>Candidates try to create a single key attached to a lease; the winner is leader and renews the lease, typically every third of the TTL. Standbys watch the key. If the leader dies, renewals stop, the lease expires, the key vanishes, and the standbys race again. A leader that fails to renew must step down on its own, earlier than the nominal expiry to leave room for clock error, because the service will hand leadership to someone else once the lease expires. All leader actions should carry an epoch or fencing token so that a zombie leader's late writes are rejected. Failover time is roughly the TTL, which you tune against the tolerance for needless failovers.</p></details>
+
+<details><summary>How would you distribute dynamic configuration to 10,000 servers using a coordination service?</summary>
+<p>Store the config as a small versioned value, have each server read it at start and watch it, and swap in the new immutable config object on a change event. Writing straight to 10,000 watchers makes each change cost 10,000 notifications and 10,000 rereads, so I would add a per-host or per-rack agent that watches once and fans out locally, add jitter to rereads, and keep a last-known-good copy on disk so servers can start when the coordination service is down. I would roll out risky changes gradually by cell or percentage, and keep secrets in a dedicated secret store, not in the coordination service.</p></details>
+
+<details><summary>What happens to services built on ZooKeeper or etcd if the cluster loses quorum?</summary>
+<p>Writes and linearizable reads stop, because they need a majority. Existing sessions cannot be renewed, so clients see disconnection and, once their timeouts pass without a quorum to re-establish them, expiry. Locks and leaderships built on them can no longer be safely held, so well-written clients step down, and the application typically pauses leader-only work rather than risk split-brain. Clients with cached data can often keep serving reads of configuration. This is the consistency-over-availability tradeoff of the CP design (see <a href="29-consensus.html">Chapter 29</a>), and it is why the cluster must be sized, placed across zones, and monitored as critical infrastructure.</p></details>
+
+<h2 id="recap-sec">20. Recap</h2>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>A coordination service (ZooKeeper, etcd, Consul) is a small, strongly consistent store, replicated by consensus (ZAB or Raft) across 3 or 5 servers, offering watches and automatic cleanup of data owned by vanished clients.</li>
+<li>Data must be small and relatively slow-changing. More servers add fault tolerance, never capacity. Use odd cluster sizes. It is not a general database, and it is a critical shared dependency.</li>
+<li>ZooKeeper offers a tree of znodes (persistent, ephemeral, sequential) with one-shot watches; etcd offers a flat key space with global revisions, leases, streaming watches and transactions; Consul adds gossip, health checks and service discovery.</li>
+<li>Sessions and leases expire based on silence, which cannot distinguish a crash from a pause or partition. A client must stop protected work when it loses contact; no timeout is perfectly safe.</li>
+<li>A distributed lock is either for efficiency (approximate is fine) or for correctness (needs a fencing token checked by the resource). Redis <code>SET NX PX</code> with a random token and a Lua release is good for efficiency; Redlock's safety for correctness is contested because of timing assumptions and no token.</li>
+<li>ZooKeeper locks use ephemeral sequential nodes with predecessor watches to avoid the herd effect and give FIFO fairness; etcd uses lease-attached keys ordered by revision, which also provide fencing tokens.</li>
+<li>Pitfalls: pauses, clock drift, lease expiry mid-work, lost or foreign unlock, reentrancy, deadlock, and too-fine granularity.</li>
+<li>Prefer to avoid locks: idempotency, conditional writes, unique constraints, row locks, single-consumer queues, partitioning. Layer them: a lock for efficiency, a constraint or token for correctness.</li>
+<li>Leader election is a long-held lock with lease renewal, self step-down before expiry, and an epoch on all writes. Config and membership use the same primitives; control the watch fan-out with local agents.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="27-failure-time-ordering.html">Chapter 27</a> (partial failure, pauses and clocks, the root of every lock pitfall) and <a href="29-consensus.html">Chapter 29</a> (the Raft and Paxos machinery inside these services). Related: <a href="18-relational-internals.html">Chapter 18</a> (row locks and unique constraints as alternatives), <a href="32-idempotency-ids.html">Chapter 32</a> (idempotency keys that remove the need for locks), <a href="38-scheduling-workflows.html">Chapter 38</a> (schedulers and workflow engines that use leader election), and <a href="49-discovery-config.html">Chapter 49</a> (service discovery and central configuration built on these stores).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

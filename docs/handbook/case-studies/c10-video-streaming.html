@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 10: Design YouTube / Netflix | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c10-video-streaming">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 10 · Worked solutions</div>
+<h1>Design YouTube / Netflix</h1>
+<p class="lead">A video platform is two systems glued together: a heavy, asynchronous factory that turns an uploaded file into dozens of playable versions, and a gigantic read-only delivery network that pushes those versions to hundreds of millions of screens. This page walks through both, with real arithmetic, and shows why the bill is dominated by bytes leaving your network.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+
+<p>The prompt is usually one line: "Design YouTube" or "Design Netflix". The two products differ (YouTube accepts uploads from anyone and has a huge long tail of rarely watched videos; Netflix licenses or produces a small catalog and serves it to subscribers), but the architecture underneath is the same: <b>ingest a video file, convert it into many streamable renditions, store them durably, and deliver them through a CDN with adaptive bitrate streaming</b>. We design the YouTube-style superset (user uploads), and note where Netflix differs.</p>
+
+<p>Before drawing anything, a strong candidate asks questions that pin the scope. Here are the questions and the answers we will assume for the rest of the page.</p>
+
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>Who uploads?</td><td>Any registered user (creator). Videos range from 10 seconds to 12 hours, up to about 10 GB per file.</td></tr>
+<tr><td>Scale?</td><td>500 million daily active viewers, about 3 billion video starts per day. About 5 million new uploads per day.</td></tr>
+<tr><td>Devices?</td><td>Phones, browsers, smart TVs, game consoles. Network quality varies from 500 kbit/s mobile to gigabit fiber.</td></tr>
+<tr><td>Live streaming?</td><td>Out of the main design; we add a short comparison note (section 13).</td></tr>
+<tr><td>Quality targets?</td><td>Playback starts in under 2 seconds at the 95th percentile; rebuffering (stalls) under 0.5 percent of play time.</td></tr>
+<tr><td>Content protection?</td><td>Public user videos are unencrypted; premium and licensed content needs DRM (digital rights management).</td></tr>
+<tr><td>Search, recommendations, comments?</td><td>Present, but covered at a high level. The core of the interview is upload, processing, and delivery.</td></tr>
+<tr><td>Multi-region?</td><td>Yes. Viewers are global; origin storage is replicated across at least two regions.</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements</h2>
+
+<h3>2.1 Functional</h3>
+<ul>
+  <li>A creator uploads a video file with title, description, and visibility, and the upload survives network failures (resumable).</li>
+  <li>The system processes the file into multiple resolutions, bitrates and codecs, plus thumbnails, and marks the video "ready".</li>
+  <li>A viewer plays a video on any device, and the quality adapts to current bandwidth. Seeking is fast.</li>
+  <li>Viewers can search, browse a home feed of recommendations, and see view counts and likes.</li>
+  <li>Premium titles are protected with DRM.</li>
+</ul>
+
+<h3>2.2 Non-functional</h3>
+<ul>
+  <li><b>Availability of playback:</b> 99.99 percent. A failed upload is annoying; a failed play is a headline. Playback and upload are separate failure domains on purpose.</li>
+  <li><b>Low start-up time and few stalls</b> (the quality targets above). Latency is dominated by the delivery path, so the CDN is the main lever.</li>
+  <li><b>Durability:</b> an uploaded original must never be lost (eleven nines, the standard for <a href="../chapters/21-object-storage.html">object storage, Chapter 21</a>).</li>
+  <li><b>Scalability:</b> read-to-write ratio is extreme (about 600 views per upload), and processing load is bursty.</li>
+  <li><b>Cost efficiency:</b> bandwidth and storage dominate; section 12 quantifies this.</li>
+  <li><b>Eventual consistency is fine</b> for view counts, likes and search; strong consistency is needed only for upload state and permissions.</li>
+</ul>
+
+<h3>2.3 Out of scope</h3>
+<p>Ad serving and auction, payments and subscriptions, comment threading, content moderation machine-learning models, creator studio analytics, and the video editor. We mention hooks for moderation (a processing stage) but do not design it.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+
+<p>Estimation (see <a href="../chapters/02-estimation.html">Chapter 2</a>) tells us which part of the system is the hard part. Watch how the numbers separate: upload traffic is tiny in QPS but heavy in compute; playback is moderate in QPS but astronomical in bytes.</p>
+
+<h3>3.1 Traffic</h3>
+<ul>
+  <li>Video starts: 500M daily active viewers × 6 starts each = 3 billion per day. Per second: 3,000,000,000 ÷ 86,400 ≈ <b>34,700 starts per second</b> on average. Peak is about 3 times average in the evening: roughly <b>100,000 starts per second</b>.</li>
+  <li>Uploads: 5,000,000 ÷ 86,400 ≈ <b>58 uploads per second</b> average, about 150 at peak. Read to write ratio is 3,000M ÷ 5M = 600 : 1.</li>
+  <li>Each start fetches the manifest (about 10 KB) and then one segment every 4 seconds. A 6-minute average view downloads about 90 segments. So segment requests are 3B × 90 = 270 billion per day, about <b>3.1 million segment requests per second</b> on average, more at peak. These are served almost entirely by the CDN, never by your application servers.</li>
+</ul>
+
+<h3>3.2 Delivery bandwidth (the number that matters)</h3>
+<ul>
+  <li>Watch time: 3B views × 6 minutes = 18 billion minutes = <b>300 million hours per day</b>.</li>
+  <li>Average concurrent streams: 300M hours ÷ 24 hours = <b>12.5 million streams</b>.</li>
+  <li>Average delivered bitrate (a blend of phone 720p and TV 1080p/4K): 2.5 Mbit/s. Average egress: 12.5M × 2.5 Mbit/s = 31.25 Tbit/s. Peak at about 2 times: <b>roughly 60 Tbit/s</b>.</li>
+  <li>Bytes per day: 300M hours × 3,600 s × 2.5 Mbit/s ÷ 8 ≈ 3.4 × 10<sup>17</sup> bytes = <b>about 340 PB per day</b>.</li>
+</ul>
+
+<h3>3.3 Storage</h3>
+<ul>
+  <li>Average upload: 8 minutes, 500 MB source file. 5M uploads per day × 0.5 GB = <b>2.5 PB per day of originals</b>.</li>
+  <li>Transcoded ladder (all renditions, H.264 plus a modern codec for popular videos): about 1 GB per average video, so 5 PB per day. Total new storage about <b>7.5 PB per day</b>, or 7.5 × 365 ≈ <b>2.7 EB per year</b> before replication overhead. Erasure coding (about 1.4 to 1.5 times) brings raw capacity to roughly 4 EB per year. This is why storage tiering and deleting unneeded renditions matter (section 12).</li>
+  <li>Metadata: assume 1 billion videos × 2 KB of metadata = 2 TB. This is tiny and fits a sharded relational store comfortably; metadata is not the scaling problem.</li>
+</ul>
+
+<h3>3.4 Transcoding compute</h3>
+<ul>
+  <li>New video minutes per day: 5M × 8 = 40 million video minutes.</li>
+  <li>Encoding a full H.264 ladder costs about 10 CPU core-minutes per video minute (ballpark, depends on preset and resolution; 4K is far more expensive, tiny thumbnails far less). Per day: 400M core-minutes ÷ 1,440 minutes = about <b>280,000 cores busy on average</b>, about 600,000 at peak. This is why encoding is a huge fleet, why hardware accelerators (GPUs, custom ASICs) exist, and why we must encode in parallel.</li>
+</ul>
+
+<h3>3.5 Cache sizing</h3>
+<p>Video popularity is roughly Zipf-like (a few videos get most views). Assume the most popular 1 percent of videos get about 70 percent of views and the top 20 percent get about 95 percent. If 1 billion videos × 1 GB = 1 EB of renditions, the "hot" 1 percent is 10 PB. That working set is spread over thousands of edge locations, each holding the regionally popular subset (hundreds of terabytes per large site). The long tail (5 percent of views) goes to regional or origin storage. This asymmetry drives the cache hierarchy in section 8.</p>
+
+<h2 id="api">4. API design</h2>
+
+<p>We use plain HTTPS APIs (see <a href="../chapters/05-api-design.html">Chapter 5</a>). Video bytes never flow through these application APIs on the way to a viewer; they flow from CDN edges directly.</p>
+
+<h3>4.1 Upload</h3>
+<pre>POST /v1/uploads
+  body: { filename, size_bytes, content_type, title, description, visibility, sha256_of_first_mb? }
+  -> 201 { upload_id, video_id, part_size: 8388608, part_urls_endpoint, expires_at }
+
+PUT  {signed_part_url}            # sent straight to object storage, not to our servers
+  headers: Content-Length, Content-MD5
+  -> 200 { etag }
+
+GET  /v1/uploads/{upload_id}      # resume: which parts exist?
+  -> 200 { uploaded_parts: [1,2,3,5], next_part_hint: 4 }
+
+POST /v1/uploads/{upload_id}/complete
+  body: { parts: [{n:1, etag:"..."}, ...] }
+  -> 202 { video_id, status: "PROCESSING" }</pre>
+
+<h3>4.2 Playback and metadata</h3>
+<pre>GET /v1/videos/{video_id}
+  -> 200 { title, channel, duration, status, thumbnails[], manifest_url, drm: {systems:[...], license_url}, counts:{views, likes} }
+
+GET {manifest_url}                # https://cdn.example.com/v/{video_id}/master.m3u8  (or .mpd)
+GET {cdn}/v/{video_id}/1080p_h264/seg_00042.m4s
+
+POST /v1/videos/{video_id}/license     # DRM only, returns a license for the player's CDM
+POST /v1/videos/{video_id}/view        # beacon: {session_id, position_ms, ...}, async, fire and forget
+GET  /v1/search?q=...&page_token=...
+GET  /v1/feed?cursor=...</pre>
+
+<p>Two design points worth saying aloud. First, uploads use <b>signed URLs</b> so the multi-gigabyte bytes go directly to object storage and bypass our API tier. Second, the view beacon is fire-and-forget and returns immediately; counting happens asynchronously (section 10).</p>
+
+<h2 id="data">5. Data model and storage choices</h2>
+
+<table>
+<tr><th>Data</th><th>Store</th><th>Why</th></tr>
+<tr><td>Original uploads, transcoded segments, manifests, thumbnails</td><td>Object storage (<a href="../chapters/21-object-storage.html">Chapter 21</a>)</td><td>Huge immutable blobs, cheap per GB, eleven nines durability, native multipart upload, range reads, lifecycle tiering. A filesystem or database would be absurdly expensive here.</td></tr>
+<tr><td>Video metadata (title, owner, status, renditions list, visibility)</td><td>Sharded relational store by <code>video_id</code> (<a href="../chapters/18-relational-internals.html">Chapter 18</a>, <a href="../chapters/25-sharding.html">Chapter 25</a>), with Redis in front (<a href="../chapters/15-redis.html">Chapter 15</a>)</td><td>Small rows, rich queries by owner, transactions for state transitions. 2 TB total.</td></tr>
+<tr><td>Upload sessions and job state</td><td>Same relational store (or a workflow engine, <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>)</td><td>Needs strong consistency and compare-and-set for state transitions.</td></tr>
+<tr><td>Job queue for transcoding tasks</td><td>Kafka or a work queue (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>)</td><td>Durable, replayable, supports many consumer workers and back-pressure.</td></tr>
+<tr><td>Search index</td><td>Search engine (<a href="../chapters/22-search-engines.html">Chapter 22</a>)</td><td>Inverted index over titles, descriptions, captions.</td></tr>
+<tr><td>View counts, likes</td><td>Sharded counters in Redis/wide-column plus a stream pipeline</td><td>Extremely write heavy, approximate OK. See section 10.</td></tr>
+<tr><td>Watch history, recommendations features</td><td>Wide-column NoSQL (<a href="../chapters/20-nosql.html">Chapter 20</a>)</td><td>Append-heavy, keyed by user, large volume.</td></tr>
+</table>
+
+<p>A sketch of the central metadata table:</p>
+<pre>videos(video_id PK, owner_id, title, description, duration_ms, status,   -- UPLOADING|PROCESSING|READY|FAILED|BLOCKED
+       visibility, source_object_key, manifest_key, created_at, ready_at)
+renditions(video_id, codec, width, height, bitrate_kbps, playlist_key, state)   -- one row per ladder rung
+upload_sessions(upload_id PK, video_id, user_id, size_bytes, part_size, parts_bitmap, expires_at)</pre>
+
+<h2 id="first">6. A first simple design</h2>
+
+<p>Start naive so we can see precisely why it breaks. One web server accepts the upload, stores the file on local disk, runs <code>ffmpeg</code> to make a few MP4 files, and serves them with plain progressive download (the browser requests the whole MP4 file over HTTP and the server supports byte ranges for seeking). Metadata is in one database.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 190" role="img" aria-label="A naive single-server video design">
+  <rect class="ext" x="30" y="60" width="130" height="60" rx="10"/><text class="t-c t-b" x="95" y="86">Browser</text><text class="t-c t-sm" x="95" y="104">upload + play</text>
+  <rect class="box" x="290" y="45" width="190" height="90" rx="10"/><text class="t-c t-b" x="385" y="72">One web server</text><text class="t-c t-sm" x="385" y="93">upload, ffmpeg,</text><text class="t-c t-sm" x="385" y="110">serve MP4 files</text>
+  <rect class="db" x="640" y="20" width="200" height="55" rx="10"/><text class="t-c t-b" x="740" y="44">Local disk</text><text class="t-c t-sm" x="740" y="62">originals + MP4s</text>
+  <rect class="db" x="640" y="105" width="200" height="55" rx="10"/><text class="t-c t-b" x="740" y="129">SQL database</text><text class="t-c t-sm" x="740" y="147">metadata</text>
+  <path class="arrow" d="M160 90 L286 90"/>
+  <path class="arrow" d="M480 70 L636 48"/>
+  <path class="arrow" d="M480 110 L636 132"/>
+</svg>
+<figcaption>The naive design. It works for a demo and fails at almost every number in section 3.</figcaption>
+</figure>
+
+<p>What breaks, in order of severity:</p>
+<ol>
+  <li><b>Bandwidth:</b> one server's 10 to 100 Gbit/s link is a rounding error against 60 Tbit/s. Delivery must be distributed to the edge.</li>
+  <li><b>One bitrate fits nobody:</b> a single 1080p file stalls on a 2 Mbit/s phone connection and wastes data on a small screen. We need several renditions and a way for the player to switch.</li>
+  <li><b>Encoding on the request path:</b> transcoding a one-hour video can take an hour on one machine. It must be asynchronous, parallel, and retryable.</li>
+  <li><b>Uploads of gigabytes fail:</b> a mobile connection drops at 90 percent and the user starts over. Uploads must be resumable and chunked.</li>
+  <li><b>Local disk:</b> not durable, not shared, not scalable. Use object storage.</li>
+  <li><b>The server is a single point of failure</b> for everything.</li>
+</ol>
+
+<h2 id="architecture">7. Scaled high-level architecture</h2>
+
+<p>The fix is to split the system into three planes that scale independently: the <b>upload and processing plane</b> (write path, asynchronous, compute heavy), the <b>delivery plane</b> (read path, CDN based, bandwidth heavy), and the <b>metadata and discovery plane</b> (API, search, recommendations, counts).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 960 520" role="img" aria-label="High-level architecture of a video streaming platform">
+  <text class="t-b" x="20" y="22">Upload and processing plane</text>
+  <rect class="ext" x="20" y="40" width="110" height="56" rx="10"/><text class="t-c t-b" x="75" y="73">Creator</text>
+  <rect class="box" x="170" y="40" width="130" height="56" rx="10"/><text class="t-c t-b" x="235" y="63">Upload API</text><text class="t-c t-sm" x="235" y="82">sessions, signed URLs</text>
+  <rect class="db" x="340" y="40" width="150" height="56" rx="10"/><text class="t-c t-b" x="415" y="63">Object storage</text><text class="t-c t-sm" x="415" y="82">originals (raw bucket)</text>
+  <rect class="cache" x="530" y="40" width="130" height="56" rx="10"/><text class="t-c t-b" x="595" y="63">Job queue</text><text class="t-c t-sm" x="595" y="82">Kafka / work queue</text>
+  <rect class="box" x="700" y="40" width="150" height="56" rx="10"/><text class="t-c t-b" x="775" y="63">Workflow orchestrator</text><text class="t-c t-sm" x="775" y="82">DAG per video</text>
+  <rect class="box" x="700" y="130" width="150" height="56" rx="10"/><text class="t-c t-b" x="775" y="153">Transcode workers</text><text class="t-c t-sm" x="775" y="172">thousands, autoscaled</text>
+  <rect class="db" x="340" y="130" width="150" height="56" rx="10"/><text class="t-c t-b" x="415" y="153">Object storage</text><text class="t-c t-sm" x="415" y="172">renditions (origin bucket)</text>
+  <path class="arrow" d="M130 68 L166 68"/><path class="arrow" d="M300 68 L336 68"/><path class="arrow" d="M490 68 L526 68"/><path class="arrow" d="M660 68 L696 68"/>
+  <path class="arrow" d="M775 96 L775 126"/><path class="arrow" d="M700 158 L494 158"/>
+
+  <text class="t-b" x="20" y="232">Delivery plane</text>
+  <rect class="ext" x="20" y="250" width="110" height="56" rx="10"/><text class="t-c t-b" x="75" y="283">Viewer</text>
+  <rect class="cache" x="170" y="250" width="150" height="56" rx="10"/><text class="t-c t-b" x="245" y="273">ISP / edge cache</text><text class="t-c t-sm" x="245" y="292">segments, manifests</text>
+  <rect class="cache" x="360" y="250" width="150" height="56" rx="10"/><text class="t-c t-b" x="435" y="273">Regional cache</text><text class="t-c t-sm" x="435" y="292">mid-tier / shield</text>
+  <rect class="db" x="550" y="250" width="150" height="56" rx="10"/><text class="t-c t-b" x="625" y="273">Origin storage</text><text class="t-c t-sm" x="625" y="292">same renditions bucket</text>
+  <rect class="box" x="740" y="250" width="150" height="56" rx="10"/><text class="t-c t-b" x="815" y="273">License server</text><text class="t-c t-sm" x="815" y="292">DRM keys (premium)</text>
+  <path class="arrow" d="M130 278 L166 278"/><path class="arrow dash" d="M320 278 L356 278"/><path class="arrow dash" d="M510 278 L546 278"/>
+  <path class="arrow dash" d="M130 300 C 400 345 700 345 815 310"/>
+
+  <text class="t-b" x="20" y="382">Metadata and discovery plane</text>
+  <rect class="box" x="20" y="400" width="140" height="56" rx="10"/><text class="t-c t-b" x="90" y="423">API gateway</text><text class="t-c t-sm" x="90" y="442">auth, rate limit</text>
+  <rect class="box" x="200" y="400" width="140" height="56" rx="10"/><text class="t-c t-b" x="270" y="423">Video service</text><text class="t-c t-sm" x="270" y="442">metadata, status</text>
+  <rect class="db" x="380" y="400" width="140" height="56" rx="10"/><text class="t-c t-b" x="450" y="423">Sharded SQL</text><text class="t-c t-sm" x="450" y="442">+ Redis cache</text>
+  <rect class="box" x="560" y="400" width="130" height="56" rx="10"/><text class="t-c t-b" x="625" y="423">Search</text><text class="t-c t-sm" x="625" y="442">inverted index</text>
+  <rect class="box" x="730" y="400" width="130" height="56" rx="10"/><text class="t-c t-b" x="795" y="423">Reco / feed</text><text class="t-c t-sm" x="795" y="442">candidates + ranker</text>
+  <rect class="cache" x="380" y="470" width="320" height="40" rx="10"/><text class="t-c t-b" x="540" y="495">View-event stream to counters, reco, analytics</text>
+  <path class="arrow" d="M160 428 L196 428"/><path class="arrow" d="M340 428 L376 428"/>
+  <path class="arrow" d="M520 428 L556 428"/><path class="arrow dash" d="M450 456 L450 466"/>
+</svg>
+<figcaption>Three planes. Bytes of video flow only through the delivery plane (viewer to edge cache, with dashed cache-fill paths on a miss). Control traffic goes through the metadata plane. The workflow orchestrator in the upload plane writes renditions to origin storage and flips <code>status = READY</code> in the metadata store.</figcaption>
+</figure>
+
+<h3>7.1 Upload flow, step by step</h3>
+<ol>
+  <li>The client calls <code>POST /v1/uploads</code>. The Upload API authenticates, checks quota, creates a row in <code>upload_sessions</code> and a video row in state <code>UPLOADING</code>, and returns a part size and an upload id.</li>
+  <li>The client splits the file into 8 MB parts and uploads each directly to object storage using a signed URL, several parts in parallel. Each part's checksum is verified by the storage service.</li>
+  <li>If the connection breaks, the client asks <code>GET /v1/uploads/{id}</code> (or the storage service's list-parts call), learns which parts exist, and sends only the missing ones.</li>
+  <li>The client calls <code>complete</code> with the list of part numbers and entity tags. Object storage assembles the final object. The API flips the state to <code>PROCESSING</code> and publishes a message <code>video.uploaded</code> to the queue.</li>
+  <li>The orchestrator picks up the message and starts the processing DAG (section 9). When it finishes, it sets <code>READY</code> and emits <code>video.ready</code> for search indexing, notifications and recommendations.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Sequence diagram of a resumable chunked upload">
+  <text class="t-c t-b" x="90" y="24">Client</text><text class="t-c t-b" x="330" y="24">Upload API</text><text class="t-c t-b" x="580" y="24">Object storage</text><text class="t-c t-b" x="810" y="24">Queue</text>
+  <line class="life" x1="90" y1="34" x2="90" y2="390"/><line class="life" x1="330" y1="34" x2="330" y2="390"/><line class="life" x1="580" y1="34" x2="580" y2="390"/><line class="life" x1="810" y1="34" x2="810" y2="390"/>
+  <path class="arrow" d="M90 62 L326 62"/><text class="t-sm" x="100" y="55">1 create session (size, name)</text>
+  <path class="arrow" d="M326 84 L94 84"/><text class="t-sm" x="110" y="104">upload_id, part size, signed URLs</text>
+  <path class="arrow" d="M90 130 L576 130"/><text class="t-sm" x="110" y="123">2 PUT part 1, 2, 3 (parallel, direct)</text>
+  <path class="arrow-g" d="M576 150 L94 150"/><text class="t-sm" x="110" y="168">etag per part</text>
+  <path class="arrow-r" d="M90 196 L400 196"/><text class="t-sm" x="110" y="189">PUT part 4 ... connection drops</text>
+  <text class="t-c t-sm" x="330" y="222">client app restarts or reconnects</text>
+  <path class="arrow" d="M90 246 L326 246"/><text class="t-sm" x="100" y="239">3 GET session: which parts exist?</text>
+  <path class="arrow" d="M326 266 L94 266"/><text class="t-sm" x="110" y="284">parts 1-3 done, send 4 onward</text>
+  <path class="arrow" d="M90 310 L576 310"/><text class="t-sm" x="110" y="303">PUT parts 4..N</text>
+  <path class="arrow" d="M90 338 L326 338"/><text class="t-sm" x="100" y="331">4 complete(parts + etags)</text>
+  <path class="arrow" d="M326 358 L576 358"/><text class="t-sm" x="340" y="352">assemble object</text>
+  <path class="arrow" d="M326 378 L806 378"/><text class="t-sm" x="560" y="372">5 publish video.uploaded</text>
+</svg>
+<figcaption>Read top to bottom. Bytes go client to storage directly. The API only issues URLs and bookkeeping. After a drop, the client asks which parts already exist and resumes, so a 10 GB upload never restarts from zero.</figcaption>
+</figure>
+
+<h2 id="upload">8. Deep dive 1: the upload path</h2>
+
+<h3>8.1 Why chunked and resumable</h3>
+<p>A single HTTP request carrying 5 GB has a tiny chance of surviving a mobile network: any timeout, radio handover or proxy limit kills the whole request, and the user must start over. <b>Chunking</b> divides the file into fixed-size parts (commonly 5 to 16 MB), each its own small request. Failure costs at most one part. Parts can also be sent in parallel to use available bandwidth, and each part can be retried independently. This is the same idea as the multipart upload in <a href="../chapters/21-object-storage.html">object storage (Chapter 21)</a> and the large-file pattern in the <a href="../chapters/60-pattern-playbook.html">pattern playbook (Chapter 60)</a>.</p>
+
+<h3>8.2 Where the state lives</h3>
+<p>For resumability, someone must remember which parts arrived. Two choices:</p>
+<table>
+<tr><th>Option</th><th>How it works</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>A. Client to our servers (own chunk protocol, like tus)</td><td>Our upload servers receive chunks, append to a staging file, and track offsets.</td><td>Full control, can inspect bytes early (virus scan, format sniff).</td><td>We pay ingress bandwidth and CPU, upload servers are stateful, need sticky routing or shared staging storage.</td></tr>
+<tr><td>B. Client direct to object storage via signed URLs (multipart)</td><td>API issues pre-signed part URLs; storage tracks parts; client reconciles via list-parts.</td><td>Our servers handle only tiny control requests. Storage scales and is already durable. No stateful upload tier.</td><td>Less control per byte; validation must occur after completion (an async step in the DAG).</td></tr>
+</table>
+<p><b>Choice: B.</b> At 2.5 PB per day of ingest, we do not want to proxy bytes. Validation (container sanity, virus scan, policy checks) is an early DAG stage anyway. We keep the session row in our database so the creator's browser can resume days later, and we set a lifecycle rule that aborts incomplete multipart uploads after, say, 7 days so orphan parts do not cost money forever.</p>
+
+<h3>8.3 Integrity and idempotency</h3>
+<ul>
+  <li>Each part carries a checksum (MD5 or CRC) that storage verifies; a corrupted part is rejected and re-sent.</li>
+  <li>Re-sending the same part number is harmless (last write wins with identical bytes). This is natural idempotency; see <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>.</li>
+  <li><code>complete</code> is idempotent on <code>upload_id</code>: a second call returns the existing state instead of publishing a second job. The state transition <code>UPLOADING -&gt; PROCESSING</code> is a compare-and-set in the database.</li>
+  <li>Optional dedup: hash the full file (computed client-side or after upload). If an identical original already exists for the same owner, skip processing.</li>
+</ul>
+
+<h3>8.4 Making it fast for the creator</h3>
+<p>Creators often want to see their video quickly. Common trick: as soon as the first low-resolution rendition (for example 360p) is ready, mark the video "playable in low quality" and keep processing higher rungs in the background. YouTube-style platforms show "HD processing" for this reason. The metadata row therefore has a per-rendition state and the manifest is regenerated as renditions appear.</p>
+
+<h2 id="transcode">9. Deep dive 2: the transcoding pipeline</h2>
+
+<h3>9.1 What transcoding actually does</h3>
+<p>The uploaded file is a <b>container</b> (MP4, MOV, MKV) holding compressed video and audio <b>streams</b> in some <b>codec</b> (H.264, HEVC, ProRes...). A codec is the compression algorithm. We cannot stream it as is: it may be a 50 Mbit/s camera file, in a codec some devices cannot decode, at one resolution. Transcoding decodes the original and re-encodes it into a <b>ladder</b> of renditions, each with a resolution and target bitrate, in codecs devices can play, cut into short <b>segments</b> so the player can switch quality at segment boundaries.</p>
+
+<p>A typical H.264 ladder for a 16:9 source (illustrative numbers; real platforms tune them per title, see section 9.5):</p>
+<table>
+<tr><th>Rung</th><th>Resolution</th><th>Video bitrate</th><th>Use</th></tr>
+<tr><td>1</td><td>256 x 144</td><td>about 200 kbit/s</td><td>terrible networks</td></tr>
+<tr><td>2</td><td>426 x 240</td><td>about 400 kbit/s</td><td>weak mobile</td></tr>
+<tr><td>3</td><td>640 x 360</td><td>about 800 kbit/s</td><td>phones on 3G/4G</td></tr>
+<tr><td>4</td><td>854 x 480</td><td>about 1.4 Mbit/s</td><td>small screens</td></tr>
+<tr><td>5</td><td>1280 x 720</td><td>about 2.8 Mbit/s</td><td>default on many devices</td></tr>
+<tr><td>6</td><td>1920 x 1080</td><td>about 5 Mbit/s</td><td>TVs, laptops</td></tr>
+<tr><td>7 (selected videos)</td><td>3840 x 2160</td><td>about 12-16 Mbit/s with a better codec</td><td>4K TVs</td></tr>
+</table>
+<p>Sum of the first six rungs is about 10.6 Mbit/s; for an 8-minute video that is 480 s × 10.6 Mbit/s ÷ 8 ≈ 640 MB, plus audio and extra codecs, which matches our "about 1 GB per average video" estimate. Audio is encoded separately (for example AAC at 64 to 128 kbit/s, perhaps in several languages) and referenced by the manifest, so it is not duplicated per video rung.</p>
+
+<h3>9.2 Codecs: tradeoffs</h3>
+<table>
+<tr><th>Codec</th><th>Compression vs H.264</th><th>Encode cost</th><th>Device support</th><th>Licensing</th></tr>
+<tr><td>H.264 (AVC)</td><td>baseline</td><td>low</td><td>universal</td><td>patent pool, widely licensed</td></tr>
+<tr><td>HEVC (H.265)</td><td>about 30-40 percent smaller at same quality</td><td>higher</td><td>most modern phones and TVs, patchy in browsers</td><td>complex, several pools</td></tr>
+<tr><td>VP9</td><td>similar to HEVC</td><td>high</td><td>browsers, Android, many TVs</td><td>royalty free</td></tr>
+<tr><td>AV1</td><td>about 30-50 percent smaller than H.264</td><td>very high (often 5-20 times H.264)</td><td>growing, hardware decode on recent devices</td><td>royalty free</td></tr>
+</table>
+<p>The economic rule: a better codec costs more CPU once (at encode time) but saves bandwidth on every view. So you spend the expensive encode only on <b>videos that will be watched a lot</b>. A typical policy: encode everything in H.264 immediately so it plays everywhere; after a video crosses a view-count threshold, a background job produces VP9/AV1 renditions. A video watched 10 views a month never earns its AV1 encode; a video watched 10 million times pays for it in hours. Netflix, with a small catalog and huge per-title audience, encodes aggressively with several codecs up front.</p>
+
+<h3>9.3 The pipeline as a DAG of parallel jobs</h3>
+<p>A DAG (directed acyclic graph) is a set of tasks with dependency edges and no cycles; a task runs when everything it depends on has finished. Modeling processing as a DAG lets the orchestrator run independent tasks in parallel and retry only the failed ones. See <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a> for workflow engines (durable state, retries, timeouts) and <a href="../chapters/34-queues-kafka.html">Chapter 34</a> for the task queues that feed workers.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 960 470" role="img" aria-label="Transcoding DAG with parallel segment encodes">
+  <rect class="box" x="20" y="200" width="130" height="60" rx="10"/><text class="t-c t-b" x="85" y="226">Validate</text><text class="t-c t-sm" x="85" y="244">probe, scan, policy</text>
+  <rect class="box" x="190" y="200" width="130" height="60" rx="10"/><text class="t-c t-b" x="255" y="226">Split</text><text class="t-c t-sm" x="255" y="244">at GOP boundaries</text>
+
+  <text class="t-sm" x="360" y="30">Parallel fan-out: chunk x rendition</text>
+  <rect class="cache" x="360" y="50" width="130" height="36" rx="8"/><text class="t-c" x="425" y="73">enc c1 360p</text>
+  <rect class="cache" x="360" y="96" width="130" height="36" rx="8"/><text class="t-c" x="425" y="119">enc c1 720p</text>
+  <rect class="cache" x="360" y="142" width="130" height="36" rx="8"/><text class="t-c" x="425" y="165">enc c1 1080p</text>
+  <rect class="cache" x="360" y="214" width="130" height="36" rx="8"/><text class="t-c" x="425" y="237">enc c2 360p</text>
+  <rect class="cache" x="360" y="260" width="130" height="36" rx="8"/><text class="t-c" x="425" y="283">enc c2 720p</text>
+  <rect class="cache" x="360" y="306" width="130" height="36" rx="8"/><text class="t-c" x="425" y="329">enc c2 1080p</text>
+  <rect class="cache" x="360" y="378" width="130" height="36" rx="8"/><text class="t-c" x="425" y="401">enc cN ...</text>
+
+  <rect class="box" x="530" y="130" width="130" height="60" rx="10"/><text class="t-c t-b" x="595" y="156">Package</text><text class="t-c t-sm" x="595" y="174">segments + playlists</text>
+  <rect class="box" x="530" y="270" width="130" height="60" rx="10"/><text class="t-c t-b" x="595" y="296">Audio encode</text><text class="t-c t-sm" x="595" y="314">AAC, languages</text>
+  <rect class="box" x="530" y="360" width="130" height="60" rx="10"/><text class="t-c t-b" x="595" y="386">Thumbnails</text><text class="t-c t-sm" x="595" y="404">sprites, posters</text>
+  <rect class="box" x="700" y="200" width="120" height="60" rx="10"/><text class="t-c t-b" x="760" y="226">Manifest</text><text class="t-c t-sm" x="760" y="244">master playlist</text>
+  <rect class="db" x="850" y="200" width="90" height="60" rx="10"/><text class="t-c t-b" x="895" y="226">READY</text><text class="t-c t-sm" x="895" y="244">flip status</text>
+
+  <path class="arrow" d="M150 230 L186 230"/>
+  <path class="arrow" d="M320 220 L356 70"/><path class="arrow" d="M320 225 L356 114"/><path class="arrow" d="M320 230 L356 160"/>
+  <path class="arrow" d="M320 232 L356 232"/><path class="arrow" d="M320 238 L356 278"/><path class="arrow" d="M320 242 L356 324"/><path class="arrow" d="M320 250 L356 396"/>
+  <path class="arrow" d="M490 68 L526 150"/><path class="arrow" d="M490 114 L526 156"/><path class="arrow" d="M490 160 L526 162"/>
+  <path class="arrow" d="M490 232 L526 170"/><path class="arrow" d="M490 278 L526 176"/><path class="arrow" d="M490 324 L526 182"/>
+  <path class="arrow" d="M660 160 L696 220"/><path class="arrow" d="M660 300 L696 244"/><path class="arrow" d="M660 390 L696 250"/>
+  <path class="arrow" d="M820 230 L846 230"/>
+</svg>
+<figcaption>Validate, split once, then fan out into chunk-by-rendition encode tasks that run on many workers at once. Audio and thumbnails run in parallel with the video encodes. A fan-in step packages the segments, writes the manifest, and flips status to READY. A 60-chunk, 6-rung video yields 360 independent encode tasks.</figcaption>
+</figure>
+
+<h4>The stages in detail</h4>
+<ol>
+  <li><b>Validate:</b> run a probe (<code>ffprobe</code>-style) to read duration, codecs, resolution, frame rate; reject corrupt or absurd files; run malware and policy checks (copyright fingerprinting, nudity classifiers) which may be separate asynchronous DAG branches that can block publication.</li>
+  <li><b>Split:</b> cut the video into <b>chunks</b> at <b>GOP</b> boundaries. A GOP (group of pictures) starts with a key frame (I-frame) that can be decoded without any earlier frame; later frames in the group depend on it. You can only cut at key frames without re-encoding. Chunks of about 8 seconds (two 4-second playback segments) balance parallelism against overhead. Splitting is cheap because it copies bytes rather than re-encoding.</li>
+  <li><b>Encode fan-out:</b> for each chunk and each rendition, one task: "decode chunk c, scale to W x H, encode at bitrate B, write segment files". To keep quality continuous across chunk seams, every rendition uses identical key-frame alignment (the same timestamps), which is also what allows the player to switch rungs on a segment boundary.</li>
+  <li><b>Package:</b> wrap encoded chunks as playable segments (fragmented MP4, also called CMAF) and write per-rendition playlists. Because CMAF segments are the same bytes for HLS and DASH, only the small manifests differ (section 10).</li>
+  <li><b>Fan-in and publish:</b> when all required tasks are complete, write the master manifest, verify (probe the output, check durations match), set the status to <code>READY</code>, and emit the event.</li>
+</ol>
+
+<h3>9.4 Workers, queues and scheduling</h3>
+<p>The orchestrator creates a task message per unit of work and puts it on a queue (partitioned by priority class, for example "premium and live-adjacent" versus "bulk"). Stateless worker processes pull a task, fetch the source chunk from object storage, encode, upload the output, and acknowledge. Properties we rely on:</p>
+<ul>
+  <li><b>Idempotent tasks.</b> The output key is deterministic (<code>/v/{video}/{rung}/seg_{n}.m4s</code>), so a retried task overwrites with identical bytes. At-least-once delivery from the queue is therefore safe.</li>
+  <li><b>Visibility timeout / lease.</b> If a worker dies (spot instance reclaimed), its lease expires and another worker picks up the task. Only that chunk is redone, not the whole video.</li>
+  <li><b>Autoscaling on queue depth.</b> Workers scale with backlog age (target: p95 time-to-first-playable under 5 minutes for typical uploads), see <a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>. Encode workers are ideal for cheap preemptible (spot) capacity because tasks are short and retryable.</li>
+  <li><b>Priorities and fairness.</b> A 12-hour upload must not starve everyone; split it into chunks so it interleaves with others, and apply per-user concurrency caps.</li>
+  <li><b>Heterogeneous hardware.</b> CPU for H.264, GPU or ASIC for heavy codecs, selected by task type label on the queue.</li>
+  <li><b>Poison tasks.</b> After N failures a task goes to a dead letter queue, and the video is marked FAILED with a reason. See <a href="../chapters/35-messaging-patterns.html">Chapter 35</a>.</li>
+</ul>
+
+<h3>9.5 Options compared: how to parallelize</h3>
+<table>
+<tr><th>Option</th><th>Description</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>A. One whole-file encode per rendition</td><td>6 tasks per video, each encodes the full duration.</td><td>Simple; best quality continuity; no seams.</td><td>A 3-hour video takes hours; poor parallelism; a failure at 95 percent redoes everything.</td></tr>
+<tr><td>B. Chunk x rendition (chosen)</td><td>Split at GOPs, encode independently.</td><td>Latency scales with 1 / workers (a 1-hour video finishes in minutes); cheap retries; good spot-instance fit.</td><td>More tasks and orchestration state; need identical key-frame alignment; rate control per chunk can vary slightly (mitigated by two-pass or constrained VBR).</td></tr>
+<tr><td>C. Hardware-only single stream</td><td>Fast fixed-function encoder per stream.</td><td>Very fast, power efficient.</td><td>Lower compression efficiency than best software encoders; capex.</td></tr>
+</table>
+<p>We choose B, and use hardware encoders where throughput matters more than compression efficiency. The refinement used by large services is <b>per-title (or per-shot) encoding</b>: instead of a fixed ladder, analyze the content. A static cartoon looks fine at 1 Mbit/s for 1080p; a sports match needs 8. The ladder is computed so each rung is the cheapest bitrate that hits a quality target (measured with a metric such as VMAF). This saves meaningful bandwidth, which section 12 shows is the dominant cost.</p>
+
+<h3>9.6 Orchestration state and failure</h3>
+<p>The orchestrator persists each video's DAG: task states (PENDING, RUNNING, DONE, FAILED), attempt counts and output keys. If the orchestrator crashes, a new instance reloads state and re-enqueues tasks whose lease expired. Use a durable workflow engine rather than in-memory coordination. The fan-in "all chunks done" is a counter or a query over task rows, executed transactionally so two workers finishing simultaneously do not both trigger packaging (use compare-and-set on the DAG stage state, see <a href="../chapters/30-coordination-locks.html">Chapter 30</a>).</p>
+
+<h2 id="streaming">10. Deep dive 3: adaptive streaming and the manifest</h2>
+
+<h3>10.1 Why not just send one file</h3>
+<p>Network bandwidth fluctuates second to second (a train enters a tunnel, someone starts a download). Fixed-bitrate playback either stalls (bitrate above bandwidth) or wastes quality (below). <b>Adaptive bitrate streaming (ABR)</b> solves this: the video is stored as many short segments in several bitrates, and the <b>player</b> (not the server) decides, segment by segment, which bitrate to fetch next, using plain HTTP GET requests. Because delivery is plain HTTP on static files, ordinary CDNs and caches work perfectly, which is the key reason this protocol family won over older stateful streaming servers (RTMP and similar).</p>
+
+<h3>10.2 HLS and DASH</h3>
+<table>
+<tr><th></th><th>HLS (HTTP Live Streaming)</th><th>MPEG-DASH</th></tr>
+<tr><td>Origin</td><td>Apple, now an IETF informational RFC</td><td>MPEG standard</td></tr>
+<tr><td>Manifest</td><td><code>.m3u8</code> text playlists (a master playlist listing renditions, then one media playlist per rendition)</td><td><code>.mpd</code> XML (Media Presentation Description)</td></tr>
+<tr><td>Segment format</td><td>MPEG-TS historically; fragmented MP4 (CMAF) now</td><td>fragmented MP4 (CMAF), WebM</td></tr>
+<tr><td>Support</td><td>Safari, iOS and Apple TV (required), almost everywhere now</td><td>Android, Chrome, many smart TVs; not native in Safari</td></tr>
+<tr><td>DRM</td><td>FairPlay (and others with CMAF)</td><td>Widevine, PlayReady</td></tr>
+</table>
+<p>With CMAF, the same segment files serve both protocols, so storage and CDN cache are not doubled; only two small manifests are generated. That is the practical answer to "which one?": produce both from one set of segments.</p>
+
+<h3>10.3 What the manifest contains</h3>
+<p>The manifest is the table of contents. An HLS master playlist looks like this:</p>
+<pre>#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360,CODECS="avc1.4d401e,mp4a.40.2"
+360p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2"
+720p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5400000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"
+1080p/index.m3u8</pre>
+<p>and each media playlist lists its segments:</p>
+<pre>#EXTM3U
+#EXT-X-TARGETDURATION:4
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:4.000,
+seg_00001.m4s
+#EXTINF:4.000,
+seg_00002.m4s
+...
+#EXT-X-ENDLIST</pre>
+<p>The master playlist gives bandwidth and codec per rendition so the player can pick a start rung it can decode. Each media playlist enumerates segment URLs and durations; <code>EXT-X-ENDLIST</code> marks VOD (video on demand, a finished video). Seeking to minute 5 means summing durations (or computing from the fixed 4 s) to find segment 75 and fetching it directly, so seeks are fast. Manifests are small (a few KB to tens of KB), cached with a short to moderate TTL; segments are immutable and cached for a long time, which is what makes the CDN so effective.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 960 400" role="img" aria-label="Adaptive streaming: master manifest, ladder, and player switching">
+  <rect class="box" x="20" y="30" width="200" height="70" rx="10"/><text class="t-c t-b" x="120" y="58">Master manifest</text><text class="t-c t-sm" x="120" y="78">lists 6 renditions + audio</text>
+  <rect class="cache" x="290" y="20" width="200" height="34" rx="8"/><text class="t-c" x="390" y="42">1080p playlist (5 Mbit/s)</text>
+  <rect class="cache" x="290" y="62" width="200" height="34" rx="8"/><text class="t-c" x="390" y="84">720p playlist (2.8 Mbit/s)</text>
+  <rect class="cache" x="290" y="104" width="200" height="34" rx="8"/><text class="t-c" x="390" y="126">360p playlist (0.8 Mbit/s)</text>
+  <path class="arrow" d="M220 60 L286 38"/><path class="arrow" d="M220 65 L286 80"/><path class="arrow" d="M220 75 L286 120"/>
+  <text class="t-sm" x="530" y="42">each playlist lists 4 s segments: seg_1, seg_2, seg_3 ...</text>
+
+  <text class="t-b" x="20" y="190">What the player fetches over time</text>
+  <rect class="hit" x="40"  y="215" width="100" height="44" rx="6"/><text class="t-c" x="90"  y="242">360p seg 1</text>
+  <rect class="hit" x="150" y="215" width="100" height="44" rx="6"/><text class="t-c" x="200" y="242">720p seg 2</text>
+  <rect class="hit" x="260" y="215" width="100" height="44" rx="6"/><text class="t-c" x="310" y="242">1080p seg 3</text>
+  <rect class="hit" x="370" y="215" width="100" height="44" rx="6"/><text class="t-c" x="420" y="242">1080p seg 4</text>
+  <rect class="miss" x="480" y="215" width="100" height="44" rx="6"/><text class="t-c" x="530" y="242">720p seg 5</text>
+  <rect class="miss" x="590" y="215" width="100" height="44" rx="6"/><text class="t-c" x="640" y="242">360p seg 6</text>
+  <rect class="hit" x="700" y="215" width="100" height="44" rx="6"/><text class="t-c" x="750" y="242">720p seg 7</text>
+  <text class="t-sm" x="40" y="285">start low for fast first frame; ramp up as throughput measured; step down when the buffer shrinks (tunnel at seg 5-6); recover</text>
+
+  <text class="t-b" x="20" y="330">Player decision inputs</text>
+  <text class="t-sm" x="40" y="352">measured throughput of the last segments (smoothed)  |  buffer level in seconds (target 20-30 s VOD)</text>
+  <text class="t-sm" x="40" y="372">screen size and decoder limits  |  data-saver setting  |  never exceed ~80 percent of measured throughput</text>
+</svg>
+<figcaption>The master manifest lists the ladder; the player requests one segment at a time and picks the rung for the next. The switch is possible only because all renditions have aligned segment boundaries. Red boxes show the player stepping down when throughput collapses, before the buffer empties.</figcaption>
+</figure>
+
+<h3>10.4 The player's algorithm (high level)</h3>
+<p>The player maintains a buffer of downloaded but unplayed video (say 20 to 30 seconds for VOD). Classic rate-based ABR picks the highest rung whose bitrate is below about 80 percent of measured throughput. Buffer-based ABR (used in research and several production players) picks the rung from the buffer level: a nearly full buffer allows a higher rung, a draining buffer drops. Modern players combine both with hysteresis, so quality does not oscillate. Start-up is aggressive: begin with a low rung or the middle one, because a quick first frame matters more than the first seconds of sharpness. Segment duration is a tradeoff: shorter segments (2 s) adapt faster and start faster but increase request count and manifest size; longer ones (6 to 10 s) reduce overhead but react slowly. 4 s is a common compromise. For seeking, a sprite sheet of thumbnails lets the scrubber show previews without fetching video.</p>
+
+<h2 id="cdn">11. Deep dive 4: CDN design, cache fill and ISP appliances</h2>
+
+<p>The delivery plane is a CDN problem (<a href="../chapters/12-cdn.html">Chapter 12</a> explains edges, PoPs, routing, cache keys and purging; here we apply it). The numbers of section 3 say we deliver 60 Tbit/s at peak, so the design question is: <b>how do we deliver almost all bytes from as close to the viewer as possible, and keep traffic off our origin and off expensive transit links?</b></p>
+
+<h3>11.1 Hierarchy and cache fill</h3>
+<figure class="diagram">
+<svg viewBox="0 0 960 440" role="img" aria-label="CDN hierarchy with ISP appliances, regional cache and origin shield">
+  <rect class="ext" x="20" y="170" width="120" height="60" rx="10"/><text class="t-c t-b" x="80" y="196">Viewers</text><text class="t-c t-sm" x="80" y="214">in ISP network</text>
+  <rect class="cache" x="190" y="150" width="170" height="100" rx="10"/><text class="t-c t-b" x="275" y="178">ISP appliance</text><text class="t-c t-sm" x="275" y="198">inside the ISP,</text><text class="t-c t-sm" x="275" y="214">200+ TB flash/disk</text><text class="t-c t-sm" x="275" y="230">hit about 90-95%</text>
+  <rect class="cache" x="410" y="150" width="170" height="100" rx="10"/><text class="t-c t-b" x="495" y="178">CDN PoP edge</text><text class="t-c t-sm" x="495" y="198">IXP / metro site,</text><text class="t-c t-sm" x="495" y="214">serves ISPs without</text><text class="t-c t-sm" x="495" y="230">an appliance</text>
+  <rect class="cache" x="630" y="150" width="140" height="100" rx="10"/><text class="t-c t-b" x="700" y="178">Regional</text><text class="t-c t-sm" x="700" y="198">mid-tier / shield</text><text class="t-c t-sm" x="700" y="214">collapses misses</text>
+  <rect class="db" x="810" y="150" width="130" height="100" rx="10"/><text class="t-c t-b" x="875" y="184">Origin</text><text class="t-c t-sm" x="875" y="204">object storage</text><text class="t-c t-sm" x="875" y="220">multi-region</text>
+  <path class="arrow-g" d="M140 200 L186 200"/><path class="arrow dash" d="M360 200 L406 200"/><path class="arrow dash" d="M580 200 L626 200"/><path class="arrow dash" d="M770 200 L806 200"/>
+  <text class="t-sm" x="190" y="130">hit: served locally, no backbone traffic</text>
+  <text class="t-sm" x="410" y="110">miss: fill upstream, one request per object per site</text>
+  <text class="t-sm" x="630" y="130">request coalescing: N misses become 1</text>
+
+  <text class="t-b" x="20" y="300">Off-peak fill (Netflix style): push popular titles ahead of demand</text>
+  <rect class="box" x="40" y="320" width="230" height="56" rx="10"/><text class="t-c t-b" x="155" y="344">Popularity forecast</text><text class="t-c t-sm" x="155" y="362">new releases, regional trends</text>
+  <rect class="box" x="350" y="320" width="230" height="56" rx="10"/><text class="t-c t-b" x="465" y="344">Fill scheduler</text><text class="t-c t-sm" x="465" y="362">nightly window, per-site manifest</text>
+  <rect class="cache" x="660" y="320" width="230" height="56" rx="10"/><text class="t-c t-b" x="775" y="344">Appliances pre-warmed</text><text class="t-c t-sm" x="775" y="362">fill when links are idle</text>
+  <path class="arrow" d="M270 348 L346 348"/><path class="arrow" d="M580 348 L656 348"/>
+</svg>
+<figcaption>Top: the pull-through hierarchy. A hit at the ISP appliance never touches the backbone; a miss climbs one tier at a time and is coalesced. Bottom: for predictable catalogs, popular titles are pushed to appliances during the night, when links are idle, so peak hours are served almost entirely from the edge.</figcaption>
+</figure>
+
+<p><b>Pull-through (lazy) fill</b> is the default: the edge receives a request for a segment it lacks, forwards to its parent, stores the response, and serves it. Two refinements matter at this scale. <b>Request coalescing</b> (also called collapsed forwarding): if 5,000 viewers ask an edge for the same new segment at the same moment, the edge sends one upstream request and holds the others until it returns, which prevents a thundering herd on the origin (related to the cache stampede problem in <a href="../chapters/14-caching-failures.html">Chapter 14</a>). An <b>origin shield</b> (the regional tier) does the same one level up, so origin storage sees at most one request per object per region instead of one per edge. <b>Push (proactive) fill</b> suits catalogs with predictable popularity, such as Netflix, where a forecast says what will be hot in each region tonight.</p>
+
+<h3>11.2 ISP-embedded appliances (Open Connect style)</h3>
+<p>Internet service providers (ISPs) pay to receive traffic from the rest of the internet over transit or peering links. When 30 to 40 percent of an ISP's evening traffic is one video service, both sides benefit if the content is cached inside the ISP: the video company places its own cache servers, <b>appliances</b>, in the ISP's data centers (free of charge to the ISP, who supplies power, space and connectivity). Viewers on that ISP are routed to their local appliance; traffic never crosses the ISP's expensive upstream links, and the video company avoids paying a CDN or transit for those bytes. Netflix's Open Connect and Google's Global Cache (GGC) are the well-known examples. Details:</p>
+<ul>
+  <li>Each appliance holds a large slice of the catalog (often hundreds of terabytes of flash and disk) and serves at tens to hundreds of Gbit/s.</li>
+  <li>Control plane: appliances report health and what they hold; a steering service answers "which servers should this client use?" using the client's ISP, location and appliance load. Steering happens in the application API (the play request returns CDN URLs) rather than relying only on DNS or anycast, which gives finer control (see <a href="../chapters/04-dns.html">Chapter 4</a> for DNS-based routing limits).</li>
+  <li>Fallback: if the local appliance is down, misses, or overloaded, the client falls back to a PoP edge or another appliance; the manifest can list several base URLs.</li>
+  <li>Popularity-aware placement: the most popular titles are replicated on many appliances in a region; the long tail on fewer. Consistent hashing within a site spreads objects across the site's servers so each object has one home, and a hot object gets a few replicas (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>).</li>
+</ul>
+<p>YouTube, by contrast, has a huge long tail of 1 billion videos. Its appliances (GGC) cache only what is locally popular and rely on a deep hierarchy for everything else. The tail is the reason hit ratio at the edge is lower for UGC (user generated content) than for a curated catalog (about 85 to 95 percent versus 95 percent or more by bytes).</p>
+
+<h3>11.3 Cache details specific to video</h3>
+<ul>
+  <li><b>Cache key:</b> path of the segment only. Never include session ids, tokens or tracking query parameters in the key. If access control is needed, use <b>signed URLs or cookies</b> validated at the edge, with the signature excluded from the cache key so one cached copy serves everyone (see <a href="../chapters/12-cdn.html">Chapter 12</a>).</li>
+  <li><b>TTLs:</b> segments are immutable, so a very long TTL (days to a year) is safe. The master manifest changes only when renditions are added (for example AV1 arriving later), so a TTL of minutes. Live manifests need a TTL of about one segment duration or less.</li>
+  <li><b>Range requests:</b> some DASH profiles and progressive downloads use byte ranges. Edges must cache ranges (or fetch aligned slices of 1 to 2 MB) rather than the whole file per range.</li>
+  <li><b>Eviction:</b> LRU variants with admission control (a new object is admitted only if seen twice) keep one-hit wonders from evicting hot segments. In the long tail, many videos are watched once; admitting them wastes capacity.</li>
+  <li><b>Prefetch:</b> when the edge serves segment n of rendition r, it can prefetch n+1 and n+2 from the parent. Sequential access is highly predictable.</li>
+</ul>
+
+<h3>11.4 Options compared: build vs rent a CDN</h3>
+<table>
+<tr><th>Option</th><th>Pros</th><th>Cons</th><th>When</th></tr>
+<tr><td>Rent a commercial CDN</td><td>Zero capex, global instantly, DDoS absorption</td><td>Per-GB price, less control of caching and steering, can be capacity-constrained at your peak</td><td>Startups up to a few Tbit/s</td></tr>
+<tr><td>Multi-CDN (two or three vendors, steered by a control plane)</td><td>Resilience to one vendor's outage, price leverage, best per-region performance</td><td>More integration, cache fragmentation, config drift</td><td>Mid-to-large platforms</td></tr>
+<tr><td>Own CDN with ISP appliances</td><td>Lowest cost per GB at scale, full control, best quality</td><td>Huge capex and ops, ISP relationships, hardware logistics</td><td>When egress bill is the dominant cost (tens of Tbit/s)</td></tr>
+</table>
+<p>Our scale (60 Tbit/s peak) justifies the third; the realistic path is rent first, multi-CDN second, own appliances last (see phasing, section 16).</p>
+
+<h2 id="views">12. Deep dive 5: view counts and discovery at scale</h2>
+
+<h3>12.1 View counting</h3>
+<p>At peak there are about 100,000 view starts per second, and a viral video can receive 100,000 counts per second all for one key. A single database row incremented per view melts: row-level lock contention, a hot partition, and write amplification. This is the classic hot-key counter problem from the <a href="../chapters/60-pattern-playbook.html">pattern playbook (Chapter 60)</a>. The standard answers, in order of sophistication:</p>
+<table>
+<tr><th>Approach</th><th>How</th><th>Tradeoff</th></tr>
+<tr><td>A. Increment the DB row</td><td><code>UPDATE videos SET views = views + 1</code></td><td>Simple; collapses at about 1,000 writes/s per row.</td></tr>
+<tr><td>B. Sharded counters</td><td>Split the count into K sub-counters (<code>video:123:s0..s15</code>); increment a random one; read sums them.</td><td>Spreads writes K ways; reads cost K lookups (cache the sum).</td></tr>
+<tr><td>C. Stream and aggregate (chosen)</td><td>Players send a view event; it goes to Kafka partitioned by video id; consumers aggregate in memory in 1 to 5 second windows and write one increment per video per window; displayed count is cached and eventually consistent.</td><td>Write rate drops by orders of magnitude (a viral video yields 1 write per window rather than 100,000); counts lag by seconds.</td></tr>
+</table>
+
+<figure class="diagram">
+<svg viewBox="0 0 960 300" role="img" aria-label="View count pipeline using a stream and windowed aggregation">
+  <rect class="ext" x="20" y="110" width="110" height="60" rx="10"/><text class="t-c t-b" x="75" y="136">Players</text><text class="t-c t-sm" x="75" y="154">view beacons</text>
+  <rect class="box" x="170" y="110" width="120" height="60" rx="10"/><text class="t-c t-b" x="230" y="136">Edge collector</text><text class="t-c t-sm" x="230" y="154">validate, dedup</text>
+  <rect class="cache" x="330" y="110" width="130" height="60" rx="10"/><text class="t-c t-b" x="395" y="136">Kafka</text><text class="t-c t-sm" x="395" y="154">key = video_id</text>
+  <rect class="box" x="500" y="110" width="140" height="60" rx="10"/><text class="t-c t-b" x="570" y="136">Window aggregator</text><text class="t-c t-sm" x="570" y="154">sum per video / 5 s</text>
+  <rect class="db" x="690" y="30" width="140" height="56" rx="10"/><text class="t-c t-b" x="760" y="55">Counter store</text><text class="t-c t-sm" x="760" y="73">sharded, cached sum</text>
+  <rect class="db" x="690" y="110" width="140" height="56" rx="10"/><text class="t-c t-b" x="760" y="135">Data lake</text><text class="t-c t-sm" x="760" y="153">raw events, billing</text>
+  <rect class="box" x="690" y="190" width="140" height="56" rx="10"/><text class="t-c t-b" x="760" y="215">Reco features</text><text class="t-c t-sm" x="760" y="233">watch history</text>
+  <path class="arrow" d="M130 140 L166 140"/><path class="arrow" d="M290 140 L326 140"/><path class="arrow" d="M460 140 L496 140"/>
+  <path class="arrow" d="M640 125 L686 62"/><path class="arrow" d="M640 140 L686 138"/><path class="arrow" d="M640 155 L686 214"/>
+  <text class="t-sm" x="20" y="270">A viral video: 100,000 beacons per second in, 1 counter write per video per window out. Exact numbers are reconciled nightly from the lake.</text>
+</svg>
+<figcaption>Raw events are cheap, durable and replayable in the stream; the count shown to users is a derived, cached, slightly stale aggregate. See <a href="../chapters/37-batch-stream.html">Chapter 37</a> for windowed aggregation and <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a> for approximate counting.</figcaption>
+</figure>
+
+<p>Two semantic points. First, a "view" is defined by policy (for instance 30 seconds of watch time), and bots and replays are filtered in the collector; the public count is deliberately conservative and may freeze briefly while fraud checks run. Second, the number shown on the page does not need to be exact, so it is read from cache and updates every few seconds; billing-grade numbers (ad impressions, royalties) come from the exact batch pipeline over raw events.</p>
+
+<h3>12.2 Metadata, search and recommendations (high level)</h3>
+<ul>
+  <li><b>Metadata reads</b> are a classic cache-aside workload (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>): the video row is cached in Redis keyed by id with a TTL of minutes; writes (title edit) invalidate. Because video metadata is read about 600 times per write, hit ratio exceeds 99 percent.</li>
+  <li><b>Search</b>: when a video becomes READY, an indexer consumes <code>video.ready</code> and writes title, description, auto-generated captions, channel and tags into an inverted index (<a href="../chapters/22-search-engines.html">Chapter 22</a>). Ranking blends text relevance with popularity, freshness and personalization. The index is sharded by video id with scatter-gather queries and replicated for availability.</li>
+  <li><b>Recommendations</b> are the largest driver of watch time. A typical two-stage design: <b>candidate generation</b> (several cheap models retrieve a few hundred candidates from billions using embeddings, co-watch graphs, subscriptions) followed by a <b>ranker</b> (a larger model scores candidates for expected watch time) and then filters (already watched, policy). Features come from the event stream and a feature store; the model is trained offline and served online with latency budgets of tens of milliseconds. We state this and stop: it is a separate case study in itself.</li>
+</ul>
+
+<h2 id="drm">13. DRM, live streaming and other special cases</h2>
+
+<h3>13.1 DRM for premium content</h3>
+<p>Plain HTTPS protects bytes in transit but anyone can save the segments. Studios require <b>DRM</b>: segments are encrypted, and the decryption key reaches only authorized, certified players, inside a protected module on the device (the CDM, content decryption module), which refuses to let the key or the decoded frames be extracted on well-protected devices. The three major systems are <b>Widevine</b> (Google; Android, Chrome), <b>FairPlay</b> (Apple; Safari, iOS, Apple TV) and <b>PlayReady</b> (Microsoft; Windows, Xbox, many TVs). The Common Encryption standard (CENC, with the "cbcs" and "cenc" schemes) lets us encrypt the segments once and carry per-system metadata in the manifest, so one set of encrypted CMAF segments serves all three; each DRM system supplies its own license.</p>
+<ol>
+  <li>During packaging, the packager asks a <b>key management service</b> for a content key per video (often a separate key per resolution tier, so SD can be licensed more loosely than 4K), encrypts segments with AES, and stores the key id in the manifest.</li>
+  <li>The player sees the encryption info, makes a license request to our <b>license server</b> with an auth token (the user's subscription entitlement), and the DRM system in the device receives a license containing the key plus rules (expiry, allowed output protection, offline permitted).</li>
+  <li>The device decrypts segment by segment. The CDN serves encrypted files, identical for everyone, so caching is unaffected.</li>
+</ol>
+<p>The license server is a new critical dependency: its availability decides whether premium playback starts, so it is stateless, multi-region, cached for the entitlement check, and the player caches licenses for the viewing session (offline downloads hold a persistent license). It is small in bytes but strict in latency (adds to start-up time), so place it near users and keep it off the segment path. Pitfall: rotating keys mid-video increases security but adds license requests; do it rarely. DRM is not unbreakable and does not stop screen recording; it raises the cost of piracy and satisfies contracts.</p>
+
+<h3>13.2 Live versus VOD</h3>
+<table>
+<tr><th>Aspect</th><th>VOD (this design)</th><th>Live</th></tr>
+<tr><td>Ingest</td><td>File upload, resumable</td><td>Continuous contribution stream (RTMP, SRT or WebRTC) from the broadcaster to an ingest PoP</td></tr>
+<tr><td>Transcoding</td><td>Offline, parallel, minutes to hours, retryable</td><td>Real time per stream: the encoder must keep up with the clock, so one stream is pinned to a worker (with hot standby); you cannot fan out into chunks arbitrarily</td></tr>
+<tr><td>Segments</td><td>All exist before playback; long TTL</td><td>Created every 2 to 6 seconds; manifest is a sliding window, refreshed constantly</td></tr>
+<tr><td>Latency</td><td>Irrelevant to the viewer</td><td>Standard HLS/DASH: 15 to 30 seconds behind real time; low-latency HLS/DASH (partial segments, chunked transfer): 2 to 5 seconds; WebRTC: under 1 second but costly to scale</td></tr>
+<tr><td>CDN</td><td>Cache nearly everything for days</td><td>Segment is hot for seconds then cold; huge synchronized demand for the newest segment makes request coalescing and shield tiers essential</td></tr>
+<tr><td>Failure</td><td>Retry</td><td>Dropped packets are gone; redundant ingest paths and a hot-standby encoder</td></tr>
+</table>
+<p>Live events (a final, a premiere) are the worst case for the CDN: millions of viewers want the same bytes at the same second, but at least all of them want the same bytes, which is ideal for caching if coalescing works. A live stream is often recorded to storage as it runs and then becomes a VOD asset through the same packaging stage.</p>
+
+<h2 id="cost">14. Cost analysis: egress dominates</h2>
+
+<p>Cloud and CDN bills have three big lines: storage, compute and egress (bytes leaving to the internet). Using section 3:</p>
+<table>
+<tr><th>Item</th><th>Quantity</th><th>Unit price (illustrative)</th><th>Daily cost</th></tr>
+<tr><td>Egress</td><td>340 PB</td><td>$0.02 per GB list price, about $0.003 to $0.01 per GB at committed volume; near cost with owned appliances</td><td>340M GB × $0.005 = about $1.7M (at list price $0.02: $6.8M)</td></tr>
+<tr><td>Storage growth</td><td>7.5 PB new per day; about 1 EB of existing renditions</td><td>$0.004 per GB-month blended tiers</td><td>Standing: 1,000,000,000 GB × $0.004 = $4M per month, about $130K per day, growing by roughly $30K per day for each day of new data</td></tr>
+<tr><td>Transcode compute</td><td>about 280,000 cores average</td><td>$0.01 per core-hour on spot</td><td>280,000 × 24 × $0.01 = about $67K</td></tr>
+<tr><td>Metadata, search, API</td><td>hundreds of nodes</td><td></td><td>tens of thousands</td></tr>
+</table>
+<p>Egress is more than 90 percent of the bill, so almost every cost lever should reduce delivered bytes or the price per byte:</p>
+<ul>
+  <li><b>Better codecs and per-title encoding</b> cut bitrate for the same quality by 20 to 50 percent. A 30 percent saving on $1.7M per day is $510K per day, which pays for large encode farms.</li>
+  <li><b>High edge hit ratio:</b> every byte served from an ISP appliance avoids transit and backbone cost. Raising hit ratio from 90 to 95 percent halves origin-side egress.</li>
+  <li><b>Own appliances and peering</b> turn per-GB prices into fixed hardware and circuit costs.</li>
+  <li><b>Player policy:</b> cap resolution on small screens and in data-saver mode, limit buffer-ahead so abandoned videos do not waste downloaded bytes, stop autoplay when idle (the "are you still watching" prompt exists partly for cost).</li>
+  <li><b>Storage tiering:</b> originals older than N days move to infrequent-access or archive tiers (kept, because new codecs may need re-encoding); unwatched high-resolution renditions of long-tail videos are deleted and regenerated on demand from the original. Most of the 1 billion videos are almost never watched, so this is a major storage saving. Erasure coding instead of three-way replication gives 1.4 to 1.5 times overhead rather than 3 times (<a href="../chapters/21-object-storage.html">Chapter 21</a>).</li>
+  <li><b>Lazy codec ladders:</b> expensive encodes (AV1, 4K) only after popularity thresholds, as in section 9.2.</li>
+</ul>
+<div class="callout key"><b>Key idea</b>
+In video, the unit economics are cost per hour streamed. Encode compute is a one-time cost per video; storage is a monthly cost per video; egress is paid on every view. A decision that lowers bytes per view even slightly beats nearly any server optimization.
+</div>
+
+<h2 id="scale">15. Scaling, bottlenecks and hot spots</h2>
+<ul>
+  <li><b>Segment requests (3 to 10 million per second):</b> never touch application servers. They go DNS or API steering to an edge, then cache. Origin sees only fills: at 95 percent edge hit ratio, origin-side load is about 5 percent of 60 Tbit/s, still 3 Tbit/s; so a regional shield tier is needed to coalesce misses and cut it by another factor of several.</li>
+  <li><b>Metadata API (100,000 play requests per second at peak):</b> a play request reads a cached metadata row, checks entitlement and returns manifest URL plus steering info. Stateless API servers behind load balancers (<a href="../chapters/09-load-balancing.html">Chapter 9</a>) and the API gateway (<a href="../chapters/11-api-gateway.html">Chapter 11</a>), cache hit above 99 percent. Metadata store sharded by <code>video_id</code>; owner queries use a secondary index or a separate table keyed by owner.</li>
+  <li><b>Hot videos:</b> a premiere makes one manifest and a handful of segments extremely hot. The manifest is tiny and can be served from edge memory. For segments, the edge replicates hot objects across multiple servers in the site instead of one home, and small objects are held in RAM.</li>
+  <li><b>Upload burst:</b> uploads follow time of day and events. Object storage absorbs ingest; the queue absorbs the processing burst; autoscaling handles the compute. If backlog grows too much, degrade gracefully: process only the low-resolution rungs first, delay AV1.</li>
+  <li><b>Transcoding bottlenecks:</b> large files read repeatedly by many chunk tasks. Co-locate workers with the storage region and read chunks by range request rather than copying the whole file per task; the split stage can write chunks as separate objects so each task reads just its chunk.</li>
+  <li><b>Search and recommendation:</b> scaled with usual sharding and replication; both fed by the event stream so they stay off the playback path.</li>
+</ul>
+
+<h2 id="failures">16. Failure modes, consistency, multi-region</h2>
+
+<table>
+<tr><th>Component</th><th>Failure</th><th>User impact</th><th>Mitigation</th></tr>
+<tr><td>Upload API</td><td>Down</td><td>New uploads cannot start; playback unaffected</td><td>Stateless, multiple AZs; clients retry with backoff; in-flight uploads continue direct to storage.</td></tr>
+<tr><td>Object storage (one region)</td><td>Region outage</td><td>Uploads in that region fail; origin fills for non-cached segments fail</td><td>Cross-region replication of renditions (async, since renditions are immutable); the CDN origin list has a secondary origin; originals replicated before acknowledging "complete" (or accepted risk window, documented).</td></tr>
+<tr><td>Transcode worker</td><td>Crash or preemption</td><td>Delay</td><td>Lease expiry, retry only the chunk; idempotent output keys.</td></tr>
+<tr><td>Transcode produces wrong output</td><td>Corrupt or desynced segment (silent)</td><td>Playback glitch, player error on one rung</td><td>Verification stage: probe each output, check duration and frame count, compare checksum with expected, sample-decode; fail the task if mismatched. Keep original so re-encoding is always possible.</td></tr>
+<tr><td>Queue/orchestrator</td><td>Down or lag</td><td>Videos stay in PROCESSING longer</td><td>Durable queue and workflow state; alert on backlog age; replay is safe because tasks are idempotent.</td></tr>
+<tr><td>Metadata DB shard</td><td>Primary fails</td><td>Videos on shard cannot be looked up for a short time</td><td>Replicas with automatic failover (<a href="../chapters/24-replication.html">Chapter 24</a>); cached metadata keeps most plays working through the blip; the manifest URL is deterministic, so a cached client can still play.</td></tr>
+<tr><td>CDN edge or ISP appliance</td><td>Overload or failure</td><td>Rebuffering for local users</td><td>Health checks and steering remove it; the client retries on the next base URL in the manifest; capacity headroom of 30 percent at peak; load-shed by lowering the default rung briefly.</td></tr>
+<tr><td>CDN vendor</td><td>Whole provider degraded</td><td>Regional or global playback failures</td><td>Multi-CDN with client-side or server-side switching based on real error rates (<a href="../chapters/40-resilience.html">Chapter 40</a>).</td></tr>
+<tr><td>Origin overload (cache stampede)</td><td>Many edges miss on the same new object</td><td>Slow starts, origin errors</td><td>Request coalescing, shield tier, pre-warming for known releases, stale-while-revalidate for manifests.</td></tr>
+<tr><td>License server (DRM)</td><td>Slow or down</td><td>Premium plays fail to start</td><td>Multi-region active-active, cached entitlements, persistent licenses, short timeouts with retry; fail closed only for premium.</td></tr>
+<tr><td>Counter pipeline</td><td>Lag or loss</td><td>Counts stale or low</td><td>Acceptable by design; events are durable in Kafka and replayable; nightly reconciliation corrects.</td></tr>
+<tr><td>Search or reco</td><td>Down</td><td>Search page or home feed degraded</td><td>Fall back to cached or trending lists; playback and direct links still work.</td></tr>
+</table>
+
+<h3>16.1 Consistency and idempotency decisions</h3>
+<ul>
+  <li><b>State machine for each video</b> (UPLOADING, PROCESSING, READY, FAILED, BLOCKED) transitions only by compare-and-set; visibility changes (making a video private, a takedown) must take effect quickly. Because segments are cached for days, a takedown cannot rely on expiring TTLs. Takedown does two things: flip the metadata (the play API stops handing out URLs) and issue a CDN purge (<a href="../chapters/12-cdn.html">Chapter 12</a>) for the manifest; segments without a manifest are practically unreachable, and for sensitive cases use signed, short-lived URLs so access ends when the signature expires.</li>
+  <li><b>Immutable, content-addressed outputs.</b> Never overwrite a segment URL with different bytes; if you re-encode, publish under a new version path and a new manifest. This avoids stale-cache bugs where an old manifest points to a new segment and the player sees a decode error.</li>
+  <li><b>Eventual consistency for reads:</b> counts, search index, recommendations. A newly READY video may take seconds to appear in search; that is fine.</li>
+  <li><b>Exactly-once effects</b> are built from at-least-once delivery plus idempotent handlers: <code>video.ready</code> handlers dedupe on <code>(video_id, version)</code>; see <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>.</li>
+</ul>
+
+<h3>16.2 Multi-region</h3>
+<p>Originals are written to a home region and replicated asynchronously to a second region (immutable objects, so replication needs no conflict resolution). Transcoding runs in the region where the original lives, with spillover to another region if capacity is short. The metadata store has a primary region per shard, with cross-region read replicas; play requests read from the nearest replica (a slightly stale status is fine because READY is monotonic). Delivery is inherently multi-region through the CDN. See <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a> and <a href="../chapters/41-ha-dr.html">Chapter 41</a>.</p>
+
+<h2 id="ops">17. Security, abuse, monitoring and SLOs</h2>
+<ul>
+  <li><b>Upload abuse:</b> per-user quotas and rate limits (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>), file size and duration caps, content scanning (malware in containers, illegal content classifiers, copyright fingerprinting against rights-holder databases) as DAG branches that can block publishing. Decompression bombs: validate in a sandboxed worker with CPU and memory limits, since parsing untrusted media files is a classic attack surface for decoder vulnerabilities.</li>
+  <li><b>Hotlinking and scraping:</b> signed URLs with short expiry for premium content; rate limits at the edge; bot detection.</li>
+  <li><b>Privacy:</b> private and unlisted videos require authorization at the play API and signed segment URLs (<a href="../chapters/55-security.html">Chapter 55</a>).</li>
+  <li><b>DDoS:</b> the CDN edge absorbs volumetric attacks; the origin is not reachable except from CDN and shield IPs.</li>
+</ul>
+
+<h3>17.1 Metrics and service level objectives</h3>
+<p>Video quality is measured from the client (quality of experience, QoE), because server-side success codes do not capture a stalled player. See <a href="../chapters/54-observability-slos.html">Chapter 54</a>.</p>
+<table>
+<tr><th>SLI</th><th>Target (SLO)</th></tr>
+<tr><td>Play request success (manifest returned)</td><td>99.99 percent</td></tr>
+<tr><td>Time to first frame, p95</td><td>under 2 seconds</td></tr>
+<tr><td>Rebuffer ratio (stall time / play time)</td><td>under 0.5 percent; alert at 1 percent</td></tr>
+<tr><td>Average delivered bitrate / share of sessions at or above 720p</td><td>tracked per ISP and device; regressions page the on-call</td></tr>
+<tr><td>Edge cache hit ratio by bytes</td><td>above 95 percent (curated), above 85 percent (UGC)</td></tr>
+<tr><td>Upload success rate</td><td>above 99.5 percent</td></tr>
+<tr><td>Time from upload complete to first playable rendition, p95</td><td>under 5 minutes for videos shorter than 10 minutes</td></tr>
+<tr><td>Transcode backlog age</td><td>under 10 minutes</td></tr>
+</table>
+
+<h2 id="evolution">18. Evolution, phasing and alternatives not chosen</h2>
+<h3>18.1 Build order</h3>
+<ol>
+  <li><b>Phase 1 (launch):</b> signed-URL multipart upload to object storage, a worker pool transcoding a small H.264 ladder into HLS with 6-second segments, a rented CDN, metadata in one relational primary with a replica, basic search in the same database or a hosted search service, view counts via a simple stream aggregator. This handles thousands of concurrent streams.</li>
+  <li><b>Phase 2:</b> DAG orchestration with chunk-level parallelism, per-title encoding, VP9/AV1 for popular videos, multi-CDN, Redis metadata cache, a dedicated search cluster, a recommendation candidate generator.</li>
+  <li><b>Phase 3 (10 times scale, 120 million concurrent streams, 600 Tbit/s):</b> own appliances inside ISPs and peering, pre-positioning with popularity forecasts, regional shield tiers, cell-based architecture so one bad deploy affects a fraction of users (<a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>), custom encoding hardware, QoE-driven steering that reroutes users per ISP in real time, and a feature store plus real-time ranker.</li>
+</ol>
+<h3>18.2 Alternatives not chosen</h3>
+<ul>
+  <li><b>Server-side adaptive streaming with a stateful streaming server (RTMP, RTSP):</b> needs per-session state and special servers, and does not use ordinary HTTP caches. HTTP segments won because they scale with the CDN.</li>
+  <li><b>Peer-to-peer delivery:</b> reduces egress, but is complex, hurts mobile battery and upload bandwidth, and has security and privacy issues; some platforms used it, most dropped it as CDN prices fell and appliances arrived.</li>
+  <li><b>Storing video in a database:</b> poor cost, poor throughput, no range-read benefits. Object storage plus metadata in a database is the proper split.</li>
+  <li><b>Transcode on demand at request time (just-in-time packaging):</b> store one mezzanine encode and repackage to HLS/DASH on the fly. Saves storage for the long tail and is used selectively (especially for manifests and DRM packaging), but adds CPU to the read path, so hot titles are pre-packaged.</li>
+  <li><b>Fixed ladder for every video:</b> simpler, but wastes bytes; per-title wins as bandwidth cost grows.</li>
+</ul>
+
+<h2 id="qa">19. Interview Q&amp;A</h2>
+
+<details><summary>Why upload directly to object storage instead of through your servers?</summary>
+<p>Proxying multi-gigabyte uploads would make our application tier carry 2.5 PB per day of ingest, which requires large, stateful servers with sticky routing for resumability and wastes CPU on byte copying. With signed URLs for multipart upload, the API issues small control messages and the object store, which is already built for durable high-throughput ingest, receives the bytes. We still need validation, so we do it after completion as the first stage in the processing DAG, in a sandbox. The trade is less inline control for a much simpler, cheaper, more scalable system.</p></details>
+
+<details><summary>How do you make an upload resumable, and what if the client loses its state completely?</summary>
+<p>The file is split into fixed-size parts and each part is uploaded as an independent request. The server side, either the object store's multipart session or our own session row, records which parts arrived with their checksums. After a failure the client asks for the list of completed parts and sends only the missing ones; if the client lost its local state, such as after reinstalling the app, it can still query by upload id (or by file fingerprint plus user), and it needs to re-read the local file only. Parts are idempotent, so duplicates are harmless, and incomplete sessions expire through a lifecycle rule so abandoned parts do not accumulate cost.</p></details>
+
+<details><summary>Why split into chunks for transcoding, and what is the catch?</summary>
+<p>Encoding is the slowest part and is proportional to duration, so a single-machine encode of a three-hour film would take hours and a failure near the end would repeat all work. Splitting at key-frame boundaries lets hundreds of workers encode chunks simultaneously, so latency becomes roughly the time for one chunk plus overhead, and a failed worker redoes only a few seconds of video. The catches are that all renditions need identical key-frame alignment so the player can switch between them, rate control can differ between chunks and cause slight quality jumps (mitigated by constrained two-pass encoding or look-ahead context), and orchestration state grows (hundreds of tasks per video), which is why we use a durable workflow engine.</p></details>
+
+<details><summary>Explain HLS versus DASH and what the manifest does.</summary>
+<p>Both break the video into short HTTP-fetchable segments across multiple bitrates, with the player choosing which rendition to fetch next. HLS uses text playlists, a master listing renditions with bandwidth, resolution and codec, and per-rendition playlists listing segment URLs. DASH uses an XML manifest with the same information. HLS is mandatory on Apple devices and DASH is common on Android and TVs, but with CMAF fragmented MP4 segments the media bytes are identical, so we store one set and only generate two small manifests. The manifest is what enables adaptation, fast seeking by computing the segment index, DRM signaling, multiple audio languages and subtitles, and it lets us change the CDN base URL or add new renditions without touching players.</p></details>
+
+<details><summary>How does the CDN keep the origin from being overwhelmed when a new popular video is released?</summary>
+<p>Several layers of protection stack. Each edge uses request coalescing so many simultaneous requests for the same missing segment produce one upstream fetch. A regional shield tier does the same across edges, so the origin sees at most one request per object per region. For predictable releases we pre-position the segments (push fill) during off-peak hours, so the first viewer already gets a hit. Segments are immutable with long TTLs so they never need revalidation, and manifests use short TTLs with stale-while-revalidate to avoid synchronized expiry. Together, origin traffic stays near the small fraction of traffic that is truly cold.</p></details>
+
+<details><summary>Why would a company put its own servers inside ISPs?</summary>
+<p>At tens of terabits per second the cost and congestion of moving bytes across the internet backbone dominate. An appliance inside the ISP serves local viewers over the ISP's own network, so the ISP avoids paying for upstream transit for that traffic and viewers get lower latency and fewer stalls, while the video company avoids per-GB CDN fees and gains full control of caching and steering. It is only economical at very high volume because of the capex and operations, which is why smaller services rent CDN capacity instead. The appliance holds the locally popular catalog and fills itself overnight, with the rest falling back to regional PoPs.</p></details>
+
+<details><summary>How would you count views for a viral video without melting the database?</summary>
+<p>Never increment a database row per view. Players send beacons to a collector that validates and dedups them, and the events are written to a partitioned stream keyed by video id. Aggregators sum counts in short windows of a few seconds and write one increment per video per window to a sharded counter store, with the displayed total served from cache. A viral video that generates 100,000 events per second becomes about one write per window. The count is eventually consistent by design; exact numbers for payments and ads are computed later from the raw event log, which is retained in the data lake and can be replayed after a bug.</p></details>
+
+<details><summary>What is your strategy for codec choice and encoding cost?</summary>
+<p>Encoding is a one-time cost while delivery is paid on every view, so the right investment depends on expected views. Everything is encoded to H.264 immediately for universal playback and fast availability. Videos that cross popularity thresholds are re-encoded with VP9 or AV1, which are 30 to 50 percent smaller at the same quality, because the bandwidth savings quickly exceed the extra CPU. Per-title encoding tailors the bitrate ladder to the content's complexity. A catalog like Netflix's, with a small number of titles each watched millions of times, encodes with expensive settings up front, while a user-generated platform does it lazily after the video proves popular.</p></details>
+
+<details><summary>How do you implement DRM without breaking CDN caching?</summary>
+<p>The segments are encrypted once with a content key using a common encryption scheme, so every viewer fetches identical encrypted bytes and the CDN can cache them normally. Authorization happens at the license server: after checking the viewer's entitlement, it returns a license containing the key to the device's secure decryption module, using Widevine, FairPlay or PlayReady as appropriate. So access control is moved from the content path to a small, low-bandwidth, highly available service. We keep that service multi-region and cache entitlement checks because it sits on the critical path of playback start-up.</p></details>
+
+<details><summary>What changes for live streaming?</summary>
+<p>Ingest becomes a continuous stream and the transcoder must run in real time, so you cannot fan out arbitrarily by chunk; each stream gets a dedicated encoder with a hot standby. Segments are produced every few seconds and the manifest becomes a sliding window with a very short TTL. End-to-end latency is a design parameter: standard HLS sits 15 to 30 seconds behind, low-latency HLS or DASH gets to a few seconds using partial segments, and WebRTC gets below one second at higher cost. The CDN sees synchronized demand for the newest segment, so coalescing and shielding are critical, and the stream is simultaneously recorded so it can become a VOD asset after the event.</p></details>
+
+<details><summary>A takedown request arrives for a video cached across the CDN. What do you do?</summary>
+<p>First flip the status in the metadata store so the play API refuses to return manifests, and propagate through the metadata cache by explicit invalidation. Then issue a CDN purge for the manifest paths (and segment prefixes where the CDN supports prefix purge); because segment URLs are not discoverable without the manifest, and premium or sensitive content uses short-lived signed URLs, the exposure window is bounded by the purge propagation time and signature lifetime. We also record the event for audit and block re-upload of the same content with fingerprint matching.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">20. Recap</h2><ul>
+  <li>Estimate first: about 34,700 starts per second average (about 100,000 at peak), 12.5 million concurrent streams, about 340 PB per day egress, 7.5 PB per day of new storage, and roughly 280,000 busy encode cores. Playback bandwidth, not request rate, is the hard problem.</li>
+  <li>Split into three planes: upload and processing (async, compute heavy), delivery (CDN, bandwidth heavy), metadata and discovery (cacheable APIs).</li>
+  <li>Uploads are chunked, resumable and go direct to object storage by signed URLs; session state and idempotent completion live in the database.</li>
+  <li>Transcoding is a DAG: validate, split at GOP boundaries, fan out chunk by rendition encodes on queue-fed autoscaled workers, package as CMAF, write HLS and DASH manifests, flip to READY. Tasks are idempotent and retried per chunk.</li>
+  <li>Adaptive streaming moves the quality decision to the player over plain HTTP segments; the manifest lists the ladder; immutable segments make CDN caching almost perfect.</li>
+  <li>CDN: edge plus regional shield, coalescing, long TTL segments and short TTL manifests, ISP appliances and off-peak pre-positioning at large scale.</li>
+  <li>View counts: stream, window-aggregate, sharded counters, cached display; exact numbers from the batch log.</li>
+  <li>DRM encrypts once and licenses per device system; live is a different real-time pipeline with the same delivery model.</li>
+  <li>Egress is over 90 percent of cost, so codecs, per-title encoding, hit ratio and peering are the main cost levers.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> <a href="../chapters/01-interview-framework.html">Chapter 1</a> (framework), <a href="../chapters/02-estimation.html">Chapter 2</a> (estimation), <a href="../chapters/04-dns.html">Chapter 4</a> (steering), <a href="../chapters/12-cdn.html">Chapter 12</a> (CDN), <a href="../chapters/13-caching-patterns.html">Chapter 13</a> and <a href="../chapters/14-caching-failures.html">Chapter 14</a> (caching and stampedes), <a href="../chapters/21-object-storage.html">Chapter 21</a> (object storage, multipart, erasure coding), <a href="../chapters/22-search-engines.html">Chapter 22</a> (search), <a href="../chapters/25-sharding.html">Chapter 25</a> (sharding), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotency), <a href="../chapters/34-queues-kafka.html">Chapter 34</a> (queues and Kafka), <a href="../chapters/37-batch-stream.html">Chapter 37</a> (stream aggregation), <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a> (DAG workflows), <a href="../chapters/40-resilience.html">Chapter 40</a> (resilience), <a href="../chapters/54-observability-slos.html">Chapter 54</a> (SLOs), <a href="../chapters/60-pattern-playbook.html">Chapter 60</a> (pattern playbook). Related case studies: <a href="c06-news-feed.html">news feed</a> for feed ranking and fan-out, <a href="c01-url-shortener.html">URL shortener</a> for the read-heavy metadata pattern.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

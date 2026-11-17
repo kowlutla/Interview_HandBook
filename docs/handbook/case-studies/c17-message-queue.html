@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 17: Design a Message Queue | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c17-message-queue">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 17 · Worked solutions</div>
+<h1>Design a Message Queue</h1>
+<p class="lead">We design a Kafka-class distributed log from an empty whiteboard: how a broker stores messages on disk, how partitions and replicas give throughput and durability, how consumers share work and remember where they are, and what happens when machines die. The target is one million messages per second, and we build up to it step by step instead of reciting a product manual.</p>
+
+<p>The conceptual background (queue versus log versus publish/subscribe, what a partition and an offset are) is taught in <a href="../chapters/34-queues-kafka.html">Chapter 34</a>, and patterns built on top of queues (fan-out, retries, dead letters) are in <a href="../chapters/35-messaging-patterns.html">Chapter 35</a>. Here we do the opposite job: assume the interviewer says "do not use Kafka, build one", and derive every mechanism from a requirement and a number.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt: <i>"Design a distributed message queue that lets producers publish messages and consumers read them, at very high throughput, without losing acknowledged messages."</i> That sentence hides many decisions, so the first minutes go to questions. Below are the questions a strong candidate asks and the answers we will assume for the rest of the page.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th><th>Why it matters</th></tr>
+<tr><td>Is this an in-process job queue or a shared platform service?</td><td>A shared platform used by hundreds of teams (multi-tenant).</td><td>Forces quotas, isolation, authentication and a metadata service.</td></tr>
+<tr><td>Peak and average load?</td><td>1,000,000 messages/s peak, 500,000/s average, average message 1 KB.</td><td>Sets partition count, broker count and disk plan.</td></tr>
+<tr><td>Do many consumers need to read the same message?</td><td>Yes. A typical topic has 3 independent consumer groups; any group may replay history.</td><td>Argues for a retained log, not delete-on-read.</td></tr>
+<tr><td>Ordering?</td><td>Order guaranteed per key (within a partition), not globally.</td><td>Global order would cap throughput at one writer.</td></tr>
+<tr><td>Durability?</td><td>An acknowledged message must survive the loss of any one machine (and optionally any two).</td><td>Sets replication factor 3 and the ack rules.</td></tr>
+<tr><td>Delivery guarantee?</td><td>At-least-once by default; effectively-once for opt-in producers and transactions.</td><td>Decides offsets, idempotence and transactions.</td></tr>
+<tr><td>Retention?</td><td>7 days by time for event streams; compaction for "latest value per key" topics.</td><td>Storage budget and cleanup design.</td></tr>
+<tr><td>Latency?</td><td>Producer ack p99 under 50 ms at acks=all; end to end under 100 ms for tail consumers.</td><td>Batching delay budget.</td></tr>
+<tr><td>Message size?</td><td>Up to 1 MB hard limit; typical 1 KB.</td><td>Bounds buffer sizes and replication fetch sizes.</td></tr>
+<tr><td>Single region?</td><td>One region, three availability zones. Cross-region mirroring is out of scope but noted.</td><td>Rack-aware replica placement.</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional</h3>
+<ul>
+<li>Create <b>topics</b> (named streams), each split into a configurable number of <b>partitions</b>.</li>
+<li>Producers append messages (key, value, headers, timestamp) to a topic; the system chooses the partition by key hash or round robin.</li>
+<li>Consumers read messages in order from a partition starting at any <b>offset</b>; consumers cooperate in <b>consumer groups</b> so each partition is read by exactly one member of a group at a time.</li>
+<li>Consumers commit progress (offsets) so a restart resumes where it stopped.</li>
+<li>Configurable retention (time or size) and log compaction.</li>
+<li>Opt-in idempotent producer and atomic multi-partition transactions.</li>
+</ul>
+<h3>2.2 Non-functional</h3>
+<ul>
+<li><b>Throughput:</b> 1M msg/s peak (1 GB/s) with horizontal scale-out.</li>
+<li><b>Durability:</b> no loss of acknowledged messages under a single broker failure.</li>
+<li><b>Availability:</b> a partition stays writable through one broker failure after a short failover (seconds).</li>
+<li><b>Latency:</b> milliseconds when batching is tuned for it; throughput is the primary goal.</li>
+<li><b>Scalability:</b> add brokers and partitions without downtime.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Per-message priorities, delayed or scheduled delivery, arbitrary message filtering on the broker, a SQL query layer, cross-region active/active replication, and a stream-processing engine. We touch some of these in the evolution section, but they would distract from the core: a fast, durable, replicated log.</p>
+
+<h2 id="estimation">3. Estimation with real arithmetic</h2>
+<p>Estimation drives the design here more than in most problems, because the numbers decide whether a spinning disk, an SSD, or memory is the right primary store.</p>
+<h3>3.1 Throughput</h3>
+<ul>
+<li>Peak ingress: 1,000,000 msg/s × 1 KB = 1,000 MB/s = <b>about 1 GB/s</b>. Average: 500,000 × 1 KB = 500 MB/s.</li>
+<li>Replication factor 3: the leader receives each byte once, then two followers fetch it. Cluster-internal replication traffic at peak is 2 × 1 GB/s = 2 GB/s, and total bytes written to disks across the cluster is 3 × 1 GB/s = <b>3 GB/s</b>.</li>
+<li>Three consumer groups each read the whole stream: egress 3 × 1 GB/s = 3 GB/s at peak. Mostly served from the page cache (section 5.2).</li>
+<li>Total network at peak across the cluster: 1 (in) + 2 (replication) + 3 (out) = 6 GB/s, roughly 48 Gbit/s.</li>
+</ul>
+<h3>3.2 Storage</h3>
+<ul>
+<li>Per day at average rate: 500 MB/s × 86,400 s = 43.2 TB/day (one copy).</li>
+<li>7-day retention: 43.2 × 7 = 302 TB; with RF 3 = <b>about 907 TB, say 0.9 PB raw</b>.</li>
+<li>With 70 percent target disk utilization we provision 0.9 / 0.7 = 1.3 PB.</li>
+</ul>
+<h3>3.3 Broker count</h3>
+<ul>
+<li>Disk write per broker: we want each broker to stay near 100 to 150 MB/s of combined leader and follower writes so that reads and compaction have headroom. 3 GB/s ÷ 150 MB/s = 20 brokers by write bandwidth.</li>
+<li>Storage: 1.3 PB ÷ 30 brokers = about 43 TB per broker (for example 12 × 4 TB drives in a JBOD layout). Storage prefers more brokers than bandwidth does, so we choose <b>30 brokers</b>, leaving per-broker peak write at 3 GB/s ÷ 30 = 100 MB/s.</li>
+<li>Network per broker: 6 GB/s ÷ 30 = 200 MB/s, comfortably inside a 10 Gbit/s NIC (1.25 GB/s), which also leaves room for rebuilds after a failure.</li>
+</ul>
+<h3>3.4 Partitions</h3>
+<ul>
+<li>A single partition is written by one leader thread and read sequentially. A prudent target is about 10 MB/s produce per partition. 1 GB/s ÷ 10 MB/s = 100 partitions minimum for the hottest topic.</li>
+<li>Consumers are the other bound: if one consumer thread can process 5 MB/s of business logic, a group needs 1,000 MB/s ÷ 5 = 200 consumers, hence at least 200 partitions. We provision <b>600 partitions</b> for the big topic (3x headroom, divisible by many group sizes).</li>
+<li>Across the platform, 3,000 partitions with RF 3 gives 9,000 replicas, which is 300 per broker. That is well inside the comfortable range (each replica is a few open files and a memory-mapped index).</li>
+</ul>
+<h3>3.5 Segment and index sizing</h3>
+<ul>
+<li>Segment size 1 GB. A sparse index entry every 4 KB of log, each 8 bytes (4 byte relative offset, 4 byte file position): 1 GB ÷ 4 KB = 262,144 entries × 8 B = <b>2 MB per segment index</b>. A broker with 43 TB holds about 43,000 segments, so all indexes total roughly 86 GB, memory-mapped lazily, and only the hot ones are resident.</li>
+</ul>
+<h3>3.6 Memory and page cache</h3>
+<ul>
+<li>Each broker: 64 GB RAM, 6 GB JVM heap (or equivalent), roughly 55 GB left to the operating system page cache.</li>
+<li>Ingress per broker averages 500 MB/s ÷ 30 = about 17 MB/s of leader writes (plus follower writes, about 50 MB/s total). 55 GB of cache therefore holds around 55,000 MB ÷ 50 MB/s = 1,100 s, about 18 minutes of recent data. Consumers that keep up read the tail straight from memory and never touch the disks.</li>
+</ul>
+<div class="callout key"><b>Key idea</b> The numbers show that 1 GB/s is easy only because every access is sequential and batched. 1M individual random writes per second would need an enormous SSD fleet. 1 GB/s of sequential appends is a couple of dozen cheap machines.</div>
+
+<h2 id="api">4. API design</h2>
+<h3>4.1 Producer API</h3>
+<pre><code>Produce(topic, [records], acks = 0 | 1 | all, producerId, epoch, baseSequence, txnId?)
+  record = { key: bytes, value: bytes, headers: map, timestamp: int64 }
+  response per partition = { partition, baseOffset, errorCode, logAppendTime }</code></pre>
+<p>Records are sent in <b>batches per partition</b>. The batch is also the unit that is compressed, checksummed, replicated and written to disk. <code>producerId</code>, <code>epoch</code> and <code>baseSequence</code> support idempotence (section 8).</p>
+<h3>4.2 Consumer API</h3>
+<pre><code>Fetch(topic, partition, fetchOffset, maxBytes, maxWaitMs, minBytes)
+  response = { highWatermark, records[], lastStableOffset }
+JoinGroup(groupId, memberId, subscriptions)   -> assignment
+Heartbeat(groupId, memberId, generation)
+CommitOffset(groupId, topic, partition, offset, generation)</code></pre>
+<p><code>minBytes</code> and <code>maxWaitMs</code> give <b>long polling</b>: the broker parks the fetch until enough data exists or a timeout passes, so idle consumers do not spin. Consumers <b>pull</b>; the broker never pushes. Pull lets a slow consumer fall behind safely (the data is still on disk), makes batching natural, and moves flow control to the reader.</p>
+<h3>4.3 Admin and metadata API</h3>
+<pre><code>CreateTopic(name, partitions, replicationFactor, configs)
+Metadata(topics) -> { brokers[], per partition: leader, leaderEpoch, replicas[], isr[] }</code></pre>
+<p>Clients ask any broker for metadata, cache it, and send each produce or fetch directly to the leader of the target partition. There is no central router in the data path.</p>
+
+<h2 id="data-model">5. Data model and storage choice</h2>
+<h3>5.1 Why an append-only log</h3>
+<p>The central decision is the on-disk structure. A message queue does three things to data: append to the end, read a contiguous range starting somewhere, and delete from the front. A B-tree (see <a href="../chapters/19-storage-engines.html">Chapter 19</a>) is built for random updates in place and pays write amplification we never need. An LSM tree sorts by key, which also is not needed because order here is arrival order. A plain <b>append-only file</b> is both the simplest and the fastest structure: writes are sequential, reads are sequential, and deletion is dropping whole files. The idea is the same write-ahead log that databases use for durability, promoted to be the primary storage.</p>
+<h3>5.2 Segments, index and page cache</h3>
+<p>Each partition is a directory of <b>segment</b> files. A segment is a pair (or trio) of files named by the offset of its first message: <code>00000000000012345678.log</code> holds records, <code>.index</code> maps offsets to file positions, and <code>.timeindex</code> maps timestamps to offsets. Only the newest segment is written (the <b>active segment</b>); when it reaches 1 GB (or a time limit) the broker rolls a new one. Old segments are immutable, which makes caching, deletion, copying to cold storage and compaction all simple.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Partition as a directory of segments with sparse index lookup">
+  <text class="t-b" x="20" y="22">Partition 7 of topic orders (directory of segments)</text>
+  <rect class="db" x="30" y="40" width="200" height="60" rx="8"/><text class="t-c t-b" x="130" y="64">Segment 0</text><text class="t-c t-sm" x="130" y="84">offsets 0 .. 999,999 (closed)</text>
+  <rect class="db" x="250" y="40" width="200" height="60" rx="8"/><text class="t-c t-b" x="350" y="64">Segment 1000000</text><text class="t-c t-sm" x="350" y="84">offsets 1.0M .. 1.99M (closed)</text>
+  <rect class="cache" x="470" y="40" width="240" height="60" rx="8"/><text class="t-c t-b" x="590" y="64">Segment 2000000 (active)</text><text class="t-c t-sm" x="590" y="84">appends go here; 1 GB roll</text>
+  <path class="arrow" d="M730 70 L790 70"/><text class="t-sm" x="796" y="74">next write</text>
+  <text class="t-b" x="20" y="140">Lookup: fetch offset 2,000,500</text>
+  <rect class="box" x="30" y="156" width="250" height="130" rx="8"/>
+  <text class="t-b" x="44" y="178">.index (sparse, mmap)</text>
+  <text class="t-sm" x="44" y="200">rel.offset   file position</text>
+  <text class="t-sm" x="44" y="220">0            0</text>
+  <text class="t-sm" x="44" y="238">38           4,096</text>
+  <text class="t-sm" x="44" y="256" style="fill:var(--good)">452          61,440   &lt;- floor</text>
+  <text class="t-sm" x="44" y="274">901          123,904</text>
+  <rect class="cache" x="350" y="156" width="300" height="130" rx="8"/>
+  <text class="t-b" x="364" y="178">.log (sequential scan)</text>
+  <text class="t-sm" x="364" y="200">1. binary search index: greatest entry</text>
+  <text class="t-sm" x="364" y="218">   at or below target (452 -> pos 61,440)</text>
+  <text class="t-sm" x="364" y="236">2. seek there, scan forward over batch</text>
+  <text class="t-sm" x="364" y="254">   headers until offset 500 is found</text>
+  <text class="t-sm" x="364" y="272">3. at most about 4 KB scanned</text>
+  <path class="arrow" d="M280 221 L346 221"/>
+  <rect class="ext" x="700" y="156" width="170" height="130" rx="8"/>
+  <text class="t-c t-b" x="785" y="184">Page cache</text>
+  <text class="t-c t-sm" x="785" y="206">recent log tail stays in</text>
+  <text class="t-c t-sm" x="785" y="224">RAM; reads served with</text>
+  <text class="t-c t-sm" x="785" y="242">sendfile (zero copy)</text>
+  <text class="t-c t-sm" x="785" y="260">straight to the socket</text>
+  <path class="arrow dash" d="M650 221 L696 221"/>
+  <text class="t-sm" x="30" y="316">Segment file name = first offset it contains; finding the segment is a binary search over file names.</text>
+</svg>
+<figcaption>Reading starts by choosing the segment from file names, then a binary search of its small sparse index, then a short forward scan in the log file. The index is sparse (one entry per about 4 KB) so it stays tiny and memory-mapped.</figcaption>
+</figure>
+<p><b>Why a sparse index.</b> Indexing every message would cost 8 bytes per 1 KB message, an index 0.8 percent of the data, and would force random index writes. A sparse index of one entry per 4 KB shrinks it 4x again and is written only as the log grows. A lookup does a binary search for the greatest indexed offset less than or equal to the target, then scans forward at most a few kilobytes. That scan is cheap because one batch header gives its length, so the broker can skip whole batches without decoding records.</p>
+<p><b>Why disks are fine.</b> Sequential disk throughput on commodity drives is hundreds of MB/s, and on SSDs several GB/s, while random access can be 100 to 1,000 times slower. Our access pattern never seeks except at consumer start. The broker also does not keep its own cache: it writes through the operating system, which keeps recently written pages in the <b>page cache</b>. The broker does not call fsync for every write; durability comes from replication to other machines (section 6.3), and the OS flushes dirty pages in the background. Skipping a private cache avoids duplicating data in memory (once in a heap cache, once in the page cache), avoids garbage collection pauses on a huge heap, and means a broker restart keeps its warm cache.</p>
+<p><b>Zero copy.</b> A naive send of a file over a socket copies data four times: disk to kernel buffer, kernel to user buffer, user to socket buffer, socket to NIC. Because the log format on disk equals the wire format, the broker can use the <code>sendfile</code> system call, which moves pages from the page cache straight to the network card with no user-space copy. Consumers reading the tail therefore cost the broker almost no CPU, which is why three consumer groups per topic are affordable. (Caveat: with TLS enabled the data must be encrypted in user space, so zero copy is lost and CPU becomes the limit; we return to this in cost.)</p>
+<h3>5.3 Record batch format</h3>
+<table>
+<tr><th>Field</th><th>Purpose</th></tr>
+<tr><td>baseOffset, length</td><td>Position of the first record; lets the broker skip batches without parsing.</td></tr>
+<tr><td>leaderEpoch</td><td>Fencing: identifies which leader term wrote the batch (section 6.4).</td></tr>
+<tr><td>CRC</td><td>Detects corruption on disk and over the wire.</td></tr>
+<tr><td>attributes</td><td>Compression codec, transactional flag, control-batch flag.</td></tr>
+<tr><td>producerId, producerEpoch, baseSequence</td><td>Idempotence and deduplication.</td></tr>
+<tr><td>records[]</td><td>Delta-encoded offsets and timestamps, key, value, headers.</td></tr>
+</table>
+<p>The broker assigns offsets and appends the batch as received. Because the producer compresses a whole batch (for example with LZ4 or zstd), the broker stores and forwards it compressed without ever decompressing, which multiplies effective network and disk capacity by the compression ratio (often 2x to 5x for JSON or log-like data).</p>
+<h3>5.4 What stores what</h3>
+<table>
+<tr><th>Data</th><th>Store</th><th>Reason</th></tr>
+<tr><td>Message payloads</td><td>Per-partition segment files on broker local disks</td><td>Sequential IO, page cache, zero copy.</td></tr>
+<tr><td>Cluster metadata (topics, partition assignments, leaders, ISR, configs)</td><td>Replicated metadata log managed by a Raft quorum of controller nodes (see <a href="../chapters/29-consensus.html">Chapter 29</a>)</td><td>Small, strongly consistent, rarely changed.</td></tr>
+<tr><td>Consumer group offsets</td><td>An internal compacted topic <code>__consumer_offsets</code> (key = group + topic + partition)</td><td>Reuses the log: durable, replicated, latest value wins via compaction.</td></tr>
+<tr><td>Transaction state</td><td>Internal compacted topic <code>__transaction_state</code></td><td>Same reasoning.</td></tr>
+<tr><td>Old segments</td><td>Optional object store (tiered storage, section 12)</td><td>Cheaper storage for cold data.</td></tr>
+</table>
+<p>Notice the recurring trick: the log is also the database for the system's own state. Offsets and transaction state are just more topics. That keeps the number of mechanisms small, and the replication and failover we build for user data protect the control state for free.</p>
+
+<h2 id="first-design">6. A first simple design, then the scaled architecture</h2>
+<h3>6.1 One box</h3>
+<p>Start with a single server and a single log file: producers append, consumers read from an offset, a background job deletes old segments. This already supports replay, many independent readers (each tracks its own offset), and trivially high throughput. It fails in three ways, and each failure drives one major part of the design:</p>
+<ol>
+<li><b>One writer, one disk limits throughput.</b> Fix: split the topic into <b>partitions</b>, spread over many brokers.</li>
+<li><b>The machine dies and the data is gone or unavailable.</b> Fix: <b>replicate</b> every partition to other brokers with one elected leader.</li>
+<li><b>Several consumer processes want to share the work without reading the same message twice.</b> Fix: <b>consumer groups</b> assign each partition to one member and store committed offsets.</li>
+</ol>
+<h3>6.2 Scaled architecture</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Cluster architecture with producers, brokers, controller quorum and consumer groups">
+  <rect class="ext" x="20" y="60" width="150" height="50" rx="8"/><text class="t-c t-b" x="95" y="90">Producer A</text>
+  <rect class="ext" x="20" y="130" width="150" height="50" rx="8"/><text class="t-c t-b" x="95" y="160">Producer B</text>
+  <rect class="ext" x="20" y="200" width="150" height="50" rx="8"/><text class="t-c t-b" x="95" y="230">Producer C</text>
+
+  <rect class="box" x="260" y="40" width="130" height="190" rx="8"/><text class="t-c t-b" x="325" y="62">Broker 1 (AZ-a)</text>
+  <rect class="cache" x="274" y="76" width="102" height="34" rx="6"/><text class="t-c t-sm" x="325" y="98">P0 leader</text>
+  <rect class="db" x="274" y="120" width="102" height="34" rx="6"/><text class="t-c t-sm" x="325" y="142">P1 follower</text>
+  <rect class="db" x="274" y="164" width="102" height="34" rx="6"/><text class="t-c t-sm" x="325" y="186">P2 follower</text>
+
+  <rect class="box" x="420" y="40" width="130" height="190" rx="8"/><text class="t-c t-b" x="485" y="62">Broker 2 (AZ-b)</text>
+  <rect class="db" x="434" y="76" width="102" height="34" rx="6"/><text class="t-c t-sm" x="485" y="98">P0 follower</text>
+  <rect class="cache" x="434" y="120" width="102" height="34" rx="6"/><text class="t-c t-sm" x="485" y="142">P1 leader</text>
+  <rect class="db" x="434" y="164" width="102" height="34" rx="6"/><text class="t-c t-sm" x="485" y="186">P2 follower</text>
+
+  <rect class="box" x="580" y="40" width="130" height="190" rx="8"/><text class="t-c t-b" x="645" y="62">Broker 3 (AZ-c)</text>
+  <rect class="db" x="594" y="76" width="102" height="34" rx="6"/><text class="t-c t-sm" x="645" y="98">P0 follower</text>
+  <rect class="db" x="594" y="120" width="102" height="34" rx="6"/><text class="t-c t-sm" x="645" y="142">P1 follower</text>
+  <rect class="cache" x="594" y="164" width="102" height="34" rx="6"/><text class="t-c t-sm" x="645" y="186">P2 leader</text>
+
+  <path class="arrow" d="M170 85 L256 100"/><path class="arrow" d="M170 155 L416 145"/><path class="arrow" d="M170 225 L590 195"/>
+  <path class="arrow-g dash" d="M376 93 L430 93"/><path class="arrow-g dash" d="M376 137 L430 137"/>
+
+  <rect class="ext" x="760" y="60" width="120" height="50" rx="8"/><text class="t-c t-b" x="820" y="82">Group X</text><text class="t-c t-sm" x="820" y="99">3 members</text>
+  <rect class="ext" x="760" y="130" width="120" height="50" rx="8"/><text class="t-c t-b" x="820" y="152">Group Y</text><text class="t-c t-sm" x="820" y="169">1 member</text>
+  <path class="arrow" d="M710 100 L756 90"/><path class="arrow" d="M710 150 L756 155"/>
+
+  <rect class="db" x="260" y="290" width="450" height="70" rx="8"/><text class="t-c t-b" x="485" y="314">Controller quorum (3 or 5 nodes, Raft)</text>
+  <text class="t-c t-sm" x="485" y="336">metadata log: topics, partition leaders, ISR, configs, broker liveness</text>
+  <path class="arrow dash" d="M485 290 L485 234"/>
+  <text class="t-sm" x="500" y="266">leader and ISR decisions pushed to brokers</text>
+
+  <text class="t-sm" x="20" y="300">Producers and consumers</text><text class="t-sm" x="20" y="316">talk directly to the</text><text class="t-sm" x="20" y="332">partition leader, using</text><text class="t-sm" x="20" y="348">cached metadata.</text>
+  <text class="t-sm" x="730" y="300">Dashed green lines:</text><text class="t-sm" x="730" y="316">followers pull from</text><text class="t-sm" x="730" y="332">the leader.</text>
+</svg>
+<figcaption>Every partition has one leader and two followers on different brokers in different availability zones. Leaders are spread so every broker leads some partitions. The controller quorum is out of the data path and only decides who leads what.</figcaption>
+</figure>
+<p>Key properties of this layout: (1) the load is balanced because leaders, and therefore client traffic, are spread evenly over brokers; (2) the replica set of a partition spans three availability zones so a zone loss costs at most one replica; (3) clients bypass the controller entirely, so the controller is not a throughput bottleneck.</p>
+<h3>6.3 Produce flow with acks</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Sequence diagram of a produce request with acks equals all">
+  <rect class="ext" x="40" y="14" width="130" height="34" rx="8"/><text class="t-c t-b" x="105" y="36">Producer</text>
+  <rect class="cache" x="290" y="14" width="150" height="34" rx="8"/><text class="t-c t-b" x="365" y="36">Leader (B1)</text>
+  <rect class="db" x="530" y="14" width="150" height="34" rx="8"/><text class="t-c t-b" x="605" y="36">Follower (B2)</text>
+  <rect class="db" x="730" y="14" width="140" height="34" rx="8"/><text class="t-c t-b" x="800" y="36">Follower (B3)</text>
+  <path class="life" d="M105 48 L105 345"/><path class="life" d="M365 48 L365 345"/><path class="life" d="M605 48 L605 345"/><path class="life" d="M800 48 L800 345"/>
+  <path class="arrow" d="M105 80 L361 80"/><text class="t-sm" x="120" y="72">1 batch (compressed)</text>
+  <text class="t-sm" x="378" y="104">2 validate, assign offsets 500..599</text>
+  <text class="t-sm" x="378" y="122">append to active segment (page cache)</text>
+  <path class="arrow dash" d="M605 150 L369 150"/><text class="t-sm" x="396" y="144">3 Fetch(offset 500) long poll</text>
+  <path class="arrow dash" d="M800 180 L369 180"/><text class="t-sm" x="500" y="174">3 Fetch(offset 500) long poll</text>
+  <path class="arrow-g" d="M369 205 L601 205"/><text class="t-sm" x="400" y="199">4 batch returned</text>
+  <path class="arrow-g" d="M369 232 L796 232"/><text class="t-sm" x="640" y="226">4 batch returned</text>
+  <text class="t-sm" x="618" y="256">5 follower appends</text>
+  <path class="arrow dash" d="M605 272 L369 272"/><text class="t-sm" x="400" y="266">6 next Fetch(offset 600) = ack</text>
+  <text class="t-sm" x="378" y="296">7 all ISR members at 600: high watermark = 600</text>
+  <path class="arrow-g" d="M361 322 L109 322"/><text class="t-sm" x="130" y="316">8 ack baseOffset=500 (acks=all)</text>
+</svg>
+<figcaption>Followers are ordinary fetch clients of the leader, so replication reuses the read path. A fetch for offset 600 proves the follower stored everything below it. When every in-sync replica has caught up, the leader advances the high watermark and answers the producer.</figcaption>
+</figure>
+<ol>
+<li>The producer sends a compressed batch to the partition leader (found from cached metadata).</li>
+<li>The leader checks authorization, quotas and the idempotence sequence, assigns consecutive offsets, and appends to the active segment (this lands in the page cache).</li>
+<li>Followers have fetch requests parked at the leader; the new data completes them.</li>
+<li>Each follower appends the bytes to its own log.</li>
+<li>The follower's next fetch carries the new offset, telling the leader it is caught up.</li>
+<li>When all members of the <b>in-sync replica set (ISR)</b> have the batch, the leader advances the <b>high watermark</b> and only data below the high watermark is visible to consumers.</li>
+<li>With <code>acks=all</code> the leader now responds to the producer.</li>
+</ol>
+<h3>6.4 Producer-side batching and acks</h3>
+<p>Per-message requests would waste the network and disk: a 1 KB message wrapped in a request header spends a round trip for 1 KB of payload. Producers therefore accumulate records per partition in memory and send when a batch reaches <code>batch.size</code> (say 64 KB) or has waited <code>linger.ms</code> (say 5 ms), whichever comes first. At 1,000 msg/s on one partition that is a batch of 5 records every 5 ms; at 100,000 msg/s per producer the batches fill by size and linger never triggers. Batching gives order-of-magnitude throughput gains for a few milliseconds of latency, and it lets compression work (a compressor needs many similar records to find redundancy). The producer keeps several requests in flight per broker (default 5) to hide round-trip latency.</p>
+<table>
+<tr><th>acks</th><th>Producer is told success when</th><th>Loss window</th><th>Typical use</th></tr>
+<tr><td>0</td><td>Bytes are handed to the network, no reply</td><td>Any broker or network failure loses data silently</td><td>Metrics, best-effort telemetry</td></tr>
+<tr><td>1</td><td>Leader appended (not yet replicated)</td><td>Leader dies before followers fetch: acknowledged data lost</td><td>Logs where rare loss is fine, lowest latency</td></tr>
+<tr><td>all</td><td>Every in-sync replica has the batch AND ISR size is at least <code>min.insync.replicas</code></td><td>None while at least one ISR member survives</td><td>Business events, default for important topics</td></tr>
+</table>
+<p>With RF 3 and <code>min.insync.replicas=2</code>, <code>acks=all</code> tolerates one broker failure without losing data and without losing write availability. If two replicas are down, the ISR falls to 1, below the minimum, and the leader rejects writes (a deliberate choice of consistency over availability for that partition; see <a href="../chapters/24-replication.html">Chapter 24</a> for the general leader-follower tradeoffs and quorum reasoning).</p>
+<p>Messages are partitioned by <code>hash(key) mod numPartitions</code>, so all events for one key (say one order id) go to one partition and keep their relative order. Without a key, producers use a sticky strategy: fill one batch for one partition, then move to another, which produces full batches instead of many tiny ones.</p>
+
+<h2 id="deep-replication">7. Deep dive 1: replication, ISR and leader election</h2>
+<h3>7.1 Why ISR instead of a pure majority quorum</h3>
+<p>A Raft-style group (<a href="../chapters/29-consensus.html">Chapter 29</a>) commits an entry when a majority has it, so with 3 replicas the commit needs 2, and the slowest replica never delays a write. Kafka-style replication instead tracks a dynamic <b>in-sync replica set</b>: the replicas that are caught up with the leader (within <code>replica.lag.time.max.ms</code>, typically 30 s, of having fetched up to the log end). A write is committed when <i>all</i> ISR members have it. The two schemes compare as follows.</p>
+<table>
+<tr><th>Property</th><th>Majority quorum (Raft style)</th><th>ISR (wait for all in-sync)</th></tr>
+<tr><td>Replicas needed to survive f failures with no committed-data loss</td><td>2f + 1 (3 replicas tolerate 1)</td><td>f + 1 (2 replicas tolerate 1; 3 tolerate 2 if min ISR is 1)</td></tr>
+<tr><td>Write latency</td><td>Median of replicas (a slow minority is ignored)</td><td>Slowest ISR member, but a slow one is evicted from the ISR after the lag timeout</td></tr>
+<tr><td>Storage cost for given fault tolerance</td><td>Higher</td><td>Lower; matters at petabytes</td></tr>
+<tr><td>Election</td><td>Voting among replicas, handled by the algorithm</td><td>Any ISR member is safe; chosen by controller, so a separate consensus (metadata quorum) is needed</td></tr>
+<tr><td>Failure mode</td><td>Unavailable if majority lost</td><td>Unavailable if ISR below min, or if all ISR members lost</td></tr>
+</table>
+<p><b>Choice:</b> ISR, because at 0.9 PB raw the replica count is the cost driver, and because tolerating f failures with f + 1 copies is cheaper than 2f + 1. The price is that we need an external strongly consistent coordinator for leadership, which we already have for metadata (section 7.3). The data path stays cheap; the consensus runs only on rare metadata changes.</p>
+<h3>7.2 High watermark, log end offset and truncation</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Replica logs showing log end offset and high watermark, and failover with truncation">
+  <text class="t-b" x="20" y="22">Before failure: committed data is below the high watermark (HW)</text>
+  <text class="t-sm" x="20" y="60">Leader B1</text>
+  <rect class="cache" x="100" y="40" width="440" height="28" rx="4"/><text class="t-sm" x="106" y="58">offsets 0 ......................................... 599</text>
+  <text class="t-sm" x="548" y="58">LEO 600, HW 600</text>
+  <text class="t-sm" x="20" y="100">Follower B2</text>
+  <rect class="db" x="100" y="80" width="440" height="28" rx="4"/><text class="t-sm" x="106" y="98">offsets 0 ......................................... 599</text>
+  <text class="t-sm" x="548" y="98">LEO 600</text>
+  <text class="t-sm" x="20" y="140">Follower B3</text>
+  <rect class="db" x="100" y="120" width="380" height="28" rx="4"/><text class="t-sm" x="106" y="138">offsets 0 ................................ 549</text>
+  <text class="t-sm" x="548" y="138">LEO 550 (lagging, still ISR)</text>
+  <text class="t-b" x="20" y="190">Leader B1 crashes after accepting 600..650 that only it had (acks=1 data)</text>
+  <text class="t-sm" x="20" y="228">B2 elected</text>
+  <rect class="cache" x="100" y="208" width="440" height="28" rx="4"/><text class="t-sm" x="106" y="226">offsets 0 ......................................... 599</text>
+  <text class="t-sm" x="548" y="226">new leader, epoch 5; HW stays at 550</text>
+  <text class="t-sm" x="20" y="268">B1 returns</text>
+  <rect class="miss" x="100" y="248" width="500" height="28" rx="4"/><text class="t-sm" x="106" y="266">offsets 0 ..................................... 599 600..650 (unreplicated)</text>
+  <path class="arrow-r" d="M606 262 L690 262"/><text class="t-sm" x="696" y="266">asks leader: end of epoch 4?</text>
+  <text class="t-sm" x="100" y="304">B1 truncates 600..650 (never acked under acks=all), then fetches from B2 as a follower in epoch 5.</text>
+  <text class="t-sm" x="100" y="324">This is why consumers only see data below the HW: they never read what could later disappear.</text>
+</svg>
+<figcaption>The leader's log end offset (LEO) can be ahead of the high watermark. A new leader is chosen from the ISR, so it holds all committed data. The old leader's extra, uncommitted tail is truncated when it rejoins, found via leader epoch comparison.</figcaption>
+</figure>
+<p><b>Leader epoch</b> is a number that increments on each leadership change and is stamped on batches. When a restarted replica rejoins, it asks the new leader "where did epoch N end?" and truncates to that offset. Without epochs, replicas that merely compared high watermarks could diverge silently after a rapid double failover, a historical source of data loss bugs.</p>
+<h3>7.3 Controller election and metadata</h3>
+<p>Leader election for a partition must be decided by one authority, otherwise two brokers could both think they lead (split brain; see <a href="../chapters/29-consensus.html">Chapter 29</a>). We run a small <b>controller quorum</b> (3 or 5 nodes) using Raft to maintain a replicated metadata log: topic definitions, partition replica assignments, current leader and ISR for each partition, broker registrations. One quorum member is the active controller. Brokers register and send heartbeats to the controller (every few seconds, session timeout about 10 s). When a broker's session expires:</p>
+<ol>
+<li>The controller marks the broker fenced and finds every partition it led.</li>
+<li>For each, it picks the first live replica in the assignment that is in the ISR, bumps the leader epoch, records the change in the metadata log (committed by the Raft majority) and publishes it to brokers.</li>
+<li>Brokers update their roles; clients receive a <code>NotLeaderForPartition</code> error on their next request, refresh metadata and retry the new leader.</li>
+</ol>
+<p>Thousands of leaders can be moved in seconds because the decision is one metadata record per partition and followers already hold the data. If the active controller itself dies, the quorum elects a new one in a second or two, and the new controller already has the full metadata log in memory (this is the reason metadata lives in a Raft log rather than being re-read from an external store).</p>
+<h3>7.4 ISR shrink and unclean election</h3>
+<p>If a follower falls behind by more than the lag timeout (slow disk, GC, network trouble), the leader removes it from the ISR and reports the new ISR to the controller. Writes continue with a smaller ISR, which is the availability benefit, but the durability margin is smaller. If the ISR shrinks to just the leader and that leader dies, no in-sync replica exists. There is a choice, and it is a classic consistency versus availability decision:</p>
+<table>
+<tr><th>Policy</th><th>Behaviour</th><th>Cost</th><th>Use when</th></tr>
+<tr><td>Clean only (<code>unclean.leader.election=false</code>)</td><td>Partition stays offline until an ISR member returns</td><td>Unavailable (maybe for minutes or until the machine is repaired)</td><td>Orders, payments, anything where loss is worse than delay</td></tr>
+<tr><td>Unclean allowed</td><td>An out-of-sync replica becomes leader immediately</td><td>Silently loses the messages it lacked; consumer offsets may point beyond the new log end</td><td>Metrics, click streams where being up beats completeness</td></tr>
+</table>
+<p>Our default: clean only, <code>min.insync.replicas=2</code>, RF 3, <code>acks=all</code> for tier-1 topics. Combined, the system never acknowledges data that exists on fewer than 2 machines, and never promotes a replica that missed acknowledged data.</p>
+
+<h2 id="deep-consumers">8. Deep dive 2: consumer groups, offsets and delivery semantics</h2>
+<h3>8.1 Consumer groups and rebalancing</h3>
+<p>A <b>consumer group</b> is a set of consumer processes that share a <code>group.id</code>. The group's contract: each partition of the subscribed topics is assigned to exactly one member at a time, so members process disjoint subsets in parallel and per-partition order is kept. Parallelism is capped by partition count (600 partitions, at most 600 useful consumers). A second group with a different id receives its own full copy, which is how publish/subscribe fan-out works over a log.</p>
+<p>Membership is managed by a <b>group coordinator</b>, which is simply the broker that leads the <code>__consumer_offsets</code> partition that the group id hashes to. That makes coordinators scale out with no new component and gives them automatic failover.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Consumer group rebalance when a member joins">
+  <text class="t-b" x="20" y="22">Before: 2 members, 6 partitions</text>
+  <rect class="ext" x="30" y="40" width="160" height="40" rx="8"/><text class="t-c t-b" x="110" y="65">Consumer C1</text>
+  <rect class="ext" x="30" y="100" width="160" height="40" rx="8"/><text class="t-c t-b" x="110" y="125">Consumer C2</text>
+  <rect class="db" x="300" y="34" width="70" height="26" rx="4"/><text class="t-c t-sm" x="335" y="52">P0</text>
+  <rect class="db" x="380" y="34" width="70" height="26" rx="4"/><text class="t-c t-sm" x="415" y="52">P1</text>
+  <rect class="db" x="460" y="34" width="70" height="26" rx="4"/><text class="t-c t-sm" x="495" y="52">P2</text>
+  <rect class="db" x="300" y="94" width="70" height="26" rx="4"/><text class="t-c t-sm" x="335" y="112">P3</text>
+  <rect class="db" x="380" y="94" width="70" height="26" rx="4"/><text class="t-c t-sm" x="415" y="112">P4</text>
+  <rect class="db" x="460" y="94" width="70" height="26" rx="4"/><text class="t-c t-sm" x="495" y="112">P5</text>
+  <path class="arrow" d="M190 60 L296 48"/><path class="arrow" d="M190 120 L296 108"/>
+  <text class="t-b" x="20" y="190">C3 joins: coordinator starts a rebalance, generation 8 becomes 9</text>
+  <text class="t-sm" x="30" y="214">1. JoinGroup from all members     2. leader member computes assignment     3. SyncGroup distributes it</text>
+  <rect class="ext" x="30" y="230" width="130" height="36" rx="8"/><text class="t-c t-b" x="95" y="253">C1: P0, P1</text>
+  <rect class="ext" x="180" y="230" width="130" height="36" rx="8"/><text class="t-c t-b" x="245" y="253">C2: P3, P4</text>
+  <rect class="hit" x="330" y="230" width="130" height="36" rx="8"/><text class="t-c t-b" x="395" y="253">C3: P2, P5</text>
+  <text class="t-sm" x="30" y="296">Eager protocol: everyone stops, drops all partitions, rejoins (stop-the-world). Cooperative protocol: only moved partitions (P2, P5) pause.</text>
+  <text class="t-sm" x="30" y="316">Triggers: join, leave, missed heartbeat (session timeout), slow poll loop (max.poll.interval), partition count change.</text>
+  <rect class="cache" x="600" y="214" width="270" height="70" rx="8"/>
+  <text class="t-c t-b" x="735" y="240">Commit with generation 9</text>
+  <text class="t-c t-sm" x="735" y="260">stale member (generation 8)</text>
+  <text class="t-c t-sm" x="735" y="276">is rejected: fencing</text>
+</svg>
+<figcaption>A rebalance reassigns partitions when membership changes. The generation number fences zombie members: an old consumer that wakes after a long pause cannot commit offsets for partitions it no longer owns.</figcaption>
+</figure>
+<p>Rebalances are the main operational pain of group consumption. In the eager protocol every member revokes all partitions, so a deploy that restarts 200 consumers one by one triggers 200 full pauses. Mitigations: <b>cooperative rebalancing</b> (only the moved partitions stop), <b>static membership</b> (a consumer with a fixed instance id that restarts within the session timeout keeps its partitions without any rebalance), and a sticky assignor that minimizes movement. Heartbeats run on a background thread; if the processing loop exceeds <code>max.poll.interval</code> the member is considered dead, so slow handlers need smaller batches or an async hand-off.</p>
+<h3>8.2 Offsets and commit strategies</h3>
+<p>The consumer's position is a single integer per partition, the offset of the next message to read. To survive restart, it commits that integer to the coordinator, which writes <code>(group, topic, partition) -> offset</code> into the compacted <code>__consumer_offsets</code> topic. When a partition is assigned, the consumer starts at the committed offset (or at earliest or latest if none exists, by configuration). Where the commit happens relative to processing determines the delivery guarantee.</p>
+<table>
+<tr><th>Strategy</th><th>Sequence</th><th>If crash between steps</th><th>Result</th></tr>
+<tr><td>Commit before processing</td><td>commit, process</td><td>Offset says done but work not done</td><td><b>At-most-once</b>: message lost</td></tr>
+<tr><td>Commit after processing</td><td>process, commit</td><td>Work done but offset not stored; reprocessed after restart</td><td><b>At-least-once</b>: duplicates (default recommendation)</td></tr>
+<tr><td>Atomic process + commit</td><td>both in one transaction (same DB, or Kafka transaction)</td><td>Neither happened, or both did</td><td><b>Exactly-once effect</b></td></tr>
+</table>
+<p>A batch commit every N messages or every second (async) is typical for throughput; the cost is that after a crash up to a batch worth of messages replay, so handlers must be idempotent (for patterns see <a href="../chapters/35-messaging-patterns.html">Chapter 35</a>).</p>
+<h3>8.3 Idempotent producer</h3>
+<p>The produce path has its own duplicate source: a producer sends a batch, the leader appends it, the ack is lost, and the producer retries, creating a second copy. The idempotent producer fixes this without the broker storing every message id. Each producer gets a <code>producerId</code> from the broker (and an epoch). It numbers batches per partition with a monotonically increasing <b>sequence number</b>. The leader remembers, per (producerId, partition), the last few sequence numbers and offsets it accepted (the last 5 batches match the 5 in-flight limit). A retried batch with an already-seen sequence is acknowledged with the original offset and not appended; a sequence gap triggers an error, which also means that with retries, ordering in one partition is preserved. The state is rebuilt after failover from the producer-id snapshots and the log itself, because the leader's followers see the same producer fields in each batch.</p>
+<p>Scope is limited: it dedups within one producer session and one partition. A restarted producer gets a new id unless it uses a stable <code>transactional.id</code>.</p>
+<h3>8.4 Transactions and exactly-once processing</h3>
+<p>The common stream-processing loop is consume, transform, produce to another topic, commit the input offsets. For exactly-once, the output records and the input offset commit must be atomic. The transaction protocol:</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Transaction protocol with coordinator, partitions and commit markers">
+  <rect class="ext" x="30" y="14" width="140" height="34" rx="8"/><text class="t-c t-b" x="100" y="36">Producer</text>
+  <rect class="cache" x="270" y="14" width="190" height="34" rx="8"/><text class="t-c t-b" x="365" y="36">Txn coordinator</text>
+  <rect class="db" x="560" y="14" width="150" height="34" rx="8"/><text class="t-c t-b" x="635" y="36">Output partitions</text>
+  <rect class="db" x="750" y="14" width="130" height="34" rx="8"/><text class="t-c t-b" x="815" y="36">Offsets topic</text>
+  <path class="life" d="M100 48 L100 330"/><path class="life" d="M365 48 L365 330"/><path class="life" d="M635 48 L635 330"/><path class="life" d="M815 48 L815 330"/>
+  <path class="arrow" d="M100 78 L361 78"/><text class="t-sm" x="120" y="70">1 InitProducerId(txnId): bump epoch, fence old</text>
+  <path class="arrow" d="M100 112 L361 112"/><text class="t-sm" x="120" y="104">2 AddPartitions(T1, T2) logged</text>
+  <path class="arrow" d="M100 146 L631 146"/><text class="t-sm" x="400" y="138">3 produce records (invisible to read_committed)</text>
+  <path class="arrow" d="M100 180 L811 180"/><text class="t-sm" x="520" y="172">4 SendOffsetsToTransaction(group, offsets)</text>
+  <path class="arrow" d="M100 214 L361 214"/><text class="t-sm" x="120" y="206">5 EndTxn(commit)</text>
+  <text class="t-sm" x="378" y="238">6 write PREPARE_COMMIT to txn log (the decision point)</text>
+  <path class="arrow-g" d="M365 256 L631 256"/><path class="arrow-g" d="M365 256 L811 270"/><text class="t-sm" x="400" y="250">7 write COMMIT markers</text>
+  <text class="t-sm" x="378" y="296">8 write COMPLETE; consumers with read_committed now see the records</text>
+  <path class="arrow-g" d="M361 316 L104 316"/><text class="t-sm" x="130" y="310">ack to producer after step 6</text>
+</svg>
+<figcaption>The transaction coordinator logs the decision first, then writes commit markers into every partition touched. Readers in read_committed mode skip records of open or aborted transactions, bounded by the last stable offset.</figcaption>
+</figure>
+<p>Records of an uncommitted transaction are physically in the partition logs (so they do not need a separate buffer), but consumers set to <code>read_committed</code> never see them: the broker serves only up to the <b>last stable offset</b> (the first offset of the earliest still-open transaction) and filters aborted records using an aborted-transactions index. A stable <code>transactional.id</code> plus an epoch fences zombie producers: when a replacement starts, the old instance's writes are rejected. Cost: one extra commit-marker round per transaction, so transactions are batched (commit every 100 ms rather than per message), and a long-open transaction delays visibility of everything after it in that partition.</p>
+<div class="callout watch"><b>Watch out</b> "Exactly-once" holds only inside the system boundary: records in topics and offsets. An external side effect (an email, an HTTP call, a write to a non-transactional database) can still repeat; for those, make the handler idempotent with a dedup key or an outbox, as in <a href="../chapters/35-messaging-patterns.html">Chapter 35</a>.</div>
+<h3>8.5 Delivery guarantees summary</h3>
+<table>
+<tr><th>Guarantee</th><th>How achieved</th><th>Cost</th></tr>
+<tr><td>At-most-once</td><td>acks=0 or commit before processing</td><td>Possible loss, lowest latency</td></tr>
+<tr><td>At-least-once</td><td>acks=all, retries, commit after processing</td><td>Duplicates on retry or replay</td></tr>
+<tr><td>Effectively-once</td><td>Idempotent producer + idempotent or transactional consumer</td><td>Small CPU/latency overhead, transaction coordination</td></tr>
+</table>
+
+<h2 id="deep-retention">9. Deep dive 3: retention, compaction and ordering</h2>
+<h3>9.1 Retention</h3>
+<p>Retention deletes whole closed segments, never individual messages. A background task checks each partition and removes segments whose newest record is older than <code>retention.ms</code> (7 days) or while the partition exceeds <code>retention.bytes</code>. Deleting a file is a constant-time metadata operation, so it costs far less than an update-in-place store. One caveat: because a segment is deleted only when its <i>newest</i> record expires, and the active segment is never deleted, a quiet partition can keep much older data than 7 days; time-based segment rolling (for example roll at least every 24 hours) bounds that.</p>
+<h3>9.2 Compaction</h3>
+<p>Some topics hold state, not events: "the current profile of user 42", "current price of item 9", the consumer offsets topic itself. For these we want to keep <b>at least the latest value for every key</b> instead of a time window. <b>Log compaction</b> does this. A cleaner thread scans a partition's closed segments and builds an in-memory map of key to the latest offset (about 24 bytes per key with a hash of the key, so 1 GB of cleaner memory covers around 40 million keys). It then rewrites the segments, copying only records that are the newest for their key, into new segments, and swaps them in. Offsets of surviving records do not change; compaction just leaves gaps. A delete is a record with a null value (a <b>tombstone</b>), which is kept for <code>delete.retention.ms</code> so that slow consumers see the delete, then removed.</p>
+<table>
+<tr><th>Option</th><th>Keeps</th><th>Cleanup cost</th><th>Replay semantic</th><th>Use for</th></tr>
+<tr><td>Time/size delete</td><td>Everything for the window</td><td>Near zero (drop files)</td><td>Full history for the window</td><td>Event streams, logs, clicks</td></tr>
+<tr><td>Compaction</td><td>Latest value per key, unbounded time</td><td>Read and rewrite IO, cleaner CPU, memory map</td><td>Rebuilds current state; history is lost</td><td>Changelogs, config, offsets, caches</td></tr>
+<tr><td>Both (compact,delete)</td><td>Latest per key, but only inside a time window</td><td>Both costs</td><td>Bounded state</td><td>Session-like state with expiry</td></tr>
+</table>
+<p>Compaction is the same garbage-collection idea as an LSM tree's compaction (<a href="../chapters/19-storage-engines.html">Chapter 19</a>), applied to a log: duplicates of a key are the stale versions. The cleaner only compacts closed segments and throttles IO so it does not hurt producers, and the "dirty ratio" (fraction of the log not yet compacted) triggers it.</p>
+<h3>9.3 Ordering</h3>
+<ul>
+<li>Within a partition, order equals append order, and consumers see exactly that order. No ordering is promised across partitions.</li>
+<li>Order for a key is therefore achieved by routing all messages for the key to one partition. This couples correctness to the partition count: if you increase partitions from 600 to 900, <code>hash(key) mod N</code> changes and a key's later events move to a different partition, breaking per-key order across the change. Practice: over-provision partitions up front, or accept a one-time drain-and-switch when resizing keyed topics.</li>
+<li>Producer retries can reorder batches if multiple requests are in flight and an earlier one fails. Idempotence (with at most 5 in-flight) keeps order because the broker rejects out-of-sequence batches and the client resends in sequence.</li>
+<li>Consumer side: process each partition on a single thread, or dispatch to workers keyed by message key, otherwise parallel handlers reorder results.</li>
+<li>A hot key (one customer producing 30 percent of traffic) pins load to one partition. Mitigation: salt the key into sub-keys when per-key strict order is not needed, or give the hot tenant a dedicated topic.</li>
+</ul>
+
+<h2 id="tradeoffs">10. Contrast: log (Kafka-style) versus per-message-ack queue (SQS-style)</h2>
+<p>An interviewer will often ask why we did not build a classic queue. A traditional queue such as SQS stores independent messages. A consumer receives a message, which becomes invisible for a <b>visibility timeout</b> (say 30 s); the consumer processes it and explicitly deletes it; if it crashes, the timeout expires and the message reappears for another consumer. There is no offset, order is only best-effort in standard queues, and acknowledgement is per message.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Comparison of log with offsets versus queue with visibility timeout">
+  <text class="t-b" x="20" y="22">Log: one cursor per consumer group</text>
+  <rect class="db" x="30" y="40" width="40" height="34" rx="4"/><text class="t-c t-sm" x="50" y="62">0</text>
+  <rect class="db" x="76" y="40" width="40" height="34" rx="4"/><text class="t-c t-sm" x="96" y="62">1</text>
+  <rect class="db" x="122" y="40" width="40" height="34" rx="4"/><text class="t-c t-sm" x="142" y="62">2</text>
+  <rect class="cache" x="168" y="40" width="40" height="34" rx="4"/><text class="t-c t-sm" x="188" y="62">3</text>
+  <rect class="cache" x="214" y="40" width="40" height="34" rx="4"/><text class="t-c t-sm" x="234" y="62">4</text>
+  <rect class="cache" x="260" y="40" width="40" height="34" rx="4"/><text class="t-c t-sm" x="280" y="62">5</text>
+  <path class="arrow-g" d="M188 110 L188 78"/><text class="t-sm" x="30" y="126">committed offset 3 (group X): one integer</text>
+  <path class="arrow" d="M96 160 L96 78"/><text class="t-sm" x="30" y="176">group Y is at offset 1; replay = move the number</text>
+  <text class="t-sm" x="30" y="206">Messages 0..2 are not deleted by being read.</text>
+  <text class="t-sm" x="30" y="226">One slow message (offset 3) blocks the partition:</text>
+  <text class="t-sm" x="30" y="244">head-of-line blocking; skip needs a DLQ topic.</text>
+  <text class="t-sm" x="30" y="268">Per-message state: none. Cost per ack: about zero.</text>
+  <text class="t-b" x="470" y="22">Per-message queue: state per message</text>
+  <rect class="db" x="480" y="40" width="70" height="34" rx="4"/><text class="t-c t-sm" x="515" y="62">m1 visible</text>
+  <rect class="miss" x="556" y="40" width="110" height="34" rx="4"/><text class="t-c t-sm" x="611" y="62">m2 in flight 30s</text>
+  <rect class="hit" x="672" y="40" width="70" height="34" rx="4"/><text class="t-c t-sm" x="707" y="62">m3 deleted</text>
+  <rect class="db" x="748" y="40" width="70" height="34" rx="4"/><text class="t-c t-sm" x="783" y="62">m4 visible</text>
+  <text class="t-sm" x="480" y="110">Consumer takes m2, invisible until timeout or delete.</text>
+  <text class="t-sm" x="480" y="130">Crash: m2 reappears after 30 s, delivered to anyone.</text>
+  <text class="t-sm" x="480" y="150">Slow m2 does not block m1 or m4 (no head-of-line).</text>
+  <text class="t-sm" x="480" y="180">Retry count, DLQ redrive, per-message delay: built in.</text>
+  <text class="t-sm" x="480" y="206">No replay: once deleted, it is gone.</text>
+  <text class="t-sm" x="480" y="226">Ordering: none (standard) or per group (FIFO) at</text>
+  <text class="t-sm" x="480" y="244">far lower throughput; scale = more messages in flight.</text>
+  <text class="t-sm" x="480" y="268">Per-message state and acks: costly at 1M/s.</text>
+</svg>
+<figcaption>A log keeps one integer of state per consumer group and partition; a per-message queue keeps state (visible, in flight, deleted, receive count) for every message. That is the root of both the log's throughput advantage and the queue's flexibility.</figcaption>
+</figure>
+<table>
+<tr><th>Dimension</th><th>Log (this design)</th><th>Per-message-ack queue</th></tr>
+<tr><td>Throughput</td><td>Millions/s, sequential IO</td><td>Tens to hundreds of thousands per queue at best; per-message bookkeeping</td></tr>
+<tr><td>Consumers of same data</td><td>Many groups, replay anytime</td><td>One logical consumer set; fan-out needs topic plus several queues</td></tr>
+<tr><td>Work distribution</td><td>Static by partition (max consumers = partitions)</td><td>Dynamic competing consumers, any count</td></tr>
+<tr><td>Slow or poison message</td><td>Blocks that partition until skipped or sent to DLQ</td><td>Only that message retries; DLQ after N receives</td></tr>
+<tr><td>Per-message delay, priority</td><td>Not native</td><td>Delay, redrive, sometimes priority</td></tr>
+<tr><td>Ordering</td><td>Per partition</td><td>FIFO queue per message group, limited throughput</td></tr>
+<tr><td>Retention</td><td>Time or size window, independent of consumption</td><td>Until deleted or up to about 14 days</td></tr>
+</table>
+<div class="callout tip"><b>Interview tip</b> Say the decision rule out loud: use a log when you need high throughput, replay, and several independent consumers of one stream; use a per-message queue for a job pool where each task is independent, may take variable time, needs retries and delays, and order does not matter. Many systems use both: a log for event ingestion, queues for work dispatch.</div>
+<p>Can we add queue semantics on top of a log? Yes, partially: a consumer can emulate a visibility timeout with a retry topic chain (retry-1m, retry-10m, dead letter) and commit offsets after republishing failed messages, the pattern in <a href="../chapters/35-messaging-patterns.html">Chapter 35</a>. It costs complexity and breaks strict per-key order for retried messages, which is why it is a pattern and not a core feature.</p>
+
+<h2 id="scaling">11. Scaling, hot spots, backpressure and multi-tenancy</h2>
+<h3>11.1 Scaling out</h3>
+<ul>
+<li><b>Add brokers:</b> new brokers start empty. A reassignment moves chosen partition replicas to them by having them join as additional followers, catch up by fetching, enter the ISR, and then the old replica is removed. Throttle replication (for example 50 MB/s per broker) so rebalancing traffic does not starve normal traffic. Moving 43 TB at 50 MB/s takes 43,000,000 MB / 50 = 860,000 s, about 10 days, which is why a cluster rebalancer moves a fraction at a time and why tiered storage (section 12) makes elasticity much faster: only the local hot part, a few hours of data, must move.</li>
+<li><b>Add partitions:</b> raises parallelism but changes key-to-partition mapping (section 9.3).</li>
+<li><b>Rack-aware placement:</b> replicas of a partition go to different availability zones.</li>
+<li><b>Leader balancing:</b> a periodic "preferred leader" election returns leadership to the first replica in the assignment so no broker accumulates too much leader traffic after failures.</li>
+</ul>
+<h3>11.2 Hot spots</h3>
+<p>A broker is hot when its leader partitions receive more bytes than average. Causes: a hot key, an unevenly sized topic, or too many leaders after failover. Remedies: move the hottest partition to a lighter broker, split the key space, size partitions by bytes not by count, and monitor per-broker bytes in/out and request-handler idle percentage.</p>
+<h3>11.3 Backpressure</h3>
+<p>Overload must degrade gracefully. We apply backpressure at several layers:</p>
+<ol>
+<li><b>Producer client buffer:</b> <code>buffer.memory</code> (say 64 MB) bounds queued batches; when full, <code>send()</code> blocks for <code>max.block.ms</code> and then fails, pushing the pressure into the application.</li>
+<li><b>Broker request queues:</b> a bounded queue between network threads and IO threads; if full, network threads stop reading sockets, so TCP windows close and the clients slow.</li>
+<li><b>Quotas:</b> the broker computes a throttle time and delays the response (and mutes the channel) for clients exceeding their byte rate; well-behaved clients just see longer latency.</li>
+<li><b>Pull consumers:</b> a consumer that cannot keep up simply reads more slowly; lag grows but nothing breaks, because disk absorbs the backlog. Backlog is bounded by retention: lag beyond 7 days means data loss for that group, which is the alert threshold to watch.</li>
+</ol>
+<h3>11.4 Multi-tenancy and quotas</h3>
+<p>With hundreds of teams on one cluster, one noisy tenant must not harm others. Controls:</p>
+<table>
+<tr><th>Control</th><th>What it limits</th><th>Example</th></tr>
+<tr><td>Produce byte-rate quota per client id or principal</td><td>Ingress MB/s</td><td>20 MB/s per tenant default, raised by request</td></tr>
+<tr><td>Fetch byte-rate quota</td><td>Egress MB/s</td><td>60 MB/s per tenant</td></tr>
+<tr><td>Request-time quota</td><td>Broker CPU share (percent of IO threads)</td><td>10 percent per tenant; guards against many tiny requests</td></tr>
+<tr><td>Connection and partition caps</td><td>Resource counts, metadata size</td><td>Max 2,000 partitions and 500 connections per tenant</td></tr>
+<tr><td>ACLs and topic prefixes</td><td>Who may read and write what</td><td>Tenant owns <code>team-x.*</code> topics</td></tr>
+<tr><td>Dedicated clusters</td><td>Hard isolation for critical or huge tenants</td><td>Payments gets its own cluster</td></tr>
+</table>
+<p>Quotas are enforced per broker, so a tenant's cluster-wide limit is the per-broker value times the brokers its partitions touch; platform teams must size the numbers with that in mind. Throttling by delay, not rejection, avoids retry storms.</p>
+
+<h2 id="tiered">12. Tiered storage</h2>
+<p>At 0.9 PB raw on local disks, 7 days of retention is costly and makes broker replacement slow. But most reads touch only the last minutes (page cache) and the long tail is for occasional replay. <b>Tiered storage</b> keeps a short <b>local tier</b> (for example 6 hours) on broker disks and offloads closed segments to an <b>object store</b> (S3-like), keeping the 7 days or even months there.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="Tiered storage with local hot tier and object store cold tier">
+  <rect class="cache" x="30" y="40" width="250" height="90" rx="8"/><text class="t-c t-b" x="155" y="66">Hot tier: broker local disk</text>
+  <text class="t-c t-sm" x="155" y="88">active + last 6 hours of segments</text>
+  <text class="t-c t-sm" x="155" y="106">page cache, zero copy, RF 3</text>
+  <rect class="db" x="400" y="40" width="250" height="90" rx="8"/><text class="t-c t-b" x="525" y="66">Cold tier: object store</text>
+  <text class="t-c t-sm" x="525" y="88">closed segments up to 7+ days</text>
+  <text class="t-c t-sm" x="525" y="106">durable itself, no 3x replication</text>
+  <path class="arrow" d="M280 70 L396 70"/><text class="t-sm" x="292" y="62">upload closed segment</text>
+  <path class="arrow dash" d="M396 108 L284 108"/><text class="t-sm" x="292" y="126">range read on demand</text>
+  <rect class="box" x="720" y="40" width="150" height="90" rx="8"/><text class="t-c t-b" x="795" y="66">Remote log</text><text class="t-c t-b" x="795" y="84">manager</text><text class="t-c t-sm" x="795" y="106">segment to object map</text>
+  <path class="arrow dash" d="M720 85 L654 85"/>
+  <rect class="ext" x="30" y="180" width="250" height="60" rx="8"/><text class="t-c t-b" x="155" y="206">Tail consumer</text><text class="t-c t-sm" x="155" y="226">reads RAM: under 5 ms</text>
+  <rect class="ext" x="400" y="180" width="250" height="60" rx="8"/><text class="t-c t-b" x="525" y="206">Replaying consumer</text><text class="t-c t-sm" x="525" y="226">first byte tens of ms, then streams</text>
+  <path class="arrow-g" d="M155 180 L155 134"/><path class="arrow" d="M525 180 L525 134"/>
+  <text class="t-sm" x="30" y="270">Effect: local disk falls from 907 TB to about 32 TB (6h of data, RF 3); rebalancing moves hours, not days.</text>
+</svg>
+<figcaption>Closed segments are copied to an object store and later removed locally. Fetches below the local start offset are served by a remote-log component that reads ranges from the object store, so replaying consumers do not disturb the hot path (they also are served without page cache pollution).</figcaption>
+</figure>
+<p>Arithmetic: the hot tier holds 6 hours: 500 MB/s × 21,600 s = 10.8 TB per copy, 32 TB with RF 3, about 1 TB per broker instead of 30 TB. The object store keeps one durable copy of 302 TB (the store replicates internally). That cuts expensive broker SSD capacity by roughly 28x and makes adding or replacing a broker a matter of copying about 1 TB, in under an hour at 400 MB/s, instead of days. Design details: upload only closed segments below the high watermark; keep the index and leader-epoch checkpoint with each segment so a new leader can serve it; retention deletes remote segments by metadata; and a metadata record per segment is tracked in an internal topic. Tradeoffs: the first byte of a cold read is slower (tens of milliseconds), object store request fees apply, and compacted topics are harder to tier.</p>
+
+<h2 id="failures">13. Failure modes and mitigations</h2>
+<table>
+<tr><th>Failure</th><th>What happens</th><th>Mitigation / outcome</th></tr>
+<tr><td>Follower broker crash</td><td>Leader removes it from ISR after lag timeout; ISR 3 to 2. Writes continue with acks=all.</td><td>No data loss. On return it truncates to the leader's epoch boundary, fetches the gap, rejoins ISR. Alert on under-replicated partitions.</td></tr>
+<tr><td>Leader broker crash</td><td>Clients get errors or timeouts. Controller sees the session expire (about 10 s), elects an ISR member, bumps epoch.</td><td>Unavailability of those partitions for seconds; clients refresh metadata and retry; idempotent producer prevents duplicates. Acked acks=all data survives.</td></tr>
+<tr><td>Two brokers lost (RF 3, min ISR 2)</td><td>ISR of affected partitions falls to 1; writes rejected with NotEnoughReplicas.</td><td>Consistency over availability. Reads of committed data still work. Recovery by bringing a broker back.</td></tr>
+<tr><td>All ISR replicas lost</td><td>Partition offline.</td><td>Clean mode: wait for an ISR replica. Unclean mode: promote an out-of-sync replica, accept loss. Per-topic decision.</td></tr>
+<tr><td>Availability zone loss</td><td>One replica of every partition gone; leaders there fail over.</td><td>Rack-aware placement guarantees at least 2 replicas survive. Capacity headroom: remaining 20 brokers must carry the load (size so that 2/3 of capacity covers peak).</td></tr>
+<tr><td>Slow disk or GC pause on a leader</td><td>Followers lag, ISR shrinks; producers see high latency.</td><td>Per-disk metrics, replica lag timeout, move leaders away; keep heaps small and use off-heap page cache.</td></tr>
+<tr><td>Network partition: old leader isolated</td><td>It may still accept acks=1 writes locally; with acks=all it cannot reach followers and its ISR shrinks, but it needs the controller to know.</td><td>Epoch fencing: followers and controller reject the old epoch, the old leader learns at the next metadata contact and truncates. With acks=all and min ISR 2 an isolated leader cannot commit.</td></tr>
+<tr><td>Controller node failure</td><td>Quorum elects a new active controller in a second or two.</td><td>Data path unaffected; only topic creation and leader changes pause.</td></tr>
+<tr><td>Corrupted record on disk</td><td>CRC mismatch on read or recovery.</td><td>Truncate the tail on unclean shutdown recovery and refetch from the leader; bad segment is re-replicated.</td></tr>
+<tr><td>Consumer crash</td><td>Heartbeats stop; group rebalances after session timeout (typically 10 to 45 s).</td><td>Resumes from last committed offset; reprocessing of up to one commit interval, so handlers are idempotent.</td></tr>
+<tr><td>Poison message</td><td>Consumer throws on the same record forever; partition stuck.</td><td>Bounded retries, then publish to a dead-letter topic and commit past it (<a href="../chapters/35-messaging-patterns.html">Chapter 35</a>).</td></tr>
+<tr><td>Consumer lag growth</td><td>Backlog grows, risk that retention deletes unread data.</td><td>Alert on lag in time units (seconds behind) and on lag versus retention; add consumers up to the partition count; extend retention temporarily.</td></tr>
+<tr><td>Producer retry storm</td><td>Brokers overloaded, clients retry harder.</td><td>Exponential backoff with jitter, bounded in-flight, quotas via throttling instead of errors.</td></tr>
+<tr><td>Metadata staleness</td><td>Client sends to old leader.</td><td>NotLeader error triggers immediate metadata refresh; leader epoch in the request fences stale views.</td></tr>
+</table>
+<h3>13.1 Consistency and idempotency decisions in one place</h3>
+<ul>
+<li>Committed means present on all ISR members (at least 2 by min ISR). Consumers read only committed data.</li>
+<li>Leadership is changed only by the Raft-backed controller and is fenced by an epoch, so there is at most one effective leader per partition per epoch.</li>
+<li>Retry safety through producer idempotence; effectively-once across topics through transactions; everything outside needs idempotent consumers.</li>
+<li>Durability does not depend on fsync per write; it depends on independent failure of replicas in different zones. If a whole region loses power simultaneously, un-flushed page cache on all three replicas can be lost. That is a conscious tradeoff; set a periodic flush or choose cross-region mirroring when the risk matters.</li>
+</ul>
+<h3>13.2 Multi-region note</h3>
+<p>A stretch cluster across regions pays inter-region latency on every acks=all write and is fragile to partitions. The usual design is one cluster per region with asynchronous <b>mirroring</b> (a consumer-producer pipeline that copies topics and translates offsets). Failover is then eventually consistent, with a recovery point equal to mirror lag, similar to async replication tradeoffs in <a href="../chapters/24-replication.html">Chapter 24</a>. We leave it out of scope but mention it, which is exactly the right depth in an interview.</p>
+
+<h2 id="ops">14. Security, monitoring, SLOs and cost</h2>
+<h3>14.1 Security and abuse</h3>
+<ul>
+<li>TLS between clients and brokers and between brokers; SASL or mutual TLS for identity; ACLs per principal on topics, groups and transactional ids.</li>
+<li>Quotas (section 11.4) double as abuse control. A maximum message size (1 MB) protects memory.</li>
+<li>Encryption at rest through disk or volume encryption; client-side payload encryption for sensitive fields since the broker stores bytes opaquely.</li>
+<li>TLS defeats zero copy, so size CPU for it or terminate TLS in hardware offload, otherwise plan for roughly 2x broker CPU on the consumer path.</li>
+</ul>
+<h3>14.2 Monitoring and SLOs</h3>
+<table>
+<tr><th>Signal</th><th>Why</th><th>Alert on</th></tr>
+<tr><td>Under-replicated partitions</td><td>Early warning of durability loss</td><td>Greater than 0 for 5 minutes</td></tr>
+<tr><td>Offline partitions, active controller count</td><td>Availability</td><td>Offline above 0 immediately; controllers not exactly 1</td></tr>
+<tr><td>ISR shrink and expand rates</td><td>Flapping brokers or slow disks</td><td>Sustained shrinks</td></tr>
+<tr><td>Produce p99 latency, request handler idle percent</td><td>Saturation</td><td>p99 above 50 ms, idle below 30 percent</td></tr>
+<tr><td>Consumer lag (offsets and time)</td><td>Freshness and risk of data expiring</td><td>Lag time above SLO, lag above 50 percent of retention</td></tr>
+<tr><td>Disk usage, page cache hit, disk await</td><td>Capacity and latency</td><td>Disk above 70 percent</td></tr>
+<tr><td>Rebalance rate per group</td><td>Unstable consumers</td><td>More than a few per hour</td></tr>
+</table>
+<p>SLOs for the platform: 99.95 percent of produce requests succeed (acks=all) within 50 ms p99; zero acknowledged-message loss as a durability objective measured by canary topics with end-to-end checksums; tail-consumer end-to-end latency p99 under 100 ms; partition failover under 10 seconds.</p>
+<h3>14.3 Cost</h3>
+<p>The cost is dominated by disks and cross-zone network. With 30 brokers and 6 GB/s of internal traffic, cross-zone bytes (leader to followers in other zones, 2 GB/s at peak) are billed in most clouds, so cost-aware designs let consumers fetch from the nearest replica (follower fetching) rather than always the leader, saving about two thirds of consumer cross-zone traffic. Compression multiplies capacity by 2x to 5x. Tiered storage removes most SSD cost. Right-size retention per topic: a default of 7 days across 3,000 partitions, when most consumers are real-time, wastes petabytes.</p>
+
+<h2 id="evolution">15. Evolution, phasing and alternatives not chosen</h2>
+<h3>15.1 What to build first</h3>
+<ol>
+<li><b>Phase 1:</b> a single-node broker with append-only segments, sparse index, producer batching, pull-based fetch and committed offsets stored in a topic. Validates the storage format and 1 GB/s on one big machine.</li>
+<li><b>Phase 2:</b> partitions across brokers, metadata service, leader/follower replication with ISR, acks and min ISR, controller failover.</li>
+<li><b>Phase 3:</b> consumer groups with coordinator and rebalancing, retention, compaction.</li>
+<li><b>Phase 4:</b> idempotent producer, transactions, quotas and security.</li>
+<li><b>Phase 5:</b> tiered storage, follower fetching, cross-region mirroring, self-service tooling.</li>
+</ol>
+<h3>15.2 At 10x scale (10M msg/s, 10 GB/s)</h3>
+<ul>
+<li>Brokers: about 300 by the same arithmetic, which stresses the controller (roughly 30,000 partitions to 100,000 replicas). The Raft-based metadata log handles this, but we would split into multiple clusters per business domain (cell architecture) to limit blast radius and rebalancing times.</li>
+<li>Tiered storage becomes mandatory, since 9 PB raw is not affordable on local SSD.</li>
+<li>Broker count per cluster is capped by partition-replica count per broker and controller memory; a "federated cluster" layer or a routing proxy gives clients one logical namespace.</li>
+<li>Zero-copy tail reads give way to CPU limits once TLS is everywhere, so we scale CPU and use kernel TLS offload.</li>
+</ul>
+<h3>15.3 Alternatives considered</h3>
+<table>
+<tr><th>Alternative</th><th>Why not (here)</th></tr>
+<tr><td>Per-message queue (SQS, RabbitMQ classic)</td><td>Per-message state does not reach 1M/s on modest hardware; no replay; fan-out costs.</td></tr>
+<tr><td>Raft per partition for data replication</td><td>Costs 3 replicas for 1 failure and a Raft group per partition (thousands of groups, heartbeats); fine for smaller scale (some newer brokers do it) but ISR is cheaper at petabytes.</td></tr>
+<tr><td>Broker-side per-message cache in heap</td><td>Duplicates the page cache and causes GC pauses.</td></tr>
+<tr><td>Push delivery</td><td>Broker must know each consumer's speed, no natural batching; pull is simpler and safer.</td></tr>
+<tr><td>Storage-compute separation from day one (all data in object storage, stateless brokers)</td><td>Cheaper elasticity but higher latency per write (object store commit); chosen only when latency of hundreds of ms is acceptable. Our hybrid (local hot tier) keeps latency low.</td></tr>
+<tr><td>Global ordering</td><td>Would need a single partition: about 10 MB/s ceiling.</td></tr>
+</table>
+
+<h2 id="qa">16. Interview Q&amp;A</h2>
+<details><summary>Why is Kafka-style storage fast on spinning or cheap disks when "disk is slow"?</summary>
+<p>The slowness of disks is the slowness of seeks, not of streaming. Because we only append to the end of a file and read forward from an offset, the drives do large sequential transfers at hundreds of MB/s. On top of that the operating system page cache holds the recently written tail, so tail readers never touch the disk, and producer batching plus compression turn many small messages into big writes. Finally the log format equals the wire format, so sendfile moves bytes from cache to NIC without copying them through the application. Our 1 GB/s needs about 30 machines mostly for capacity, not because any single piece is slow.</p></details>
+<details><summary>A producer gets a timeout on an acks=all send. Was the message written? What do you do?</summary>
+<p>You do not know: the leader may have appended and replicated the batch and the response was lost, or the request never arrived. The right behaviour is to retry, and to make the retry safe with the idempotent producer, which attaches a producer id and sequence number so the leader recognizes a duplicate batch and returns the original offset instead of appending again. Without idempotence a retry creates duplicates, so the consumer would need its own dedup key. Retries should use bounded exponential backoff with jitter and an overall delivery timeout so a long outage fails loudly instead of queuing forever.</p></details>
+<details><summary>What exactly guarantees that an acknowledged message is not lost when the leader dies?</summary>
+<p>Three rules together. First, with acks=all the leader acknowledges only after every in-sync replica has the batch, and the ISR must contain at least min.insync.replicas (2) members, so the data exists on at least two machines in different zones. Second, a new leader is elected only from the ISR, so it has all committed data. Third, the old leader's extra uncommitted tail is truncated on return using leader epochs. If you violate any rule (acks=1, unclean election, min ISR 1) you reopen a loss window, which is exactly the set of knobs we expose per topic.</p></details>
+<details><summary>How do you choose the number of partitions, and what goes wrong if you pick badly?</summary>
+<p>Take the larger of two numbers: target throughput divided by per-partition throughput (1 GB/s over 10 MB/s is 100), and the maximum consumer parallelism you will ever want (200 consumers at 5 MB/s each is 200), then add headroom, so 600 for our big topic. Too few partitions caps throughput and consumer scale; too many increases open files, memory for indexes, replication fetch overhead, failover time (each partition needs a leader election), and end-to-end latency since each partition batches separately. For keyed topics the count is also hard to change later, because hash mod N reshuffles keys, so you over-provision at the start.</p></details>
+<details><summary>Explain a consumer rebalance and how you would reduce its impact.</summary>
+<p>When a member joins, leaves, or stops heartbeating, the group coordinator bumps the generation and the members run JoinGroup and SyncGroup to receive a new partition assignment. With the eager protocol every member stops consuming while this happens, which on a large group can mean tens of seconds of zero throughput, and repeated rolling deploys cause repeated stalls. I would use cooperative rebalancing so only moved partitions pause, static membership with an instance id so a quick restart keeps its partitions, a sticky assignor, and a session timeout longer than typical restarts. I would also keep the poll loop short so slow processing is not mistaken for a dead consumer.</p></details>
+<details><summary>How would you provide exactly-once delivery?</summary>
+<p>I would not claim it end to end. Inside the log system you combine an idempotent producer (no duplicates from retries), transactions (output records and consumer offsets commit atomically, with transactional.id fencing to kill zombie instances), and read_committed consumers that skip aborted data. That gives exactly-once for consume-transform-produce between topics. For an external effect such as a database row or an email, the sink must either take part in the same transaction (store the offset in the same database transaction as the result) or be idempotent with a deduplication key. So the honest answer is at-least-once delivery plus idempotent processing, which produces an exactly-once effect.</p></details>
+<details><summary>When would you pick compaction rather than time-based retention?</summary>
+<p>Pick compaction when the topic represents the latest state per key and new consumers need to rebuild that state, like user profiles, configuration, or the consumer offsets topic itself; time-based retention would delete a key that simply has not changed in 7 days, which is wrong. Pick time retention for events, where each record is a fact at a moment and the window of replay is what matters. Compaction costs read and rewrite IO and memory for the key map, and it gives up history of intermediate values, and deletes need tombstones kept long enough for slow consumers to observe them.</p></details>
+<details><summary>Why use a log instead of SQS-style queue for this? When is the opposite right?</summary>
+<p>The log keeps one integer of state per group and partition rather than per message state, which is why it reaches millions of messages per second, supports replay by resetting an offset, and lets many groups read independently at no extra write cost. The price is head-of-line blocking per partition, parallelism capped by partitions, and no native delays or per-message retry. A per-message queue with a visibility timeout is the right choice for a task pool: independent jobs of uneven duration, elastic worker counts, retry counts and dead-lettering per message, and no need for order or replay. Many real platforms run both, with the log as the system of record for events.</p></details>
+<details><summary>A partition is offline and the business wants it back now. What are the options and risks?</summary>
+<p>First check if an ISR member is merely slow or restarting; waiting for it is the safe path and preserves all committed data. If the ISR replicas are truly gone, one can enable unclean leader election for that topic and promote an out-of-sync replica. That restores availability immediately but permanently loses the messages the replica did not have, possibly leaves consumers with committed offsets beyond the new end of log (they reset to earliest or latest), and can reorder history seen by downstream systems. This is a business decision per topic: for payments I would wait, for clickstream I would promote. After the incident I would review why the ISR shrank to one, for example min ISR 2 not being enforced.</p></details>
+<details><summary>How does the system stay balanced and avoid a noisy neighbor?</summary>
+<p>Balance comes from spreading partition leaders evenly across brokers, using rack-aware replica placement, periodically re-electing preferred leaders, and moving hot partitions with throttled reassignments. Isolation uses per-client quotas on produce and fetch bytes and on request-handler time, enforced by delaying responses rather than rejecting, plus caps on partitions and connections per tenant and ACL-scoped topic prefixes. For tenants whose peaks are huge or whose data is critical, a dedicated cluster is cleaner than tuning quotas. Monitoring per-tenant bytes and throttle time shows who is pushing the limits before others notice.</p></details>
+<details><summary>How does tiered storage change failure recovery and consumer behaviour?</summary>
+<p>With only about 6 hours of data local, a replacement broker has to copy around 1 TB rather than 30 TB, so recovery and expansion drop from days to under an hour, and the window in which the ISR is reduced is much shorter. Consumers that read recent data see no change; consumers replaying older data are served from the object store with higher first-byte latency but without evicting the hot data from the page cache, since remote reads bypass it. The risks are additional dependencies (the object store must be available for old reads), per-request costs, and complexity for compacted topics, which are often kept local.</p></details>
+
+<h2 id="recap-sec">17. Connects to</h2>
+<p class="connects"><b>Connects to:</b> the concepts of queues, logs, partitions and consumer groups are in <a href="../chapters/34-queues-kafka.html">Chapter 34</a>; retries, DLQ, fan-out and idempotent consumers in <a href="../chapters/35-messaging-patterns.html">Chapter 35</a>; segment files, write-ahead logs and compaction in <a href="../chapters/19-storage-engines.html">Chapter 19</a>; leader-follower replication, lag and failover in <a href="../chapters/24-replication.html">Chapter 24</a>; controller election, quorum and epoch fencing in <a href="../chapters/29-consensus.html">Chapter 29</a>. Related designs: the notification pipeline in <a href="c08-notification-system.html">Case study 8</a> and the chat system in <a href="c07-chat.html">Case study 7</a> consume exactly this kind of log.</p>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">18. Recap</h2><ul>
+<li>The core is an <b>append-only, segmented log per partition</b> with a sparse index; sequential IO, the OS page cache, batching, compression and zero copy turn 1 GB/s into about 30 modest brokers.</li>
+<li>Estimation: 1M msg/s × 1 KB = 1 GB/s; RF 3 gives 3 GB/s of disk writes, about 0.9 PB raw for 7 days; 600 partitions for the large topic.</li>
+<li><b>Durability</b> comes from leader plus ISR replication across zones: acks=all, min ISR 2, election only from the ISR, epoch-based truncation, and a Raft-backed controller to avoid split brain.</li>
+<li><b>Consumers</b> pull, keep one offset per partition per group, and share work via coordinator-managed groups; commit after processing gives at-least-once, idempotent producers and transactions give effectively-once inside the system.</li>
+<li><b>Retention</b> deletes whole segments; <b>compaction</b> keeps the latest value per key; ordering holds per partition only, so key routing and partition count must be planned.</li>
+<li><b>Operations:</b> backpressure through bounded buffers and throttling, tenant quotas, tiered storage for cheap elasticity, and alerts on under-replicated partitions and consumer lag.</li>
+<li>Versus a per-message queue with visibility timeouts: the log trades flexible per-message handling for throughput, replay and cheap fan-out.</li>
+</ul></div>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

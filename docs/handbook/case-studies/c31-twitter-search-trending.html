@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design Tweet Search and Trending Topics | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="c31-twitter-search-trending">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 31 · Worked solutions</div>
+<h1>Design Tweet Search and Trending Topics</h1>
+<p class="lead">Half a billion short posts arrive every day, and users expect to find a post seconds after it is written, and to see what the world is talking about right now. This worked solution builds a real-time inverted index with tiers, a two-stage ranker, and a streaming trending pipeline based on windows, a Count-Min Sketch and a top-K structure, with the numbers and failure modes an interviewer will probe.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt: "Design search for a microblogging service like Twitter, including the list of trending topics." Two features share one input, the firehose of newly created posts (we call them tweets). The first feature is <b>search</b>: a user types a query such as <code>world cup final</code>, and gets the most relevant or the most recent tweets matching it. The second is <b>trending</b>: a short list of terms and hashtags whose usage is surging right now in a region.</p>
+<p>These two problems look unrelated but have the same shape. Both consume an unbounded stream of small documents, both must reflect events within seconds to a minute, and both must absorb sudden spikes (a goal in a football match, an earthquake) that are many times the average rate. The difference is the question asked of the data: search asks "which documents contain these terms", which needs an inverted index; trending asks "which terms have changed their frequency most", which needs approximate counting over time windows. We follow the framework of <a href="../chapters/01-interview-framework.html">Chapter 1</a>: ask, assume, then design.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th><th>Why it matters</th></tr>
+<tr><td>How much content, and how fast does it arrive?</td><td>500 million new tweets per day, about 5,800 per second on average, designed for 20,000 per second at peak.</td><td>Sizes ingestion, Kafka and the index write path.</td></tr>
+<tr><td>How many searches?</td><td>1 billion searches per day (about 11,600 per second average, 35,000 at peak).</td><td>Sizes the query fan-out and result caching.</td></tr>
+<tr><td>How fresh must a tweet be to be searchable?</td><td>Searchable within 10 seconds of posting at p99; typically 1 to 3 seconds.</td><td>This is the defining requirement: it forces a real-time, in-memory, incrementally updated index, not a nightly batch build.</td></tr>
+<tr><td>How far back can users search?</td><td>Everything ever posted, but the vast majority of queries want the last few days. Older results can be slower (up to 1 to 2 seconds).</td><td>Justifies tiered indexes: a small hot tier and a large cold tier.</td></tr>
+<tr><td>What kinds of queries?</td><td>Keywords (AND semantics by default), exact phrases in quotes, hashtags, mentions, and filters such as language, from:user, date range, has:media. Two sort modes: Top (relevance) and Latest (reverse chronological).</td><td>Phrase queries need positions in the index; filters need cheap per-document attributes.</td></tr>
+<tr><td>Are results personalized?</td><td>Lightly: the ranker may use the searcher's social graph and language. Retrieval itself is global.</td><td>Keeps the index shared; personalization lives in the rerank stage.</td></tr>
+<tr><td>How are trends defined?</td><td>Terms and hashtags with an unusually high rate compared to their own recent baseline, per country or city, refreshed every minute. Not simply the most frequent words.</td><td>"The" is always frequent; trending is about change, not volume.</td></tr>
+<tr><td>Deletes and edits?</td><td>A deleted tweet must disappear from search within about a minute. Engagement counts (likes, retweets) change constantly.</td><td>Needs tombstones and an in-place update path that does not re-index the document.</td></tr>
+<tr><td>Safety?</td><td>Spam and bot-driven trends must be suppressed; abusive and illegal content is filtered.</td><td>Trending is a manipulation target; counts alone are not enough.</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li>Index every public tweet, and make it searchable by words, hashtags, mentions and phrases.</li>
+<li>Return a page of results for a query, sorted by relevance ("Top") or by time ("Latest"), with cursor pagination.</li>
+<li>Support filters: language, author, time range, media, minimum engagement.</li>
+<li>Reflect deletes, account suspensions and privacy changes in results.</li>
+<li>Publish a ranked list of trending topics per location, refreshed about once a minute, with a count estimate and a short description label.</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Index freshness:</b> p99 under 10 seconds from tweet creation to searchable.</li>
+<li><b>Query latency:</b> p50 under 100 ms and p99 under 300 ms server-side for recent-tier queries.</li>
+<li><b>Availability:</b> 99.95 percent for search. A degraded answer (fewer shards, slightly stale ranking) is always preferred to an error. Trending may serve a slightly old list rather than fail.</li>
+<li><b>Scalability:</b> absorb a 10x spike in tweet rate for tens of minutes without losing data (buffered, not dropped), accepting a short growth in index lag.</li>
+<li><b>Consistency:</b> eventual. Two users may briefly see different result sets; no read-your-writes guarantee is required, except that a user's own new tweet should usually appear in their own search (handled by the client, section 13).</li>
+<li><b>Durability:</b> the index is derived data, so it can be rebuilt. The tweet store and the Kafka log are the sources of truth.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Composing, storing and serving tweets and timelines (see <a href="c06-news-feed.html">Case study 6</a>), the social graph, ads in search, people and account search, image and video content understanding, and typeahead as you type (see <a href="c11-autocomplete.html">Case study 11</a>). We note where each plugs in.</p>
+
+<h2 id="estimation">3. Back-of-envelope estimation</h2>
+<p>We follow <a href="../chapters/02-estimation.html">Chapter 2</a>: state assumptions, do the arithmetic, and keep the numbers consistent through the rest of the page.</p>
+<h3>3.1 Write side</h3>
+<ul>
+<li>500 million tweets per day divided by 86,400 seconds is about <b>5,800 tweets per second</b> on average.</li>
+<li>Peak design rate: 20,000 tweets per second (about 3.4 times the average). Real events can briefly exceed this; the queue absorbs the difference.</li>
+<li>Average stored tweet record (text up to 280 characters, ids, entities, metadata) is about 1 KB, so raw ingest is 20 MB per second at peak and 500 GB per day. This is small for Kafka; the write path is limited by indexing CPU, not bandwidth.</li>
+<li>Tokenization: after dropping stop words and duplicates, a tweet yields about 15 index terms (words, hashtags, mentions, URL domains). That is 500 million times 15 = <b>7.5 billion postings per day</b> (a posting is one entry "term T appears in tweet D").</li>
+</ul>
+<h3>3.2 Read side</h3>
+<ul>
+<li>1 billion searches per day gives about 11,600 queries per second average; with a peak factor of 3, about <b>35,000 queries per second</b>.</li>
+<li>Many queries repeat (trending topics, celebrity names). A short-lived result cache (5 to 30 seconds) absorbs about 40 percent, so the search backend sees about <b>21,000 queries per second</b> at peak.</li>
+<li>Read to write ratio, counting queries against tweets: 11,600 to 5,800, about 2 to 1 by operation count, but each query touches many index entries while each write touches only 15, so index reads dominate CPU.</li>
+<li>Response: 20 hydrated tweets at about 1.5 KB each is 30 KB, so 35,000 per second times 30 KB is about 1 GB per second, around 8.4 Gbit/s at the edge. Hydration (fetching tweet bodies) is a significant cost, handled in section 7.</li>
+</ul>
+<h3>3.3 Index size</h3>
+<ul>
+<li><b>Postings:</b> a posting costs about 4 bytes in the real-time tier (a delta-friendly document id plus a position or flags, uncompressed enough to append cheaply). 7.5 billion per day times 4 bytes is <b>30 GB per day</b>.</li>
+<li><b>Real-time tier (7 days):</b> postings 7 days times 30 GB = 210 GB. Per-document attributes (author id, language, flags, engagement counters, about 24 bytes) for 3.5 billion tweets is 84 GB. The term dictionary (about 200 million distinct terms including hashtags and typos at about 40 bytes) is 8 GB. Total about <b>300 GB</b>.</li>
+<li><b>Archive tier:</b> one year is 182 billion tweets. Compressed postings (about 2.5 bytes each) are 182 billion times 15 times 2.5 = 6.8 TB, plus attributes, so roughly <b>10 TB per year</b>. Keeping 5 years online is about 50 TB, 100 TB with two replicas, on SSD.</li>
+</ul>
+<h3>3.4 Capacity of the real-time tier</h3>
+<p>We split the 7-day tier into <b>16 partitions</b> by hash of the tweet id. Each holds 3.5 billion divided by 16 = about 220 million tweets and about 19 GB of index, which fits comfortably in a 64 GB machine with room for the operating system, the segment being written and growth. Each partition has <b>3 replicas</b>, so 16 times 3 = 48 machines. Each query is sent to one replica of each of the 16 partitions, so a partition's replica set serves all 21,000 queries per second, about 7,000 per second per replica. At roughly 1 ms of CPU per partition-query on a 16-core machine (about 16,000 per second capacity) that is under 45 percent utilization at peak, which leaves headroom for a lost replica or a hot query. Indexing is easy by comparison: 20,000 tweets per second divided by 16 is 1,250 tweets per second per partition.</p>
+<table>
+<tr><th>Quantity</th><th>Value</th></tr>
+<tr><td>Tweets per day / average / peak per second</td><td>500 million / 5,800 / 20,000</td></tr>
+<tr><td>Postings per day</td><td>7.5 billion (about 30 GB)</td></tr>
+<tr><td>Searches per day / average / peak QPS</td><td>1 billion / 11,600 / 35,000</td></tr>
+<tr><td>Backend QPS after 40 percent result-cache hits</td><td>21,000 (fan-out 16, so about 336,000 partition-queries per second)</td></tr>
+<tr><td>Real-time tier (7 days)</td><td>about 300 GB; 16 partitions times 3 replicas = 48 nodes, about 19 GB each</td></tr>
+<tr><td>Archive tier</td><td>about 10 TB per year; 50 TB for 5 years, 100 TB with 2 replicas</td></tr>
+<tr><td>Trending events (3 candidate terms per tweet)</td><td>17,400 per second average, 60,000 peak; 18 million in a 5-minute window at peak</td></tr>
+<tr><td>Count-Min Sketch per 5-minute bucket per worker</td><td>about 1 MB (section 11); 288 buckets cover 24 hours in under 300 MB</td></tr>
+<tr><td>Kafka tweet topic</td><td>500 GB per day; 3 days retention, 3 replicas, about 4.5 TB</td></tr>
+</table>
+<p>The important conclusions: the hot index fits in the RAM of a modest cluster, so <b>we shard for query throughput and fan-out latency, not for capacity</b>; and the archive is large enough that it must live on SSD with an entirely different structure. That asymmetry is the argument for tiering (section 9).</p>
+
+<h2 id="api">4. API design</h2>
+<pre><code>GET /v1/search?q=world+cup+final&amp;sort=top|latest&amp;lang=en
+               &amp;since=2026-11-10T00:00Z&amp;until=...&amp;from=user123
+               &amp;filter=media&amp;limit=20&amp;cursor=eyJtYXhJZCI6Li4ufQ
+
+200 OK
+{
+  "results": [
+    {"id": "1858...", "author": {"id": "u1", "handle": "..."},
+     "text": "...", "created_at": "2026-11-17T09:00:03Z",
+     "metrics": {"likes": 120, "reposts": 34}, "score": 0.83}
+  ],
+  "next_cursor": "eyJtYXhJZCI6IjE4NTgu...",
+  "tiers_searched": ["realtime"],
+  "partial": false
+}
+
+GET /v1/trends?place=us-ny&amp;limit=20
+200 OK  Cache-Control: public, max-age=30
+{
+  "as_of": "2026-11-17T09:01:00Z",
+  "trends": [
+    {"term": "#WorldCupFinal", "rank": 1, "volume_estimate": 412000,
+     "window": "1h", "category": "sports"}
+  ]
+}</code></pre>
+<p>Design choices worth stating aloud:</p>
+<ul>
+<li><b>Cursor pagination, not page numbers.</b> New tweets arrive constantly, so offset pagination would shift results between pages and duplicate or skip entries. For "Latest" the cursor encodes the largest tweet id already shown: the next page is "matching tweets with id below this". For "Top" the cursor carries the score and id of the last item. See <a href="../chapters/05-api-design.html">Chapter 5</a>.</li>
+<li><b>Tweet ids are time-ordered</b> (a Snowflake-style id carrying a millisecond timestamp, see <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>). Sorting by id is sorting by time, and a time range filter becomes an id range filter. This one property simplifies the index, the cursor and the tiering.</li>
+<li><b>Partial results are explicit.</b> The response says if a tier or partitions were skipped because of a timeout, so clients can show a hint instead of silently showing less.</li>
+<li><b>Internal write path:</b> there is no public index API. The tweet service publishes <code>TweetCreated</code>, <code>TweetDeleted</code> and <code>EngagementDelta</code> events to Kafka; the indexing pipeline consumes them (section 7).</li>
+<li><b>Trends are cacheable</b> per place for 30 seconds at the CDN (<a href="../chapters/12-cdn.html">Chapter 12</a>), since every user in a region sees the same list. The request rate on the origin is therefore tiny.</li>
+</ul>
+
+<h2 id="data-model">5. Data model and storage choice</h2>
+<table>
+<tr><th>Data</th><th>Store</th><th>Reason</th></tr>
+<tr><td>Tweet bodies (source of truth)</td><td>Sharded key-value or wide-column store keyed by tweet id, behind a cache (<a href="../chapters/20-nosql.html">Chapter 20</a>, <a href="../chapters/13-caching-patterns.html">Chapter 13</a>)</td><td>The index stores ids and a few attributes, not the full text; bodies are fetched ("hydrated") only for the final page of results.</td></tr>
+<tr><td>Event log of creates, deletes, engagement</td><td>Kafka, partitioned by tweet id (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>)</td><td>Durable, replayable, decouples the tweet service from indexing, lets a rebuilt index replay history.</td></tr>
+<tr><td>Real-time inverted index</td><td>Custom in-memory index per partition replica, Lucene-like concepts (<a href="../chapters/22-search-engines.html">Chapter 22</a>)</td><td>Needs lock-free concurrent reads while appending; general-purpose engines optimize for batch segments and refresh intervals of seconds.</td></tr>
+<tr><td>Archive index</td><td>Immutable, compressed on-disk segments on SSD, built in batch, stored in object storage and mapped into memory on serving nodes (<a href="../chapters/21-object-storage.html">Chapter 21</a>, <a href="../chapters/19-storage-engines.html">Chapter 19</a>)</td><td>Old tweets never change (except deletes), so the best structure is a read-optimized compressed segment.</td></tr>
+<tr><td>Trend counters</td><td>In-memory Count-Min Sketches plus heaps in stream workers; checkpointed to object storage</td><td>High update rate, tolerant of small error, small memory.</td></tr>
+<tr><td>Trend results per place</td><td>Redis keys per place with a TTL (<a href="../chapters/15-redis.html">Chapter 15</a>)</td><td>Tiny, read-heavy, replaced wholesale every minute.</td></tr>
+<tr><td>Blocklists, spam scores, user quality</td><td>Versioned config store plus a feature store read by the ranker</td><td>Small, must be consistent and quickly updated.</td></tr>
+</table>
+<p>The central structure is the <b>inverted index</b>: a dictionary that maps each term to a <b>postings list</b>, the list of ids of documents containing that term. To answer <code>world cup</code>, look up the list for <code>world</code>, the list for <code>cup</code>, and intersect them. The idea is explained in <a href="../chapters/22-search-engines.html">Chapter 22</a> and the underlying text structures in <a href="../chapters/58-geospatial-text.html">Chapter 58</a>; here we focus on what changes when the documents are tweets arriving at thousands per second.</p>
+<p>What makes tweets special for an index designer:</p>
+<ul>
+<li><b>They are tiny.</b> 15 terms per document, so a posting list for a common word grows by millions of entries per hour but each entry is cheap.</li>
+<li><b>They are immutable text.</b> A tweet's words never change, so postings are append-only. Only counters and deletion flags change, and those live outside the postings (section 8).</li>
+<li><b>Queries want recency.</b> Most users want the newest matches. If postings are stored newest first, the first entries scanned are the ones most wanted, and a query can stop early once it has enough results.</li>
+<li><b>Time is a free partitioning key.</b> Since ids are time-ordered, old and new data separate naturally into tiers.</li>
+</ul>
+
+<h2 id="first-design">6. A first simple design</h2>
+<p>Start with something one team could ship in a month. Tweets are written to a relational table. A background job reads new rows every minute and sends them to a single Elasticsearch cluster (<a href="../chapters/22-search-engines.html">Chapter 22</a>). The search endpoint sends a boolean query to Elasticsearch, sorted by a relevance score and a recency boost. Trends are computed by a cron job that runs <code>SELECT term, COUNT(*) ... GROUP BY term</code> over the last hour and compares with the previous hour.</p>
+<p>This works at small scale and fails in predictable ways, which gives the plan for the rest of the page:</p>
+<ol>
+<li>A one-minute polling and a refresh interval (Elasticsearch makes documents visible only after a refresh, typically every second or more) put freshness in tens of seconds to minutes, and heavy bulk indexing at 20,000 documents per second causes merge storms and latency spikes. We need an <b>index designed for continuous appends</b> (section 8).</li>
+<li>Seven years of tweets in one index make every query pay for data nobody wants. We need <b>tiers by age</b> (section 9).</li>
+<li>Default relevance scoring such as BM25 treats a tweet like a web page, but tweets need engagement, author reputation, spam suppression and recency. We need a <b>purpose-built ranking pipeline</b> (section 10).</li>
+<li>The GROUP BY trend query scans hundreds of millions of rows, only runs every few minutes, and measures popularity, not surge. We need <b>streaming approximate counting</b> (section 11).</li>
+<li>The cluster is a single failure domain with no handling of hot queries or traffic spikes. We need <b>replication, caching, load shedding and degradation paths</b> (sections 12 and 13).</li>
+</ol>
+
+<h2 id="architecture">7. Scaled architecture and request flows</h2>
+<p>As in most search systems, the architecture has a <b>write path</b> that turns events into index state and a <b>read path</b> that scatters a query across index partitions and gathers a ranked answer. A third, independent <b>trending path</b> consumes the same event stream and produces a small list. They share only Kafka, so a failure in one does not stop the others.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 980 520" role="img" aria-label="High-level architecture of tweet search and trending">
+  <text class="t-b" x="20" y="22">Write path</text>
+  <rect class="ext" x="20" y="36" width="110" height="52" rx="8"/><text class="t-c t-b" x="75" y="58">Tweet service</text><text class="t-c t-sm" x="75" y="76">create / delete</text>
+  <rect class="box" x="170" y="36" width="110" height="52" rx="8"/><text class="t-c t-b" x="225" y="58">Kafka</text><text class="t-c t-sm" x="225" y="76">tweet events</text>
+  <rect class="box" x="320" y="36" width="130" height="52" rx="8"/><text class="t-c t-b" x="385" y="58">Ingester</text><text class="t-c t-sm" x="385" y="76">tokenize, enrich</text>
+  <rect class="box" x="490" y="36" width="120" height="52" rx="8"/><text class="t-c t-b" x="550" y="58">Kafka</text><text class="t-c t-sm" x="550" y="76">to-index (16 parts)</text>
+  <rect class="cache" x="650" y="20" width="150" height="40" rx="8"/><text class="t-c t-b" x="725" y="45">Realtime tier (7 d)</text>
+  <rect class="cache" x="650" y="68" width="150" height="40" rx="8"/><text class="t-c t-b" x="725" y="93">16 parts x 3 replicas</text>
+  <rect class="db" x="840" y="20" width="120" height="40" rx="8"/><text class="t-c t-b" x="900" y="45">Archive tier</text>
+  <rect class="db" x="840" y="68" width="120" height="40" rx="8"/><text class="t-c t-b" x="900" y="93">Tweet store</text>
+  <path class="arrow" d="M130 62 L166 62"/><path class="arrow" d="M280 62 L316 62"/><path class="arrow" d="M450 62 L486 62"/><path class="arrow" d="M610 50 L646 40"/><path class="arrow" d="M610 74 L646 88"/>
+  <path class="arrow dash" d="M800 40 L836 40"/>
+
+  <text class="t-b" x="20" y="170">Read path (search)</text>
+  <rect class="ext" x="20" y="186" width="100" height="52" rx="8"/><text class="t-c t-b" x="70" y="208">Client</text><text class="t-c t-sm" x="70" y="226">web, mobile</text>
+  <rect class="box" x="160" y="186" width="110" height="52" rx="8"/><text class="t-c t-b" x="215" y="208">Gateway</text><text class="t-c t-sm" x="215" y="226">auth, rate limit</text>
+  <rect class="cache" x="310" y="186" width="110" height="52" rx="8"/><text class="t-c t-b" x="365" y="208">Result cache</text><text class="t-c t-sm" x="365" y="226">5-30 s TTL</text>
+  <rect class="box" x="460" y="186" width="130" height="52" rx="8"/><text class="t-c t-b" x="525" y="208">Search root</text><text class="t-c t-sm" x="525" y="226">parse, fan-out, merge</text>
+  <rect class="cache" x="640" y="170" width="150" height="40" rx="8"/><text class="t-c t-b" x="715" y="195">Realtime partitions</text>
+  <rect class="db" x="640" y="218" width="150" height="40" rx="8"/><text class="t-c t-b" x="715" y="243">Archive (if needed)</text>
+  <rect class="box" x="830" y="186" width="130" height="52" rx="8"/><text class="t-c t-b" x="895" y="208">Ranker</text><text class="t-c t-sm" x="895" y="226">rerank top 200</text>
+  <path class="arrow" d="M120 212 L156 212"/><path class="arrow" d="M270 212 L306 212"/><path class="arrow" d="M420 212 L456 212"/><path class="arrow" d="M590 200 L636 190"/><path class="arrow" d="M590 224 L636 238"/><path class="arrow dash" d="M790 190 L826 205"/>
+
+  <text class="t-b" x="20" y="330">Trending path</text>
+  <rect class="box" x="20" y="346" width="120" height="52" rx="8"/><text class="t-c t-b" x="80" y="368">Term extractor</text><text class="t-c t-sm" x="80" y="386">tags, entities</text>
+  <rect class="box" x="180" y="346" width="130" height="52" rx="8"/><text class="t-c t-b" x="245" y="368">Stream workers</text><text class="t-c t-sm" x="245" y="386">CMS + heaps, windows</text>
+  <rect class="box" x="350" y="346" width="130" height="52" rx="8"/><text class="t-c t-b" x="415" y="368">Trend scorer</text><text class="t-c t-sm" x="415" y="386">surge vs baseline</text>
+  <rect class="box" x="520" y="346" width="130" height="52" rx="8"/><text class="t-c t-b" x="585" y="368">Quality filter</text><text class="t-c t-sm" x="585" y="386">spam, safety, dedupe</text>
+  <rect class="db" x="690" y="346" width="120" height="52" rx="8"/><text class="t-c t-b" x="750" y="368">Trends store</text><text class="t-c t-sm" x="750" y="386">Redis per place</text>
+  <rect class="cache" x="850" y="346" width="110" height="52" rx="8"/><text class="t-c t-b" x="905" y="368">CDN</text><text class="t-c t-sm" x="905" y="386">30 s cache</text>
+  <path class="arrow" d="M140 372 L176 372"/><path class="arrow" d="M310 372 L346 372"/><path class="arrow" d="M480 372 L516 372"/><path class="arrow" d="M650 372 L686 372"/><path class="arrow" d="M810 372 L846 372"/>
+  <path class="arrow dash" d="M550 88 L550 120 L80 120 L80 342"/>
+  <text class="t-sm" x="200" y="114">the to-index topic also feeds the term extractor</text>
+
+  <text class="t-sm" x="20" y="450">Solid arrows: synchronous or streaming data flow. Dashed: optional or secondary (cold tier, rerank service, fan-out of the same topic).</text>
+  <text class="t-sm" x="20" y="470">All three paths read the same Kafka events; none of them calls another path directly.</text>
+</svg>
+<figcaption>The write path (top) turns events into 16 partitioned real-time indexes plus an archive. The read path (middle) is a scatter-gather through a search root and a ranker. The trending path (bottom) consumes the same stream and publishes a small per-place list.</figcaption>
+</figure>
+
+<h3>7.1 Write flow: tweet to searchable</h3>
+<ol>
+<li>The tweet service stores the tweet in the tweet store and publishes <code>TweetCreated</code> to Kafka, partitioned by tweet id (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>). Publishing after the durable write, with the event carrying the id, makes duplicates harmless (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>).</li>
+<li>The <b>ingester</b> consumes the event and does the CPU-heavy work once: Unicode normalization, language detection, tokenization (with special handling for hashtags, mentions, URLs, emoji and languages without spaces), stop-word handling, URL expansion, entity extraction and a spam and quality score. Doing this once, not on every replica, saves 3 times the CPU.</li>
+<li>The ingester emits an <b>index message</b>: tweet id, the list of terms with positions, the attribute record (author, language, flags, quality), onto a second topic partitioned by <code>hash(tweet id) mod 16</code>.</li>
+<li>Each of the three replicas of partition p consumes partition p of that topic <b>independently</b> and applies the message to its own in-memory index. Replicas do not talk to each other; they converge because they apply the same log. This is the "state machine on a log" pattern, and it avoids replication traffic and replica-to-replica coordination (see <a href="../chapters/24-replication.html">Chapter 24</a>).</li>
+<li>As soon as the index writer publishes the new document (section 8), queries see it. End-to-end this takes typically 1 to 3 seconds, well inside the 10-second target.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Sequence diagram of tweet ingestion into the real-time index">
+  <rect class="ext" x="20" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="75" y="32">Tweet svc</text>
+  <rect class="box" x="190" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="245" y="32">Kafka</text>
+  <rect class="box" x="360" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="415" y="32">Ingester</text>
+  <rect class="cache" x="530" y="10" width="140" height="34" rx="8"/><text class="t-c t-b" x="600" y="32">Replica of part p</text>
+  <rect class="db" x="730" y="10" width="140" height="34" rx="8"/><text class="t-c t-b" x="800" y="32">Checkpoint store</text>
+  <line class="life" x1="75" y1="44" x2="75" y2="320"/><line class="life" x1="245" y1="44" x2="245" y2="320"/><line class="life" x1="415" y1="44" x2="415" y2="320"/><line class="life" x1="600" y1="44" x2="600" y2="320"/><line class="life" x1="800" y1="44" x2="800" y2="320"/>
+  <path class="arrow" d="M75 70 L240 70"/><text class="t-sm" x="90" y="64">1. TweetCreated(id, text)</text>
+  <path class="arrow" d="M245 100 L410 100"/><text class="t-sm" x="258" y="94">2. consume</text>
+  <path class="arrow" d="M415 130 L415 150"/><text class="t-sm" x="425" y="146">3. tokenize, lang, spam score</text>
+  <path class="arrow" d="M415 180 L240 180"/><text class="t-sm" x="258" y="174">4. produce to-index[p]</text>
+  <path class="arrow" d="M245 210 L596 210"/><text class="t-sm" x="360" y="204">5. replica consumes (all 3 independently)</text>
+  <path class="arrow" d="M600 240 L600 260"/><text class="t-sm" x="610" y="256">6. append postings, publish doc</text>
+  <path class="arrow dash" d="M600 290 L796 290"/><text class="t-sm" x="615" y="284">7. periodic segment snapshot + offset</text>
+  <text class="t-sm" x="20" y="316">Searchable after step 6: typically 1 to 3 s from step 1.</text>
+</svg>
+<figcaption>Every replica applies the same ordered log to its own memory. Step 7 is what lets a restarted replica load a snapshot and replay only the tail of the log instead of the whole week.</figcaption>
+</figure>
+
+<h3>7.2 Read flow: a search</h3>
+<ol>
+<li>The gateway authenticates and rate-limits (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>). The key for the <b>result cache</b> is the normalized query plus sort, filters and a coarse locale; a hit returns in a few milliseconds. Queries that depend on the searcher's identity bypass or partition this cache.</li>
+<li>On a miss the <b>search root</b> parses the query into a tree (terms, phrases, filters), expands hashtags and normalizes language, and decides which tiers are needed. For a query with no date filter the real-time tier is tried first.</li>
+<li>The root <b>scatters</b> the query to one replica of each of the 16 real-time partitions, picked by least outstanding requests, with a hedged duplicate to another replica if the first has not answered by the 95th percentile latency (<a href="../chapters/40-resilience.html">Chapter 40</a>).</li>
+<li>Each partition intersects postings, applies filters and live-deleted flags, scores candidates with a cheap formula, and returns its best 50 (id plus score plus a few feature values). It stops early once enough candidates are found (section 8.4).</li>
+<li>The root <b>gathers</b> up to 16 times 50 = 800 candidates, merges, keeps the best 200, and sends them to the ranker for the full model (section 10). If the real-time tier returned fewer than the page needs, and the query allows older results, the root queries the archive tier too.</li>
+<li>The root <b>hydrates</b> the top 20 ids from the tweet cache and store, drops anything blocked or deleted, and returns the page with a cursor.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 920 360" role="img" aria-label="Sequence diagram of a search query with scatter gather">
+  <rect class="ext" x="20" y="10" width="100" height="34" rx="8"/><text class="t-c t-b" x="70" y="32">Client</text>
+  <rect class="box" x="170" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="225" y="32">Search root</text>
+  <rect class="cache" x="340" y="10" width="140" height="34" rx="8"/><text class="t-c t-b" x="410" y="32">16 partitions</text>
+  <rect class="box" x="540" y="10" width="100" height="34" rx="8"/><text class="t-c t-b" x="590" y="32">Ranker</text>
+  <rect class="db" x="700" y="10" width="120" height="34" rx="8"/><text class="t-c t-b" x="760" y="32">Tweet cache</text>
+  <line class="life" x1="70" y1="44" x2="70" y2="350"/><line class="life" x1="225" y1="44" x2="225" y2="350"/><line class="life" x1="410" y1="44" x2="410" y2="350"/><line class="life" x1="590" y1="44" x2="590" y2="350"/><line class="life" x1="760" y1="44" x2="760" y2="350"/>
+  <path class="arrow" d="M70 70 L220 70"/><text class="t-sm" x="85" y="64">1. GET /search?q=...</text>
+  <path class="arrow" d="M225 100 L225 118"/><text class="t-sm" x="235" y="114">2. parse, cache miss</text>
+  <path class="arrow" d="M225 146 L406 146"/><text class="t-sm" x="240" y="140">3. scatter (hedged after p95)</text>
+  <path class="arrow-g" d="M410 176 L229 176"/><text class="t-sm" x="240" y="170">4. 16 x top 50 (early stop)</text>
+  <path class="arrow" d="M225 206 L586 206"/><text class="t-sm" x="300" y="200">5. best 200 candidates</text>
+  <path class="arrow-g" d="M590 236 L229 236"/><text class="t-sm" x="300" y="230">6. reranked order</text>
+  <path class="arrow" d="M225 266 L756 266"/><text class="t-sm" x="420" y="260">7. hydrate top 20 ids</text>
+  <path class="arrow-g" d="M760 296 L229 296"/><text class="t-sm" x="420" y="290">8. tweet bodies, counts</text>
+  <path class="arrow-g" d="M225 330 L74 330"/><text class="t-sm" x="80" y="324">9. page + cursor</text>
+</svg>
+<figcaption>The budget is about 300 ms at p99: roughly 20 ms for the scatter step, 5 ms for merge, 30 ms for the ranker and 20 ms for hydration, leaving a deliberate margin for a slow partition and for hedging.</figcaption>
+</figure>
+
+<h2 id="deep-index">8. Deep dive 1: the real-time inverted index</h2>
+<p>This is the part an interviewer will press hardest: how can an index be written continuously by one thread and read by thousands of queries per second without locks and without stale reads? The classic Lucene model (many small immutable segments, a refresh that opens a new reader, background merges) gives near-real-time visibility in a second or more, but at our write rate the refresh and merge machinery costs a lot and adds latency jitter. A purpose-built design, in the spirit of the publicly described real-time index of Twitter's search system (Earlybird), exploits the special properties of tweets.</p>
+
+<h3>8.1 Single writer, many readers</h3>
+<p>Each partition replica has <b>one writer thread</b> that applies index messages in log order, and many reader threads that serve queries. Because there is exactly one writer, no write-write locking is required. Readers must never see a half-written document. The trick is a <b>publication barrier</b>: the writer fills in all of a document's data (postings, attributes), then, as the very last step, advances a single volatile integer, <code>maxPublishedDocId</code>. A reader reads that integer once at the start of the query and ignores any document id above it. Writes to memory before the volatile write become visible to a reader that sees the new value (this is the happens-before guarantee in the Java memory model, and the same idea exists with atomics and release/acquire ordering in C++ and Rust). So readers see a consistent snapshot of the index "up to document N" without taking any lock.</p>
+
+<h3>8.2 Postings that grow without reallocation</h3>
+<p>A postings list for <code>world</code> grows continuously. If it were a normal growable array, growing it would copy it, and a reader in the middle of the old copy would be confused. Instead the index uses <b>pooled, chained blocks</b>.</p>
+<ul>
+<li>A large <b>posting pool</b> of preallocated integer arrays is divided into slices. The first slice for a term holds, say, 4 postings. When it fills, a new slice of 8 is allocated from the pool and linked to the old one; then 16, 32, and so on up to a maximum slice size. Slices are never moved or freed during the segment's life.</li>
+<li>The term dictionary is a hash map from the term to a small record: pointer to the <i>last</i> slice, and a document count. New postings are appended at the head, so the list is ordered <b>newest to oldest</b> when walked from the pointer backward through the chain.</li>
+<li>Appending a posting writes the int into the current slice and then bumps the slice's length counter; as above, readers use the published doc id as the guard, so they never read past what has been published.</li>
+</ul>
+<p>Each posting packs the document id (as a local sequence number within the partition, not the full 64-bit tweet id) with the position of the term in the tweet and a few flag bits, into one 32-bit integer. Positions are needed to answer phrase queries such as <code>"world cup"</code>: the two terms must appear at adjacent positions in the same document. Tweets are at most 280 characters, so positions fit in a few bits.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 920 380" role="img" aria-label="Real-time index structure with term dictionary, chained posting slices and published doc id">
+  <text class="t-b" x="20" y="22">Term dictionary (hash map)</text>
+  <rect class="box" x="20" y="36" width="190" height="36" rx="6"/><text class="t-b" x="32" y="59">"world" -> tail ptr, df</text>
+  <rect class="box" x="20" y="80" width="190" height="36" rx="6"/><text class="t-b" x="32" y="103">"cup" -> tail ptr, df</text>
+  <rect class="box" x="20" y="124" width="190" height="36" rx="6"/><text class="t-b" x="32" y="147">"#final" -> tail ptr, df</text>
+  <text class="t-b" x="300" y="22">Posting pool: chained slices for "world" (newest first)</text>
+  <rect class="cache" x="300" y="36" width="120" height="44" rx="6"/><text class="t-c t-b" x="360" y="56">slice 3 (16)</text><text class="t-c t-sm" x="360" y="72">docs 9120 ... 9105</text>
+  <rect class="cache" x="470" y="36" width="110" height="44" rx="6"/><text class="t-c t-b" x="525" y="56">slice 2 (8)</text><text class="t-c t-sm" x="525" y="72">docs 9104 ... 9097</text>
+  <rect class="cache" x="630" y="36" width="100" height="44" rx="6"/><text class="t-c t-b" x="680" y="56">slice 1 (4)</text><text class="t-c t-sm" x="680" y="72">docs 9096 ... 9093</text>
+  <path class="arrow" d="M210 54 L296 58"/>
+  <path class="arrow" d="M420 58 L466 58"/><path class="arrow" d="M580 58 L626 58"/>
+  <text class="t-sm" x="300" y="100">Each slice is a fixed int[]; a full slice is never moved, a bigger one is chained in front.</text>
+  <text class="t-sm" x="300" y="118">A posting = local doc id + position + flags, packed in 32 bits.</text>
+
+  <text class="t-b" x="20" y="210">Document table (arrays indexed by local doc id)</text>
+  <rect class="db" x="20" y="224" width="880" height="44" rx="6"/>
+  <text class="t-sm" x="34" y="243">docId:   ... 9118   9119   9120</text>
+  <text class="t-sm" x="34" y="259">tweetId (64-bit), authorId, lang, flags, quality, likes, reposts (updated in place)</text>
+  <rect class="hit" x="20" y="290" width="440" height="44" rx="6"/><text class="t-b" x="32" y="310">maxPublishedDocId = 9120 (volatile, written last)</text><text class="t-sm" x="32" y="326">readers snapshot this once; docs above it are invisible</text>
+  <rect class="miss" x="500" y="290" width="400" height="44" rx="6"/><text class="t-b" x="512" y="310">doc 9121: being written, not yet visible</text><text class="t-sm" x="512" y="326">writer fills slices, then advances the pointer</text>
+  <path class="arrow dash" d="M240 290 L240 270"/>
+</svg>
+<figcaption>Dictionary entries point at the newest slice of each list; slices chain backward to older postings. A reader walks a list from the newest entry down, and ignores any id above maxPublishedDocId, so it never sees a half-built document.</figcaption>
+</figure>
+
+<h3>8.3 Mutable fields without re-indexing</h3>
+<p>Likes and reposts change every second, far faster than postings should be rewritten. They live in the <b>document table</b>, a set of parallel arrays (one array per field) indexed by local doc id. An <code>EngagementDelta</code> event updates the counter in place with an atomic write. Ranking reads the counter at query time. Because counters are separate from postings, a viral tweet costs the same index work as a quiet one. Engagement events are batched: the stream aggregates deltas per tweet for about a second, so a tweet receiving 10,000 likes per second produces one update per second, not 10,000.</p>
+<p><b>Deletes</b> are a bit in the flags array plus a tombstone event. The posting entries stay in place (removing them would require locking the chain), but the query path checks the flag for each candidate and skips deleted documents. A background compaction (when the segment is sealed) drops them permanently. Account suspension and privacy changes use the same mechanism, applied by author id through a small "blocked authors" set checked at query time.</p>
+
+<h3>8.4 Query evaluation and early termination</h3>
+<p>For <code>world cup</code>, the engine walks both lists from newest backward, doing a merge-style intersection (advance whichever list has the larger doc id until both point at the same id). Each match is checked against filters (language, flags), scored with the cheap formula, and added to a bounded min-heap of size 50. <b>For "Latest"</b> sort, the first 50 matches are the answer, so the walk stops almost immediately: cost is proportional to the page size, not to the length of the lists. <b>For "Top"</b> sort the engine must look at more candidates, but it scans only a time budget or a candidate budget (for example, the newest 100,000 matching documents or 20 ms, whichever comes first) because older documents are rarely top-ranked and engagement takes time to accumulate. A phrase query adds a position check on matches. For very common single terms, a list holds millions of entries per partition, but early termination keeps the cost constant. Rare terms have short lists and are cheap anyway; the expensive case is a conjunction of two common terms that rarely co-occur, and the time budget bounds it.</p>
+
+<h3>8.5 Segments, sealing and recovery</h3>
+<p>A partition does not keep one giant structure. It is divided into <b>segments</b> of about 16 million documents each (about 3 hours of a partition's traffic at 1,250 tweets per second, rounded). Only the newest segment is writable. When it fills, it is <b>sealed</b>: a background thread converts it into an optimized read-only form (sorted dictionary, delta-encoded and bit-packed postings, deleted documents removed) and uploads the snapshot to object storage. The old, chained structure is then discarded. Sealed segments are much smaller (the 4-byte postings drop to about 2 to 2.5 bytes) and faster to scan. A segment older than 7 days is dropped from the real-time tier because the archive already has it.</p>
+<p>On restart a replica downloads the newest sealed segments from object storage (or a sibling replica), restores the partial segment from the last checkpoint, and then <b>replays the Kafka tail from the checkpointed offset</b>. A node with 19 GB of index can be back in a few minutes, rather than replaying a week of events. See <a href="../chapters/41-ha-dr.html">Chapter 41</a> for recovery principles.</p>
+
+<h2 id="deep-tiers">9. Deep dive 2: tiers and partitioning</h2>
+<p>We have two decisions: how to split the data across machines (partitioning), and how to split by age (tiering). They are independent axes.</p>
+<h3>9.1 Document partitioning versus term partitioning</h3>
+<p>A search index can be split two ways. In <b>document partitioning</b> (also called local indexing) each partition holds a complete inverted index for a subset of documents. A query is sent to all partitions, and each answers over its own documents. In <b>term partitioning</b> (global indexing) each partition holds the postings lists for a subset of terms, across all documents. A query goes only to the partitions owning its terms.</p>
+<table>
+<tr><th>Aspect</th><th>Document partitioning</th><th>Term partitioning</th></tr>
+<tr><td>Query fan-out</td><td>All partitions (16 here)</td><td>Only partitions owning the query terms (1 to 3)</td></tr>
+<tr><td>Work per partition</td><td>Small: short local lists, early termination works</td><td>Large: a hot term's whole list lives on one machine</td></tr>
+<tr><td>Intersection</td><td>Local, in memory</td><td>Must ship long lists between machines, or intersect on the root</td></tr>
+<tr><td>Write cost for one tweet</td><td>One partition (the tweet's)</td><td>Up to 15 partitions (one per term): 15 network writes and 15 failure points</td></tr>
+<tr><td>Hot spots</td><td>Even by construction (hash of id)</td><td>Severe: "the", "world cup" or a hashtag during an event all hit one node</td></tr>
+<tr><td>Failure of one partition</td><td>Lose 1/16 of the documents; answer is still good</td><td>Lose all documents for the terms it owned; queries on them fail</td></tr>
+<tr><td>Tail latency</td><td>Slowest of 16 (mitigated by hedging)</td><td>Fewer calls, but heavier ones</td></tr>
+</table>
+<p><b>Decision: document partitioning by hash of tweet id.</b> The write path touches one partition, hot terms are spread evenly, and early termination over newest-first lists is local and cheap. The cost is that every query fans out to all 16 partitions, which is why we keep partition counts low (16 rather than 256) and use hedged requests. A larger partition count would multiply the per-query overhead, and the data does not need it (each partition is 19 GB). See <a href="../chapters/25-sharding.html">Chapter 25</a> for partitioning strategies in general.</p>
+<p>A variation that some systems use is partitioning by <b>time</b> within the real-time tier: one cluster per day. Queries for the newest content then touch fewer machines, but a "Top" query across a week must query seven clusters, and the newest cluster takes the entire write load, which creates a hot spot. We combine the two: partition by hash, and inside each partition order segments by time, so recency optimization happens locally.</p>
+
+<h3>9.2 The tiers</h3>
+<table>
+<tr><th>Tier</th><th>Covers</th><th>Structure</th><th>Latency</th><th>Cost</th></tr>
+<tr><td>Real-time</td><td>Last 7 days, about 3.5 billion tweets</td><td>In-memory, chained slices plus sealed compact segments, 16 partitions times 3 replicas</td><td>p99 under 100 ms</td><td>Highest per tweet (RAM), but small: about 300 GB</td></tr>
+<tr><td>Archive</td><td>Everything older, about 10 TB per year</td><td>Immutable compressed segments on SSD, built in batch from the tweet store, partitioned by time range then by id hash, 2 replicas</td><td>200 ms to 2 s</td><td>Low per tweet (SSD, 2.5 bytes per posting)</td></tr>
+<tr><td>Cold backup</td><td>All segments as files</td><td>Object storage</td><td>Rebuild only</td><td>Cheapest</td></tr>
+</table>
+
+<figure class="diagram">
+<svg viewBox="0 0 920 330" role="img" aria-label="Tiered index by tweet age and which queries reach each tier">
+  <text class="t-b" x="20" y="22">Time axis (tweet age)</text>
+  <line x1="40" y1="60" x2="880" y2="60" stroke="var(--fg)" stroke-width="2" marker-end="url(#ah)"/>
+  <text class="t-sm" x="40" y="80">now</text><text class="t-sm" x="190" y="80">7 days</text><text class="t-sm" x="400" y="80">1 year</text><text class="t-sm" x="690" y="80">5+ years</text>
+  <rect class="cache" x="40" y="100" width="150" height="70" rx="8"/><text class="t-c t-b" x="115" y="124">Real-time tier</text><text class="t-c t-sm" x="115" y="142">RAM, 300 GB</text><text class="t-c t-sm" x="115" y="158">48 nodes, p99 100 ms</text>
+  <rect class="db" x="200" y="100" width="420" height="70" rx="8"/><text class="t-c t-b" x="410" y="124">Archive tier (SSD)</text><text class="t-c t-sm" x="410" y="142">compressed immutable segments, time-ranged, about 10 TB per year</text><text class="t-c t-sm" x="410" y="158">queried only if needed, p99 under 2 s</text>
+  <rect class="ext" x="630" y="100" width="250" height="70" rx="8"/><text class="t-c t-b" x="755" y="124">Deep archive</text><text class="t-c t-sm" x="755" y="142">fewer replicas, lower SLO, or</text><text class="t-c t-sm" x="755" y="158">query on explicit date filter only</text>
+  <text class="t-b" x="20" y="215">Which tier does a query hit?</text>
+  <rect class="hit" x="20" y="228" width="270" height="80" rx="8"/><text class="t-b" x="32" y="250">No date filter, enough hits</text><text class="t-sm" x="32" y="270">Real-time tier alone: about 95 percent</text><text class="t-sm" x="32" y="288">of queries (assumed).</text>
+  <rect class="cache" x="320" y="228" width="270" height="80" rx="8"/><text class="t-b" x="332" y="250">Too few hits, or sparse term</text><text class="t-sm" x="332" y="270">Fall through to archive in parallel after</text><text class="t-sm" x="332" y="288">a short wait; merge both lists.</text>
+  <rect class="miss" x="620" y="228" width="280" height="80" rx="8"/><text class="t-b" x="632" y="250">Date filter older than 7 days</text><text class="t-sm" x="632" y="270">Skip real-time; go straight to the</text><text class="t-sm" x="632" y="288">archive segments in that date range.</text>
+</svg>
+<figcaption>Because tweet ids are time-ordered, deciding the tier is a range check on the id. Most queries never touch the archive, which is why it can be slower and cheaper.</figcaption>
+</figure>
+
+<p>Moving a tweet from tier to tier is automatic: a batch job (<a href="../chapters/37-batch-stream.html">Chapter 37</a>) reads one day of tweets from the tweet store once it is, say, 6 days old, builds the archive segment (full sort and compression, offline, with whole-corpus statistics available for better ranking features), and publishes it. At day 7 the real-time partitions drop that day. During the overlap both tiers contain the day, and the root deduplicates by tweet id. The batch build can also fold in final engagement counts, spam decisions and deletions, so the archive is cleaner than the real-time index.</p>
+
+<h2 id="deep-ranking">10. Deep dive 3: ranking</h2>
+<p>Ranking in search is a funnel: cheap scoring over many documents, expensive scoring over few. Doing it in two stages is the only way to get a machine-learned model over a corpus this size within 300 ms.</p>
+<h3>10.1 Stage one: retrieval scoring inside each partition</h3>
+<p>Each partition computes a linear score on features that can be read directly from the document table: recency (decay by age), a log of likes and reposts (with a floor for new tweets), author quality, whether the tweet has media, language match with the searcher, and a spam penalty. The formula is simple, for example <code>score = w1*log(1+likes) + w2*log(1+reposts) + w3*quality + w4*recencyDecay - w5*spam</code>, with weights tuned offline. Its job is not to be perfect but to avoid dropping the eventual winners: we keep 50 per partition, 800 in total.</p>
+<h3>10.2 Stage two: the rerank service</h3>
+<p>The root sends the best 200 to a ranker running a gradient-boosted tree or small neural model. It uses richer features, some personalized: whether the searcher follows the author, mutual connections, the tweet's engagement velocity (likes in the last 10 minutes, a strong sign of interest), text match quality (term proximity, whether the phrase matches exactly), and a predicted probability of a click or like. Features are fetched in one batch from a feature store keyed by tweet id and user id. The model returns a sorted list; the root keeps the top 20 for the page and caches the rest for the next page, so scrolling is cheap.</p>
+<h3>10.3 Latest versus Top, and diversity</h3>
+<p>"Latest" skips the ranker entirely: merge by tweet id descending. "Top" applies the model but also a <b>diversity pass</b> so one author or one retweet storm does not fill the page: cap results per author and collapse near-duplicates (same text, or quote-tweets of the same source) using a hash of normalized text. Safety filters run after ranking, to avoid ranking something that would be removed.</p>
+<h3>10.4 Comparing the options</h3>
+<table>
+<tr><th>Option</th><th>Strength</th><th>Weakness</th><th>Verdict</th></tr>
+<tr><td>BM25 only (text relevance)</td><td>Simple, no training data</td><td>Tweets are too short for term-frequency statistics to mean much; ignores popularity and spam</td><td>Use as a feature, not as the ranker</td></tr>
+<tr><td>Hand-tuned linear score only</td><td>Cheap, explainable, runs in every partition</td><td>Cannot capture feature interactions or personalization</td><td>Use as stage one</td></tr>
+<tr><td>ML model on every candidate</td><td>Best quality</td><td>Millions of candidates times model cost is impossible in 300 ms</td><td>Reject</td></tr>
+<tr><td>Two-stage funnel (cheap then ML on 200)</td><td>Quality close to the full model at bounded cost</td><td>Stage one can drop a good candidate; extra hop</td><td><b>Chosen</b>; mitigate by tuning stage-one recall offline</td></tr>
+</table>
+
+<h2 id="deep-trending">11. Deep dive 4: trending topics with windows, Count-Min Sketch and top-K</h2>
+<h3>11.1 What "trending" means</h3>
+<p>A term is trending when its recent rate is high <i>relative to what is normal for it</i>. The word "good" is mentioned a million times an hour and never trends; a new hashtag going from 20 mentions per hour to 20,000 does. So we need two numbers per term: a count in the current window, and a baseline. We also need this for tens of millions of distinct terms at 60,000 events per second at peak, where an exact hash map per term would hold hundreds of millions of keys, most seen once (the long tail).</p>
+<h3>11.2 Candidate extraction</h3>
+<p>The term extractor emits events for: hashtags, @mentions of high-profile accounts, named entities, and frequent n-grams (two and three word phrases), plus a location (country, region, city when available). About 3 candidate terms per tweet gives 17,400 events per second on average and 60,000 at peak, as in the estimate. Events are partitioned by <code>hash(term)</code>, so all events for one term reach the same worker. That is what makes per-term counting correct without cross-worker merging.</p>
+<h3>11.3 Windows</h3>
+<p>Counts are kept in <b>tumbling buckets of 5 minutes</b> (bucket sizes of 1 minute would be even smoother but cost 5 times more memory). The "current window" is a sliding combination of the last k buckets, for example the last 3 buckets (15 minutes). Because buckets are additive, the sliding window is just the sum of its buckets; sliding forward is dropping the oldest bucket and starting a new one, with no per-event expiry. The baseline is the average of the same term over the previous 24 hours (and, for periodic topics such as morning news, the same hour yesterday and last week). Each worker keeps 288 buckets (24 hours) per sketch.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 920 300" role="img" aria-label="Five-minute bucket windows used for trending with current window and baseline">
+  <text class="t-b" x="20" y="22">One sketch per 5-minute bucket; windows are sums of buckets</text>
+  <rect class="box" x="30" y="40" width="60" height="44" rx="4"/><text class="t-c t-sm" x="60" y="66">b-12</text>
+  <rect class="box" x="96" y="40" width="60" height="44" rx="4"/><text class="t-c t-sm" x="126" y="66">b-11</text>
+  <rect class="box" x="162" y="40" width="60" height="44" rx="4"/><text class="t-c t-sm" x="192" y="66">b-10</text>
+  <rect class="box" x="228" y="40" width="60" height="44" rx="4"/><text class="t-c t-sm" x="258" y="66">b-9</text>
+  <rect class="box" x="294" y="40" width="60" height="44" rx="4"/><text class="t-c t-sm" x="324" y="66">b-8</text>
+  <rect class="box" x="360" y="40" width="60" height="44" rx="4"/><text class="t-c t-sm" x="390" y="66">b-7</text>
+  <rect class="box" x="426" y="40" width="60" height="44" rx="4"/><text class="t-c t-sm" x="456" y="66">b-6</text>
+  <rect class="box" x="492" y="40" width="60" height="44" rx="4"/><text class="t-c t-sm" x="522" y="66">b-5</text>
+  <rect class="box" x="558" y="40" width="60" height="44" rx="4"/><text class="t-c t-sm" x="588" y="66">b-4</text>
+  <rect class="box" x="624" y="40" width="60" height="44" rx="4"/><text class="t-c t-sm" x="654" y="66">b-3</text>
+  <rect class="hit" x="690" y="40" width="60" height="44" rx="4"/><text class="t-c t-sm" x="720" y="66">b-2</text>
+  <rect class="hit" x="756" y="40" width="60" height="44" rx="4"/><text class="t-c t-sm" x="786" y="66">b-1</text>
+  <rect class="cache" x="822" y="40" width="70" height="44" rx="4"/><text class="t-c t-sm" x="857" y="66">b0 open</text>
+  <path class="arrow" d="M30 130 L890 130"/>
+  <text class="t-sm" x="30" y="150">older</text><text class="t-sm" x="840" y="150">newer</text>
+  <rect class="miss" x="30" y="170" width="540" height="40" rx="6"/><text class="t-b" x="42" y="195">Baseline: average per-bucket rate over earlier buckets (up to 24 h)</text>
+  <rect class="hit" x="690" y="170" width="202" height="40" rx="6"/><text class="t-b" x="702" y="195">Current: b-2, b-1, b0</text>
+  <text class="t-b" x="30" y="245">surge = (current_rate + a) / (baseline_rate + a),  a = smoothing, e.g. 10 events per bucket</text>
+  <text class="t-sm" x="30" y="268">Trending requires surge above a threshold AND current volume above a floor AND enough distinct authors.</text>
+  <text class="t-sm" x="30" y="288">When a bucket closes, its sketch is frozen, checkpointed to object storage, and a fresh empty sketch opens.</text>
+</svg>
+<figcaption>Buckets are additive, so sliding a window is free: sum the newest buckets for the current rate and the older buckets for the baseline. The smoothing constant a stops a term seen 2 times versus 0 times from looking like an infinite surge.</figcaption>
+</figure>
+
+<h3>11.4 Count-Min Sketch</h3>
+<p>A <b>Count-Min Sketch</b> (CMS, see <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>) estimates how many times each key was seen, using fixed memory regardless of the number of distinct keys. It is a grid of counters with d rows and w columns, and d independent hash functions, one per row. To <b>add</b> a term, compute its d hashes and increment one counter in each row. To <b>estimate</b> a term, read its d counters and take the <b>minimum</b>. Counters can only be over-counted (other terms collide into the same cell), never under-counted, and the minimum across rows is the least contaminated one. So the estimate is never below the true count and is above it by a bounded amount.</p>
+<p>The guarantee: choose <code>w = ceil(e / epsilon)</code> and <code>d = ceil(ln(1 / delta))</code>. Then, with probability at least 1 minus delta, the estimate exceeds the truth by at most epsilon times N, where N is the total number of events added to the sketch.</p>
+<p>Worked example for our parameters. Partitioning by term over 8 workers, each worker sees 18 million divided by 8 = 2.25 million events per 5-minute bucket at peak. We choose w = 65,536 columns and d = 4 rows. Then epsilon = e / 65,536 = 4.1 times 10 to the minus 5, so the over-count is at most 4.1e-5 times 2.25 million, about <b>93 events</b>, with probability 1 minus e to the minus 4, about <b>98.2 percent</b>. Memory: 65,536 times 4 times 4-byte counters = 1 MB per bucket. The 288 buckets of a day are 288 MB per worker, which is why we can keep full history in RAM. In practice the typical error is much lower than the bound, because most counters are lightly loaded. A term that really trends has thousands of events per bucket, so 93 is noise (under 2 percent at 5,000 events), while a term with true count 3 may read as up to 96, which is why we also require a minimum floor and check against the heap, below.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 310" role="img" aria-label="Count-Min Sketch with four rows, add and estimate operations">
+  <text class="t-b" x="20" y="22">CMS: d = 4 rows, w = 65,536 columns (shown narrow)</text>
+  <rect class="cache" x="40" y="40" width="440" height="30" rx="4"/><text class="t-sm" x="46" y="60">row 1  h1("#final")=7:  [ 3 | 0 | 12 | ... | 41 | ... ]</text>
+  <rect class="cache" x="40" y="76" width="440" height="30" rx="4"/><text class="t-sm" x="46" y="96">row 2  h2("#final")=2:  [ 9 | 4 | 17 | ... | 5 | ... ]</text>
+  <rect class="cache" x="40" y="112" width="440" height="30" rx="4"/><text class="t-sm" x="46" y="132">row 3  h3("#final")=5:  [ 0 | 33 | 6 | ... | 28 | ... ]</text>
+  <rect class="cache" x="40" y="148" width="440" height="30" rx="4"/><text class="t-sm" x="46" y="168">row 4  h4("#final")=1:  [ 2 | 1 | 55 | ... | 14 | ... ]</text>
+  <text class="t-b" x="520" y="52">add(x):</text><text class="t-sm" x="520" y="70">for each row i: counter[i][hi(x)] += 1</text>
+  <text class="t-b" x="520" y="102">estimate(x):</text><text class="t-sm" x="520" y="120">min over rows of counter[i][hi(x)]</text>
+  <text class="t-sm" x="520" y="138">e.g. read 41, 5, 28, 14 -> estimate 5</text>
+  <text class="t-sm" x="520" y="156">(true count is at most 5, never below it)</text>
+  <rect class="box" x="40" y="205" width="260" height="85" rx="8"/><text class="t-b" x="52" y="227">Properties</text><text class="t-sm" x="52" y="246">Never under-counts</text><text class="t-sm" x="52" y="262">Fixed memory, O(d) per op</text><text class="t-sm" x="52" y="278">Mergeable: add the grids</text>
+  <rect class="miss" x="330" y="205" width="260" height="85" rx="8"/><text class="t-b" x="342" y="227">Limits</text><text class="t-sm" x="342" y="246">Cannot list its keys</text><text class="t-sm" x="342" y="262">Over-counts by up to eps*N</text><text class="t-sm" x="342" y="278">Cannot delete old events</text>
+  <rect class="hit" x="620" y="205" width="270" height="85" rx="8"/><text class="t-b" x="632" y="227">So we add</text><text class="t-sm" x="632" y="246">A top-K heap for the keys</text><text class="t-sm" x="632" y="262">Bucket per 5 min (expiry by drop)</text><text class="t-sm" x="632" y="278">HLL for distinct authors</text>
+</svg>
+<figcaption>The sketch answers "how many times was this key seen" but cannot say which keys exist. It is paired with a small heap that remembers candidate heavy hitters.</figcaption>
+</figure>
+
+<h3>11.5 From counts to a top-K list</h3>
+<p>A sketch alone cannot produce a list of the top terms because it does not store keys. The standard companion is a <b>min-heap of size K</b> (K around 1,000 per worker) plus a map from term to its current estimate. For each incoming event: increment the sketch, read the new estimate, and if the term is already in the heap update its value; otherwise, if the estimate beats the heap's minimum, replace the minimum. The heap then holds the K terms with the highest estimated counts in this bucket. This is the pattern in <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>. An alternative that needs no separate sketch is the <b>Space-Saving</b> algorithm (or Misra-Gries), which keeps K counters directly and, when a new key arrives and the table is full, evicts the smallest counter and reuses it with the evicted count plus one, so errors are bounded by the smallest count.</p>
+<p>At the end of each minute, every worker computes for each heap candidate the current-window count (sum of the newest buckets' estimates) and the baseline, computes the surge score, and emits its top 100 by score. A coordinator merges the 8 workers' lists (terms are partitioned by hash, so each term appears in one list only), applies filters, and writes the top 20 per place to Redis.</p>
+<table>
+<tr><th>Approach</th><th>Memory</th><th>Accuracy</th><th>Complexity</th><th>Verdict</th></tr>
+<tr><td>Exact hash map per window</td><td>Hundreds of millions of keys times about 50 bytes, tens of GB per worker per bucket, times 288 buckets</td><td>Exact</td><td>Simple, but long-tail keys dominate memory</td><td>Only for the top candidates, not all terms</td></tr>
+<tr><td>Count-Min Sketch plus top-K heap</td><td>1 MB per bucket per worker, plus a heap of 1,000 entries</td><td>Over-count at most about 93 events at 98 percent confidence</td><td>Small, mergeable, bucket expiry by dropping</td><td><b>Chosen</b></td></tr>
+<tr><td>Space-Saving (K counters)</td><td>K entries per bucket</td><td>Exact for true heavy hitters; error bounded by the smallest counter</td><td>Slightly more complex eviction logic, but no hashing grid</td><td>Valid alternative; fine when the baseline for non-top terms is not needed</td></tr>
+<tr><td>Batch SQL GROUP BY every few minutes</td><td>Disk scans</td><td>Exact</td><td>Simple, but minutes of lag and heavy load</td><td>Use only for offline analysis and backfill</td></tr>
+</table>
+<p>A subtlety: the baseline for a candidate needs its count in past buckets, which is exactly a sketch lookup: <code>estimate(term)</code> in each of the older buckets' sketches. The sketches thus double as the history. Because every estimate over-counts, a rare term's baseline may be inflated by 93 per bucket, which would hide a genuine surge from 3 to 500. The smoothing constant and the minimum volume floor (say 1,000 events in the current window) address that: a term must have clearly large volume before the error matters.</p>
+
+<h3>11.6 Quality: spam, distinct authors, and safety</h3>
+<p>Raw counts are trivially gamed: a botnet posting the same hashtag 100,000 times would trend. Defences, in the order applied:</p>
+<ol>
+<li><b>Count distinct users, not events.</b> A per-term <b>HyperLogLog</b> (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>, about 1.5 KB for 2 percent error) of author ids is kept for each heap candidate. A term needs a minimum number of distinct authors (say 500 in the window) and a ratio of distinct authors to events not far below that of normal terms.</li>
+<li><b>Discount low-quality authors.</b> Each event is weighted by the author's quality score (new accounts, accounts flagged as automated count as a small fraction).</li>
+<li><b>Dedupe near-identical terms</b> (<code>#WorldCup</code>, <code>World Cup</code>, <code>#worldcup2026</code>) into one cluster, showing the highest-volume variant.</li>
+<li><b>Safety and policy filters:</b> blocklists, classifier scores on the tweets mentioning the term, and a human review queue for the top few slots in sensitive categories.</li>
+<li><b>Hysteresis:</b> a term enters the list after exceeding a high threshold for 2 consecutive minutes and leaves only after dropping below a lower threshold for several minutes, to avoid flapping.</li>
+</ol>
+<p>Finally, <b>per-place lists</b>. Each event carries the author's location (country, region, city when known). The worker counts keys of the form <code>(place, term)</code> for each level, so a term can trend in Brazil without trending globally. This multiplies keys by about 3 (city, country, global), still comfortably inside the sketch's capacity because the sketch memory does not depend on the key count, only the error depends on N.</p>
+
+<h2 id="scaling">12. Scaling, bottlenecks and hot spots</h2>
+<ul>
+<li><b>Query fan-out and tail latency.</b> A query is as slow as the slowest of 16 partitions. If each partition is slower than 100 ms one time in 100, a query sees at least one slow partition about 15 percent of the time (1 minus 0.99 to the 16th power). Mitigations: hedged requests after the p95 latency, a per-partition timeout (about 120 ms) after which the root proceeds with partial results (flagging <code>partial: true</code>), load-aware replica choice, and keeping garbage collection pauses off the query path (preallocated pools and arrays help here). See <a href="../chapters/40-resilience.html">Chapter 40</a>.</li>
+<li><b>Hot queries.</b> During a major event, a single query such as the event's hashtag can be 5 percent of all search traffic. The result cache with short TTL absorbs most of it, with request coalescing (one backend call for N identical concurrent requests) so a cache expiry does not cause a stampede (<a href="../chapters/14-caching-failures.html">Chapter 14</a>). We can also precompute and warm results for the current trending terms every few seconds.</li>
+<li><b>Hot writes.</b> A tweet spike raises ingest to several times average. Kafka buffers; each partition's single writer has headroom (1,250 per second against a capacity of tens of thousands per second for pure appends). If lag grows past 10 seconds we alert, and if it grows further we shed the least valuable work first: skip stage-two enrichment (quality scoring is deferred), and only if needed throttle indexing of low-quality-author tweets. Search keeps serving the older state.</li>
+<li><b>Viral tweets.</b> Engagement events for one tweet can reach thousands per second. They are pre-aggregated per tweet in the stream for 1 second (section 8.3), so the index sees one update per tweet per second.</li>
+<li><b>Hydration.</b> Fetching 20 tweet bodies for every query at 21,000 queries per second is 420,000 reads per second. A tweet cache (<a href="../chapters/14-caching-failures.html">Chapter 14</a>) keyed by tweet id has a hit rate above 95 percent because the same recent tweets are shown repeatedly, leaving about 21,000 reads per second for the store.</li>
+<li><b>Rebalancing.</b> To go from 16 to 32 partitions, the new layout is built as a parallel set (new Kafka topic with 32 partitions, new nodes loading from the tweet store in id order), and traffic is switched when it has caught up. Because the real-time tier holds only 7 days, this is fast: a week of data replayed in hours. This is a major reason to keep the hot tier short.</li>
+<li><b>Replicas serve reads only.</b> All three replicas ingest independently, so adding a replica is just provisioning a node, loading a snapshot and replaying the tail, with no coordination with the others.</li>
+</ul>
+
+<h2 id="failures">13. Failure modes, consistency and idempotency</h2>
+<table>
+<tr><th>Component</th><th>Failure</th><th>Effect</th><th>Mitigation</th></tr>
+<tr><td>Index replica crash</td><td>One of 3 replicas of a partition dies</td><td>Capacity drops by a third for that partition; no data loss</td><td>Replicas are independent; load balancing skips it; replacement loads snapshot plus replays the Kafka tail (minutes). Provisioned headroom (45 percent utilization) absorbs the loss.</td></tr>
+<tr><td>Whole partition down</td><td>All 3 replicas of partition p unavailable</td><td>Results miss 1/16 of recent tweets</td><td>Root returns partial results with the flag; alert; restore from snapshots. Not an outage.</td></tr>
+<tr><td>Slow replica (GC pause, noisy neighbor)</td><td>Tail latency up</td><td>Whole query slow</td><td>Hedging, timeouts, outlier ejection from the load balancer (<a href="../chapters/09-load-balancing.html">Chapter 9</a>).</td></tr>
+<tr><td>Kafka broker or lag</td><td>Events delayed</td><td>Freshness degrades from seconds to minutes; search and trends are stale but correct</td><td>Replication factor 3, producer retries with acks=all, lag alerts, and the tweet store is the fallback source for a rebuild (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>).</td></tr>
+<tr><td>Ingester crash or bug</td><td>Tokenizer emits wrong terms</td><td>Bad postings written to a whole class of tweets</td><td>Consumer offsets are committed after the output is produced (at-least-once); version the analyzer; fix and replay the affected range into new segments. Index messages are idempotent.</td></tr>
+<tr><td>Duplicate delivery</td><td>An index message is applied twice</td><td>Duplicate documents in results</td><td>Index apply is idempotent by tweet id: the replica keeps a per-partition map or Bloom filter of recent ids and ignores a repeat (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>).</td></tr>
+<tr><td>Out-of-order events</td><td>Delete arrives before create, or engagement before create</td><td>Delete lost, or counter lost</td><td>All events for one tweet share a Kafka partition key (so they are ordered); a tombstone for an unknown id is kept for an hour and applied when the create arrives.</td></tr>
+<tr><td>Archive build failure</td><td>The nightly segment for day X is not ready at day 7</td><td>A gap in search for day X</td><td>Real-time tier keeps day X until the archive segment is verified (checksum plus document count equals the tweet store count). Never drop before verifying.</td></tr>
+<tr><td>Ranker down or slow</td><td>No stage-two model</td><td>Lower relevance only</td><td>Timeout 40 ms; fall back to stage-one order (circuit breaker, <a href="../chapters/51-microservice-resilience.html">Chapter 51</a>).</td></tr>
+<tr><td>Stream worker crash (trending)</td><td>Loses in-memory sketches</td><td>Trends for that term hash range are wrong until recovered</td><td>Checkpoint closed buckets to object storage; replay the last 15 minutes from Kafka from the last checkpoint offset; the other 7 workers are unaffected. Serve the last good trend list meanwhile.</td></tr>
+<tr><td>Wrong data</td><td>A manipulated or offensive term trends</td><td>Reputation damage</td><td>Quality filters (section 11.6), a kill switch to remove a term from the list within seconds, and human review for the top slots.</td></tr>
+</table>
+<p><b>Consistency decisions.</b> Search is eventually consistent. The system makes only two stronger promises. First, deletes: the tombstone path is prioritized (separate small topic, processed first), so a deleted tweet disappears from every replica within about a minute, and at read time the root double-checks hydrated tweets against the tweet store (a hydrated tweet that comes back "deleted" is dropped), making the user-visible guarantee stronger than the index's. Second, a user's own just-posted tweet: the client merges its locally known new tweets into the first page of its own search, so it appears even if the index is a few seconds behind (see <a href="../chapters/28-cap-consistency.html">Chapter 28</a> on read-your-writes).</p>
+<p><b>Multi-region.</b> Tweets are global, but queries are mostly regional. The simplest robust layout is a <b>complete index copy per region</b>: each region consumes the same Kafka stream (mirrored across regions, <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>) and builds its own 48-node real-time tier. Reads stay local and a region failure is handled by routing users to another region (<a href="../chapters/41-ha-dr.html">Chapter 41</a>). The cost is multiplying hardware by the number of regions, which is acceptable because the hot tier is small (300 GB); the archive can be shared by two or three regions. Trends are computed per region from the regional stream and also globally.</p>
+
+<h2 id="security-ops">14. Security, abuse, monitoring and cost</h2>
+<h3>14.1 Security and abuse</h3>
+<ul>
+<li><b>Scraping and bulk extraction.</b> Search is a tempting scraping target. Per-user and per-IP rate limits (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>), cost-based limits (deep pagination counts more), and bot detection at the gateway (<a href="../chapters/55-security.html">Chapter 55</a>).</li>
+<li><b>Query abuse.</b> Wildcards and huge boolean expressions can make one query expensive. Limit term count, forbid leading wildcards, and enforce the per-partition time budget.</li>
+<li><b>Visibility rules.</b> Protected accounts, blocked and muted authors, and age-restricted content are enforced at read time using the searcher's context (filters applied after ranking, before hydration returns). Index-time exclusion handles only global rules such as suspended accounts.</li>
+<li><b>Spam and manipulation of search.</b> Keyword stuffing and mass-hashtag spam are detected in the ingester (a spam score stored per document) and penalized in stage-one ranking, not removed from the index, which allows fast policy changes by changing weights.</li>
+<li><b>Privacy.</b> Deletion requests and account erasure must propagate to the index and to the archive (a tombstone list applied during segment builds and a periodic purge), see <a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>.</li>
+</ul>
+<h3>14.2 Monitoring and SLOs</h3>
+<table>
+<tr><th>SLI</th><th>Target</th><th>Alert when</th></tr>
+<tr><td>Index freshness (tweet create to searchable, p99)</td><td>Under 10 s</td><td>Above 30 s for 5 minutes, or consumer lag above 50,000 messages</td></tr>
+<tr><td>Search latency (server-side p50 / p99)</td><td>100 ms / 300 ms</td><td>p99 above 500 ms for 5 minutes</td></tr>
+<tr><td>Partial-result rate</td><td>Under 0.5 percent of queries</td><td>Above 2 percent</td></tr>
+<tr><td>Search availability (non-error responses)</td><td>99.95 percent</td><td>Burn rate on the error budget (<a href="../chapters/54-observability-slos.html">Chapter 54</a>)</td></tr>
+<tr><td>Trend freshness</td><td>List updated every 60 s; age under 3 minutes</td><td>Age above 5 minutes</td></tr>
+<tr><td>Trend quality</td><td>Spam-flagged terms shown: zero</td><td>Any term removed by kill switch triggers a postmortem</td></tr>
+<tr><td>Relevance (offline)</td><td>NDCG on judged queries stable</td><td>Drop of more than 2 percent after a model or weight change</td></tr>
+</table>
+<p>Besides these, record per-partition doc counts across replicas (replicas should agree within about 0.01 percent; divergence signals a lost message or a bug), memory pool occupancy, segment seal times, and canary queries run every few seconds against each partition (a known test tweet is posted periodically, and the time until it is found is the direct freshness measurement).</p>
+<h3>14.3 Cost notes</h3>
+<ul>
+<li>The real-time tier is the expensive part per byte, but it is small: 48 machines for one region. The archive is large but cheap per byte on SSD.</li>
+<li>CPU for the ingester (language detection, tokenization, models) is the largest compute cost of the write path; doing it once per tweet instead of per replica saves two thirds of it.</li>
+<li>The result cache and the tweet cache are the cheapest way to cut cost: a 40 percent hit rate on search saves 40 percent of the 48-node tier's CPU at peak.</li>
+<li>Multi-region multiplies the real-time tier cost by the number of regions; share the archive.</li>
+<li>Trending is nearly free by comparison: 8 workers with under 1 GB of sketches each, because probabilistic structures have fixed memory.</li>
+</ul>
+
+<h2 id="evolution">15. Evolution, phasing and alternatives</h2>
+<h3>15.1 What you would build first</h3>
+<ol>
+<li><b>Phase 1 (weeks):</b> Kafka plus an off-the-shelf search engine cluster (<a href="../chapters/22-search-engines.html">Chapter 22</a>) fed by a consumer, with a 1 to 5 second refresh, simple relevance (recency plus likes) and a result cache. Trends via a streaming job using exact counts in a keyed state store over hashtags only.</li>
+<li><b>Phase 2:</b> split by age (hot index for 7 days, older indexes by month), add the stage-two ranker, hedged requests, and spam and quality scoring in the ingester.</li>
+<li><b>Phase 3:</b> replace the real-time tier with the custom append-optimized index when the refresh and merge costs of the general engine begin to dominate; move to Count-Min Sketch counting with n-gram candidates and per-place trends when exact state grows too large.</li>
+<li><b>Phase 4:</b> multi-region copies, personalization features, and deep archive tiering.</li>
+</ol>
+<h3>15.2 At 10x scale</h3>
+<ul>
+<li>Tweets at 5 billion per day: real-time tier grows to about 3 TB (still RAM-feasible across 480 machines, or move the sealed segments of days 3 to 7 to SSD with a memory-mapped layout, leaving only the newest 2 to 3 days in RAM). Partitions grow from 16 to about 64 to keep each node at 40 to 50 GB. Fan-out becomes the main latency issue; add a two-level scatter-gather tree (root to 8 mid-level aggregators to 8 partitions each) so no single node handles 64 connections.</li>
+<li>Searches at 10 billion per day: replicas rise from 3 to about 6, and the result cache becomes more important; consider caching per partition as well as at the root.</li>
+<li>Trending: add more stream workers (sketch memory stays small); the main new challenge is the human and policy layer, not the data structure.</li>
+</ul>
+<h3>15.3 Alternatives not chosen</h3>
+<table>
+<tr><th>Alternative</th><th>Why not (here)</th></tr>
+<tr><td>One big Elasticsearch cluster for everything</td><td>Good for phase 1. At this write rate, refresh and segment merge cost, shard-count limits and tail latency from merges push us to specialize the hot tier. The archive could still use it.</td></tr>
+<tr><td>Term-partitioned index</td><td>Hot-term skew, 15-way write fan-out per tweet (section 9.1).</td></tr>
+<tr><td>Storing the full tweet text in the index</td><td>Multiplies index RAM by 5 or more; text belongs in the tweet store and cache.</td></tr>
+<tr><td>Trending from the search index (facet counts)</td><td>Counts over an index are expensive and cannot express windows and baselines cheaply.</td></tr>
+<tr><td>Exact counting for all terms</td><td>Memory dominated by the long tail (section 11.5).</td></tr>
+<tr><td>Pure batch trending (hourly)</td><td>Lag defeats the purpose; trends for a live event would be an hour late.</td></tr>
+</table>
+
+<h2 id="qa">16. Interview Q&amp;A</h2>
+<details><summary>Why not simply use Elasticsearch for the real-time index?</summary>
+<p>I would start with it, and for a smaller product I would stay with it. The problems appear at our rate: Elasticsearch makes new documents visible only on a refresh (typically every second) and creates many small segments that must be merged in the background, which consumes I/O and CPU unpredictably and creates latency spikes. At 20,000 documents per second and a freshness target of a few seconds, the per-index shard overhead, merge storms and the cost of keeping recent data in the page cache add up. A single-writer, append-only in-memory index whose newest documents are visible as soon as one pointer is advanced gives us sub-second visibility with predictable latency. The archive tier, which is read-only, is a good fit for a standard engine or Lucene-like segments.</p>
+</details>
+<details><summary>How do you guarantee a deleted tweet disappears quickly?</summary>
+<p>A delete produces a high-priority event on its own small topic, keyed by tweet id so it lands on the same partition as the create. The replica sets a bit in the document table, and the query path checks that bit before returning any candidate, so the tweet vanishes from results as soon as the bit is set, typically within seconds. The postings stay until the segment is sealed and compacted. As a second line of defence, hydration reads the current state from the tweet store and cache, and drops any tweet marked deleted or from a suspended account, so even if the index lags, the user never sees the body of a deleted tweet. For the archive, a nightly purge applies the tombstone list when segments are rebuilt.</p>
+</details>
+<details><summary>Why does a Count-Min Sketch only over-count, and how do you pick its size?</summary>
+<p>Each term increments one counter in every row, and the counter may also be incremented by other terms hashing to the same cell, so every counter is at least the true count. Taking the minimum across d independent rows picks the least contaminated cell, so the estimate is at least the true count and usually close to it. You pick width w from the error you can tolerate, w = e divided by epsilon, so the over-count is at most epsilon times N (total events), and depth d from the confidence you want, d = ln(1/delta). With 65,536 columns and 4 rows, N of 2.25 million events per bucket, the bound is about 93 events with 98 percent probability, using 1 MB. If that were too noisy, doubling w halves the error; adding a row improves the confidence exponentially but costs one more memory access per update.</p>
+</details>
+<details><summary>A sketch cannot list its keys. How do you find the top-K trending terms?</summary>
+<p>You keep a candidate structure next to it. For each incoming event we update the sketch and read the new estimate. We keep a bounded min-heap of the K terms with the highest estimates (with a map for fast lookup): if the term is already tracked we update it; if not and its estimate exceeds the heap minimum, it replaces the minimum. Any term that really is a heavy hitter will cross the heap threshold at some point and be captured, because its estimate only grows during the bucket. The alternative is the Space-Saving algorithm, which maintains K counters directly and evicts the smallest when a new key arrives. At the minute boundary we compute surge scores for the heap candidates only, which is why the expensive baseline lookups are limited to about 1,000 terms per worker rather than millions.</p>
+</details>
+<details><summary>How do you stop a botnet from making a hashtag trend?</summary>
+<p>Several layers, because no single signal is reliable. First, we count distinct authors per term with a HyperLogLog, requiring a minimum number and a plausible ratio of distinct authors to events; a botnet posting one hashtag 100,000 times from 200 accounts fails this. Second, each event is weighted by author quality, so new or flagged accounts barely count. Third, we cluster near-duplicate text, because coordinated campaigns repeat the same strings. Fourth, there is a kill switch and review for the top slots, so a manipulated term can be removed in seconds. Finally, the entry and exit hysteresis means one burst cannot flicker into the list. It is an adversarial problem, so we also log and review removals to tune the thresholds.</p>
+</details>
+<details><summary>How do you rank "Top" results when recent tweets have no engagement yet?</summary>
+<p>New tweets have zero likes by definition, so a pure engagement score would bury every fresh tweet. We use features that do not depend on accumulated engagement: author quality and reputation, text match quality, the searcher's relationship to the author, and a recency decay. We also use engagement velocity (likes in the last few minutes relative to the author's normal), and we smooth the engagement term with a prior, for example log(1 + likes + prior), so a tweet from a strong author can rank above an older mediocre one. Some systems reserve a small number of slots for exploration of new tweets to collect early engagement signals. The stage-two model learns the trade-off from click and engagement data on search results.</p>
+</details>
+<details><summary>What happens to queries during a huge event when tweet volume jumps 10x?</summary>
+<p>Writes are buffered in Kafka, so no tweets are lost; index lag grows from seconds to maybe a minute while the single writer per partition works through the backlog, and since the writer has about 10 to 20 times headroom, it catches up quickly. Reads usually rise at the same time, but they are heavily concentrated on a few queries, so the result cache with request coalescing absorbs most of them, and we warm the cache for the current trending terms. If the partitions are still overloaded, load shedding applies: reject deep pagination and complex queries first, reduce candidate budgets for Top queries, skip the ranker and fall back to stage-one order. Because of that ordering of shedding, the most valuable and cheapest requests, first-page results for popular queries, are served last.</p>
+</details>
+<details><summary>Why is each replica fed from Kafka rather than replicating the index from a leader?</summary>
+<p>The replicas of a partition are deterministic state machines applying the same ordered log, so they converge without any inter-replica protocol. Copying the index from a leader would require shipping the in-memory structure changes (a network and serialization cost for every posting) and a leader election protocol with the failure modes that come with it. Independent consumption gives simple failover (any replica is as good as any other), simple scale-out (a new replica loads a snapshot and replays the tail), and isolates faults, since a bad replica cannot corrupt others. The cost is that the CPU for applying events is repeated 3 times, which is small because the heavy tokenization was already done once in the ingester. We verify convergence by comparing document counts and checksums of sealed segments across replicas.</p>
+</details>
+<details><summary>How would you support searching by a phrase or by a word near another word?</summary>
+<p>Postings store the position of the term inside the tweet along with the document id, because tweets are at most 280 characters and positions fit in a few bits. A phrase query first intersects the lists for all its terms to find documents containing every term, which is cheap with newest-first early termination. For each candidate it then checks that the position of the second term equals the position of the first plus one (for a proximity query, within a window). Because the position check only runs on the intersection result, which is small, the cost is modest. For very common phrase queries we can also index selected bigrams such as popular hashtags and entity names as terms of their own, turning the phrase query into a single list lookup.</p>
+</details>
+<details><summary>How do you rebuild the real-time index from scratch after a bad analyzer release?</summary>
+<p>The index is derived data, so a rebuild is a controlled replay. We fix the analyzer and version it, start a parallel set of partitions (new nodes), and feed them by reading seven days of tweets from the tweet store (or the Kafka topic if retention covers it) in id order, with the new analyzer, writing new segments and sealing them as usual. When the parallel set has caught up with the live stream and canary queries and document-count comparisons look correct, the root shifts traffic to it gradually, keeping the old set for instant rollback. The archive uses the same approach but in batch, segment by segment. Keeping the real-time tier to a week of data is what makes this feasible in hours and not days.</p>
+</details>
+<details><summary>Why is the trend score a ratio against a baseline and not just the highest count?</summary>
+<p>The highest counts are always the same: common words, standing hashtags and large accounts' catchphrases, which are not news. What users want is change, so we compare current volume with the term's own normal level (an average over the last day, ideally also the same hour the previous day and week), with smoothing so tiny baselines do not produce infinite ratios. We additionally require a volume floor and a minimum count of distinct authors so that a term going from 1 to 30 mentions does not trend. Variants include a z-score (how many standard deviations above the mean) or comparing against a forecast with a seasonal model; the ratio with smoothing is the simplest that works well and is explainable.</p>
+</details>
+
+<h2 id="recap-sec">17. Connects to and recap</h2>
+<p class="connects"><b>Connects to:</b> the interview method from <a href="../chapters/01-interview-framework.html">Chapter 1</a> and estimation from <a href="../chapters/02-estimation.html">Chapter 2</a>; API and cursor pagination in <a href="../chapters/05-api-design.html">Chapter 5</a>; load balancing and hedging in <a href="../chapters/09-load-balancing.html">Chapter 9</a> and <a href="../chapters/40-resilience.html">Chapter 40</a>; caching in <a href="../chapters/13-caching-patterns.html">Chapter 13</a>, <a href="../chapters/14-caching-failures.html">Chapter 14</a> and <a href="../chapters/15-redis.html">Chapter 15</a>; rate limiting in <a href="../chapters/16-rate-limiting.html">Chapter 16</a>; search engines in <a href="../chapters/22-search-engines.html">Chapter 22</a>; replication and sharding in <a href="../chapters/24-replication.html">Chapter 24</a> and <a href="../chapters/25-sharding.html">Chapter 25</a>; multi-region in <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>; consistency in <a href="../chapters/28-cap-consistency.html">Chapter 28</a>; Kafka in <a href="../chapters/34-queues-kafka.html">Chapter 34</a>; batch and stream processing in <a href="../chapters/37-batch-stream.html">Chapter 37</a>; idempotency and ids in <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>; observability in <a href="../chapters/54-observability-slos.html">Chapter 54</a>; probabilistic structures (Count-Min Sketch, HyperLogLog) in <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>; text structures in <a href="../chapters/58-geospatial-text.html">Chapter 58</a>; top-K structures in <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>. Related case studies: <a href="c11-autocomplete.html">Case study 11</a> (typeahead) and <a href="c06-news-feed.html">Case study 6</a> (feeds).</p>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>Two problems, one firehose: search needs an inverted index fed continuously; trending needs approximate counting of change over time windows.</li>
+<li>Numbers: 500 million tweets per day (5,800 per second average, 20,000 peak), 7.5 billion postings per day, 1 billion searches per day (35,000 peak, 21,000 after caching); the 7-day real-time tier is about 300 GB, so we shard for throughput and fan-out, not capacity.</li>
+<li>Real-time index: one writer per partition, many lock-free readers, newest-first chained posting slices, a published-doc-id pointer written last, counters in side arrays, deletes as flags; early termination makes query cost independent of list length.</li>
+<li>Partition by document (hash of tweet id), 16 partitions times 3 replicas, with replicas independently applying the same Kafka log; tier by age with a small RAM tier and a large compressed SSD archive; the tier is chosen by a tweet-id range check.</li>
+<li>Query path: cache, parse, hedged scatter to 16 partitions, merge 800 candidates to 200, rerank with an ML model, hydrate 20 tweets; degrade to partial results or stage-one order instead of failing.</li>
+<li>Trending: 5-minute bucket windows, a Count-Min Sketch per bucket (65,536 by 4, about 1 MB, error at most about 93 events at 98 percent confidence) plus a top-K heap, surge scored against a baseline, with distinct-author HyperLogLogs, spam weighting, dedupe, hysteresis and a kill switch.</li>
+<li>Failures are bounded by design: replicas are independent, Kafka buffers spikes, the index is rebuildable derived data, and every stage has a timeout and a fallback.</li>
+<li>Build order: off-the-shelf search plus exact hashtag counts first; specialize the hot tier and move to sketches when scale and cost demand it.</li>
+</ul></div>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

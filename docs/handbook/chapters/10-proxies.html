@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 10: Forward and Reverse Proxies | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="10-proxies">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+
+<main>
+<div class="kicker">Chapter 10 · Scaling the Stateless Tier</div>
+<h1>Forward and Reverse Proxies</h1>
+<p class="lead">A proxy is a server that sits in the middle of a conversation and talks on behalf of one side. This chapter explains the two directions a proxy can face, what a reverse proxy does inside (event loops, connection pools, buffers, timeouts), how headers carry the real client identity, how WebSocket and gRPC pass through, and how proxies fail and how to design for it.</p>
+
+<!-- ======================= 1 ======================= -->
+<h2 id="what">1. What a proxy is and why it exists</h2>
+
+<p>The word <b>proxy</b> means "someone who acts on your behalf". In networking, a proxy is a server that receives a request from one party, then makes a request of its own to another party, then passes the answer back. To the party on each side, the proxy is the other end of the conversation. The client believes it is talking to a server. The server believes it is talking to a client. In between, the proxy is free to look at the traffic, change it, remember it, refuse it, or send it somewhere different from where it seemed to be going.</p>
+
+<p>That freedom is the whole point. A plain network cable or a router only moves packets. A proxy understands a protocol (usually HTTP, sometimes raw TCP) well enough to make decisions: "this request is for the images service", "this user has exceeded their quota", "I already have this answer saved", "this response is large, so I will compress it". Putting such a decision point on the path means you can add behavior without touching either the client or the server.</p>
+
+<p>There are two directions a proxy can face, and the difference matters more than anything else in this chapter:</p>
+<ul>
+  <li>A <b>forward proxy</b> acts on behalf of <b>clients</b>. The clients know about it (or the network forces them through it), and the servers on the internet usually do not know the original clients exist. Think of a company network where every employee's browser goes out through one gateway.</li>
+  <li>A <b>reverse proxy</b> acts on behalf of <b>servers</b>. The clients usually do not know it exists. They think they are talking to <code>www.example.com</code>, and behind that name a proxy fans their requests out to many backends. This is the one you will draw in nearly every system design interview.</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b>
+A forward proxy hides and controls <b>clients</b> from the servers they visit. A reverse proxy hides and protects <b>servers</b> from the clients that visit them. The software can be identical (Nginx, Envoy and HAProxy can all do both); what differs is whose interests it serves and who configured it.
+</div>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Forward proxy versus reverse proxy positions">
+  <text class="t-b" x="20" y="24">Forward proxy: sits in front of clients</text>
+  <rect class="ext" x="20" y="44" width="120" height="40" rx="8"/><text class="t-c t-b" x="80" y="69">Client A</text>
+  <rect class="ext" x="20" y="96" width="120" height="40" rx="8"/><text class="t-c t-b" x="80" y="121">Client B</text>
+  <rect class="cache" x="290" y="62" width="150" height="56" rx="10"/><text class="t-c t-b" x="365" y="86">Forward proxy</text><text class="t-c t-sm" x="365" y="104">company / ISP gateway</text>
+  <rect class="db" x="640" y="62" width="150" height="56" rx="10"/><text class="t-c t-b" x="715" y="86">Internet servers</text><text class="t-c t-sm" x="715" y="104">any site</text>
+  <path class="arrow" d="M140 64 L286 84"/><path class="arrow" d="M140 116 L286 98"/>
+  <path class="arrow" d="M440 90 L636 90"/>
+  <text class="t-sm" x="450" y="82">server sees the proxy IP</text>
+
+  <text class="t-b" x="20" y="180">Reverse proxy: sits in front of servers</text>
+  <rect class="ext" x="20" y="200" width="120" height="40" rx="8"/><text class="t-c t-b" x="80" y="225">Client A</text>
+  <rect class="ext" x="20" y="252" width="120" height="40" rx="8"/><text class="t-c t-b" x="80" y="277">Client B</text>
+  <rect class="cache" x="290" y="218" width="150" height="56" rx="10"/><text class="t-c t-b" x="365" y="242">Reverse proxy</text><text class="t-c t-sm" x="365" y="260">public entry point</text>
+  <rect class="db" x="640" y="196" width="150" height="34" rx="8"/><text class="t-c t-b" x="715" y="218">App server 1</text>
+  <rect class="db" x="640" y="240" width="150" height="34" rx="8"/><text class="t-c t-b" x="715" y="262">App server 2</text>
+  <rect class="db" x="640" y="284" width="150" height="14" rx="6"/>
+  <path class="arrow" d="M140 220 L286 238"/><path class="arrow" d="M140 272 L286 254"/>
+  <path class="arrow" d="M440 238 L636 214"/><path class="arrow" d="M440 254 L636 256"/>
+  <text class="t-sm" x="800" y="248">hidden from clients</text>
+</svg>
+<figcaption>Same box in the middle, opposite meaning. In the forward case the proxy shields and controls the clients on the left. In the reverse case it shields and fronts the servers on the right.</figcaption>
+</figure>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="forward">2. Forward proxies</h2>
+
+<p>A forward proxy is configured by or for the <b>client side</b>. An office has a gateway; the browsers are told (through a setting or an automatic configuration file) "send your web requests to <code>proxy.corp.example:3128</code>". The browser then sends the request to the proxy and asks it to fetch the page. The proxy makes the outbound connection to the real website and relays the answer. The website sees the proxy's address, not the employee's laptop.</p>
+
+<h3>2.1 What forward proxies are used for</h3>
+<ul>
+  <li><b>Egress control.</b> "Egress" means traffic leaving your network. A company wants to decide which outside sites its machines may reach. If every machine can only get to the internet through the proxy (the firewall drops everything else), the proxy becomes a single place to allow or deny destinations by domain, category, or user. This is also how servers in a locked-down production network are allowed to call, say, only the payment provider's API and an update server, and nothing else. It limits what malware or a compromised service can reach, and stops data leaving to unknown hosts.</li>
+  <li><b>Anonymity and address hiding.</b> Because the destination sees the proxy's IP address, the real client address is hidden. Privacy services, VPN-like products and scraping fleets use proxies for this. It is not perfect anonymity: the proxy operator can see everything, and the request itself can still carry identifying cookies or headers. An anonymous proxy simply moves trust from the destination to the proxy.</li>
+  <li><b>Caching.</b> If 500 employees download the same operating system update, a caching forward proxy fetches it once and serves the other 499 from local disk, saving bandwidth and speeding up downloads. Squid is the classic example. Today, with most traffic encrypted, this works well for large public files and package mirrors, and far less for general web browsing.</li>
+  <li><b>Filtering and inspection.</b> The proxy can block malware sites, scan downloads for viruses, enforce policies such as "no social media at work", and log every access for audit. To inspect encrypted traffic it must perform <b>TLS interception</b>: it terminates the employee's TLS connection using a certificate signed by a company certificate authority that the laptops have been configured to trust, reads the plain traffic, then opens a separate TLS connection to the real site. This works but is invasive, breaks applications that pin certificates, and makes the proxy a very valuable target.</li>
+  <li><b>Access from restricted networks and rate control.</b> A proxy in a specific country lets a client appear to come from there, and a pool of proxies lets a scraper spread requests across many source addresses (which is the thing sites often try to defend against).</li>
+  <li><b>Authentication and accounting.</b> The proxy can demand credentials (the <code>Proxy-Authorization</code> header, answered with status 407 when missing) and count usage per user or team.</li>
+</ul>
+
+<h3>2.2 How a forward proxy handles HTTP and HTTPS differently</h3>
+<p>For plain <code>http://</code> traffic, the client sends the proxy a request whose request line contains the <b>full URL</b>, because the proxy needs to know where to go: <code>GET http://news.example/index.html HTTP/1.1</code>. The proxy can read and cache the whole exchange, because nothing is encrypted.</p>
+
+<p>For <code>https://</code> traffic the client does not want the proxy to read anything. It uses the <b>HTTP CONNECT method</b> to ask the proxy to set up a raw tunnel. The browser sends <code>CONNECT news.example:443 HTTP/1.1</code>. The proxy opens a TCP connection to that host and port, replies <code>200 Connection established</code>, and from that moment simply copies bytes in both directions without understanding them. The browser then performs its TLS handshake <b>through the tunnel</b> directly with the destination server. The proxy sees only the destination host name and port (and the amount of data), never the paths, headers or bodies. That is why a forward proxy that is not doing TLS interception can allow or block by domain but cannot filter by URL path or scan content.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="HTTP CONNECT tunnel sequence">
+  <rect class="ext" x="60" y="14" width="150" height="34" rx="8"/><text class="t-c t-b" x="135" y="36">Browser</text>
+  <rect class="cache" x="375" y="14" width="150" height="34" rx="8"/><text class="t-c t-b" x="450" y="36">Forward proxy</text>
+  <rect class="db" x="690" y="14" width="150" height="34" rx="8"/><text class="t-c t-b" x="765" y="36">news.example</text>
+  <line class="life" x1="135" y1="48" x2="135" y2="350"/><line class="life" x1="450" y1="48" x2="450" y2="350"/><line class="life" x1="765" y1="48" x2="765" y2="350"/>
+
+  <path class="arrow" d="M135 82 L446 82"/><text class="t-sm" x="150" y="74">1. CONNECT news.example:443 HTTP/1.1</text>
+  <path class="arrow dash" d="M450 116 L761 116"/><text class="t-sm" x="466" y="108">2. proxy opens TCP to port 443</text>
+  <path class="arrow-g" d="M446 150 L139 150"/><text class="t-sm" x="150" y="142">3. 200 Connection established</text>
+  <rect class="hit" x="60" y="172" width="780" height="30" rx="8"/><text class="t-c t-sm" x="450" y="192">From here the proxy only copies bytes; it cannot read them.</text>
+  <path class="arrow" d="M135 232 L446 232"/><path class="arrow" d="M450 232 L761 232"/><text class="t-sm" x="190" y="224">4. TLS ClientHello (inside tunnel)</text>
+  <path class="arrow-g" d="M761 270 L454 270"/><path class="arrow-g" d="M446 270 L139 270"/><text class="t-sm" x="190" y="262">5. server certificate, keys, then encrypted HTTP</text>
+  <text class="t-c t-sm" x="450" y="320">The proxy knows host, port and byte counts. It never holds the TLS keys.</text>
+</svg>
+<figcaption>The CONNECT method turns the proxy into a blind pipe. The TLS session runs end to end between browser and destination, so the proxy cannot read or modify it unless it is configured to intercept.</figcaption>
+</figure>
+
+<h3>2.3 SOCKS versus HTTP proxies</h3>
+<p>An <b>HTTP proxy</b> understands HTTP. It can read request lines, add headers, cache, and apply rules by URL for plain HTTP, and it uses CONNECT for everything else. <b>SOCKS</b> (version 5 is the one used today) is a lower-level, protocol-agnostic proxy protocol. The client opens a connection to the SOCKS server, negotiates an authentication method, and then says "connect me to this address and port" (the address can be an IP or a domain name). After that the SOCKS server just relays bytes. SOCKS does not know or care whether those bytes are HTTP, SSH, a database protocol or email, and SOCKS5 can also relay UDP datagrams. The cost of that generality is that it cannot cache or inspect HTTP, because it never parses it.</p>
+
+<table>
+<tr><th>Aspect</th><th>HTTP proxy (with CONNECT)</th><th>SOCKS5 proxy</th></tr>
+<tr><td>Layer it understands</td><td>HTTP, application layer</td><td>Just "connect to host:port", session layer, protocol-agnostic</td></tr>
+<tr><td>Can cache or rewrite plain HTTP</td><td>Yes</td><td>No, it never parses the payload</td></tr>
+<tr><td>Carries non-HTTP protocols (SSH, SMTP, databases)</td><td>Only through CONNECT to allowed ports; often restricted to 443</td><td>Yes, any TCP; UDP supported through UDP ASSOCIATE</td></tr>
+<tr><td>Name resolution</td><td>Proxy resolves the host in the request or CONNECT target</td><td>Client can send a domain name for the proxy to resolve, or resolve locally (the choice affects DNS leaks)</td></tr>
+<tr><td>Typical use</td><td>Corporate web egress, package mirrors, build agents</td><td>SSH dynamic port forwarding, privacy tools, generic app tunnelling</td></tr>
+</table>
+
+<h3>2.4 Explicit versus transparent proxies</h3>
+<p>An <b>explicit proxy</b> is one the client is configured to use. The client knows, so it addresses the proxy and (for HTTP) puts full URLs on the request line. Environment variables such as <code>HTTPS_PROXY</code>, browser settings or an automatic proxy configuration script do this. Because the client cooperates, explicit proxies can authenticate users and are the cleanest to operate.</p>
+<p>A <b>transparent proxy</b> (also called an intercepting proxy) is one the client does <b>not</b> know about. The network, for example a router or firewall, quietly redirects outgoing port 80 or 443 packets to the proxy. The proxy then recovers the intended destination from the original packet's address, or from the HTTP <code>Host</code> header or the TLS SNI (the server name sent at the start of TLS). Transparent mode needs no client configuration, which is attractive for guest Wi-Fi and ISPs. The downsides: it cannot easily authenticate individual users, it complicates HTTPS (interception requires a trusted CA or the proxy can only look at SNI), it can break clients that detect it, and it creates confusing failures because nobody on the client side realizes a proxy is involved.</p>
+<p>The same words are used on the reverse side. A reverse proxy is always transparent to clients in the sense that clients just resolve a name and connect. Do not confuse "transparent" in that casual sense with the formal forward-proxy meaning above; the formal term is about whether the client's configuration includes the proxy.</p>
+
+<div class="callout tip"><b>Interview tip</b>
+In a system design interview, forward proxies come up in two places: controlling <b>outbound</b> calls from a service tier (an "egress proxy" that allows only approved destinations and gives you one place to log and rate-limit calls to third parties), and as the background for explaining what a reverse proxy is not. Spend a sentence on them, then move to the reverse proxy.
+</div>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="reverse">3. Reverse proxies</h2>
+
+<p>A reverse proxy is the front door of a service. Public DNS for <code>api.example.com</code> points at it. Clients open connections to it and send requests as if it were the real server. The proxy chooses a backend (also called an <b>upstream</b>), forwards the request, gets the response, and returns it. Backends can be on private addresses that are not reachable from the internet at all.</p>
+
+<p>Almost every production web system has one, even if it is called something else (the L7 load balancer, the ingress controller, the edge gateway, the "front proxy"). The reason is that it is the natural place to put work that does not belong in every application server and that is cheaper to do once at the edge. The following list covers what that work is.</p>
+
+<h3>3.1 What a reverse proxy does for you</h3>
+<ul>
+  <li><b>TLS termination.</b> The proxy holds the certificate and private key, performs the expensive TLS handshake with the client, and talks plain HTTP (or a fresh internal TLS connection) to the backend. Certificates are managed and rotated in one place instead of on every application server, and the application code never touches cryptography. Chapter 3 covers the handshake. When the internal network is not trusted you re-encrypt to the backend (<b>TLS re-encryption</b>) or use mutual TLS inside a mesh (<a href="50-service-mesh.html">Chapter 50</a>).</li>
+  <li><b>Routing.</b> Using the host name, URL path, headers or cookies, the proxy picks which backend pool gets the request: <code>/api/*</code> goes to the API service, <code>/static/*</code> to a storage bucket, <code>admin.example.com</code> to the admin app. This lets one public address front many internal services and lets you move a path from the old system to a new one without any client change, which is exactly what the strangler fig migration needs (<a href="44-monolith-to-microservices.html">Chapter 44</a>).</li>
+  <li><b>Load balancing across backends.</b> It spreads requests over many identical servers and avoids unhealthy ones. Algorithms and health checks are in <a href="09-load-balancing.html">Chapter 9</a>; an L7 load balancer is a reverse proxy with a strong balancing feature set.</li>
+  <li><b>Compression.</b> Text responses (HTML, JSON, JavaScript) compress to a fraction of their size with gzip or Brotli. Doing it in the proxy keeps application servers focused on business logic. Compression costs CPU, so proxies compress only types and sizes where it pays off and skip already compressed content such as JPEG images or video.</li>
+  <li><b>Caching.</b> The proxy can keep copies of responses and answer repeat requests without bothering the backend. It is a small, close version of what a CDN does (<a href="12-cdn.html">Chapter 12</a>); section 10 covers the rules.</li>
+  <li><b>Buffering slow clients.</b> A phone on a poor connection takes seconds to upload a request or download a response. Without help, your application thread would sit waiting on that slow socket. The proxy absorbs the slow transfer on its side so the backend can finish in milliseconds. Section 7 explains this, because it is one of the strongest reasons to have a proxy at all.</li>
+  <li><b>Connection pooling and multiplexing to upstreams.</b> Thousands of clients connect to the proxy, but the proxy talks to each backend over a small set of long-lived, reused connections. This avoids a TCP and TLS handshake per request and keeps backend connection counts small and predictable (section 6).</li>
+  <li><b>Security shield.</b> Backends sit on private addresses. The proxy can drop malformed requests, enforce size and rate limits, require authentication, hide server version details and internal topology, apply a web application firewall, and absorb floods before they reach the application.</li>
+  <li><b>Canary and weighted routing.</b> The proxy can send 1% of traffic to a new version, or only requests carrying a particular header or cookie, and watch error rates before widening the rollout (<a href="43-deployment-autoscaling.html">Chapter 43</a>).</li>
+  <li><b>Protocol translation.</b> It can accept HTTP/2 or HTTP/3 from browsers and speak HTTP/1.1 to old backends, or turn HTTPS into HTTP, or gRPC-Web into gRPC.</li>
+  <li><b>Observability.</b> Every request passes through it, so it is the cheapest place for access logs, request IDs, latency histograms and error counts, even for backends you cannot modify.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="Reverse proxy responsibilities between clients and backends">
+  <rect class="ext" x="20" y="40" width="130" height="44" rx="8"/><text class="t-c t-b" x="85" y="67">Browsers</text>
+  <rect class="ext" x="20" y="110" width="130" height="44" rx="8"/><text class="t-c t-b" x="85" y="137">Mobile apps</text>
+  <rect class="ext" x="20" y="180" width="130" height="44" rx="8"/><text class="t-c t-b" x="85" y="207">Partners</text>
+
+  <rect class="cache" x="270" y="20" width="360" height="330" rx="12"/>
+  <text class="t-c t-b" x="450" y="46">Reverse proxy</text>
+  <rect class="box" x="290" y="62" width="150" height="34" rx="8"/><text class="t-c" x="365" y="84">TLS termination</text>
+  <rect class="box" x="460" y="62" width="150" height="34" rx="8"/><text class="t-c" x="535" y="84">Request limits</text>
+  <rect class="box" x="290" y="108" width="150" height="34" rx="8"/><text class="t-c" x="365" y="130">Routing rules</text>
+  <rect class="box" x="460" y="108" width="150" height="34" rx="8"/><text class="t-c" x="535" y="130">Cache lookup</text>
+  <rect class="box" x="290" y="154" width="150" height="34" rx="8"/><text class="t-c" x="365" y="176">Load balancing</text>
+  <rect class="box" x="460" y="154" width="150" height="34" rx="8"/><text class="t-c" x="535" y="176">Compression</text>
+  <rect class="box" x="290" y="200" width="150" height="34" rx="8"/><text class="t-c" x="365" y="222">Buffering</text>
+  <rect class="box" x="460" y="200" width="150" height="34" rx="8"/><text class="t-c" x="535" y="222">Upstream pools</text>
+  <rect class="box" x="290" y="246" width="150" height="34" rx="8"/><text class="t-c" x="365" y="268">Header rewriting</text>
+  <rect class="box" x="460" y="246" width="150" height="34" rx="8"/><text class="t-c" x="535" y="268">Retries, timeouts</text>
+  <rect class="box" x="290" y="292" width="320" height="34" rx="8"/><text class="t-c" x="450" y="314">Access logs, metrics, request IDs</text>
+
+  <rect class="db" x="750" y="50" width="130" height="44" rx="8"/><text class="t-c t-b" x="815" y="77">API pool</text>
+  <rect class="db" x="750" y="130" width="130" height="44" rx="8"/><text class="t-c t-b" x="815" y="157">Web pool</text>
+  <rect class="db" x="750" y="210" width="130" height="44" rx="8"/><text class="t-c t-b" x="815" y="237">Canary v2</text>
+  <rect class="db" x="750" y="290" width="130" height="44" rx="8"/><text class="t-c t-b" x="815" y="317">Static bucket</text>
+
+  <path class="arrow" d="M150 62 L266 100"/><path class="arrow" d="M150 132 L266 132"/><path class="arrow" d="M150 202 L266 170"/>
+  <path class="arrow" d="M630 100 L746 76"/><path class="arrow" d="M630 150 L746 152"/><path class="arrow dash" d="M630 200 L746 232"/><path class="arrow" d="M630 250 L746 312"/>
+</svg>
+<figcaption>A reverse proxy bundles many cross-cutting jobs at the edge. Requests pass through TLS, limits, routing and caching before reaching a backend pool, and responses come back through compression and logging.</figcaption>
+</figure>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="compare">4. Reverse proxy vs load balancer vs API gateway vs CDN</h2>
+
+<p>These four terms overlap, and interviewers like to ask how they differ. The honest answer is that they are <b>roles</b>, and one piece of software often plays several. A useful way to separate them is by the extra job each adds on top of the common core of "receive a request, pick a target, forward it".</p>
+
+<table>
+<tr><th>Component</th><th>Core job</th><th>Where it lives</th><th>Typical extra features</th><th>Typical products</th></tr>
+<tr><td><b>Reverse proxy</b></td><td>Front one or more servers; terminate TLS, route, buffer, cache, shield</td><td>In your data center or cloud, in front of an app tier</td><td>Compression, header rewriting, static file serving, simple rate limits</td><td>Nginx, Envoy, HAProxy, Caddy, Apache httpd</td></tr>
+<tr><td><b>Load balancer</b></td><td>Spread traffic over many identical instances, avoid unhealthy ones. Can be L4 (connection level) or L7 (request level). See <a href="09-load-balancing.html">Chapter 9</a></td><td>In front of any tier, also between internal tiers</td><td>Health checks, algorithms, stickiness, connection draining, global traffic steering</td><td>AWS ALB/NLB, GCP load balancer, HAProxy, Envoy, F5, Nginx</td></tr>
+<tr><td><b>API gateway</b></td><td>Single managed entry point for <b>APIs</b> with product-level policy: authentication, quotas, API keys, aggregation. See <a href="11-api-gateway.html">Chapter 11</a></td><td>Edge of your microservices</td><td>Authentication and authorization offload, per-client rate limits and plans, request transformation, API versioning, developer portal, usage metering</td><td>Kong, Apigee, AWS API Gateway, Envoy-based gateways, Zuul</td></tr>
+<tr><td><b>CDN</b></td><td>Cache and serve content from many locations worldwide, close to users. See <a href="12-cdn.html">Chapter 12</a></td><td>On the public internet, hundreds of PoPs</td><td>Geo routing, edge compute, DDoS absorption, video delivery, signed URLs</td><td>Cloudflare, Akamai, Fastly, CloudFront</td></tr>
+</table>
+
+<p>The overlap is real. A CDN edge node is a reverse proxy with a big cache run by someone else. An API gateway is a reverse proxy with API-management features. An L7 load balancer is a reverse proxy whose headline feature is backend selection. Nginx can be deployed as any of the four on different days. The mental model that keeps you out of trouble:</p>
+<ul>
+  <li><b>Reverse proxy</b> is the general mechanism: a server that accepts requests on behalf of others.</li>
+  <li><b>Load balancer</b> emphasizes spreading and resilience across many identical backends.</li>
+  <li><b>API gateway</b> emphasizes policy about <b>who</b> may call <b>which API</b> and how much, plus composition of backend services into client-friendly APIs.</li>
+  <li><b>CDN</b> emphasizes geography and caching, and is mostly operated by a vendor.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Typical layering of CDN, load balancer, gateway, services">
+  <rect class="ext" x="14" y="90" width="100" height="60" rx="10"/><text class="t-c t-b" x="64" y="125">Users</text>
+  <rect class="cache" x="150" y="80" width="140" height="80" rx="10"/><text class="t-c t-b" x="220" y="116">CDN edge</text><text class="t-c t-sm" x="220" y="136">cache, TLS, DDoS</text>
+  <rect class="box" x="330" y="80" width="140" height="80" rx="10"/><text class="t-c t-b" x="400" y="116">L4/L7 LB</text><text class="t-c t-sm" x="400" y="136">spread, health</text>
+  <rect class="box" x="510" y="80" width="140" height="80" rx="10"/><text class="t-c t-b" x="580" y="108">API gateway</text><text class="t-c t-sm" x="580" y="128">auth, quotas,</text><text class="t-c t-sm" x="580" y="144">routing</text>
+  <rect class="db" x="690" y="30" width="190" height="44" rx="8"/><text class="t-c t-b" x="785" y="57">Orders service</text>
+  <rect class="db" x="690" y="100" width="190" height="44" rx="8"/><text class="t-c t-b" x="785" y="127">Catalog service</text>
+  <rect class="db" x="690" y="170" width="190" height="44" rx="8"/><text class="t-c t-b" x="785" y="197">Users service</text>
+  <path class="arrow" d="M114 120 L146 120"/><path class="arrow" d="M290 120 L326 120"/><path class="arrow" d="M470 120 L506 120"/>
+  <path class="arrow" d="M650 105 L686 56"/><path class="arrow" d="M650 120 L686 122"/><path class="arrow" d="M650 135 L686 192"/>
+  <text class="t-c t-sm" x="450" y="236">Each box is a reverse proxy of some kind; they differ in what they emphasize.</text>
+</svg>
+<figcaption>One common stack. Every hop is technically a reverse proxy; the names describe the dominant job. In small systems several of these collapse into one Nginx or one cloud load balancer.</figcaption>
+</figure>
+
+<div class="callout watch"><b>Watch out</b>
+Do not draw four separate boxes in an interview unless each earns its place. Say what each one is for. For a small service, "a load balancer doing TLS termination in front of the app servers" is a complete answer. Add a gateway when you need per-client auth and quotas across many services, and a CDN when you have static content or global users.
+</div>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="internals">5. How a reverse proxy works inside</h2>
+
+<p>The reverse proxy handles a huge number of simultaneous connections, most of which are idle most of the time: a client opens a connection, sends a request, then waits for a response, or waits for the next click. A design that dedicates one thread to each connection (the classic Apache prefork or thread-per-request model, discussed in <a href="08-scalability-concurrency.html">Chapter 8</a>) spends memory on thousands of mostly sleeping threads and burns CPU switching among them. Modern proxies instead use an <b>event loop</b>.</p>
+
+<h3>5.1 The event loop and worker processes</h3>
+<p>An event loop is a single thread that asks the operating system "tell me which of my sockets are ready". Linux provides <code>epoll</code> (BSD has <code>kqueue</code>) for this: you register thousands of sockets, and one call returns just the ones that have data to read or room to write. The thread then handles each ready socket briefly, never blocking, and goes back to ask again. Because it never waits on a single slow connection, one thread can juggle tens of thousands of connections. This is why a small Nginx instance can hold 50,000 open connections using only a few hundred megabytes of memory.</p>
+
+<p>One event loop uses one CPU core, so to use all the cores the proxy runs several of them:</p>
+<ul>
+  <li><b>Nginx</b> has one <b>master process</b> (reads configuration, starts and replaces workers, handles signals) and several <b>worker processes</b>, typically one per CPU core (<code>worker_processes auto;</code>). Each worker runs its own event loop. The kernel spreads new connections across workers, and workers share nothing important, so there is little locking. A reload starts new workers with the new configuration and lets old workers finish their in-flight requests, which gives zero downtime configuration changes.</li>
+  <li><b>Envoy</b> uses one main thread for control tasks and a set of <b>worker threads</b>, each with its own event loop. A connection is assigned to one worker for its whole life. Because of this, the connection pools to upstreams are <b>per worker</b>, so total upstream connections equal roughly (workers × pool size).</li>
+  <li><b>HAProxy</b> runs a number of threads (<code>nbthread</code>) in one process, again each running an event loop, with configuration split into <b>frontends</b> (what it listens on) and <b>backends</b> (the server pools it forwards to).</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Reverse proxy internals: client connections, worker event loops, upstream pools">
+  <rect class="ext" x="14" y="40" width="150" height="320" rx="10"/><text class="t-c t-b" x="89" y="64">Client side</text>
+  <text class="t-c t-sm" x="89" y="90">thousands of</text><text class="t-c t-sm" x="89" y="106">connections</text>
+  <rect class="ext" x="30" y="124" width="118" height="26" rx="6"/><text class="t-c t-sm" x="89" y="141">fast client</text>
+  <rect class="ext" x="30" y="160" width="118" height="26" rx="6"/><text class="t-c t-sm" x="89" y="177">slow phone</text>
+  <rect class="ext" x="30" y="196" width="118" height="26" rx="6"/><text class="t-c t-sm" x="89" y="213">idle keep-alive</text>
+  <rect class="ext" x="30" y="232" width="118" height="26" rx="6"/><text class="t-c t-sm" x="89" y="249">slow uploader</text>
+  <rect class="ext" x="30" y="268" width="118" height="26" rx="6"/><text class="t-c t-sm" x="89" y="285">WebSocket</text>
+
+  <rect class="cache" x="230" y="20" width="440" height="360" rx="12"/>
+  <text class="t-c t-b" x="450" y="44">Proxy process</text>
+  <rect class="box" x="250" y="60" width="400" height="34" rx="8"/><text class="t-c" x="450" y="82">Master / main thread: config, reload, signals, health checks</text>
+  <rect class="box" x="250" y="112" width="190" height="110" rx="8"/><text class="t-c t-b" x="345" y="136">Worker 1</text><text class="t-c t-sm" x="345" y="158">event loop (epoll)</text><text class="t-c t-sm" x="345" y="176">~10,000 sockets</text><text class="t-c t-sm" x="345" y="194">read buffers, cache</text><text class="t-c t-sm" x="345" y="212">own upstream pool</text>
+  <rect class="box" x="460" y="112" width="190" height="110" rx="8"/><text class="t-c t-b" x="555" y="136">Worker 2</text><text class="t-c t-sm" x="555" y="158">event loop (epoll)</text><text class="t-c t-sm" x="555" y="176">~10,000 sockets</text><text class="t-c t-sm" x="555" y="194">read buffers, cache</text><text class="t-c t-sm" x="555" y="212">own upstream pool</text>
+  <rect class="cache" x="250" y="240" width="400" height="56" rx="8"/><text class="t-c t-b" x="450" y="264">Shared state (optional)</text><text class="t-c t-sm" x="450" y="282">cache zone on disk, rate-limit counters, health state</text>
+  <text class="t-c t-sm" x="450" y="330">Workers never block on one socket, so slow peers cost memory only.</text>
+  <text class="t-c t-sm" x="450" y="350">Total upstream connections = workers x pool size per worker.</text>
+
+  <rect class="db" x="740" y="40" width="146" height="320" rx="10"/><text class="t-c t-b" x="813" y="64">Upstreams</text>
+  <rect class="db" x="756" y="100" width="114" height="34" rx="6"/><text class="t-c t-sm" x="813" y="122">app-1 (pool)</text>
+  <rect class="db" x="756" y="146" width="114" height="34" rx="6"/><text class="t-c t-sm" x="813" y="168">app-2 (pool)</text>
+  <rect class="db" x="756" y="192" width="114" height="34" rx="6"/><text class="t-c t-sm" x="813" y="214">app-3 (pool)</text>
+  <text class="t-c t-sm" x="813" y="260">few, long-lived,</text><text class="t-c t-sm" x="813" y="276">reused connections</text>
+
+  <path class="arrow" d="M164 200 L226 170"/><path class="arrow" d="M670 150 L736 120"/><path class="arrow" d="M670 180 L736 164"/>
+</svg>
+<figcaption>Many cheap client connections fan in to a few event loops, which fan out to a small, reused set of upstream connections. Idle and slow clients cost only memory, not threads.</figcaption>
+</figure>
+
+<h3>5.2 The life of one request</h3>
+<ol>
+  <li><b>Accept.</b> A worker accepts the client's TCP connection. If TLS is configured, it does the handshake (cheaper on repeat visits thanks to TLS session resumption).</li>
+  <li><b>Read the request.</b> It reads and parses the request line and headers into memory, enforcing size limits and a <b>header read timeout</b>. A request body, if any, is read into a buffer in memory and spilled to a temporary file on disk when it is large (unless streaming is configured).</li>
+  <li><b>Match a rule.</b> It matches host, path and headers against routing rules, applies authentication or rate limits, and may answer straight from cache, never involving a backend.</li>
+  <li><b>Pick an upstream.</b> A balancing algorithm chooses one backend that the health checks consider alive.</li>
+  <li><b>Get a connection.</b> It takes an idle keep-alive connection to that backend from the pool, or opens a new one (a <b>connect timeout</b> applies).</li>
+  <li><b>Send and wait.</b> It writes the request, then waits for the response, bounded by a <b>read timeout</b> between bytes or an overall <b>request timeout</b>.</li>
+  <li><b>Return the response.</b> It buffers or streams the response to the client, adds or removes headers, perhaps compresses it, writes a log line, and returns the upstream connection to the pool.</li>
+</ol>
+
+<h3>5.3 Sample configurations</h3>
+<p>The three snippets below show the same idea in three products: a public listener, a pool of backends, keep-alive reuse and explicit timeouts. They are trimmed for clarity; real files have more settings. First, Nginx.</p>
+<pre><code>worker_processes auto;                 # one worker per CPU core
+events { worker_connections 20000; }   # max sockets per worker
+
+http {
+  upstream app_pool {
+    least_conn;                        # balancing algorithm
+    server 10.0.1.11:8080 max_fails=3 fail_timeout=10s;
+    server 10.0.1.12:8080 max_fails=3 fail_timeout=10s;
+    keepalive 64;                      # idle upstream connections kept per worker
+  }
+
+  server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+    ssl_certificate     /etc/ssl/api.crt;
+    ssl_certificate_key /etc/ssl/api.key;
+
+    client_header_timeout 10s;         # slowloris defence
+    client_body_timeout   15s;
+    client_max_body_size  10m;
+    send_timeout          30s;
+
+    location /api/ {
+      proxy_pass http://app_pool;
+      proxy_http_version 1.1;          # needed for upstream keep-alive
+      proxy_set_header Connection "";  # do not forward "close"
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_connect_timeout 2s;
+      proxy_read_timeout    30s;
+      proxy_next_upstream error timeout http_502 http_503;
+      proxy_next_upstream_tries 2;
+    }
+  }
+}</code></pre>
+
+<p>Envoy configures the same idea as listeners (where it accepts), routes (how a request maps to a cluster) and clusters (the upstream pools with health checking, circuit breakers and retries). A fragment of the cluster and route sections:</p>
+<pre><code>route_config:
+  virtual_hosts:
+  - name: api
+    domains: ["api.example.com"]
+    routes:
+    - match: { prefix: "/api/" }
+      route:
+        cluster: app_pool
+        timeout: 30s                   # whole-request timeout
+        retry_policy:
+          retry_on: "connect-failure,refused-stream,503"
+          num_retries: 2
+          per_try_timeout: 5s
+
+clusters:
+- name: app_pool
+  type: STRICT_DNS
+  lb_policy: LEAST_REQUEST
+  connect_timeout: 2s
+  circuit_breakers:
+    thresholds:
+    - max_connections: 1024            # cap on upstream connections
+      max_pending_requests: 256        # queue limit; excess gets 503
+      max_requests: 2048
+  outlier_detection:                   # eject misbehaving hosts
+    consecutive_5xx: 5
+    base_ejection_time: 30s
+  load_assignment: { ... endpoints 10.0.1.11, 10.0.1.12 ... }</code></pre>
+
+<p>HAProxy separates frontends from backends and is very explicit about timeouts:</p>
+<pre><code>defaults
+  mode http
+  timeout connect 2s
+  timeout client  30s        # idle or slow client
+  timeout server  30s        # waiting on the backend
+  timeout http-request 10s   # time allowed to send full request headers
+  option forwardfor          # add X-Forwarded-For
+  option http-server-close
+
+frontend web
+  bind :443 ssl crt /etc/ssl/api.pem
+  acl is_api path_beg /api/
+  use_backend app_pool if is_api
+
+backend app_pool
+  balance leastconn
+  option httpchk GET /health
+  http-check expect status 200
+  retry-on conn-failure empty-response
+  retries 2
+  server app1 10.0.1.11:8080 check maxconn 200
+  server app2 10.0.1.12:8080 check maxconn 200</code></pre>
+
+<div class="callout key"><b>Key idea</b>
+All three products expose the same four knobs that matter in practice: a <b>balancing algorithm</b>, <b>health checking</b>, <b>timeouts</b> at each stage (connect, read, write, idle), and <b>limits</b> (connections, queue depth, body size). Interviews reward candidates who name the timeouts and caps explicitly rather than saying "just put a proxy in front".
+</div>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="pooling">6. Upstream connection pooling and keep-alive</h2>
+
+<p>Opening a new TCP connection costs one round trip for the handshake, and an encrypted connection costs one or two more for TLS. Inside a data center a round trip is perhaps 0.5 ms, so a new connection adds a few milliseconds. That sounds small, but at thousands of requests per second the work (CPU for the handshake, kernel state, ephemeral ports) adds up quickly, and short-lived connections leave sockets in the TCP <code>TIME_WAIT</code> state for around a minute, which can exhaust the available local ports. Reusing connections avoids all of that.</p>
+
+<p><b>Keep-alive</b> means leaving a connection open after a response so the next request can use it. HTTP/1.1 does this by default, but in front of backends it needs the proxy to actively manage a <b>pool</b>: a set of idle connections to each backend that requests borrow and return. The effect is a big asymmetry that makes reverse proxies valuable:</p>
+
+<table>
+<tr><th>Without a proxy</th><th>With a reverse proxy and pooling</th></tr>
+<tr><td>50,000 clients each hold a connection to an app server, so each server tracks thousands of sockets and the thread or file-descriptor limit is a bottleneck</td><td>50,000 clients connect to the proxy; each app server sees perhaps 100-300 long-lived connections from the proxy</td></tr>
+<tr><td>Each new client costs a full TCP and TLS handshake at the app server</td><td>The proxy pays the client handshake; handshakes to backends are rare because pooled connections are reused</td></tr>
+<tr><td>Slow clients occupy app server capacity</td><td>Slow clients occupy only proxy memory</td></tr>
+</table>
+
+<p>Details that cause real bugs:</p>
+<ul>
+  <li><b>Idle timeout mismatch.</b> If a backend closes idle connections after 5 seconds but the proxy keeps them for 60, the proxy may pick a pooled connection at the exact moment the backend closes it. The request is sent into a dead connection and fails with a reset. The rule: the proxy's idle timeout for upstream connections must be <b>shorter</b> than the backend's. The same rule applies between a cloud load balancer and your server: your server's keep-alive timeout must exceed the load balancer's idle timeout.</li>
+  <li><b>Pool size.</b> Too small and requests queue waiting for a free connection. Too large and you let the proxy overwhelm a backend. With HTTP/1.1 one connection carries one request at a time, so the connections needed equal the concurrent requests (Little's Law from <a href="02-estimation.html">Chapter 2</a>). HTTP/2 multiplexes many requests on one connection, so a handful of connections can carry many requests.</li>
+  <li><b>Per-worker pools.</b> In Nginx and Envoy each worker has its own pool, so a configured pool of 64 with 8 workers means up to 512 connections to each backend. Remember to multiply.</li>
+  <li><b>Hop-by-hop state.</b> The client-side connection and the upstream connection are separate. HTTP/1.1 versus HTTP/2 can differ on each side, and so can TLS settings.</li>
+</ul>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="buffering">7. Request and response buffering, and slowloris</h2>
+
+<h3>7.1 Why buffering protects the backend</h3>
+<p>Imagine a backend with a pool of worker threads, say 200 per server. A request occupies a thread from the moment it starts until the response is fully written. Suppose the actual work takes 40 ms. If a client on a poor mobile connection needs 2 seconds to download a 300 KB response, then without a proxy that thread stays occupied for the whole 2 seconds, mostly doing nothing but waiting for the network to accept bytes. Now 100 such clients arrive and they hold 100 of the 200 threads, while the CPU is almost idle.</p>
+<p>With <b>response buffering</b> the backend writes the full response to the proxy at data center speed (a few milliseconds), the proxy stores it in memory or a temporary file, and the backend thread is free immediately. The proxy then feeds the slow client at the client's pace, using only a socket and a buffer, and its event loop does not mind. The same idea applies in the other direction: with <b>request buffering</b> the proxy reads an entire upload from a slow client first, and only then connects to the backend and sends the complete request at full speed. The backend never waits on a slow uploader.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Backend thread hold time with and without buffering">
+  <text class="t-b" x="20" y="22">No proxy: backend thread is held while the slow client downloads</text>
+  <text class="t-sm" x="20" y="62">App thread</text>
+  <rect class="box" x="120" y="44" width="36" height="28" rx="4"/><rect class="miss" x="156" y="44" width="660" height="28" rx="4"/>
+  <text class="t-sm" x="120" y="92">40 ms work</text><text class="t-sm" x="400" y="92">~2,000 ms writing to a slow phone, thread idle but occupied</text>
+
+  <text class="t-b" x="20" y="144">With buffering proxy: backend thread released after the fast hand-off</text>
+  <text class="t-sm" x="20" y="184">App thread</text>
+  <rect class="box" x="120" y="166" width="36" height="28" rx="4"/><rect class="hit" x="156" y="166" width="6" height="28" rx="2"/>
+  <text class="t-sm" x="176" y="184">free again after about 45 ms</text>
+  <text class="t-sm" x="20" y="232">Proxy</text>
+  <rect class="cache" x="120" y="214" width="696" height="28" rx="4"/>
+  <text class="t-sm" x="130" y="233">holds the response in a buffer and trickles it to the phone for ~2,000 ms using one socket and a few KB of memory</text>
+  <text class="t-c t-sm" x="450" y="290">The slow transfer still takes 2 s for the user, but it no longer consumes a scarce backend thread.</text>
+</svg>
+<figcaption>The red segment is the problem: a precious backend thread held for the duration of a slow network transfer. Buffering moves that wait to the proxy, where waiting is cheap.</figcaption>
+</figure>
+
+<p>Buffering has costs and exceptions, and you should be able to name them:</p>
+<ul>
+  <li><b>Memory and disk.</b> The proxy must store buffered data. Nginx keeps response buffers in memory (a configurable number and size) and spills to temporary files for larger responses; large uploads are written to disk. Size and spill limits need to be set sensibly or the proxy will run out of memory or disk under load.</li>
+  <li><b>Latency.</b> With request buffering the backend does not begin work until the whole upload has arrived. With response buffering the first byte to the client may be delayed until the proxy has received the response (or a buffer's worth of it).</li>
+  <li><b>Streaming protocols.</b> Server-Sent Events, long-polling streams, large video downloads that should start playing at once, gRPC streaming and WebSockets all need the proxy to pass data along <b>as it arrives</b>. For those routes turn buffering off (in Nginx, <code>proxy_buffering off;</code> or sending <code>X-Accel-Buffering: no</code> from the backend; <code>proxy_request_buffering off;</code> for streaming uploads). Forgetting this is a classic cause of "my live feed arrives in big lumps every 30 seconds".</li>
+</ul>
+
+<h3>7.2 Slowloris and slow-body attacks</h3>
+<p>The idea behind buffering and timeouts also defends against a cheap denial-of-service technique. In a <b>slowloris</b> attack, the attacker opens thousands of connections to your server and sends the HTTP request headers <b>extremely slowly</b>, a single header line every ten seconds, never finishing the request. A server that allocates a thread (or a connection slot) per connection and waits patiently ends up with all its capacity held by clients that are doing almost nothing. The attacker needs very little bandwidth. A related attack, <b>slow POST</b> (also called R.U.D.Y.), sends the headers promptly but trickles the body at a few bytes per second. A <b>slow read</b> attack requests a large response and then reads it one tiny window at a time.</p>
+
+<p>An event-loop reverse proxy is naturally resistant, because an idle connection costs a few kilobytes, not a thread. Even so, it has connection and memory limits, so you add explicit defenses at the proxy:</p>
+<ul>
+  <li><b>Short header and body timeouts.</b> Require the complete request headers within, say, 10 seconds (<code>client_header_timeout</code> in Nginx, <code>timeout http-request</code> in HAProxy). Require progress on the body (<code>client_body_timeout</code>), measured between reads, not for the whole upload.</li>
+  <li><b>Minimum data rate.</b> Close connections that fall below a minimum throughput after a grace period (some proxies and cloud services offer this directly).</li>
+  <li><b>Connection limits per source address</b> (<code>limit_conn</code> in Nginx, <code>stick-table</code> in HAProxy), and a cap on total connections and on the number of header bytes and body bytes.</li>
+  <li><b>Send timeouts.</b> Drop clients that will not drain a response (<code>send_timeout</code>).</li>
+  <li><b>Buffer before forwarding.</b> Because the proxy waits for the full request before contacting the backend, a slowloris victim is the proxy's cheap sockets, not your application threads.</li>
+  <li><b>Do not rely on one layer.</b> A CDN or cloud load balancer in front absorbs large floods and often enforces its own header timeouts (<a href="55-security.html">Chapter 55</a> covers DDoS more broadly).</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="Slowloris timeline at the proxy">
+  <rect class="ext" x="30" y="30" width="170" height="40" rx="8"/><text class="t-c t-b" x="115" y="55">Attacker</text>
+  <rect class="cache" x="360" y="30" width="170" height="40" rx="8"/><text class="t-c t-b" x="445" y="55">Reverse proxy</text>
+  <rect class="db" x="700" y="30" width="170" height="40" rx="8"/><text class="t-c t-b" x="785" y="55">App server</text>
+  <line class="life" x1="115" y1="70" x2="115" y2="280"/><line class="life" x1="445" y1="70" x2="445" y2="280"/><line class="life" x1="785" y1="70" x2="785" y2="280"/>
+  <path class="arrow" d="M115 100 L441 100"/><text class="t-sm" x="130" y="92">t=0s  "GET / HTTP/1.1" (partial headers)</text>
+  <path class="arrow" d="M115 140 L441 140"/><text class="t-sm" x="130" y="132">t=8s  one more header line</text>
+  <rect class="miss" x="320" y="162" width="250" height="40" rx="8"/><text class="t-c t-sm" x="445" y="180">t=10s header timeout fires</text><text class="t-c t-sm" x="445" y="194">proxy closes the connection</text>
+  <path class="arrow-r" d="M441 232 L119 232"/><text class="t-sm" x="150" y="224">408 Request Timeout / connection closed</text>
+  <text class="t-c t-sm" x="785" y="170">never contacted</text><text class="t-c t-sm" x="785" y="186">no thread consumed</text>
+</svg>
+<figcaption>Because the proxy buffers and enforces a header deadline, the half-finished request is killed at the proxy. The application server never sees it.</figcaption>
+</figure>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="headers">8. Header handling, real client IP and trust boundaries</h2>
+
+<p>Once a proxy is in the middle, the backend's TCP connection comes from the proxy, so the address the backend sees is the proxy's, not the user's. The original information has to travel in HTTP headers. This sounds like a plumbing detail, but it drives rate limiting, geolocation, fraud checks, audit logs, and security. It also has an important trap: <b>headers can be forged</b>.</p>
+
+<h3>8.1 The headers that carry the original request</h3>
+<ul>
+  <li><b><code>X-Forwarded-For</code> (XFF).</b> A de facto standard that holds a comma-separated list of addresses. Each proxy that handles the request <b>appends</b> the address of the peer that connected to it. After two proxies it might read <code>X-Forwarded-For: 198.51.100.7, 10.0.0.5</code>, meaning the first value is the original client (as claimed) and the later ones are intermediaries.</li>
+  <li><b><code>X-Forwarded-Proto</code></b> (http or https) and <b><code>X-Forwarded-Host</code></b> / <b><code>X-Forwarded-Port</code></b>. After TLS termination the backend sees plain HTTP, so it needs to know the client used HTTPS in order to build correct absolute URLs, set <code>Secure</code> cookies and avoid redirect loops.</li>
+  <li><b><code>Forwarded</code></b> (RFC 7239). The standardized replacement that puts the same information in one structured header: <code>Forwarded: for=198.51.100.7;proto=https;host=api.example.com;by=10.0.0.5</code>. Adoption is partial, so many systems still use the X-Forwarded family and you often meet both.</li>
+  <li><b><code>Host</code></b>. The name the client asked for. Routing by virtual host depends on it. A proxy normally passes the original Host through (<code>proxy_set_header Host $host;</code>). If it instead sets Host to the backend's internal name, the application can generate wrong links and cookies scoped to the wrong domain. Some backends (for example a cloud storage origin) require the Host of their own name; then the original goes in <code>X-Forwarded-Host</code>.</li>
+  <li><b><code>Via</code></b>. Lists the protocol and name of each intermediary, useful for debugging and loop detection.</li>
+  <li><b>PROXY protocol.</b> A small preamble (originally from HAProxy) that a TCP-level proxy prepends to the connection to carry the original source and destination address, so even a non-HTTP backend or an L4 balancer can pass the client address without HTTP headers. The receiving server must expect it, otherwise the preamble looks like garbage.</li>
+  <li><b>Request IDs.</b> Proxies often add a unique <code>X-Request-ID</code> (or a W3C <code>traceparent</code>) if the client did not send one, so that logs across services can be joined (<a href="52-microservice-observability.html">Chapter 52</a>).</li>
+</ul>
+
+<h3>8.2 Hop-by-hop headers</h3>
+<p>Most headers describe the whole request and are passed along unchanged. A few describe only <b>one connection</b> and must not be forwarded: <code>Connection</code>, <code>Keep-Alive</code>, <code>Proxy-Authenticate</code>, <code>Proxy-Authorization</code>, <code>TE</code>, <code>Trailer</code>, <code>Transfer-Encoding</code> and <code>Upgrade</code>, plus any header named in the <code>Connection</code> header. A correct proxy strips these and sets its own for the next hop. This is exactly why WebSocket needs special configuration (section 9): <code>Upgrade</code> is hop-by-hop, so the proxy has to deliberately re-create it.</p>
+
+<h3>8.3 The trust boundary: who may you believe?</h3>
+<p>Anyone can send <code>X-Forwarded-For: 1.2.3.4</code> with their request. Your proxy, if it blindly appends, produces <code>X-Forwarded-For: 1.2.3.4, 198.51.100.7</code>. An application that naively reads the <b>leftmost</b> value as the client IP now believes the attacker is 1.2.3.4. The consequences are concrete: an attacker bypasses an IP-based rate limit by rotating fake values, evades an IP allowlist (<code>X-Forwarded-For: 10.0.0.1</code> to look internal), poisons audit logs, or frames another address.</p>
+<p>The fix is to define a <b>trust boundary</b>. Your own proxies are trusted; anything beyond them is not. The correct algorithm is to read the header from the <b>right</b>: take the address that connected to your outermost trusted proxy as the true peer, then walk left through the list while each address belongs to a trusted proxy (known ranges), and stop at the first one that does not. That address is the client as far as you can verify.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="X-Forwarded-For across two proxies with a trust boundary">
+  <rect class="ext" x="20" y="60" width="130" height="50" rx="8"/><text class="t-c t-b" x="85" y="82">Attacker</text><text class="t-c t-sm" x="85" y="98">real IP 198.51.100.7</text>
+  <rect class="cache" x="270" y="60" width="130" height="50" rx="8"/><text class="t-c t-b" x="335" y="82">Edge proxy</text><text class="t-c t-sm" x="335" y="98">203.0.113.5</text>
+  <rect class="cache" x="520" y="60" width="130" height="50" rx="8"/><text class="t-c t-b" x="585" y="82">Inner proxy</text><text class="t-c t-sm" x="585" y="98">10.0.0.5</text>
+  <rect class="db" x="760" y="60" width="120" height="50" rx="8"/><text class="t-c t-b" x="820" y="90">App</text>
+  <path class="arrow" d="M150 85 L266 85"/><path class="arrow" d="M400 85 L516 85"/><path class="arrow" d="M650 85 L756 85"/>
+
+  <rect class="miss" x="20" y="140" width="250" height="50" rx="8"/><text class="t-sm" x="30" y="160">sends a forged header:</text><text class="t-sm" x="30" y="178">XFF: 1.2.3.4</text>
+  <rect class="box" x="290" y="140" width="250" height="50" rx="8"/><text class="t-sm" x="300" y="160">edge appends the peer it saw:</text><text class="t-sm" x="300" y="178">XFF: 1.2.3.4, 198.51.100.7</text>
+  <rect class="box" x="560" y="140" width="320" height="50" rx="8"/><text class="t-sm" x="570" y="160">inner appends the edge's address:</text><text class="t-sm" x="570" y="178">XFF: 1.2.3.4, 198.51.100.7, 203.0.113.5</text>
+
+  <rect class="hit" x="20" y="222" width="860" height="86" rx="8"/>
+  <text class="t-sm" x="34" y="244">Correct read, right to left: the peer is 10.0.0.5 (trusted inner proxy), skip it. Next 203.0.113.5 (trusted edge), skip it.</text>
+  <text class="t-sm" x="34" y="264">Next 198.51.100.7 is not a trusted proxy, so that is the client. Everything left of it (1.2.3.4) is unverified input.</text>
+  <text class="t-sm" x="34" y="286">Naive read of the leftmost value would believe the attacker's forged 1.2.3.4.</text>
+</svg>
+<figcaption>Each proxy appends the address that connected to it. Only the entries added by your own proxies can be trusted, so read from the right and stop at the first untrusted hop.</figcaption>
+</figure>
+
+<p>Practical rules that follow from this:</p>
+<ul>
+  <li>At the <b>outermost</b> proxy, the one that faces the internet, either <b>overwrite</b> client-supplied <code>X-Forwarded-For</code> with the real peer address, or append to it but remember that the pre-existing part is untrusted. Many teams choose overwrite because it is simplest to reason about. (In Nginx, <code>proxy_set_header X-Forwarded-For $remote_addr;</code> overwrites, while <code>$proxy_add_x_forwarded_for</code> appends.)</li>
+  <li>Behind a CDN or cloud load balancer, configure the list of trusted proxy ranges and let a module resolve the real client address (Nginx <code>ngx_http_realip_module</code> with <code>set_real_ip_from</code>, <code>real_ip_header</code> and <code>real_ip_recursive on</code>; Envoy <code>xff_num_trusted_hops</code>). Many CDNs also send a dedicated header (a single client IP value) that is more reliable than parsing XFF, but it is only trustworthy if the origin accepts traffic <b>only</b> from the CDN.</li>
+  <li>Make the origin unreachable except through the proxy (security groups, private networking, mutual TLS, or a shared secret header). Otherwise attackers connect directly and spoof every header.</li>
+  <li>Strip internal headers on the way in. If your backends trust headers such as <code>X-User-Id</code> or <code>X-Internal-Auth</code> set by the gateway, the edge must delete any copies sent by clients before adding its own.</li>
+  <li>Normalize and validate: a proxy and a backend that parse the same request differently can be exploited for <b>HTTP request smuggling</b>, where an ambiguous combination of <code>Content-Length</code> and <code>Transfer-Encoding</code> lets an attacker hide a second request inside the first. Defense is to use strict, current proxy versions, reject ambiguous requests, and prefer HTTP/2 or consistent HTTP/1.1 parsing on both hops.</li>
+</ul>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="protocols">9. WebSocket and gRPC through proxies</h2>
+
+<h3>9.1 WebSocket</h3>
+<p>A WebSocket (<a href="06-realtime.html">Chapter 6</a>) begins life as an ordinary HTTP/1.1 request that asks to switch protocols: the client sends <code>Connection: Upgrade</code> and <code>Upgrade: websocket</code> with a key. The server answers <code>101 Switching Protocols</code>, and from then on the same TCP connection carries framed, two-way messages instead of HTTP. For a proxy this raises three issues.</p>
+<ol>
+  <li><b>The upgrade headers are hop-by-hop.</b> A proxy that follows the HTTP rules would strip them. It must be told to pass the upgrade through. In Nginx this takes <code>proxy_http_version 1.1;</code> plus <code>proxy_set_header Upgrade $http_upgrade;</code> and <code>proxy_set_header Connection "upgrade";</code>. Envoy and HAProxy have an explicit upgrade configuration or detect it automatically.</li>
+  <li><b>After the upgrade, the proxy is a byte relay.</b> It no longer sees requests and responses, so per-request features (retries, caching, response-code based health, per-request routing) do not apply to messages, and buffering must not hold data back.</li>
+  <li><b>Connections are long-lived and idle most of the time.</b> Default read timeouts (Nginx defaults to 60 seconds of silence) will kill a quiet socket, so either raise <code>proxy_read_timeout</code> for the WebSocket location or have the application send periodic ping frames so the connection is never silent. Each socket also costs a file descriptor on the proxy and on the backend, so raise limits, and plan for the thundering herd when a proxy restarts and every client reconnects at once (use jittered client back-off).</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="WebSocket upgrade through a reverse proxy">
+  <rect class="ext" x="60" y="14" width="150" height="34" rx="8"/><text class="t-c t-b" x="135" y="36">Client</text>
+  <rect class="cache" x="375" y="14" width="150" height="34" rx="8"/><text class="t-c t-b" x="450" y="36">Reverse proxy</text>
+  <rect class="db" x="690" y="14" width="150" height="34" rx="8"/><text class="t-c t-b" x="765" y="36">App server</text>
+  <line class="life" x1="135" y1="48" x2="135" y2="320"/><line class="life" x1="450" y1="48" x2="450" y2="320"/><line class="life" x1="765" y1="48" x2="765" y2="320"/>
+  <path class="arrow" d="M135 82 L446 82"/><text class="t-sm" x="146" y="74">1. GET /chat  Upgrade: websocket</text>
+  <path class="arrow" d="M450 112 L761 112"/><text class="t-sm" x="462" y="104">2. proxy re-adds Upgrade + Connection: upgrade</text>
+  <path class="arrow-g" d="M761 146 L454 146"/><path class="arrow-g" d="M446 146 L139 146"/><text class="t-sm" x="462" y="138">3. 101 Switching Protocols (relayed)</text>
+  <rect class="hit" x="60" y="170" width="780" height="28" rx="8"/><text class="t-c t-sm" x="450" y="189">Proxy now relays frames in both directions; no request or response boundaries</text>
+  <path class="arrow" d="M135 228 L446 228"/><path class="arrow" d="M450 228 L761 228"/><text class="t-sm" x="146" y="220">message frames</text>
+  <path class="arrow-g" d="M761 262 L454 262"/><path class="arrow-g" d="M446 262 L139 262"/><text class="t-sm" x="330" y="254">pings keep idle timeouts from firing</text>
+  <text class="t-c t-sm" x="450" y="304">If the proxy's idle timeout is 60 s, send a ping every 20-30 s.</text>
+</svg>
+<figcaption>The handshake is normal HTTP, but the proxy must re-create the hop-by-hop upgrade headers. After the 101 it only relays bytes, so keep-alive pings are what prevent idle-timeout disconnects.</figcaption>
+</figure>
+
+<h3>9.2 gRPC</h3>
+<p>gRPC (<a href="05-api-design.html">Chapter 5</a>, <a href="47-service-communication.html">Chapter 47</a>) runs on <b>HTTP/2</b>. Two details matter to a proxy. First, gRPC puts its status code (<code>grpc-status</code>) in HTTP <b>trailers</b>, headers sent after the body. A proxy must support HTTP/2 end to end and forward trailers; an HTTP/1.1-only hop breaks it. Nginx has dedicated <code>grpc_pass</code>, Envoy and HAProxy handle it natively. Second, gRPC streaming calls can be open for minutes or hours, so response buffering must be off for them and timeouts must be generous or per-stream.</p>
+<p>The deepest gRPC proxy issue is <b>load balancing granularity</b>. HTTP/2 puts many requests on one long-lived connection. A layer-4 balancer picks a backend once per connection, so a client with a single connection sends <b>every</b> call to the same backend, and a newly added backend receives no traffic from existing clients. An L7 proxy that understands HTTP/2 balances <b>per request (per stream)</b> across its upstream connections, which is why gRPC systems use Envoy, a service mesh sidecar or client-side balancing rather than a plain TCP balancer. Another practical wrinkle: browsers cannot speak native gRPC, so a proxy often translates <b>gRPC-Web</b> to gRPC.</p>
+
+<table>
+<tr><th>Concern</th><th>HTTP request/response</th><th>WebSocket</th><th>gRPC</th></tr>
+<tr><td>Transport at the proxy</td><td>HTTP/1.1 or 2, per request</td><td>HTTP/1.1 Upgrade, then raw frames</td><td>HTTP/2 with trailers</td></tr>
+<tr><td>Balancing unit</td><td>Per request</td><td>Per connection (once, at upgrade)</td><td>Per stream, needs L7 and HTTP/2</td></tr>
+<tr><td>Buffering</td><td>Usually on</td><td>Off, relay</td><td>Off for streams</td></tr>
+<tr><td>Timeout concern</td><td>Read and request timeouts</td><td>Idle timeout kills quiet sockets, send pings</td><td>Per-RPC deadlines, long streams need raised limits</td></tr>
+<tr><td>Retry safety</td><td>Idempotent methods only</td><td>Not applicable to messages</td><td>Only for calls known idempotent or failed before sending</td></tr>
+</table>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="caching">10. Caching proxy semantics</h2>
+
+<p>A caching proxy (a Varnish or Squid server, an Nginx with <code>proxy_cache</code>, a CDN edge) stores responses and replays them for later identical requests. HTTP defines the rules for doing that safely. These rules are the same ones <a href="12-cdn.html">Chapter 12</a> relies on and <a href="13-caching-patterns.html">Chapter 13</a> generalizes, so this section covers just what a proxy must decide.</p>
+
+<h3>10.1 Is this response cacheable, and for how long?</h3>
+<ul>
+  <li><b><code>Cache-Control</code></b> from the origin is the main instruction. <code>max-age=N</code> says the response is fresh for N seconds. <code>s-maxage</code> sets a lifetime for <b>shared</b> caches (proxies and CDNs) separate from the browser's. <code>public</code> and <code>private</code> say whether shared caches may store it (<code>private</code> means only the user's own browser). <code>no-store</code> forbids storing anywhere. <code>no-cache</code> means "you may store it, but you must revalidate with the origin before reusing it", which is a common misunderstanding.</li>
+  <li>Without explicit lifetimes a cache may estimate freshness from <code>Last-Modified</code>, a practice called heuristic freshness. Without any validators it should not cache.</li>
+  <li>By default only responses to <code>GET</code> (and <code>HEAD</code>) with cacheable status codes (200, 301, 404 and a few others) are stored. A response to a request with an <code>Authorization</code> header is not stored by a shared cache unless the response explicitly allows it. A response carrying <code>Set-Cookie</code> is often not cached by default in proxy configurations, because it is probably personal.</li>
+</ul>
+
+<h3>10.2 What counts as "the same request"? The cache key and Vary</h3>
+<p>The proxy builds a <b>cache key</b>, by default from the method, host and full URL including the query string. Two requests with the same key share one stored response. Some responses differ by request header, for instance gzip versus plain, or language. The origin lists the headers that matter in <code>Vary</code> (for example <code>Vary: Accept-Encoding</code>), and the proxy must store a separate variant per distinct value. <code>Vary: Cookie</code> or <code>Vary: User-Agent</code> fragments the cache into near-useless pieces. A wrongly narrow key is worse: if personalized content is cached under a key that ignores the user, one user's page is served to another, a serious leak. Always design what is part of the key on purpose.</p>
+
+<h3>10.3 Freshness, revalidation and staleness</h3>
+<p>When a stored response expires, the proxy does not have to throw it away. It sends a <b>conditional request</b> to the origin with <code>If-None-Match: "etag"</code> (or <code>If-Modified-Since</code>). If the content has not changed, the origin replies <code>304 Not Modified</code> with no body, and the proxy refreshes the lifetime of its copy, saving bandwidth. Two extensions are valuable for resilience: <code>stale-while-revalidate</code> lets the proxy serve the stale copy immediately while it refreshes in the background (users never wait), and <code>stale-if-error</code> lets it serve a stale copy when the origin is failing, turning an outage into a degraded but working site. Nginx offers <code>proxy_cache_use_stale</code> and <code>proxy_cache_background_update</code> for the same ideas.</p>
+
+<h3>10.4 Stampede protection and invalidation</h3>
+<p>If a popular entry expires and 5,000 requests arrive in the same second, a naive proxy sends 5,000 identical requests to the origin. <b>Request collapsing</b> (Nginx <code>proxy_cache_lock on;</code>, Varnish request coalescing) lets one request go to the origin while the others wait for its answer. This is the proxy-level version of the cache stampede problem covered in <a href="14-caching-failures.html">Chapter 14</a>. For removing content before it expires, a proxy typically supports a <b>purge</b> API (by URL or tag), or you change the URL (versioned file names) so old entries are simply never requested again.</p>
+
+<div class="callout watch"><b>Watch out</b>
+A shared proxy cache and personalized responses are a dangerous combination. If a page that depends on the logged-in user is accidentally served with <code>public, max-age=...</code>, the cache will hand one user's account page to the next visitor. Mark user-specific responses <code>private</code> or <code>no-store</code>, and make the proxy bypass the cache when a session cookie is present unless you have deliberately designed otherwise.
+</div>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Caching proxy decision flow">
+  <rect class="ext" x="20" y="130" width="110" height="44" rx="8"/><text class="t-c t-b" x="75" y="157">Request</text>
+  <rect class="cache" x="180" y="120" width="150" height="64" rx="8"/><text class="t-c t-b" x="255" y="146">Build cache key</text><text class="t-c t-sm" x="255" y="164">method, host, URL, Vary</text>
+  <rect class="box" x="380" y="120" width="130" height="64" rx="8"/><text class="t-c t-b" x="445" y="146">Lookup</text><text class="t-c t-sm" x="445" y="164">entry present?</text>
+  <rect class="hit" x="580" y="30" width="160" height="50" rx="8"/><text class="t-c t-b" x="660" y="52">Fresh: serve it</text><text class="t-c t-sm" x="660" y="68">Age header shows seconds</text>
+  <rect class="cache" x="580" y="124" width="160" height="56" rx="8"/><text class="t-c t-b" x="660" y="146">Stale: revalidate</text><text class="t-c t-sm" x="660" y="164">If-None-Match to origin</text>
+  <rect class="miss" x="580" y="224" width="160" height="56" rx="8"/><text class="t-c t-b" x="660" y="246">Miss: fetch origin</text><text class="t-c t-sm" x="660" y="264">one request, others wait</text>
+  <rect class="db" x="780" y="124" width="100" height="56" rx="8"/><text class="t-c t-b" x="830" y="156">Origin</text>
+  <path class="arrow" d="M130 152 L176 152"/><path class="arrow" d="M330 152 L376 152"/>
+  <path class="arrow-g" d="M510 134 L576 64"/><path class="arrow" d="M510 152 L576 152"/><path class="arrow-r" d="M510 170 L576 246"/>
+  <path class="arrow dash" d="M740 152 L776 152"/><path class="arrow dash" d="M740 252 L810 184"/>
+  <text class="t-sm" x="524" y="96">fresh</text><text class="t-sm" x="520" y="148">stale</text><text class="t-sm" x="524" y="226">none</text>
+  <text class="t-c t-sm" x="450" y="318">304 refreshes the stored copy; 200 replaces it; origin failure can fall back to stale-if-error.</text>
+</svg>
+<figcaption>Every request resolves to one of three outcomes: serve a fresh copy, revalidate a stale one cheaply, or fetch fully on a miss. Collapsing makes sure concurrent misses become a single origin request.</figcaption>
+</figure>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="sidecar">11. Sidecar proxies: a preview</h2>
+
+<p>Everything so far puts a proxy at the edge of the system. A growing pattern puts a proxy next to <b>every service instance</b>. In this <b>sidecar</b> model, a small proxy (often Envoy) runs in the same host or Kubernetes pod as the application. The application talks to <code>localhost</code>, and the sidecar handles all traffic in and out of that instance. Because it is a proxy on both sides of every service-to-service call, it can add mutual TLS between services, retries and timeouts with sensible defaults, circuit breaking, load balancing based on live health, request-level metrics and traces, and traffic shifting for canaries, all without any change to application code or language.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Sidecar proxies beside two services">
+  <rect class="ext" x="20" y="90" width="110" height="50" rx="8"/><text class="t-c t-b" x="75" y="120">Edge proxy</text>
+  <rect class="cache" x="190" y="30" width="300" height="170" rx="12"/><text class="t-sm" x="204" y="52">Pod A: orders</text>
+  <rect class="box" x="210" y="70" width="110" height="60" rx="8"/><text class="t-c t-b" x="265" y="106">App</text>
+  <rect class="cache" x="350" y="70" width="120" height="60" rx="8"/><text class="t-c t-b" x="410" y="96">Sidecar</text><text class="t-c t-sm" x="410" y="114">proxy</text>
+  <path class="arrow" d="M320 100 L346 100"/>
+  <rect class="cache" x="560" y="30" width="300" height="170" rx="12"/><text class="t-sm" x="574" y="52">Pod B: payments</text>
+  <rect class="cache" x="580" y="70" width="120" height="60" rx="8"/><text class="t-c t-b" x="640" y="96">Sidecar</text><text class="t-c t-sm" x="640" y="114">proxy</text>
+  <rect class="box" x="730" y="70" width="110" height="60" rx="8"/><text class="t-c t-b" x="785" y="106">App</text>
+  <path class="arrow" d="M700 100 L726 100"/>
+  <path class="arrow" d="M130 115 L206 105"/>
+  <path class="arrow-g" d="M470 100 L576 100"/><text class="t-c t-sm" x="523" y="90">mTLS</text>
+  <rect class="ext" x="350" y="214" width="200" height="30" rx="8"/><text class="t-c t-sm" x="450" y="233">Control plane pushes config</text>
+  <path class="arrow dash" d="M410 214 L410 134"/><path class="arrow dash" d="M500 214 L640 134"/>
+</svg>
+<figcaption>A sidecar proxy beside each application instance. Application code makes plain local calls; the sidecars encrypt, retry, balance and measure traffic between services, and a control plane distributes their configuration.</figcaption>
+</figure>
+
+<p>This is the data plane of a <b>service mesh</b>. The tradeoffs (extra hop latency, memory per pod, operational complexity, debugging difficulty) and the control plane are the subject of <a href="50-service-mesh.html">Chapter 50</a>. For now, remember that a sidecar is simply a reverse proxy and a forward proxy combined and placed next to each service: inbound traffic is handled as a reverse proxy would, outbound as a forward proxy would.</p>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="failures">12. Failure modes and how to design them</h2>
+
+<p>A proxy is on the path of every request, which makes it both a convenient place to add resilience and a dangerous place to make mistakes. First, learn what the proxy's own error responses mean, because they are the vocabulary of incident diagnosis.</p>
+
+<h3>12.1 502, 503 and 504</h3>
+<table>
+<tr><th>Status</th><th>Name</th><th>What the proxy is telling you</th><th>Typical causes</th></tr>
+<tr><td><b>502</b></td><td>Bad Gateway</td><td>I reached (or tried to reach) the upstream and got an invalid or no response: the connection was refused or reset, or the reply was malformed.</td><td>Backend crashed or restarting, process listening on a different port, backend closed an idle pooled connection, protocol mismatch (HTTP versus HTTPS to the backend), response headers too large for the proxy's buffer</td></tr>
+<tr><td><b>503</b></td><td>Service Unavailable</td><td>I am not able to serve this right now: there is no healthy upstream, a limit was hit, or I am shedding load.</td><td>All backends failed health checks, circuit breaker or connection cap overflow, rate limiting, deliberate maintenance mode, deployment with zero ready pods</td></tr>
+<tr><td><b>504</b></td><td>Gateway Timeout</td><td>The upstream accepted the request but did not answer within my time limit.</td><td>Slow query or dependency, thread pool exhausted in the backend, a long GC pause, timeout set too low for a legitimately slow endpoint, network black hole</td></tr>
+<tr><td><b>499</b> (Nginx specific)</td><td>Client Closed Request</td><td>The client gave up before I could answer. Not an upstream fault, but a growing count of 499 often means your latency is too high.</td><td>Client timeouts shorter than server latency, users navigating away</td></tr>
+<tr><td><b>400 / 413 / 431 / 408</b></td><td>Client errors the proxy itself returns</td><td>Malformed request, body too large, header fields too large, or the client was too slow to send the request.</td><td>Oversized cookies, upload over <code>client_max_body_size</code>, slow or stalled clients</td></tr>
+</table>
+
+<p>A quick rule: <b>502 means the upstream broke the conversation, 503 means the proxy declined or had nothing to talk to, and 504 means the upstream was too slow.</b> Different causes call for different fixes, so make sure your dashboards and alerts separate them and also record which upstream and which phase (connect, send, wait, read) failed. Envoy adds response flags to its logs (for example, one for "no healthy upstream" and one for "upstream connection failure") that make this easy.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 310" role="img" aria-label="Where 502 503 504 arise in the proxy request path">
+  <rect class="ext" x="20" y="100" width="110" height="50" rx="8"/><text class="t-c t-b" x="75" y="130">Client</text>
+  <rect class="cache" x="230" y="90" width="150" height="70" rx="8"/><text class="t-c t-b" x="305" y="120">Proxy</text><text class="t-c t-sm" x="305" y="140">timeouts, limits</text>
+  <rect class="db" x="560" y="30" width="130" height="44" rx="8"/><text class="t-c t-b" x="625" y="57">Backend A</text>
+  <rect class="db" x="560" y="108" width="130" height="44" rx="8"/><text class="t-c t-b" x="625" y="135">Backend B</text>
+  <rect class="db" x="560" y="186" width="130" height="44" rx="8"/><text class="t-c t-b" x="625" y="213">Backend C</text>
+  <path class="arrow" d="M130 125 L226 125"/>
+  <path class="arrow-r" d="M380 105 L556 56"/><path class="arrow-r dash" d="M380 125 L556 130"/><path class="arrow-r" d="M380 145 L556 206"/>
+  <text class="t-sm" x="706" y="56">resets or sends garbage</text><text class="t-sm" x="706" y="72" style="fill:var(--bad)">proxy returns 502</text>
+  <text class="t-sm" x="706" y="130">accepts but never answers</text><text class="t-sm" x="706" y="146" style="fill:var(--bad)">read timeout, 504</text>
+  <text class="t-sm" x="706" y="208">failed health check, ejected</text><text class="t-sm" x="706" y="224" style="fill:var(--bad)">if all are out: 503</text>
+  <text class="t-c t-sm" x="450" y="276">The client sees only the proxy's status; the cause is on a different hop.</text>
+</svg>
+<figcaption>The same client-visible error family hides three different upstream conditions. The proxy converts each backend problem into a status code, which is why the proxy's own logs are the first place to look.</figcaption>
+</figure>
+
+<h3>12.2 Timeouts: set every one, and make them nest</h3>
+<p>A proxy has several distinct timers, and defaults are rarely right for your service. The connect timeout (how long to wait for a TCP connection to open) should be short, a second or two, because inside a data center a connection either opens in milliseconds or something is wrong. The read timeout (how long to wait for the response) should be a bit above the slowest legitimate request, based on the 99th or 99.9th percentile latency, not the average. Client-facing timeouts (header, body, send, idle) should be tight enough to defeat slow attacks yet long enough for slow mobile networks.</p>
+<p>Timeouts must also <b>nest correctly across hops</b>. If a browser times out at 30 seconds, the load balancer at 60, the proxy at 30, and the backend's own downstream call at 25, then a slow dependency ends in a clean error at 25 seconds. If the inner timeouts are longer than the outer, the outer layer gives up and (often) retries while the inner work is still running, doubling the load on an already slow system. The rule of thumb is that each layer's timeout is slightly shorter than the layer above it, and the deadline is propagated down so work is abandoned when no one is waiting for it (<a href="40-resilience.html">Chapter 40</a> and <a href="51-microservice-resilience.html">Chapter 51</a>).</p>
+
+<h3>12.3 Retries and non-idempotent requests</h3>
+<p>Retrying at the proxy turns many transient failures (a backend that just died, a reset connection) into successes invisible to the client. It is also one of the most dangerous features when used carelessly, for two reasons.</p>
+<ul>
+  <li><b>Duplicated side effects.</b> If the proxy sends <code>POST /payments</code> to backend A, A processes it and charges the card, but the connection resets before the response arrives, the proxy cannot tell whether the work happened. A retry to backend B may charge the customer twice. Safe-by-default behaviour is to retry automatically only when the proxy <b>knows</b> the request was not processed (the connection could not be established, or the backend refused the stream) or when the method is <b>idempotent</b> (GET, HEAD, PUT, DELETE, OPTIONS by HTTP semantics). Nginx follows this: it does not retry non-idempotent methods (POST, PATCH, LOCK) once the request has been sent, unless you add <code>non_idempotent</code> to <code>proxy_next_upstream</code>. For writes that must be retried, require an <b>idempotency key</b> that the backend deduplicates on (<a href="32-idempotency-ids.html">Chapter 32</a>, <a href="05-api-design.html">Chapter 5</a>).</li>
+  <li><b>Retry storms.</b> When a backend is overloaded and slow, retries add extra load to something already failing, which makes it fail more, which creates more retries. Three retries across three layers is 27 attempts for one user click. Defences: cap retries to one or two, use a <b>retry budget</b> (retries may be at most, say, 10% of normal traffic), add jittered back-off, retry only on failures that are likely transient, and avoid retrying at several layers. Envoy's retry budgets and per-try timeouts make this explicit.</li>
+</ul>
+
+<h3>12.4 Connection exhaustion</h3>
+<p>Several limits can run out, and each fails differently:</p>
+<ul>
+  <li><b>File descriptors.</b> Every socket is a descriptor. The default per-process limit (often 1,024) is far too low for a proxy that holds tens of thousands of connections; raise <code>ulimit -n</code> and <code>worker_rlimit_nofile</code>. Symptom: "too many open files" errors and refused connections even though CPU is idle.</li>
+  <li><b>Ephemeral ports.</b> A proxy connecting to one backend IP and port from one source IP can have only about 28,000 to 60,000 concurrent connections to that destination, since the source port is the only varying part of the connection identity. With many short-lived connections, <code>TIME_WAIT</code> sockets pile up. Fixes: keep-alive pooling, more backend IPs or source IPs, and a wider ephemeral port range.</li>
+  <li><b>Backend connection and thread limits.</b> If the proxy can open more concurrent connections than the backend can handle, the backend falls over. Cap per-backend connections (<code>maxconn</code> in HAProxy, <code>max_connections</code> in Envoy) and queue or shed the excess, preferring a fast 503 over a slow collapse. Backpressure and bounded queues are covered in <a href="08-scalability-concurrency.html">Chapter 8</a> and shedding in <a href="16-rate-limiting.html">Chapter 16</a>.</li>
+  <li><b>Proxy memory.</b> Many slow clients each holding buffers can exhaust memory; bound buffer sizes and connection counts, and use timeouts as above.</li>
+  <li><b>Head-of-line blocking.</b> With HTTP/1.1 to backends, one slow response blocks its connection. With HTTP/2 to the backend, one connection carries many streams, but a stalled connection stalls all of them, so keep several connections per backend.</li>
+</ul>
+
+<h3>12.5 Header spoofing</h3>
+<p>Covered in section 8.3: forged <code>X-Forwarded-For</code>, forged internal-auth headers, and a <code>Host</code> header that points routing at a different virtual host. To design against it, overwrite or sanitize at the outermost trusted layer, strip internal headers from external requests, validate Host against an allowlist, and ensure the origin accepts traffic only from the proxy.</p>
+
+<h3>12.6 The proxy as a single point of failure and a bottleneck</h3>
+<p>Every request goes through it, so its failure is total. The remedies are the standard ones: run <b>several</b> proxy instances behind a layer-4 balancer, a floating IP or anycast (<a href="09-load-balancing.html">Chapter 9</a> explains high availability of the load balancer itself); deploy configuration changes gradually and validate them before applying (a syntax error pushed to all proxies at once is a global outage, so use <code>nginx -t</code>, canary the config to a subset, and keep the last good version for rollback); make reloads graceful; autoscale on connections and CPU; and watch proxy-added latency. A well-tuned proxy adds well under a millisecond per request but a mistuned or overloaded one adds queueing delay that appears as latency on every service behind it.</p>
+
+<div class="callout good"><b>Design checklist for any proxy tier</b>
+Run at least two instances across failure domains. Set connect, read, send, header and idle timeouts explicitly and make inner ones shorter than outer ones. Cap connections per backend and queue depth. Retry only idempotent requests or those that never reached the backend, with a budget and jitter. Overwrite client-supplied forwarding headers at the edge. Lock the origin to the proxy. Separate 502, 503 and 504 in metrics. Reload configuration gracefully and roll it out gradually.
+</div>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="products">13. Choosing a product</h2>
+<table>
+<tr><th>Product</th><th>Strengths</th><th>Typical role</th><th>Things to know</th></tr>
+<tr><td><b>Nginx</b></td><td>Very fast static serving and reverse proxying, mature, simple configuration, good caching, huge community</td><td>Edge reverse proxy, web server, ingress, simple L7 balancer</td><td>Configuration is static (reload to change); some advanced features such as active health checks and dynamic reconfiguration are in the commercial edition or need modules</td></tr>
+<tr><td><b>HAProxy</b></td><td>Extremely efficient L4 and L7 balancing, rich health checking, detailed stats, stick tables for rate limiting and stickiness</td><td>High-performance load balancer and TCP/HTTP proxy</td><td>Not a web server or file server; caching is limited</td></tr>
+<tr><td><b>Envoy</b></td><td>Built for service-to-service traffic: dynamic configuration through APIs (xDS), HTTP/2 and gRPC first-class, circuit breaking, outlier detection, retries, rich telemetry, extensible filters</td><td>Sidecar in a mesh, gateway data plane, modern edge proxy</td><td>Configuration is verbose and normally generated by a control plane; learning curve is steeper</td></tr>
+<tr><td><b>Varnish / Squid</b></td><td>Varnish: a very flexible HTTP accelerator with a configuration language for cache policy. Squid: a long-established forward and caching proxy</td><td>Caching reverse proxy (Varnish); caching and filtering forward proxy (Squid)</td><td>Varnish does not terminate TLS on its own (it is usually placed behind a TLS terminator)</td></tr>
+<tr><td><b>Cloud managed (ALB, Cloud Load Balancing, Front Door)</b></td><td>No servers to run, built-in HA and scaling, integration with certificates and WAF</td><td>Default choice for public entry in cloud deployments</td><td>Fixed feature set, idle timeouts and limits you cannot change, cost per request or per capacity unit</td></tr>
+</table>
+
+<!-- ======================= 14 ======================= -->
+<h2 id="example">14. Worked example: sizing the proxy tier for a shopping site</h2>
+
+<p>An e-commerce site receives 8,000 requests per second at peak. The application servers run 40 ms of work per average request and are Java servers with a limit of 200 request threads each. About 10% of users are on slow mobile networks where a typical 300 KB response takes about 2 seconds to download. Total concurrent client connections at peak are about 60,000 because browsers keep connections open between clicks.</p>
+
+<h3>14.1 Without a buffering proxy</h3>
+<p>Mean time a backend thread is occupied per request is 90% of requests at 40 ms plus 10% at 40 ms + 2,000 ms: 0.9 × 0.040 + 0.1 × 2.040 = 0.036 + 0.204 = <b>0.24 seconds</b>. By Little's Law, the concurrent threads needed are arrival rate times time in system: 8,000 × 0.24 = <b>1,920 threads</b>. At 200 threads per server that needs 10 servers, and nearly all that capacity is spent waiting on slow sockets. Also, each of these servers would have to hold about 6,000 client connections itself, and perform every TLS handshake.</p>
+
+<h3>14.2 With a reverse proxy that buffers</h3>
+<p>The proxy absorbs the slow transfers. The backend thread is now held for roughly the work time plus a negligible hand-off (say 45 ms): 8,000 × 0.045 = <b>360 threads</b>, so 2 servers would suffice for thread capacity (we will run more for redundancy and CPU headroom). The slow phones still wait 2 seconds, but only the proxy pays.</p>
+
+<h3>14.3 The proxy tier itself</h3>
+<ul>
+  <li><b>Connections.</b> 60,000 client connections divided over 4 proxy instances is 15,000 each. With 4 workers per instance this is around 3,750 sockets per worker, comfortably inside a 20,000 per worker limit. Memory per idle connection is small, typically a few KB to tens of KB with TLS state, so about 15,000 × 50 KB = 750 MB per instance in the worst case. Set descriptors well above 20,000 per process.</li>
+  <li><b>Upstream pools.</b> Concurrent upstream requests are 360 on average; budget for a 3x burst, about 1,100. Spread over 6 backend servers (extra for redundancy) that is about 180 connections per backend at the burst, below the 200-thread limit. Cap each backend at <code>maxconn 200</code> so the proxy queues or sheds instead of overloading it. With 4 proxies, each keeps roughly 45 connections per backend at peak, so a keep-alive pool of 64 per worker is more than enough.</li>
+  <li><b>Handshake savings.</b> If every request opened a fresh upstream connection, 8,000 new TCP connections per second would hit the backends; with pooling it is a small trickle of new connections, mostly after backend restarts.</li>
+  <li><b>Timeouts.</b> Client header timeout 10 s, client body timeout 15 s, upstream connect 1 s, upstream read 10 s (the slowest legitimate API call is about 3 s at the 99.9th percentile), and retries limited to idempotent GETs, one retry, within a 10% retry budget. A POST to the checkout endpoint is never retried automatically; it carries an idempotency key so a user-initiated retry is safe.</li>
+  <li><b>Failure of one proxy.</b> With 4 instances at 25% each, losing one raises the others to 33%, still comfortable. Failure of one backend: health checks eject it within a few seconds, retries on connect failure protect most in-flight requests, and the remaining 5 backends absorb the load.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Worked example architecture with numbers">
+  <rect class="ext" x="14" y="110" width="140" height="80" rx="10"/><text class="t-c t-b" x="84" y="140">60,000</text><text class="t-c t-sm" x="84" y="158">client connections</text><text class="t-c t-sm" x="84" y="174">8,000 req/s peak</text>
+  <rect class="box" x="210" y="110" width="140" height="80" rx="10"/><text class="t-c t-b" x="280" y="142">L4 balancer</text><text class="t-c t-sm" x="280" y="162">or anycast / VIP</text>
+  <rect class="cache" x="410" y="30" width="170" height="58" rx="8"/><text class="t-c t-b" x="495" y="56">Proxy 1</text><text class="t-c t-sm" x="495" y="74">15,000 client conns</text>
+  <rect class="cache" x="410" y="104" width="170" height="58" rx="8"/><text class="t-c t-b" x="495" y="130">Proxy 2</text><text class="t-c t-sm" x="495" y="148">15,000 client conns</text>
+  <rect class="cache" x="410" y="178" width="170" height="58" rx="8"/><text class="t-c t-b" x="495" y="204">Proxy 3</text><text class="t-c t-sm" x="495" y="222">15,000 client conns</text>
+  <rect class="cache" x="410" y="252" width="170" height="58" rx="8"/><text class="t-c t-b" x="495" y="278">Proxy 4</text><text class="t-c t-sm" x="495" y="296">15,000 client conns</text>
+  <rect class="db" x="700" y="90" width="180" height="150" rx="10"/><text class="t-c t-b" x="790" y="120">6 app servers</text><text class="t-c t-sm" x="790" y="142">~360 busy threads avg</text><text class="t-c t-sm" x="790" y="160">~1,100 at burst</text><text class="t-c t-sm" x="790" y="178">maxconn 200 each</text><text class="t-c t-sm" x="790" y="196">~45 conns per proxy</text><text class="t-c t-sm" x="790" y="214">pooled, keep-alive</text>
+  <path class="arrow" d="M154 150 L206 150"/>
+  <path class="arrow" d="M350 140 L406 62"/><path class="arrow" d="M350 148 L406 132"/><path class="arrow" d="M350 156 L406 206"/><path class="arrow" d="M350 164 L406 278"/>
+  <path class="arrow" d="M580 62 L696 130"/><path class="arrow" d="M580 132 L696 150"/><path class="arrow" d="M580 206 L696 180"/><path class="arrow" d="M580 278 L696 210"/>
+</svg>
+<figcaption>Four proxies absorb 60,000 slow, chatty client connections and present a few hundred efficient pooled connections to six backends. Losing any single proxy or backend leaves headroom.</figcaption>
+</figure>
+
+<!-- ======================= 15 ======================= -->
+<h2 id="qa">15. Interview questions and answers</h2>
+
+<details><summary>What is the difference between a forward proxy and a reverse proxy?</summary>
+<p>A forward proxy represents clients: it sits on the client side, clients are configured to use it, and the servers on the internet see the proxy's address rather than the client's. It is used for egress control, filtering, caching and anonymity. A reverse proxy represents servers: it sits in front of your backends, clients think it is the real server, and it provides TLS termination, routing, load balancing, caching, compression and protection. The software can be the same; the difference is whose side it is on and who knows about it.</p></details>
+
+<details><summary>Why put a reverse proxy in front of application servers instead of exposing them directly?</summary>
+<p>Several reasons that compound. It terminates TLS in one place, so certificates are managed centrally. It buffers slow clients so application threads are not held waiting on slow networks, and pools connections so backends see few, long-lived connections instead of thousands of short ones. It hides the topology and gives one point to enforce limits, authentication and request filtering. It lets you route by path or host, roll out canaries, and swap backends without clients noticing. The price is one more hop, one more component that must be highly available, and one more thing to configure correctly.</p></details>
+
+<details><summary>How does a reverse proxy like Nginx handle tens of thousands of connections with so few threads?</summary>
+<p>It uses an event-driven model. Each worker process runs a single loop that asks the operating system (using epoll on Linux) which sockets are ready to read or write, handles those briefly without ever blocking, and then asks again. An idle or slow connection costs only a small buffer and a descriptor, not a thread. To use several cores, the proxy runs one worker per core, each with its own loop and its own upstream connection pool. This is why a proxy can sit in front of thousands of slow clients and still use little memory and CPU, and why heavy blocking work should never be done inside it.</p></details>
+
+<details><summary>A user's real IP shows up as the proxy's IP in your logs. How do you fix it, and what could go wrong?</summary>
+<p>The proxy adds the original address to a header such as X-Forwarded-For (or the standard Forwarded header, or uses the PROXY protocol at the TCP level), and the application or a proxy module reads it. The danger is that clients can send that header themselves. If the application takes the leftmost value, an attacker can pretend to be any address and bypass rate limits or allowlists. The fix is to define the trusted proxy ranges, overwrite or sanitize the header at the outermost proxy, read the header from the right skipping trusted hops, and make sure the origin cannot be reached except through those proxies.</p></details>
+
+<details><summary>What do 502, 503 and 504 mean, and how do you debug each?</summary>
+<p>502 Bad Gateway means the proxy reached the upstream but got an invalid response or the connection was refused or reset, so look for crashed or restarting backends, port or protocol mismatches, or idle-timeout mismatches on pooled connections. 503 Service Unavailable means the proxy had no healthy upstream or a limit rejected the request, so check health checks, circuit breaker or connection caps, and deployments with zero ready instances. 504 Gateway Timeout means the upstream accepted the request but was too slow, so look at backend latency, thread pool saturation, slow dependencies, and whether the proxy's read timeout is realistic. Good proxy logs record which upstream and which phase failed, which usually narrows it down in minutes.</p></details>
+
+<details><summary>Is it safe for a proxy to retry failed requests? What are the risks?</summary>
+<p>It is safe when the request is idempotent or when the proxy knows the backend never processed it, such as a failed connection attempt. For a non-idempotent request like POST /payments, a retry after the request was sent can run the operation twice, because a reset connection does not tell you whether the work was done. Nginx, for instance, refuses to retry such requests by default. The second risk is retry storms: retries add load to a struggling backend and multiply across layers. Use a small retry count, a retry budget, jittered back-off, per-try timeouts, and idempotency keys for writes that must be retryable.</p></details>
+
+<details><summary>How do WebSockets and gRPC change what you need to configure on a proxy?</summary>
+<p>For WebSockets the proxy must pass the Upgrade handshake through, because the Upgrade and Connection headers are hop-by-hop and would otherwise be stripped. After the 101 response it only relays frames, so buffering must not hold data back, and the default idle read timeout will disconnect quiet sockets unless you raise it or the app sends pings. For gRPC the proxy must speak HTTP/2 end to end and forward trailers, since the status code lives there. Streaming RPCs need buffering off and generous timeouts, and you need an L7 HTTP/2-aware balancer, since a connection-level balancer would pin all of a client's calls to one backend.</p></details>
+
+<details><summary>What is slowloris and how does a reverse proxy defend against it?</summary>
+<p>Slowloris holds many connections open by sending request headers or bodies extremely slowly, so a server that dedicates a thread or slot to each connection runs out of capacity while the attacker uses almost no bandwidth. An event-loop proxy is naturally resilient because idle connections are cheap, and it adds explicit defenses: tight timeouts for receiving headers and for progress on bodies, limits on connections per source address and in total, caps on header and body size, and a send timeout for clients that will not read responses. Because the proxy buffers the whole request before contacting the backend, half-finished requests never reach the application. A CDN or cloud load balancer in front adds another layer.</p></details>
+
+<details><summary>How is a reverse proxy different from an API gateway and a load balancer? When would you use each?</summary>
+<p>They are overlapping roles. A reverse proxy is the general mechanism. A load balancer is a reverse proxy (or an L4 forwarder) whose focus is spreading traffic over identical instances with health checks. An API gateway is a reverse proxy plus API-management policy: authentication, API keys, per-client quotas, request transformation and aggregation across services. In a small system one Nginx or a cloud load balancer does all of it. As the number of services and external consumers grows you introduce a gateway for policy, and add a CDN for static content and global reach. In an interview, justify each component by the problem it solves rather than listing them all.</p></details>
+
+<details><summary>How would you make the proxy tier itself highly available and safe to change?</summary>
+<p>Run at least two or three instances in different failure domains, in front of a layer-4 balancer, virtual IP or anycast address, so that no single proxy failure is visible. Size so that the loss of one instance leaves headroom. Treat configuration as code: validate syntax before applying, roll it out to a small subset first, keep the previous version for quick rollback, and prefer graceful reloads that let in-flight requests finish. Monitor connections, descriptor usage, 5xx rates by upstream, and proxy-added latency. For the dependency risk, keep the proxy logic thin so a bad rule cannot take down everything, and fall back to stale cache entries when the origin is down.</p></details>
+
+<details><summary>Explain the difference between the HTTP CONNECT method and SOCKS, and what a forward proxy can see for HTTPS traffic.</summary>
+<p>With CONNECT, the client asks an HTTP proxy to open a TCP tunnel to a host and port, the proxy answers 200, and then relays bytes blindly while the client performs TLS directly with the destination. The proxy sees only the destination host and port and traffic volume, so it can allow or block by domain but not by path or content unless it does TLS interception with a certificate authority the clients trust. SOCKS5 is a lower-level, protocol-agnostic proxy protocol that tunnels any TCP (and UDP) connection without understanding HTTP at all, so it can carry SSH or database traffic, but cannot cache or inspect web content.</p></details>
+
+<!-- ======================= 16 ======================= -->
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">16. Recap</h2>
+<ul>
+  <li>A proxy terminates one connection and opens another, which gives it a place to apply policy. A <b>forward proxy</b> serves clients (egress control, filtering, caching, anonymity); a <b>reverse proxy</b> serves servers (TLS termination, routing, balancing, caching, buffering, shielding).</li>
+  <li>HTTPS through a forward proxy uses <b>CONNECT</b>, a blind tunnel; SOCKS is a lower-level, protocol-agnostic alternative. <b>Explicit</b> proxies are configured on the client; <b>transparent</b> ones are forced by the network.</li>
+  <li>Reverse proxy, load balancer, API gateway and CDN are overlapping roles of the same mechanism, differing in emphasis: general fronting, spreading load, API policy, global caching.</li>
+  <li>Inside, proxies use <b>event loops</b> and a few worker processes or threads, <b>pool and reuse upstream connections</b>, and enforce <b>timeouts and limits</b> at every stage. Buffering protects backend threads from slow clients and is the first line of defense against slowloris; turn it off for streaming routes.</li>
+  <li>Original client details travel in <b>X-Forwarded-For / Forwarded</b> and friends. Trust only what your own proxies added, read right to left, overwrite at the edge, and lock the origin to the proxy.</li>
+  <li>WebSocket needs Upgrade passed through and long idle timeouts or pings; gRPC needs HTTP/2 with trailers and per-request L7 balancing.</li>
+  <li>Caching proxies follow <code>Cache-Control</code>, <code>Vary</code>, validators and conditional requests, with collapsing to stop stampedes. Never cache personalized responses publicly.</li>
+  <li>502 means the upstream broke the exchange, 503 means unavailable or shed, 504 means too slow. Nest timeouts, retry only safe requests with a budget, cap connections, and make the proxy tier redundant and safely deployable.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="03-networking-essentials.html">Chapter 3</a> (TCP, TLS, HTTP versions), <a href="08-scalability-concurrency.html">Chapter 8</a> (event loops and backpressure) and <a href="09-load-balancing.html">Chapter 9</a> (L4 and L7 balancing, which this chapter's L7 proxy implements). Leads to <a href="11-api-gateway.html">Chapter 11</a> (API gateways add policy on top of a reverse proxy), <a href="12-cdn.html">Chapter 12</a> (a CDN is a global caching reverse proxy), <a href="40-resilience.html">Chapter 40</a> (timeouts, retries, circuit breakers) and <a href="50-service-mesh.html">Chapter 50</a> (sidecar proxies).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

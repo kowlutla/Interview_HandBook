@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 15: Design Ticket Booking / Flash Sale | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c15-ticket-booking">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 15 · Worked solutions</div>
+<h1>Design Ticket Booking / Flash Sale</h1>
+<p class="lead">One million people click "buy" at the same second for fifty thousand seats. This worked solution shows how to make sure no seat is sold twice, how to hold a seat while someone pays, how to keep the system alive under a stampede, and how to keep the queue fair.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>We are asked to design a ticket booking system in the style of Ticketmaster or BookMyShow, with a special focus on the moment a popular event goes on sale. Most of the year the system is boring: people browse events, pick seats, pay, and receive tickets. A few times a year it is the opposite of boring. A stadium tour with 50,000 seats is announced, a million fans have been waiting for months, and at exactly 10:00:00 they all arrive together. The interesting engineering is in surviving and behaving correctly during that spike.</p>
+<p>The core difficulty is <b>contention</b>: many buyers want the same scarce, individually identified items (seat 14 in row C of section 101). Two buyers must never both walk away holding a ticket for that seat. That is the <b>oversell</b> problem, and preventing it is the one hard correctness requirement. Everything else, such as speed and fairness, can degrade gracefully; a double-sold seat cannot be undone without an angry customer standing at the gate.</p>
+<h3>1.1 Clarifying questions and assumed answers</h3>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>Reserved seating or general admission?</td><td>Both. Reserved seats are the hard case, so we design for them. General admission (a counted quantity with no seat identity) is the easy special case and also becomes our flash-sale variant in section 15.</td></tr>
+<tr><td>How big is the largest event?</td><td>50,000 seats, with about 1,000,000 people trying to buy at the on-sale moment (a 20:1 demand-to-supply ratio).</td></tr>
+<tr><td>Can a user keep a seat while they pay?</td><td>Yes. A seat is <b>held</b> for a short time (we assume 10 minutes) while the buyer enters payment details. If the buyer does not pay, the hold expires and the seat returns to the pool.</td></tr>
+<tr><td>How many tickets per order?</td><td>Up to 6, average about 2.</td></tr>
+<tr><td>Is it acceptable for the seat map to be slightly stale?</td><td>Yes. A buyer may see a seat as free that was just taken. The click must then fail politely. Showing a stale "available" is fine; selling it twice is not.</td></tr>
+<tr><td>Payments?</td><td>We integrate with an external payment provider (card, wallet). We do not build the payment system itself; see <a href="c14-payment-system.html">Case study 14</a>.</td></tr>
+<tr><td>Fairness?</td><td>Roughly first come, first served among real humans. Bots and scalpers using automation should be limited.</td></tr>
+<tr><td>Multi-region?</td><td>Events are local. Each event has one home region that owns its inventory. We serve browsing from several regions but write inventory in one place.</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li>Search and browse events, and view an event with its seat map and availability.</li>
+<li>Select seats (or a count for general admission) and place a time-limited <b>hold</b> on them.</li>
+<li>Pay for the held seats; on success the seats become <b>sold</b> and tickets are issued; on failure or timeout the seats are released.</li>
+<li>View and cancel orders (cancellation may release seats back, subject to policy).</li>
+<li>During a high-demand on-sale, place users into a <b>virtual waiting room</b> and admit them in a controlled, fair order.</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Correctness above all:</b> a seat is never sold to two people. Money is never taken for a seat the buyer does not get, and a seat is never given away unpaid forever.</li>
+<li><b>Availability under spike:</b> the browse and queue tiers stay up even when demand is 100 times the normal level. The booking tier may refuse or delay work but must not fall over.</li>
+<li><b>Latency:</b> seat map loads in under 1 second; placing a hold answers in under 300 ms at the 99th percentile once the user is admitted.</li>
+<li><b>Fairness:</b> admission order is close to arrival order; the same person cannot gain advantage with 50 browser tabs.</li>
+<li><b>Durability:</b> a confirmed order survives any single failure. Ticket records are never lost.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Secondary market resale, dynamic pricing, seat-map editor for venues, tax calculation, the internals of the payment provider and ticket barcode scanning at the gate. We mention where each would plug in but do not design it.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>As in <a href="../chapters/02-estimation.html">Chapter 2</a>, we estimate to find which numbers are scary. For this system the scary numbers are not average traffic; they are the shape of the spike.</p>
+<h3>3.1 Normal load</h3>
+<p>Suppose 20 million monthly active users and 100,000 live events. Each active user browses about 5 times a month with 10 page views per visit: 20M x 5 x 10 = 1 billion page views a month, which is about 1e9 / (30 x 86,400 s) = about 385 requests per second on average. Peak (evening, about 5 times average) is about 2,000 requests per second. Tickets sold: say 100 million a year, which is about 275,000 a day or only 3 per second on average. Normal load is tiny; a handful of servers handle it. That is why the design must be about the spike and not the average.</p>
+<h3>3.2 The on-sale spike</h3>
+<table>
+<tr><th>Quantity</th><th>Calculation</th><th>Result</th></tr>
+<tr><td>Seats for sale</td><td>given</td><td>50,000</td></tr>
+<tr><td>People arriving in the first minute</td><td>given, 20:1 demand</td><td>1,000,000</td></tr>
+<tr><td>Arrival rate of first page load</td><td>1,000,000 users, 70% within 30 s, so 700,000 / 30</td><td>about 23,000 users/s</td></tr>
+<tr><td>Raw requests during the spike (page, assets, queue polls)</td><td>about 10 requests per user in the first minute: 1M x 10 / 60 s</td><td>about 170,000 requests/s average, 300,000/s peak</td></tr>
+<tr><td>Seat map polling by waiting users</td><td>1M users each polling availability every 5 s</td><td>200,000 reads/s (must be served from cache and CDN)</td></tr>
+<tr><td>Admission rate we choose</td><td>so that the booking tier holds a safe load, 500 users/s</td><td>30,000 users admitted a minute; the full 1M queue drains in about 33 minutes</td></tr>
+<tr><td>Hold attempts per admitted user</td><td>average 3 tries (taken seats are common)</td><td>about 1,500 hold attempts/s at the 500/s admission rate</td></tr>
+<tr><td>Concurrent live holds</td><td>50,000 seats / 2 per order = 25,000 orders max; with a 10-minute TTL and abandonment, up to about 15,000 orders at once</td><td>about 30,000 seats held at the peak</td></tr>
+<tr><td>Confirmed orders</td><td>25,000 orders if everything sells; spread over the first ~10 minutes, 25,000 / 600 s</td><td>about 40 orders/s average, 150/s peak</td></tr>
+<tr><td>Payment API calls</td><td>about 1 per order plus retries and declines (say 1.5x)</td><td>about 60/s average, 250/s peak</td></tr>
+</table>
+<p>The numbers tell a clear story. The write path that must be correct (holds and orders) is only about 1,500 attempts per second and 150 orders per second, which a well-designed single database shard can handle. The terrifying numbers are the 300,000 requests per second of raw traffic and 200,000 availability reads per second. Those must be absorbed by a CDN, caches and the waiting room before they ever touch inventory.</p>
+<h3>3.3 Storage and memory</h3>
+<p>One event has 50,000 seat rows at about 100 bytes each, so 5 MB of seat state. Even 100,000 events with an average of 5,000 seats is 500 million seat rows, or about 50 GB. A year of orders: 100 million tickets at 300 bytes is 30 GB. Total hot data is well under a terabyte, so storage size is not a concern. The waiting room needs per-user state: 1M entries at about 100 bytes is 100 MB, trivially held in Redis. A seat availability bitmap for one event is 50,000 bits, which is about 6 KB. These small numbers mean a single event's entire live inventory fits comfortably in the memory of one Redis node, and that is a deliberate lever we use later.</p>
+<div class="callout key"><b>Key idea</b> The hard part is not data volume or even write volume. It is that all the writes and reads aim at the <em>same few thousand rows</em> at the same time. A system that handles a billion rows spread evenly can still collapse on 50,000 rows hit by a million people.</div>
+
+<h2 id="api">4. API design</h2>
+<p>We use a REST-style API (see <a href="../chapters/05-api-design.html">Chapter 5</a>). Every state-changing call accepts an <code>Idempotency-Key</code> header so that a client retry cannot create a second hold or second charge (see <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>).</p>
+<pre><code>GET  /v1/events/{eventId}                       -> event details (cacheable, CDN)
+GET  /v1/events/{eventId}/availability          -> {version, sections:[{id, free, price}]} (cached, stale OK)
+GET  /v1/events/{eventId}/sections/{s}/seats    -> seat-level map: [{seatId, state, price}] (cached)
+
+POST /v1/queue/{eventId}/join                   -> {queueToken, position, estWaitSec}
+GET  /v1/queue/{eventId}/status?token=...       -> {state: WAITING|ADMITTED, position, admitToken}
+
+POST /v1/events/{eventId}/holds                 (admitToken, Idempotency-Key)
+     body: {seatIds:[...]}  or  {section, quantity}
+     -> 201 {holdId, expiresAt, seats, total}  |  409 {unavailable:[seatIds]}
+
+POST /v1/holds/{holdId}/checkout                (Idempotency-Key)
+     body: {paymentMethodToken}
+     -> 202 {orderId, status: PENDING_PAYMENT}
+GET  /v1/orders/{orderId}                       -> {status: PENDING|CONFIRMED|FAILED|EXPIRED, tickets}
+DELETE /v1/holds/{holdId}                       -> release early
+POST /v1/orders/{orderId}/cancel
+POST /webhooks/payments                         (provider callback, signed)</code></pre>
+<p>Design choices worth stating aloud. The hold call returns 409 with the specific seats that failed, so the UI can say "seat 14C was just taken, here are alternatives" instead of a generic error. The checkout call returns 202 (accepted) rather than 200, because payment can take seconds and may complete through a webhook later; the client then polls or receives a push. The <code>admitToken</code> is a short-lived signed token that proves the caller passed through the waiting room; the hold endpoint rejects calls without it during a protected on-sale. Availability responses carry a <code>version</code> number so clients and caches can tell which is newer.</p>
+
+<h2 id="data">5. Data model and storage choices</h2>
+<h3>5.1 Entities</h3>
+<table>
+<tr><th>Table</th><th>Key fields</th><th>Notes</th></tr>
+<tr><td><code>events</code></td><td>event_id, venue_id, starts_at, on_sale_at, status</td><td>Read-heavy, rarely changes, cached hard.</td></tr>
+<tr><td><code>seats</code> (per event)</td><td>event_id, seat_id, section, row, number, price_tier, <b>state</b> (AVAILABLE, HELD, SOLD), <b>hold_id</b>, <b>hold_expires_at</b>, <b>version</b></td><td>The contended table. One row per seat per event, 50,000 rows for the big event.</td></tr>
+<tr><td><code>holds</code></td><td>hold_id, event_id, user_id, seat_ids, expires_at, status</td><td>Short lived; the unit that expires.</td></tr>
+<tr><td><code>orders</code></td><td>order_id, user_id, hold_id, amount, status, payment_ref, idempotency_key</td><td>Source of truth for money and tickets.</td></tr>
+<tr><td><code>tickets</code></td><td>ticket_id, order_id, event_id, seat_id, barcode</td><td>Unique (event_id, seat_id) constraint is the final safety net against oversell.</td></tr>
+<tr><td><code>queue entries</code></td><td>event_id, token, join_time, state</td><td>In Redis, not the database.</td></tr>
+</table>
+<h3>5.2 Why each store</h3>
+<ul>
+<li><b>Relational database (PostgreSQL or MySQL) for seats, holds, orders, tickets.</b> Booking needs transactions, uniqueness constraints and row-level atomic updates; <a href="../chapters/18-relational-internals.html">Chapter 18</a> covers the machinery. The data is small, the write rate is modest (hundreds per second), and correctness matters more than horizontal write scale. A relational store is the right default and gives us a unique constraint as a last line of defence.</li>
+<li><b>Redis for hot inventory state, the waiting room and rate limiting.</b> Redis operations on a single key are atomic and take microseconds; a single node serves 100,000+ simple operations a second (<a href="../chapters/15-redis.html">Chapter 15</a>). We use it for the hold fast path, the queue (sorted set, see <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>), counters and short TTL keys.</li>
+<li><b>CDN and cache for event pages and availability</b> (<a href="../chapters/12-cdn.html">Chapter 12</a>, <a href="../chapters/13-caching-patterns.html">Chapter 13</a>): static event content and a coarse availability summary, refreshed every second or two.</li>
+<li><b>Kafka for events</b> (order confirmed, hold expired, seat released) feeding email, ticket generation, analytics, and cache invalidation (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>).</li>
+</ul>
+<h3>5.3 Sharding</h3>
+<p>The natural shard key is <code>event_id</code>: every seat, hold and order for one event lives on one shard, so a hold (which touches several seats of the same event) is a single-shard transaction with no distributed coordination. Different events spread across shards (<a href="../chapters/25-sharding.html">Chapter 25</a>). The weakness is the <b>hot event</b>: one huge on-sale lands all load on one shard. Section 10 deals with it.</p>
+
+<h2 id="simple">6. A first simple design</h2>
+<p>Start with the simplest thing that is correct. One web server and one database. To buy seat 14C the server runs a transaction:</p>
+<pre><code>BEGIN;
+SELECT state FROM seats WHERE event_id=7 AND seat_id='14C' FOR UPDATE;
+-- if state = 'AVAILABLE':
+UPDATE seats SET state='HELD', hold_id=:h, hold_expires_at=now()+interval '10 min'
+ WHERE event_id=7 AND seat_id='14C';
+COMMIT;</code></pre>
+<p>The <code>FOR UPDATE</code> takes a row lock, so a second buyer for the same seat waits until the first transaction commits, then sees <code>HELD</code> and is refused. This is correct. It also works for a small venue. A background job once a minute releases holds whose expiry has passed. Payment is a synchronous call from the web server.</p>
+<p>Why it breaks at 1M users: the web servers drown in 300,000 requests per second, the seat map query scans a table that everyone is also writing, thousands of transactions queue up on the same hot rows holding database connections while they wait (the connection pool of a few hundred is exhausted), a slow payment call holds a web thread for seconds, and a scan-based expiry job fights the live traffic. Users get timeouts, retry, and make it worse. The scaled design fixes each of these in turn.</p>
+
+<h2 id="architecture">7. Scaled high-level architecture</h2>
+<figure class="diagram">
+<svg viewBox="0 0 960 470" role="img" aria-label="High-level architecture of the ticket booking system">
+  <rect class="ext" x="20" y="200" width="110" height="50" rx="10"/><text class="t-c t-b" x="75" y="223">Users</text><text class="t-c t-sm" x="75" y="240">1M browsers</text>
+  <rect class="cache" x="170" y="200" width="130" height="50" rx="10"/><text class="t-c t-b" x="235" y="223">CDN + WAF</text><text class="t-c t-sm" x="235" y="240">bot rules</text>
+  <rect class="box" x="340" y="120" width="150" height="56" rx="10"/><text class="t-c t-b" x="415" y="145">Waiting room</text><text class="t-c t-sm" x="415" y="162">queue service</text>
+  <rect class="box" x="340" y="280" width="150" height="56" rx="10"/><text class="t-c t-b" x="415" y="305">Browse / catalog</text><text class="t-c t-sm" x="415" y="322">cached reads</text>
+  <rect class="cache" x="340" y="380" width="150" height="50" rx="10"/><text class="t-c t-b" x="415" y="403">Availability cache</text><text class="t-c t-sm" x="415" y="420">stale OK, 1-2 s</text>
+  <rect class="box" x="560" y="120" width="150" height="56" rx="10"/><text class="t-c t-b" x="635" y="145">Booking service</text><text class="t-c t-sm" x="635" y="162">holds, checkout</text>
+  <rect class="cache" x="560" y="30" width="150" height="50" rx="10"/><text class="t-c t-b" x="635" y="53">Redis (per event)</text><text class="t-c t-sm" x="635" y="70">queue, hold fast path</text>
+  <rect class="db" x="780" y="120" width="150" height="56" rx="10"/><text class="t-c t-b" x="855" y="145">Inventory DB</text><text class="t-c t-sm" x="855" y="162">sharded by event</text>
+  <rect class="box" x="560" y="230" width="150" height="56" rx="10"/><text class="t-c t-b" x="635" y="255">Order / payment</text><text class="t-c t-sm" x="635" y="272">saga orchestrator</text>
+  <rect class="ext" x="780" y="230" width="150" height="56" rx="10"/><text class="t-c t-b" x="855" y="255">Payment provider</text><text class="t-c t-sm" x="855" y="272">external</text>
+  <rect class="box" x="560" y="340" width="150" height="50" rx="10"/><text class="t-c t-b" x="635" y="363">Kafka</text><text class="t-c t-sm" x="635" y="380">order and seat events</text>
+  <rect class="box" x="780" y="340" width="150" height="50" rx="10"/><text class="t-c t-b" x="855" y="363">Tickets / email</text><text class="t-c t-sm" x="855" y="380">async consumers</text>
+  <path class="arrow" d="M130 225 L166 225"/>
+  <path class="arrow" d="M300 215 L336 160"/><path class="arrow" d="M300 235 L336 295"/>
+  <path class="arrow" d="M490 148 L556 148"/><path class="arrow" d="M635 120 L635 84"/>
+  <path class="arrow" d="M710 148 L776 148"/><path class="arrow" d="M635 176 L635 226"/>
+  <path class="arrow" d="M710 258 L776 258"/><path class="arrow-g" d="M776 270 L714 270"/>
+  <path class="arrow" d="M635 286 L635 336"/><path class="arrow" d="M710 365 L776 365"/>
+  <path class="arrow dash" d="M415 336 L415 376"/>
+</svg>
+<figcaption>Traffic flows left to right. The CDN and waiting room shield the booking service; only admitted users reach holds. The availability cache is a derived, delayed copy of the truth, fed by events rather than by user requests.</figcaption>
+</figure>
+<p>Components and responsibilities:</p>
+<ul>
+<li><b>CDN and WAF</b> serve event pages, images and the JavaScript bundle, and apply bot rules before requests reach us (section 12).</li>
+<li><b>Waiting room</b> admits a controlled number of users per second into the booking tier (section 9). It is a separate, horizontally scaled service with its own Redis, so overload of the queue cannot hurt inventory and overload of inventory cannot lose the queue.</li>
+<li><b>Browse / catalog service</b> serves events and seat maps from caches. It never writes inventory.</li>
+<li><b>Booking service</b> is stateless; it validates the admit token, places holds, and drives checkout. Stateless means we scale it by adding instances behind a load balancer (<a href="../chapters/09-load-balancing.html">Chapter 9</a>).</li>
+<li><b>Inventory store</b> is the source of truth for seat state, relational, sharded by event.</li>
+<li><b>Order / payment service</b> runs the checkout saga (section 11) and talks to the payment provider.</li>
+<li><b>Kafka</b> carries confirmed-order and seat-released events to ticket issue, email, search indexing, analytics and cache refresh.</li>
+</ul>
+
+<h2 id="flows">8. Request-flow walkthroughs</h2>
+<h3>8.1 Browsing and the seat map</h3>
+<ol>
+<li>The browser requests the event page; the CDN serves the static shell. No origin hit.</li>
+<li>The page asks for <code>/availability</code>. The CDN caches this response for 1 to 2 seconds (<code>Cache-Control: max-age=2, stale-while-revalidate=5</code>), so 200,000 polls per second collapse to a handful of origin requests per second per event.</li>
+<li>The browse service builds the response from the availability cache, a Redis hash or bitmap refreshed from inventory events. It tells the user how many seats are free per section, not a guaranteed truth.</li>
+<li>When the user clicks a specific seat, only then do we go to the booking service.</li>
+</ol>
+<h3>8.2 Placing a hold (the critical write)</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 420" role="img" aria-label="Sequence diagram for placing a seat hold">
+  <rect class="ext" x="30" y="10" width="120" height="32" rx="8"/><text class="t-c t-b" x="90" y="31">Browser</text>
+  <rect class="box" x="230" y="10" width="140" height="32" rx="8"/><text class="t-c t-b" x="300" y="31">Booking svc</text>
+  <rect class="cache" x="460" y="10" width="140" height="32" rx="8"/><text class="t-c t-b" x="530" y="31">Redis</text>
+  <rect class="db" x="700" y="10" width="140" height="32" rx="8"/><text class="t-c t-b" x="770" y="31">Inventory DB</text>
+  <line class="life" x1="90" y1="42" x2="90" y2="410"/><line class="life" x1="300" y1="42" x2="300" y2="410"/><line class="life" x1="530" y1="42" x2="530" y2="410"/><line class="life" x1="770" y1="42" x2="770" y2="410"/>
+  <path class="arrow" d="M90 80 L296 80"/><text class="t-sm" x="100" y="72">1. POST /holds (admitToken, seats)</text>
+  <path class="arrow" d="M300 120 L526 120"/><text class="t-sm" x="310" y="112">2. atomic claim (Lua): free? mark HELD, TTL 10m</text>
+  <path class="arrow dash" d="M526 160 L304 160"/><text class="t-sm" x="320" y="152">3. OK or conflict list</text>
+  <path class="arrow" d="M300 210 L766 210"/><text class="t-sm" x="400" y="202">4. durable write: UPDATE seats ... WHERE state='AVAILABLE'</text>
+  <path class="arrow dash" d="M766 250 L304 250"/><text class="t-sm" x="420" y="242">5. rows updated = n (must equal seat count)</text>
+  <path class="arrow-r dash" d="M300 290 L526 290"/><text class="t-sm" x="310" y="282" style="fill:var(--bad)">5b. if DB refuses: undo the Redis claim</text>
+  <path class="arrow dash" d="M296 340 L94 340"/><text class="t-sm" x="110" y="332">6. 201 {holdId, expiresAt} or 409</text>
+  <rect class="hit" x="560" y="360" width="320" height="40" rx="8"/><text class="t-c t-sm" x="720" y="384">Redis rejects most losers cheaply; DB is the final judge</text>
+</svg>
+<figcaption>The fast path rejects contention in memory so that the database only sees requests that stand a good chance of winning. The conditional UPDATE in step 4 is the correctness guarantee; Redis alone is not trusted for the final answer.</figcaption>
+</figure>
+<ol>
+<li>The booking service validates the admit token and the idempotency key (a repeat of the same key returns the original result).</li>
+<li>It runs an atomic Redis script (section 10) that checks all requested seats are available and marks them held with a 10-minute expiry. If any seat is taken, nothing is changed and the conflict list is returned immediately.</li>
+<li>It then writes the hold to the database with a conditional update, so even if Redis lost state, the database cannot be forced into a double hold.</li>
+<li>It returns the hold id and its expiry time. The countdown timer shown to the user is computed from the server expiry time, not from the client clock.</li>
+</ol>
+<h3>8.3 Checkout and confirmation</h3>
+<ol>
+<li>The client posts checkout with a payment token. The order service creates an order in <code>PENDING_PAYMENT</code> with the idempotency key. The hold gets a short grace extension while payment is in flight (section 11).</li>
+<li>It calls the payment provider with its own idempotency key (the order id), asking to authorize and capture the amount.</li>
+<li>On success (response or webhook) a single database transaction moves the seats from <code>HELD</code> to <code>SOLD</code>, writes the tickets, and marks the order <code>CONFIRMED</code>. An outbox row is written in the same transaction; a relay publishes <code>OrderConfirmed</code> to Kafka.</li>
+<li>Consumers generate barcodes, send email and update the cache.</li>
+</ol>
+
+<h2 id="waiting-room">9. Deep dive 1: the virtual waiting room</h2>
+<h3>9.1 Why we need it</h3>
+<p>Without protection, 1M users hit the booking tier at once. Autoscaling cannot react in seconds; databases melt; the people who suffer are those with slow connections, not those who were first. A <b>virtual waiting room</b> converts an unpredictable stampede into a steady, chosen flow. The booking tier sees 500 new users a second no matter how many are waiting. It does two jobs: <b>load shaping</b> (protect the system) and <b>fairness</b> (give an orderly turn). It is the same idea as the admission control and load shedding in <a href="../chapters/16-rate-limiting.html">Chapter 16</a> and <a href="../chapters/40-resilience.html">Chapter 40</a>, packaged so the user sees a queue instead of an error page.</p>
+<h3>9.2 How it works</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Waiting room admitting users at a fixed rate">
+  <rect class="ext" x="20" y="100" width="130" height="80" rx="10"/><text class="t-c t-b" x="85" y="132">1,000,000</text><text class="t-c t-sm" x="85" y="152">arrivals in</text><text class="t-c t-sm" x="85" y="168">first minute</text>
+  <rect class="cache" x="230" y="70" width="230" height="140" rx="10"/><text class="t-c t-b" x="345" y="94">Queue (Redis)</text>
+  <text class="t-c t-sm" x="345" y="118">ticket number from a counter</text>
+  <text class="t-c t-sm" x="345" y="138">signed token carries the number</text>
+  <text class="t-c t-sm" x="345" y="158">position = number - admitted</text>
+  <text class="t-c t-sm" x="345" y="190">drains from the head only</text>
+  <rect class="box" x="540" y="100" width="130" height="80" rx="10"/><text class="t-c t-b" x="605" y="128">Admitter</text><text class="t-c t-sm" x="605" y="148">500 users/s,</text><text class="t-c t-sm" x="605" y="164">adaptive</text>
+  <rect class="db" x="750" y="100" width="130" height="80" rx="10"/><text class="t-c t-b" x="815" y="128">Booking tier</text><text class="t-c t-sm" x="815" y="148">holds + checkout</text><text class="t-c t-sm" x="815" y="164">safe load</text>
+  <path class="arrow" d="M150 140 L226 140"/><path class="arrow" d="M460 140 L536 140"/><path class="arrow-g" d="M670 140 L746 140"/>
+  <path class="arrow dash" d="M815 100 L815 50 L605 50 L605 96"/><text class="t-c t-sm" x="710" y="42">feedback: latency and errors slow or speed admission</text>
+  <text class="t-c t-sm" x="345" y="250">Clients poll status every 5-10 s with jitter, or use a long-lived stream</text>
+</svg>
+<figcaption>The queue absorbs any burst. The admitter is the only component that decides how many users move on, and it watches the health of the booking tier so that it can slow down when the system struggles.</figcaption>
+</figure>
+<ol>
+<li><b>Join.</b> Arriving users call <code>/queue/join</code>. The service assigns a monotonically increasing ticket number (a Redis <code>INCR</code>) and returns a signed token containing it. The response includes a rough position and an estimated wait.</li>
+<li><b>Wait.</b> The page polls <code>/status</code> every few seconds with random jitter so polls do not synchronise. 1M users polling every 8 s is 125,000 requests per second, so the status endpoint must be extremely cheap: it reads one value ("current admitted number") from a small local cache and compares it to the token's ticket number. If the ticket number is at most the admitted number, the user is admitted. No per-user database work is needed. Alternatively use Server-Sent Events or WebSockets to push the state (<a href="../chapters/06-realtime.html">Chapter 6</a>), which cuts polling traffic at the price of holding connections.</li>
+<li><b>Admit.</b> Every second the admitter increases the "admitted up to" counter by the allowed rate (500). Admitted users receive a short-lived signed <code>admitToken</code> (valid, say, 15 minutes) that the booking service verifies without a lookup.</li>
+<li><b>Adapt.</b> If booking latency or errors rise, the admitter lowers the rate; if the inventory is nearly sold out, it can stop admitting and tell everyone "sold out" at once, saving users a pointless wait.</li>
+</ol>
+<h3>9.3 Fairness decisions</h3>
+<p>Strict first-come-first-served has a flaw: the ordering is decided by network speed and by who opened the page first. Some sites prefer a <b>randomised</b> approach: everyone who arrives within an early window (say 10 minutes before and 5 after the on-sale time) is shuffled into a random order. This removes the premium on being fast, weakens advantage from low-latency bots, and avoids a thundering herd at exactly 10:00:00, since people may join early. We present the options and choose.</p>
+<table>
+<tr><th>Option</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Strict arrival order (FIFO)</td><td>Simple, intuitive, easy to explain. Cheap: one counter.</td><td>Rewards speed; bots and fast connections win; huge spike exactly at on-sale time.</td></tr>
+<tr><td>Randomised lottery within an arrival window</td><td>Fairer to slow connections; no benefit to refreshing; flattens the spike if users can join early.</td><td>Users may feel it is arbitrary; need to explain. Needs a window plus a shuffle step.</td></tr>
+<tr><td>No queue, just rate limit with 429</td><td>Simplest to build.</td><td>Terrible user experience; retry storm; whoever retries fastest wins; no fairness at all.</td></tr>
+<tr><td>Verified-fan pre-registration</td><td>Strongest anti-bot and fairest; sale size known in advance.</td><td>Operational burden; only for the very biggest events.</td></tr>
+</table>
+<p><b>Choice:</b> a randomised order inside an early-join window for the biggest on-sales, plain FIFO for the rest. In both cases one person gets one queue slot: we tie the token to a verified account (and a device signal) and reject duplicates, since 50 tabs should not be 50 places.</p>
+<h3>9.4 Details that matter</h3>
+<ul>
+<li><b>Token security.</b> Queue and admit tokens are signed (HMAC or a JWT-like format) and bound to the user and event, so users cannot forge positions or share admission.</li>
+<li><b>Abandonment.</b> An admitted user who does nothing wastes a slot. Admit tokens expire, and idle admitted users are timed out so capacity is recycled.</li>
+<li><b>Back-pressure honesty.</b> The queue service must itself survive 25,000 joins a second; it is a couple of Redis operations per join, so a small Redis cluster plus stateless front servers is enough. The static waiting page is served by the CDN.</li>
+<li><b>Estimated wait.</b> Compute it as (my number - admitted number) / admit rate, and show it as a range; precise numbers invite complaints.</li>
+</ul>
+<div class="callout tip"><b>Interview tip</b> Say out loud that the waiting room is a rate limiter in front of a bounded resource, with a user-facing queue as the overflow behaviour. It shows you connect it to the standard toolbox rather than treating it as a special gadget.</div>
+
+<h2 id="contention">10. Deep dive 2: preventing oversell under contention</h2>
+<p>This is the part the interviewer will probe hardest. Many buyers, few seats; how do you guarantee at most one winner per seat, and keep throughput high? There are three main techniques at the data layer, each valid, with different cost profiles.</p>
+<h3>10.1 Option A: pessimistic row locks</h3>
+<p>Take a lock on the row before reading it: <code>SELECT ... FOR UPDATE</code>. Other transactions that want the same row wait. This guarantees correctness trivially, because only one transaction at a time can examine and change the seat. The cost is that waiting transactions hold connections and threads, and under heavy contention many sit queued behind one winner who then makes them all fail. Lock waits cascade into connection-pool exhaustion. Deadlocks are possible when a buyer locks seats A then B while another locks B then A; the cure is to always lock in sorted seat order. See <a href="../chapters/18-relational-internals.html">Chapter 18</a> for lock mechanics and <a href="../chapters/08-scalability-concurrency.html">Chapter 8</a> for contention in general.</p>
+<h3>10.2 Option B: optimistic locking (compare and swap)</h3>
+<p>Do not lock. Read the row with its version number, decide, and write back only if the version is unchanged:</p>
+<pre><code>UPDATE seats
+   SET state='HELD', hold_id=:h, hold_expires_at=:exp, version=version+1
+ WHERE event_id=:e AND seat_id=:s AND state='AVAILABLE';   -- 1 row updated = won, 0 = lost</code></pre>
+<p>The <code>WHERE state='AVAILABLE'</code> condition makes the UPDATE itself the arbiter, and the database executes it atomically. No explicit lock is held across a client round trip, so no waiting on application think time. Losers get "0 rows updated" instantly and can choose another seat. For a multi-seat hold, run all updates in one transaction and require that the number of rows updated equals the number of seats; otherwise roll back. Optimistic control shines when conflicts are occasional. When 20 people fight for the same seat, 19 do wasted work, but each failure is cheap (one statement), so in practice a conditional update beats a lock for this workload. The engine still takes a row lock inside the statement, but it is held for microseconds, not for a user-facing wait.</p>
+<h3>10.3 Option C: atomic operations in Redis</h3>
+<p>Keep live seat state in Redis and let a Lua script, which Redis executes atomically with no interleaving, check and claim multiple seats at once (<a href="../chapters/15-redis.html">Chapter 15</a>):</p>
+<pre><code>-- KEYS = seat keys; ARGV[1] = holdId; ARGV[2] = ttl seconds
+for i, k in ipairs(KEYS) do
+  if redis.call('EXISTS', k) == 1 then return {0, k} end   -- someone holds or owns it
+end
+for i, k in ipairs(KEYS) do
+  redis.call('SET', k, ARGV[1], 'EX', ARGV[2])             -- claim with automatic expiry
+end
+return {1}</code></pre>
+<p>A key like <code>seat:{event7}:14C</code> exists exactly while the seat is held or sold. Because the whole script is atomic and the TTL is built into the key, both the claim and the expiry are handled by Redis. Throughput is 50,000 to 100,000 claims per second per node, far above what a database can do row by row. The weakness is durability: Redis is a cache-like store, and a failover can lose the last few writes (asynchronous replication, <a href="../chapters/24-replication.html">Chapter 24</a>). A lost "held" key could let a second buyer claim a seat that is already being paid for. Therefore we never let Redis be the last word on a confirmed sale.</p>
+<h3>10.4 Comparison</h3>
+<table>
+<tr><th>Property</th><th>Row lock (FOR UPDATE)</th><th>Optimistic (conditional UPDATE)</th><th>Redis atomic script</th></tr>
+<tr><td>Correctness guarantee</td><td>Strong (ACID)</td><td>Strong (ACID)</td><td>Strong per node, weak across failover</td></tr>
+<tr><td>Throughput on one hot event</td><td>Low: waiters pile up, maybe 1,000 to 3,000/s</td><td>Medium: maybe 5,000 to 10,000/s on good hardware</td><td>High: 50,000+/s</td></tr>
+<tr><td>Behaviour under contention</td><td>Queues and blocks; deadlock risk</td><td>Fast failure; wasted retries by client</td><td>Fast failure at memory speed</td></tr>
+<tr><td>Expiry of holds</td><td>Needs a sweeper job</td><td>Needs a sweeper job or expiry predicate</td><td>Native TTL</td></tr>
+<tr><td>Durability</td><td>Yes</td><td>Yes</td><td>No (replication lag, restart)</td></tr>
+<tr><td>Complexity</td><td>Low</td><td>Low</td><td>Medium (two stores to keep in step)</td></tr>
+</table>
+<p>The throughput numbers are order-of-magnitude figures for a well-tuned single node and vary by hardware, schema and isolation level; use them for comparison, not as promises.</p>
+<h3>10.5 Our choice: Redis in front, conditional UPDATE behind</h3>
+<p>For ordinary events the conditional UPDATE alone is enough: at 1,500 hold attempts per second a single shard handles it. For a hot event we layer them. Redis claims the seats first (cheap rejection of the roughly 60% of attempts that lose), then the database performs the conditional update that makes the hold durable, and the unique constraint on tickets <code>(event_id, seat_id)</code> guarantees that even a bug in both layers cannot create two tickets for one seat. This is the standard defence-in-depth pattern from <a href="../chapters/60-pattern-playbook.html">Chapter 60</a>: a fast but fallible gatekeeper in front of a slow but authoritative one.</p>
+<p>Handling Redis disagreeing with the database: the database is the truth. If Redis says free and the DB update changes zero rows, the service deletes the Redis key and tells the buyer the seat is gone. If Redis loses a key (failover), the DB conditional update still protects us; we only suffer extra DB load until Redis is rebuilt. On Redis restart we rebuild seat keys from the DB (states HELD with unexpired time and SOLD), and during the rebuild window we route holds directly to the database path.</p>
+<h3>10.6 Hot event handling</h3>
+<ul>
+<li><b>Dedicated capacity.</b> A mega event gets its own shard, its own Redis nodes and its own booking-service pool, so it cannot starve normal sales (the cell idea from <a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>). Capacity is provisioned ahead of the known on-sale time.</li>
+<li><b>Split by section.</b> If one shard is still too hot, partition the event's seats by section into several inventory partitions. A hold touching two sections becomes a cross-partition operation, so the UI nudges buyers to choose seats within one section, and multi-section holds are rare and use a small two-step process.</li>
+<li><b>Best-available mode.</b> Offering "give me any 2 seats together in section X" lets the server pick the least contended seats instead of everyone fighting over the front row. This both reduces conflicts and raises the sell-through rate.</li>
+<li><b>Seat-map throttling.</b> Randomly offer each admitted user a slice of the map, or show seats in randomised order, so that thousands of users do not all click the same "best" seat in the same second.</li>
+</ul>
+<h3>10.7 Expiry of holds</h3>
+<p>A hold is a promise with a deadline. If the buyer vanishes, the seats must return to the pool, otherwise the venue ends up with hundreds of ghost-held seats and fans see "sold out" for an event that is not. There are three layers, used together:</p>
+<ol>
+<li><b>Redis TTL.</b> The seat key expires on its own after 10 minutes. This is precise, free and immediate for the fast path.</li>
+<li><b>Expiry predicate in the query.</b> Treat a seat as available when <code>state='AVAILABLE' OR (state='HELD' AND hold_expires_at &lt; now())</code>. Now an expired hold never blocks a buyer even if no cleanup has run; the conditional UPDATE simply takes the seat over. This is lazy expiry, the same idea as a cache TTL in <a href="../chapters/13-caching-patterns.html">Chapter 13</a>.</li>
+<li><b>Sweeper job.</b> A periodic worker (<a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>) scans an index on <code>hold_expires_at</code> for expired holds, marks them <code>EXPIRED</code>, restores seats to <code>AVAILABLE</code> and emits <code>SeatReleased</code> events so caches and the waiting room learn about the freed inventory. The sweeper is a tidy-up, not a correctness mechanism, because layers 1 and 2 already keep the system right.</li>
+</ol>
+<div class="callout watch"><b>Watch out</b> The dangerous edge is a payment that completes at 9 minutes 59 seconds while the hold expires at 10:00 and another buyer grabs the seat. The rule in section 11 handles it: confirmation requires the hold to still be valid at the moment of the database transaction, and a payment that succeeds for an expired and lost seat is automatically refunded and the user is told.</div>
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Seat state machine">
+  <rect class="hit" x="30" y="90" width="150" height="60" rx="30"/><text class="t-c t-b" x="105" y="118">AVAILABLE</text><text class="t-c t-sm" x="105" y="136">in the pool</text>
+  <rect class="cache" x="360" y="90" width="150" height="60" rx="30"/><text class="t-c t-b" x="435" y="118">HELD</text><text class="t-c t-sm" x="435" y="136">TTL 10 min</text>
+  <rect class="db" x="710" y="90" width="150" height="60" rx="30"/><text class="t-c t-b" x="785" y="118">SOLD</text><text class="t-c t-sm" x="785" y="136">ticket issued</text>
+  <path class="arrow" d="M180 108 L356 108"/><text class="t-c t-sm" x="268" y="100">hold (conditional update)</text>
+  <path class="arrow-g" d="M510 108 L706 108"/><text class="t-c t-sm" x="608" y="100">payment confirmed</text>
+  <path class="arrow-r dash" d="M400 150 Q 270 215 140 152"/><text class="t-c t-sm" x="270" y="222">TTL expiry, user release, payment failure</text>
+  <path class="arrow dash" d="M760 150 Q 450 245 150 152"/><text class="t-c t-sm" x="560" y="212">refund / cancel policy</text>
+</svg>
+<figcaption>Only three states are needed. The only transition that creates revenue is HELD to SOLD, and it is the one guarded by both the payment result and the hold's validity.</figcaption>
+</figure>
+
+<h2 id="payment">11. Deep dive 3: payment integration and the checkout saga</h2>
+<p>Booking spans two systems that do not share a transaction: our inventory database and the external payment provider. A distributed ACID transaction across them is impossible, so we use a <b>saga</b>: a sequence of local transactions with compensating actions (<a href="../chapters/48-sagas.html">Chapter 48</a>, <a href="../chapters/31-distributed-transactions.html">Chapter 31</a>). Payment mechanics and ledgers are in <a href="c14-payment-system.html">Case study 14</a>; here we focus on how booking uses them.</p>
+<h3>11.1 Ordering the steps</h3>
+<p>There are two orderings. <b>Reserve then charge</b>: hold the seat (done), charge the card, then confirm the seat. <b>Charge then reserve</b>: charge first, then try to take the seat. The second can charge people for nothing and force refunds. The first is the standard: the hold guarantees the seat is ours while we charge, so the only compensations are releasing the seat on failure or refunding on the rare race.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Checkout saga sequence with payment provider">
+  <rect class="ext" x="20" y="10" width="110" height="32" rx="8"/><text class="t-c t-b" x="75" y="31">Client</text>
+  <rect class="box" x="210" y="10" width="140" height="32" rx="8"/><text class="t-c t-b" x="280" y="31">Order svc</text>
+  <rect class="ext" x="470" y="10" width="140" height="32" rx="8"/><text class="t-c t-b" x="540" y="31">Payment PSP</text>
+  <rect class="db" x="720" y="10" width="140" height="32" rx="8"/><text class="t-c t-b" x="790" y="31">Inventory DB</text>
+  <line class="life" x1="75" y1="42" x2="75" y2="390"/><line class="life" x1="280" y1="42" x2="280" y2="390"/><line class="life" x1="540" y1="42" x2="540" y2="390"/><line class="life" x1="790" y1="42" x2="790" y2="390"/>
+  <path class="arrow" d="M75 75 L276 75"/><text class="t-sm" x="85" y="68">1. checkout (hold, key)</text>
+  <path class="arrow" d="M280 110 L786 110"/><text class="t-sm" x="400" y="102">2. extend hold by 3 min grace; order = PENDING</text>
+  <path class="arrow" d="M280 150 L536 150"/><text class="t-sm" x="300" y="142">3. charge (idempotency key = orderId)</text>
+  <path class="arrow dash" d="M536 190 L284 190"/><text class="t-sm" x="320" y="182">4. success (response or webhook)</text>
+  <path class="arrow-g" d="M280 230 L786 230"/><text class="t-sm" x="360" y="222">5. one tx: HELD to SOLD, tickets, CONFIRMED, outbox</text>
+  <path class="arrow dash" d="M276 270 L79 270"/><text class="t-sm" x="95" y="262">6. CONFIRMED (via poll or push)</text>
+  <path class="arrow-r dash" d="M280 320 L536 320"/><text class="t-sm" x="300" y="312" style="fill:var(--bad)">5x. if step 5 fails: refund (compensation)</text>
+  <text class="t-sm" x="300" y="360">If step 4 is a decline: release the hold, order = FAILED.</text>
+</svg>
+<figcaption>The seat is protected before money moves. A failure at step 5 after a successful charge triggers a refund; a decline at step 4 simply releases the seat.</figcaption>
+</figure>
+<h3>11.2 Rules that make the saga safe</h3>
+<ul>
+<li><b>Idempotency everywhere.</b> The charge call carries a key derived from the order id, so a retry after a timeout never double charges. Our own endpoints accept a client idempotency key so double clicks create one order. Uniqueness on <code>(idempotency_key)</code> in the orders table enforces it (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>).</li>
+<li><b>Hold grace period.</b> When checkout starts, the hold's expiry is pushed out a few minutes so a slow payment cannot lose the seat while the money is in flight. The extension is capped, so it cannot be used to hoard.</li>
+<li><b>Unknown outcomes.</b> If the charge times out, we do not know whether it succeeded. The order stays <code>PENDING</code>; a reconciler queries the provider for the status by the idempotency key or order id, and finishes the saga either way. We never guess.</li>
+<li><b>Webhook plus poll.</b> The provider webhook is the fast signal, but webhooks can be lost or duplicated. We verify the signature, process each event id once, and also poll for pending orders older than a minute.</li>
+<li><b>Late success on an expired hold.</b> If money arrives for a hold that has already been lost to another buyer, the confirm transaction fails its condition, and the compensation (a full refund and an apology message) runs. This is rare because of the grace period.</li>
+<li><b>Outbox.</b> Order confirmation and the event to Kafka are written in the same local transaction (transactional outbox, <a href="../chapters/36-event-driven.html">Chapter 36</a>), so a crash cannot leave a sold seat with no ticket email.</li>
+<li><b>Timeouts and bulkheads.</b> The payment call has a tight timeout, a circuit breaker and its own thread pool so a slow provider cannot starve hold placement (<a href="../chapters/51-microservice-resilience.html">Chapter 51</a>).</li>
+</ul>
+<h3>11.3 Orchestration or choreography</h3>
+<p>We choose an <b>orchestrated</b> saga: the order service owns the state machine (PENDING, PAID, CONFIRMED, FAILED, REFUNDED) and decides the next step. For a three-step flow with money involved, one place that knows the whole story is easier to reason about and to audit than events bouncing between services. Choreography would be fine for the downstream steps (ticket email, analytics) after confirmation, and that is where we use Kafka.</p>
+
+<h2 id="caching">12. Caching availability, and protecting against bots</h2>
+<h3>12.1 Availability caching: stale reads are fine</h3>
+<p>The seat map is the most read object of the whole system, and it is allowed to be stale because the hold step is the real arbiter. The cost of showing a taken seat as free is one failed click. The cost of a perfectly fresh map is 200,000 reads a second against the contended rows. We choose staleness on purpose.</p>
+<ul>
+<li><b>Layers.</b> Browser polls the CDN (max-age 1-2 s with stale-while-revalidate); CDN origin is the browse service; the browse service reads a Redis snapshot per event (a hash of section counts and a compressed bitmap of seat states) that a small updater refreshes from inventory change events every second.</li>
+<li><b>Coalescing.</b> When the cache expires, only one request recomputes it and the rest wait or get the old value (request coalescing), avoiding a stampede on the origin; see the cache failure patterns in <a href="../chapters/14-caching-failures.html">Chapter 14</a>.</li>
+<li><b>Versioning.</b> The availability payload includes the version; the client discards older responses that arrive late.</li>
+<li><b>Deltas.</b> For huge maps, send the full bitmap once, then small diffs ("seats 14C and 14D now held"). 50,000 seats at 2 bits of state each is about 12 KB, small enough to resend whole in most cases.</li>
+<li><b>What is never cached.</b> The hold and checkout calls, and anything saying "your hold is valid until".</li>
+<li><b>Honest UI.</b> On a failed hold show the specific seats lost and refresh nearby availability, which turns most failures into a quick retry.</li>
+</ul>
+<h3>12.2 Bot and scalper protection</h3>
+<p>Bots are the biggest fairness threat: a scalper script can place holds in milliseconds, and a farm of accounts takes hundreds of places in the queue. No single defence works, so we layer them (see <a href="../chapters/55-security.html">Chapter 55</a> and <a href="../chapters/16-rate-limiting.html">Chapter 16</a>):</p>
+<table>
+<tr><th>Layer</th><th>What it does</th><th>Limitation</th></tr>
+<tr><td>Edge WAF and bot scoring</td><td>Blocks known bad IP ranges, headless-browser fingerprints, abnormal TLS or header patterns before they reach us.</td><td>Sophisticated bots imitate real browsers.</td></tr>
+<tr><td>Verified accounts</td><td>Require a login with verified email or phone, optionally a pre-registration; limit one queue entry per account.</td><td>Fake accounts can be bought; raise the cost, not eliminate.</td></tr>
+<tr><td>Challenge at queue entry</td><td>A proof-of-work or CAPTCHA-style challenge before joining, which makes bulk joining costly.</td><td>Hurts accessibility and conversion; use risk-based triggering.</td></tr>
+<tr><td>Per-account, per-device, per-IP limits</td><td>Token bucket limits on joins, holds and checkout; a cap on tickets per order and per account per event.</td><td>Shared IPs (offices, mobile carriers) cause false positives, so use soft limits.</td></tr>
+<tr><td>Signed admit tokens</td><td>Bind the right to hold seats to a user passing through the queue, so bots cannot skip it and hit the API directly.</td><td>None specific; essential.</td></tr>
+<tr><td>Post-sale checks</td><td>Detect clusters of orders by payment instrument or address, cancel suspicious orders and release seats.</td><td>Needs a fraud team and a clear policy.</td></tr>
+</table>
+<p>State the honest conclusion in the interview: you cannot eliminate bots, you can make them expensive and keep real users ahead. Fairness is a probabilistic goal.</p>
+
+<h2 id="scaling">13. Scaling, bottlenecks and sharding</h2>
+<table>
+<tr><th>Layer</th><th>Bottleneck at the spike</th><th>Mitigation</th></tr>
+<tr><td>Edge / CDN</td><td>300,000 requests/s</td><td>Static content cached; availability cached 1-2 s; waiting page static; the CDN absorbs nearly all of it.</td></tr>
+<tr><td>Queue service</td><td>25,000 joins/s then 125,000 status polls/s</td><td>A couple of Redis ops per join; status read from a local cache of one number; jittered polling or push; separate Redis cluster.</td></tr>
+<tr><td>Booking tier</td><td>1,500 hold attempts/s, 150 orders/s</td><td>Stateless instances, admission rate limited to what they sustain; autoscale on queue depth in advance, not on CPU.</td></tr>
+<tr><td>Inventory shard</td><td>All writes on one event's rows</td><td>Redis front gate, conditional updates, short transactions, hot-event cell, partition by section if required.</td></tr>
+<tr><td>Payment provider</td><td>Provider rate limits, 250 charges/s peak</td><td>Admission throttle indirectly caps it; queue checkouts with back-pressure; multiple providers as fallback.</td></tr>
+<tr><td>Fan-out after sale</td><td>Email and tickets for 25,000 orders</td><td>Asynchronous via Kafka, consumers scale independently (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>).</td></tr>
+</table>
+<h3>13.1 Capacity math for the inventory shard</h3>
+<p>One shard sees about 1,500 hold attempts a second at peak. Each attempt is one or two short statements. A modern database node handles several thousand such statements a second, so even without Redis the shard operates at perhaps 30% of capacity. With Redis rejecting the 60% of losing attempts, the shard sees roughly 600 conditional updates a second. The payoff of the waiting room is exactly this: without it the same shard would see 100 times more, and the connection pool (say 200 connections) would be starved. Replicas serve non-critical reads (my orders, event details) and the analytics path; hold and confirm always go to the primary (<a href="../chapters/24-replication.html">Chapter 24</a>).</p>
+<h3>13.2 Sharding the whole system</h3>
+<p>Shard by <code>event_id</code> using a directory service that maps each event to a shard (<a href="../chapters/25-sharding.html">Chapter 25</a>). A directory is better than pure hashing here because we know the hot events in advance and can pin the hottest ones to dedicated shards by hand. Orders are co-located with events by event_id, but user-centric queries ("my orders") need a secondary index or a separate per-user table maintained from Kafka events. This is the one place where we accept eventual consistency: a new order appears in "my tickets" a second or two after confirmation, and the confirmation screen reads straight from the primary so the buyer sees it at once.</p>
+<h3>13.3 Multi-region</h3>
+<p>Each event has one home region that owns its inventory writes; that avoids cross-region seat conflicts entirely, trading some latency for distant users (an extra 100 to 200 ms on a hold call, acceptable). Browse and static content serve from the nearest region and CDN. The waiting room runs in the home region of the event. Disaster recovery uses asynchronous replication to a second region; on regional failure we promote it, accepting a small risk that the most recent seconds of holds and sales are lost, which we reconcile against payment provider records (<a href="../chapters/41-ha-dr.html">Chapter 41</a>, <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>).</p>
+
+<h2 id="failures">14. Failure modes, consistency and idempotency</h2>
+<table>
+<tr><th>Component</th><th>If it fails, slows or lies</th><th>Mitigation</th></tr>
+<tr><td>Redis (hold fast path)</td><td>Failover loses recent keys; or node is down.</td><td>DB conditional update is authoritative, so no oversell. If Redis is down, bypass to the DB path with a lower admission rate. Rebuild keys from DB on recovery.</td></tr>
+<tr><td>Redis (waiting room)</td><td>Queue positions lost.</td><td>Persist the ticket counter and admitted number periodically; tokens are signed and carry their ticket number, so they stay valid after rebuild. Worst case: re-queue users in the same order using token numbers.</td></tr>
+<tr><td>Inventory primary</td><td>Down for 30 s during failover.</td><td>Holds fail with a retryable error; queue admission pauses automatically (health feedback); users stay in line. Confirmed sales are durable because of synchronous replication to a standby within the region.</td></tr>
+<tr><td>Booking service crash mid-hold</td><td>Redis claimed, DB not yet written (or the reverse).</td><td>Redis claim has a TTL, so an orphan clears itself. DB write without Redis is harmless. Idempotency key allows the client to retry safely.</td></tr>
+<tr><td>Payment provider slow or down</td><td>Checkouts time out; user may be charged without knowing.</td><td>Circuit breaker, grace extension of holds, reconciliation worker, honest "payment processing" state, alternative provider.</td></tr>
+<tr><td>Webhook lost or duplicated</td><td>Order stuck PENDING, or confirmed twice.</td><td>Poll fallback; dedupe by event id; confirm transition is conditional and idempotent.</td></tr>
+<tr><td>Kafka down</td><td>Tickets and email delayed.</td><td>Outbox buffers in the DB; consumers catch up; the sale itself is already committed.</td></tr>
+<tr><td>Stale availability cache</td><td>Users click taken seats.</td><td>Expected and harmless; hold returns precise 409 and fresh nearby seats.</td></tr>
+<tr><td>Clock skew</td><td>Hold expiry judged differently on different nodes.</td><td>Use database time for expiry decisions (<code>now()</code> on the primary) and Redis TTL; the client shows a countdown from server-provided remaining seconds (<a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>).</td></tr>
+<tr><td>Thundering retries</td><td>Clients hammering after errors.</td><td>Exponential backoff with jitter in the client code; server-supplied Retry-After; queue shields the core.</td></tr>
+</table>
+<h3>14.1 Consistency choices</h3>
+<p>Per <a href="../chapters/28-cap-consistency.html">Chapter 28</a>, we choose consistency over availability for the one thing that matters: the seat state transitions are linearizable on the event's primary. When the primary is unreachable we refuse holds rather than risk two owners. Everything else, such as availability counts, "my orders" lists, search results and analytics, is eventually consistent. This split is the central consistency story: strong where a wrong answer costs money and trust, weak where a wrong answer costs one extra click.</p>
+<h3>14.2 Idempotency summary</h3>
+<ul>
+<li>Join queue: one token per user per event; repeats return the existing token.</li>
+<li>Place hold: idempotency key maps to the original hold result for the key's lifetime (24 hours).</li>
+<li>Checkout: unique key per order attempt; payment key derived from order id.</li>
+<li>Confirm: transition HELD to SOLD guarded by <code>WHERE hold_id=:h AND state='HELD'</code>, so a duplicate confirm changes zero rows and is treated as success if the order is already confirmed.</li>
+<li>Consumers of Kafka events dedupe on event id, since delivery is at-least-once.</li>
+</ul>
+
+<h2 id="flash-sale">15. The flash-sale variant: pre-decremented stock</h2>
+<p>Consider a different but related problem: 10,000 limited-edition sneakers (or 50,000 general-admission tickets with no seat identity) go on sale and 1M users hit "buy". There is no seat map; items are interchangeable, so the question is simply "is there stock left?" This removes the identity contention, but now every single request touches <b>one counter</b>, the ultimate hot key.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Flash sale pipeline with pre-decremented stock">
+  <rect class="ext" x="20" y="100" width="110" height="60" rx="10"/><text class="t-c t-b" x="75" y="127">Buyers</text><text class="t-c t-sm" x="75" y="146">100k req/s</text>
+  <rect class="cache" x="170" y="100" width="130" height="60" rx="10"/><text class="t-c t-b" x="235" y="122">Gate</text><text class="t-c t-sm" x="235" y="140">bots, rate limit,</text><text class="t-c t-sm" x="235" y="154">queue</text>
+  <rect class="cache" x="340" y="100" width="160" height="60" rx="10"/><text class="t-c t-b" x="420" y="122">Redis stock counter</text><text class="t-c t-sm" x="420" y="140">atomic, never below 0</text><text class="t-c t-sm" x="420" y="154">split into N buckets</text>
+  <rect class="box" x="540" y="100" width="130" height="60" rx="10"/><text class="t-c t-b" x="605" y="122">Kafka</text><text class="t-c t-sm" x="605" y="142">order requests</text>
+  <rect class="db" x="710" y="100" width="170" height="60" rx="10"/><text class="t-c t-b" x="795" y="122">Order workers + DB</text><text class="t-c t-sm" x="795" y="142">create order, pay</text>
+  <path class="arrow" d="M130 130 L166 130"/><path class="arrow" d="M300 130 L336 130"/><path class="arrow" d="M500 130 L536 130"/><path class="arrow" d="M670 130 L706 130"/>
+  <path class="arrow-r dash" d="M420 100 L420 40 L170 40 L90 96"/><text class="t-c t-sm" x="300" y="32">counter at 0: instant "sold out", no DB touch</text>
+  <path class="arrow-r dash" d="M795 160 L795 230 L420 230 L420 164"/><text class="t-c t-sm" x="610" y="248">payment timeout or failure: return the unit</text>
+</svg>
+<figcaption>Stock is decided at the gate, in memory, in microseconds. Only winners (10,000 of the 1,000,000) become orders, and they are processed at a pace the database can sustain.</figcaption>
+</figure>
+<ol>
+<li><b>Load stock into Redis before the sale</b>: <code>SET stock:sku 10000</code>.</li>
+<li><b>Atomic decrement.</b> Each request runs a script: if stock is at least the requested quantity, decrement it and return success; otherwise return sold out. The script, not a separate GET then DECR, avoids a race that would drive stock negative. A single Redis key handles about 100,000 operations a second, which meets our peak, and 990,000 losers get an instant "sold out" without touching a database.</li>
+<li><b>Record the winner</b> (user, sku, quantity, reservation id) in a durable store, typically by publishing to Kafka and writing a short-lived reservation key with a TTL (the payment window).</li>
+<li><b>Order workers</b> consume reservations at their own pace, create orders and start payment. If payment fails or the TTL passes, a compensation increments the counter and the unit returns to the pool, exactly like a hold expiring.</li>
+<li><b>Reconcile.</b> The database is authoritative. A periodic job checks that the counter equals (total minus sold minus active reservations) and repairs drift. The DB also enforces <code>sold &lt;= total</code> with a conditional update as in section 10, so a counter bug can cause an under-sale but never an oversell.</li>
+</ol>
+<h3>15.1 Splitting the hot key</h3>
+<p>If one key becomes the bottleneck (say 500,000 attempts a second), split the stock into N buckets: 10 keys of 1,000 units on different Redis shards. A request picks a random bucket; if empty it tries another bucket or two, and declares sold out only after all are empty or after a few probes. This multiplies throughput by N at the price of slightly imperfect "last items" behaviour (a bucket may be empty while another has one unit), solved by a final sweep that tries all buckets sequentially.</p>
+<table>
+<tr><th>Aspect</th><th>Reserved seating</th><th>Flash sale / general admission</th></tr>
+<tr><td>Contended resource</td><td>Many distinct seats, popular ones contested</td><td>One counter (or N buckets)</td></tr>
+<tr><td>Atomic primitive</td><td>Conditional update or multi-key Lua script</td><td>Lua decrement script</td></tr>
+<tr><td>Choice by buyer</td><td>Specific seats</td><td>Quantity only</td></tr>
+<tr><td>Where oversell is prevented</td><td>DB constraint plus Redis gate</td><td>Counter plus DB conditional total check</td></tr>
+<tr><td>Return of stock</td><td>TTL expiry and release</td><td>Compensating increment</td></tr>
+</table>
+<div class="callout tip"><b>Interview tip</b> Name the trade: pre-decrementing takes the decision out of the slow system. The price is that Redis and the database can disagree, so you reconcile and keep a database guard. Always say "fast gate, authoritative store".</div>
+
+<h2 id="widget">16. Try it: sell-through simulator</h2>
+<div class="widget"><h4>Waiting room drain time</h4>
+<div class="row"><label>People in queue <input id="w-users" type="number" value="1000000" min="1"></label>
+<label>Admit rate per second <input id="w-rate" type="number" value="500" min="1"></label>
+<label>Seats <input id="w-seats" type="number" value="50000" min="1"></label>
+<label>Seats per order <input id="w-per" type="number" value="2" min="1"></label>
+<label>Admitted users who buy (percent) <input id="w-conv" type="number" value="30" min="1" max="100"></label>
+<button id="w-go" type="button">Compute</button></div>
+<div class="log" id="w-out">Press Compute.</div></div>
+
+<h2 id="security">17. Security, monitoring and cost</h2>
+<h3>17.1 Security and abuse</h3>
+<p>Beyond the bot controls in section 12: protect card data by never touching it (the browser sends it straight to the provider and we store only a token, which keeps us out of the heaviest compliance scope). Sign and expire queue and admit tokens. Validate that the hold belongs to the user at checkout. Rate limit by account and device. Stop hold hoarding by capping seats per account per event and capping the grace extension. Log every state transition on seats for audit and for dispute resolution. See <a href="../chapters/55-security.html">Chapter 55</a>.</p>
+<h3>17.2 Monitoring and SLOs</h3>
+<ul>
+<li><b>Correctness SLO:</b> zero double-sold seats. This is audited by a continuous job that counts tickets per (event, seat) and alerts on any count above one; the unique constraint should make it impossible, and the alarm tells us if the guard was bypassed.</li>
+<li><b>Latency SLO:</b> hold placement p99 under 300 ms; seat map p99 under 1 s; queue status p99 under 200 ms.</li>
+<li><b>Availability SLO:</b> 99.9% of join and status calls succeed on a sale day; 99.95% for holds from admitted users.</li>
+<li><b>Business signals:</b> hold-to-purchase conversion (healthy is perhaps 50 to 70%), hold expiry rate, queue depth and admission rate, payment decline rate, reconcile backlog, Redis versus DB drift.</li>
+<li><b>Runbook dials:</b> admission rate, kill switch for the queue, per-event feature flags, switch to DB-only hold path, enlarge hold grace.</li>
+</ul>
+<p>Observability practices are in <a href="../chapters/54-observability-slos.html">Chapter 54</a>. Run a load test and game day well before a big sale, replaying realistic arrival curves, because a first-ever test on the real day is a failed design review.</p>
+<h3>17.3 Cost notes</h3>
+<p>The system is idle most of the time, so cost is about peaks. Pre-warm and scale the booking tier and Redis for scheduled events, then scale back. The CDN carries nearly all the bytes, and CDN egress is typically the largest bill line on a sale day. The waiting room is cheap per user (a couple of Redis operations), and it saves money by letting us provision for 500 admissions a second instead of 25,000. Inventory databases are small in storage terms; reserve compute, not disk.</p>
+
+<h2 id="evolution">18. Evolution, phasing and alternatives</h2>
+<h3>18.1 What to build first</h3>
+<ol>
+<li><b>Phase 1:</b> single relational database, conditional-update holds, TTL via expiry predicate, sweeper, synchronous payment with idempotency keys. Correct and enough for normal events.</li>
+<li><b>Phase 2:</b> CDN and cached availability, order saga with webhook plus reconciliation, outbox and Kafka for tickets and email.</li>
+<li><b>Phase 3:</b> waiting room with signed tokens, rate limits and basic bot defence. Needed when the first big on-sale arrives.</li>
+<li><b>Phase 4:</b> Redis hold gate, dedicated hot-event cells, section partitions, randomised admission, flash-sale counter path.</li>
+</ol>
+<h3>18.2 At 10x scale</h3>
+<p>With 10M waiting users and several simultaneous mega events: multiple waiting-room clusters partitioned by event, push-based status over long-lived connections instead of polling, partitioned inventory by section for the biggest venues with a coordinator for cross-section holds, regional payment routing, and pre-sale verified-fan lotteries so the demand arrives as a controlled list rather than a flood.</p>
+<h3>18.3 Alternatives not chosen</h3>
+<ul>
+<li><b>Distributed locks for seats</b> (<a href="../chapters/30-coordination-locks.html">Chapter 30</a>, <a href="c21-lock-service.html">Case study 21</a>). A lock service adds another moving part and failure mode without being more correct than a conditional update. Lock leases can also expire at the wrong time. We rely on the data store's own atomic primitive instead.</li>
+<li><b>Everything in Redis, no relational store.</b> Fast, but durability and uniqueness guarantees are weaker; a lost key could oversell. Rejected for the source of truth.</li>
+<li><b>Serializable transactions on all booking.</b> Correct but throughput drops under retries; conditional updates give the same guarantee here with less machinery.</li>
+<li><b>Event sourcing the seat state.</b> Good audit trail, but adds read-model complexity; a plain table plus an audit log gets the benefit more cheaply.</li>
+<li><b>Auction or dynamic pricing instead of queueing.</b> Solves scarcity economically; a product decision beyond our scope.</li>
+</ul>
+
+<h2 id="qa">19. Interview Q&amp;A</h2>
+<details><summary>How do you guarantee a seat is never sold twice?</summary>
+<p>Multiple layers, with the database as the final authority. The hold is a conditional update, <code>UPDATE ... WHERE state='AVAILABLE'</code>, and we only treat the hold as won when the number of rows changed equals the number of seats requested. The move to SOLD is also conditional on the hold id and state. Finally a unique constraint on tickets (event_id, seat_id) makes a duplicate physically impossible to insert. Redis in front is an optimisation that rejects losers cheaply, and if it loses data the database layers still hold. I would also run an audit job that alerts if any seat ever has more than one ticket.</p></details>
+<details><summary>Why not just use SELECT FOR UPDATE on the seat row?</summary>
+<p>It is correct, and for ordinary events it is perfectly fine. The problem appears under heavy contention: transactions queue behind the winner, each holding a database connection while it waits, so a hot seat can exhaust the pool and stall unrelated work. Deadlocks also appear when multi-seat holds lock rows in different orders. A conditional update gives the same atomicity in one statement with no waiting on client think time, and losers fail instantly. If I did use row locks I would lock in sorted seat order, set a short lock timeout and keep transactions tiny.</p></details>
+<details><summary>What happens when a user abandons the checkout?</summary>
+<p>The hold has a TTL of about ten minutes. The Redis key expires on its own, the query treats a hold with a past expiry as available, and a sweeper job tidies the database rows and publishes SeatReleased events so caches and the waiting room see the freed seats. The user sees a countdown derived from the server expiry time. If they pay near the deadline, checkout extends the hold by a short grace period, so a slow payment does not lose the seat, and if a charge does succeed for a seat that was lost, we refund automatically.</p></details>
+<details><summary>Why have a waiting room instead of just autoscaling?</summary>
+<p>Autoscaling takes minutes while the spike takes seconds, and even infinite compute would not help because the bottleneck is contention on the same inventory rows and on the payment provider's rate limit, neither of which scales out by adding web servers. The waiting room shapes the load into a rate the contended part can sustain, and also supplies fairness and a clear user experience: a position and an estimated wait rather than errors and refresh storms. The cost is complexity and a short delay for users, but the alternative is a site-wide outage during the most visible moment of the year.</p></details>
+<details><summary>How do you make the queue fair, and stop bots from jumping it?</summary>
+<p>Fairness comes from assigning positions in a way that speed cannot game. For the biggest sales I would randomise order among everyone who joined in a window around the start time, rather than strict arrival order. One verified account gets one place, enforced by tying the signed token to the account and device, and the booking API rejects any call without a valid admit token, so bots cannot bypass the queue. On top of that sit WAF bot scoring, challenges at join time, per-account purchase limits and post-sale fraud review. I would be honest that this reduces bots and raises their cost, and cannot eliminate them.</p></details>
+<details><summary>Is it acceptable to show stale seat availability?</summary>
+<p>Yes, deliberately. The map is a hint, and the hold step is the real arbiter. Serving the map from CDN and a Redis snapshot refreshed every second or so protects the inventory from 200,000 reads a second. The cost is that sometimes a user clicks a seat that is already gone, and we handle that with a precise 409 listing which seats failed and showing nearby alternatives. What is never allowed to be stale is the hold, checkout and confirmation path, which always runs against the authoritative store.</p></details>
+<details><summary>Payment succeeded but our service crashed before confirming the seat. What now?</summary>
+<p>The order is in PENDING_PAYMENT with a stored idempotency key and the provider has a record of the charge. On restart, or through the webhook, the order service learns of the success and runs the confirm transaction, which moves the seat to SOLD and writes tickets and the outbox event atomically. A reconciliation worker sweeps pending orders older than a minute and asks the provider for their status by order id, so nothing waits on a lost webhook. If the hold was lost in the meantime, we refund. The key point is that every step is idempotent and every ambiguous state is resolved by querying the truth rather than guessing.</p></details>
+<details><summary>How would you handle a hot event on one shard?</summary>
+<p>First, the waiting room already caps the load that reaches it. Second, I would pin the hot event to its own shard and Redis nodes in a dedicated cell so it cannot hurt other sales, and pre-provision for the known on-sale time. Third, the Redis gate absorbs rejections so the database only sees likely winners. If that is still not enough, partition the event's seats by section into several inventory partitions and steer buyers towards single-section holds, or offer best-available so the system chooses uncontended seats for them. Splitting the hot counter into buckets does the same job in the flash-sale variant.</p></details>
+<details><summary>How does the flash-sale variant differ from reserved seating?</summary>
+<p>There is no seat identity, so contention is on a single counter rather than many rows. I pre-load the stock into Redis and decrement atomically with a script that never goes below zero, giving each of a million requests an answer in microseconds and sending only the winners to a Kafka queue for order creation and payment. Failed or expired payments increment the counter back. Because Redis can drift from the database, a reconciliation job repairs the counter and the database keeps a conditional guard so the sold total can never exceed stock. If one key is too hot, split it into several bucket keys.</p></details>
+<details><summary>What would you do about a user who gets charged twice?</summary>
+<p>Prevent it first: the client sends an idempotency key for checkout so double clicks collapse into one order, and the charge to the provider uses a key derived from the order id so a retry after a timeout cannot create a second charge. A unique constraint on the key backs this up. If it still happens, for example through a provider bug, the reconciliation job compares our orders with the provider's settlements, detects the extra capture and issues an automatic refund. The key principle is to detect duplicates through reconciliation as well as prevent them, since no prevention is perfect.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">20. Recap</h2><ul>
+<li>The hard problem is contention on a few thousand inventory rows, not data volume: 1M users, 50,000 seats, about 1,500 hold attempts per second and 150 orders per second after shaping.</li>
+<li>A virtual waiting room turns a stampede into a steady admission rate, provides fairness (randomised window, one place per account) and protects the booking tier and payment provider.</li>
+<li>Prevent oversell with a conditional UPDATE as the authority, Redis atomic scripts as a fast gate, and a unique constraint on tickets as the last safety net.</li>
+<li>Seats move AVAILABLE, HELD (TTL), SOLD. Holds expire through Redis TTL, an expiry predicate and a sweeper; payments get a short grace period.</li>
+<li>Checkout is an orchestrated saga: reserve, charge with an idempotency key, confirm in one transaction with an outbox, compensate with refunds; unknown outcomes are reconciled, never guessed.</li>
+<li>Availability can be stale; hold and confirm cannot. Cache the map in CDN and Redis for a second or two.</li>
+<li>Shard by event; give hot events dedicated cells; partition by section only if needed.</li>
+<li>Flash sale: pre-decrement stock in Redis, queue winners, return stock on failure, reconcile with the database.</li>
+<li>Layer bot defences (WAF, verified accounts, challenges, limits, signed tokens); aim to raise cost, not to promise elimination.</li>
+</ul></div>
+<p class="connects"><b>Connects to:</b> <a href="../chapters/01-interview-framework.html">Chapter 1</a> (framework followed here), <a href="../chapters/02-estimation.html">Chapter 2</a> (spike estimates), <a href="../chapters/12-cdn.html">Chapter 12</a> and <a href="../chapters/13-caching-patterns.html">Chapter 13</a> (availability caching), <a href="../chapters/15-redis.html">Chapter 15</a> (atomic scripts, TTL), <a href="../chapters/16-rate-limiting.html">Chapter 16</a> (admission and rate limits), <a href="../chapters/18-relational-internals.html">Chapter 18</a> (locks, conditional updates), <a href="../chapters/25-sharding.html">Chapter 25</a> (sharding by event), <a href="../chapters/28-cap-consistency.html">Chapter 28</a> (consistency split), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotency), <a href="../chapters/48-sagas.html">Chapter 48</a> (checkout saga), <a href="../chapters/60-pattern-playbook.html">Chapter 60</a> (patterns); related cases: <a href="c14-payment-system.html">Case study 14</a>, <a href="c21-lock-service.html">Case study 21</a>, <a href="c03-rate-limiter.html">Case study 3</a>.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+<script>
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+function setParts(node, parts) { node.textContent = ''; parts.forEach(function (p) { if (typeof p === 'string') node.appendChild(document.createTextNode(p)); else node.appendChild(el('b', null, p.b)); }); }
+document.getElementById('w-go').addEventListener('click', function () {
+  var u = +document.getElementById('w-users').value, r = +document.getElementById('w-rate').value;
+  var s = +document.getElementById('w-seats').value, p = +document.getElementById('w-per').value;
+  var c = +document.getElementById('w-conv').value / 100;
+  var ordersNeeded = Math.ceil(s / p);
+  var admittedNeeded = Math.ceil(ordersNeeded / c);
+  var sellOutSec = admittedNeeded / r;
+  var m = function (x) { return (x / 60).toFixed(1) + ' min'; };
+  setParts(document.getElementById('w-out'), [
+    'Orders needed to sell out: ', {b: String(ordersNeeded)}, '. Admitted users needed at ', Math.round(c * 100) + '% buying: ', {b: String(admittedNeeded)}, '. ',
+    'Sold out after about ', {b: m(sellOutSec)}, '. About ', {b: String(Math.max(0, u - admittedNeeded))}, ' users learn it is sold out without ever reaching seat selection.'
+  ]);
+});
+</script>
+</body>
+</html>

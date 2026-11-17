@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 33: Gossip, Failure Detection and Merkle Trees | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="33-gossip-merkle">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Chapter 33 · Module 4 · Distributed Systems Theory</div>
+<h1>Gossip, Failure Detection and Merkle Trees</h1>
+<p class="lead">In a large cluster nobody is in charge, yet every node must agree on who is alive, where data lives, and whether its copy of the data matches its neighbours'. This chapter shows how nodes spread information by gossiping like a rumor, how they decide a peer is dead without being fooled by a slow network, and how they find the few differing records among billions by comparing hash trees.</p>
+
+<h2 id="problem">1. The problem: who is in the cluster, and who is alive?</h2>
+
+<p>Imagine a database made of 1,000 servers. A client asks one of them for a key, and that server must know which other server owns the key (see <a href="25-sharding.html">Chapter 25</a>). It must also know which of those servers are currently healthy, because sending a write to a dead machine wastes time. So every node needs a reasonably fresh answer to two questions: <b>membership</b> (which nodes belong to the cluster, and what tokens or ranges does each own?) and <b>liveness</b> (which of those members are working right now?).</p>
+
+<p>The obvious design is a central authority. One service, a "monitor", receives a heartbeat (a small "I am alive" message) from every node every second and keeps the member list. Everyone else asks the monitor. This is simple and is how many systems start, and it is often the right choice at small scale. In fact, ZooKeeper, etcd and similar coordination services are used exactly this way for modest clusters.</p>
+
+<p>But a central monitor has well-known weaknesses at scale:</p>
+<ul>
+  <li><b>Single point of failure.</b> If the monitor dies or is partitioned away, nobody knows who is alive. You fix this by replicating the monitor, which means running a consensus group (<a href="24-replication.html">Chapter 24</a>), which itself needs care.</li>
+  <li><b>Bottleneck.</b> A thousand nodes sending one heartbeat per second is only 1,000 messages per second, which is easy. But with 100,000 nodes, or a heartbeat every 100 ms, or a member list that has to be pushed back out to every node, the monitor becomes the hot spot.</li>
+  <li><b>Wrong vantage point.</b> The monitor sees the network from its own position. If the link between the monitor and node A breaks, the monitor declares A dead although A is perfectly reachable from all its peers. What matters for a database is whether <i>peers</i> can talk to A, not whether one observer can.</li>
+  <li><b>Coupling.</b> Every node's view of the world depends on one component being reachable. In a multi-datacenter deployment, a cross-ocean link failure would make an entire region believe the other region is dead or, worse, lose track of its own members.</li>
+</ul>
+
+<p>The other extreme is <b>all-to-all heartbeating</b>: every node pings every other node every second. With N nodes that is N × (N − 1) messages per second. For N = 1,000 that is nearly one million messages per second, and every node must process 999 incoming messages each second just to learn that nothing happened. The cost grows with the <i>square</i> of the cluster size, so this collapses well before a few thousand nodes.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Central monitor, all-to-all heartbeats, and gossip compared">
+  <text class="t-c t-b" x="150" y="20">Central monitor</text>
+  <rect class="cache" x="110" y="90" width="80" height="40" rx="8"/><text class="t-c t-b" x="150" y="115">Monitor</text>
+  <rect class="box" x="20" y="40" width="50" height="28" rx="6"/><text class="t-c t-sm" x="45" y="59">n1</text>
+  <rect class="box" x="230" y="40" width="50" height="28" rx="6"/><text class="t-c t-sm" x="255" y="59">n2</text>
+  <rect class="box" x="20" y="170" width="50" height="28" rx="6"/><text class="t-c t-sm" x="45" y="189">n3</text>
+  <rect class="box" x="230" y="170" width="50" height="28" rx="6"/><text class="t-c t-sm" x="255" y="189">n4</text>
+  <path class="arrow" d="M70 60 L120 92"/><path class="arrow" d="M230 60 L180 92"/><path class="arrow" d="M70 180 L120 128"/><path class="arrow" d="M230 180 L180 128"/>
+  <text class="t-c t-sm" x="150" y="232">N messages, but one SPOF and one viewpoint</text>
+
+  <text class="t-c t-b" x="450" y="20">All-to-all heartbeats</text>
+  <circle class="box" cx="450" cy="55" r="16"/><circle class="box" cx="520" cy="110" r="16"/><circle class="box" cx="495" cy="185" r="16"/><circle class="box" cx="405" cy="185" r="16"/><circle class="box" cx="380" cy="110" r="16"/>
+  <path class="arrow" d="M450 71 L515 96"/><path class="arrow" d="M450 71 L385 96"/><path class="arrow" d="M450 71 L402 170"/><path class="arrow" d="M450 71 L492 170"/>
+  <path class="arrow" d="M520 126 L497 170"/><path class="arrow" d="M504 110 L396 110"/><path class="arrow" d="M505 190 L421 190"/><path class="arrow" d="M384 126 L402 170"/><path class="arrow" d="M512 124 L412 172"/><path class="arrow" d="M386 124 L488 172"/>
+  <text class="t-c t-sm" x="450" y="232">N x (N-1) messages: quadratic</text>
+
+  <text class="t-c t-b" x="750" y="20">Gossip</text>
+  <circle class="hit" cx="750" cy="55" r="16"/><circle class="box" cx="820" cy="110" r="16"/><circle class="box" cx="795" cy="185" r="16"/><circle class="box" cx="705" cy="185" r="16"/><circle class="box" cx="680" cy="110" r="16"/>
+  <path class="arrow-g" d="M750 71 L815 96"/><path class="arrow-g" d="M750 71 L685 96"/>
+  <path class="arrow dash" d="M820 126 L797 170"/><path class="arrow dash" d="M680 126 L702 170"/>
+  <text class="t-c t-sm" x="750" y="232">Each node picks a few random peers: N x k</text>
+</svg>
+<figcaption>A central monitor is cheap but fragile. All-to-all is robust but quadratic. Gossip keeps the per-node cost constant by letting each node talk to only a few random peers per round, with no leader.</figcaption>
+</figure>
+
+<div class="callout key"><b>Key idea</b>
+Decentralized membership tries to give every node a good-enough view of the cluster with <b>constant work per node</b>, <b>no single point of failure</b>, and <b>views formed from many vantage points</b>. Gossip (also called epidemic) protocols are the standard tool. The price is that information spreads in rounds, so views are <i>eventually</i> consistent rather than instantly consistent.</div>
+
+<h2 id="gossip">2. Gossip: spreading information like a rumor</h2>
+
+<p>The idea comes from how rumors, or diseases, spread. Suppose one person learns a piece of news. Every minute, each person who knows the news tells it to a randomly chosen friend. At first only one person knows. After one minute, two know. After two minutes, up to four. The number of informed people roughly doubles each round until most people know, at which point new tellings increasingly hit people who already know. Within a surprisingly small number of rounds, nearly everyone knows, even though nobody coordinated anything and nobody had to talk to more than one person per minute.</p>
+
+<p>Translate this to a cluster. Every node runs a loop on a timer (typically once per second, sometimes faster). Each <b>gossip round</b>, the node picks a small number of random peers, called the <b>fanout</b> (commonly 1 to 3), and exchanges state with them. The state is whatever the cluster must agree on: membership entries, heartbeat counters, tokens, schema versions, load figures. When a node learns something new from a peer, it simply includes it in its own future exchanges, and so the information spreads outward from its origin.</p>
+
+<h3>2.1 Push, pull and push-pull</h3>
+<p>When two nodes gossip, there are three ways to exchange data.</p>
+<ul>
+  <li><b>Push.</b> The initiator sends what it knows to the peer. This is fast at the start (a node that knows something actively spreads it) but slow at the end: when almost everybody is informed, the few uninformed nodes are rarely chosen as targets by anyone, so the last stragglers take a while.</li>
+  <li><b>Pull.</b> The initiator asks the peer "what do you know that I do not?" and the peer answers. This is slow at the start (few nodes have anything to give, so most pulls return nothing new) but very fast at the end: an uninformed node asks a random peer, and by then most peers are informed, so it learns immediately.</li>
+  <li><b>Push-pull.</b> Both directions in one exchange: each side tells the other what it has and receives what it lacks. It combines the fast start of push with the fast finish of pull and is the most common choice in production systems (Cassandra's three-message handshake and memberlist's periodic full state exchange are both push-pull flavours).</li>
+</ul>
+
+<h3>2.2 Why it converges in O(log N) rounds</h3>
+<p>Take pure push with fanout 1 and N nodes. Early on, when few nodes know the news, almost every message lands on an uninformed node, so the informed count doubles each round: 1, 2, 4, 8, ... After about log<sub>2</sub> N rounds roughly half of the cluster is informed. Then the dynamics reverse: the informed fraction is large, and the chance that a given uninformed node is hit by at least one push in a round is about 1 − e<sup>−1</sup> ≈ 63%, so the uninformed fraction shrinks by a constant factor (about e) each round. Clearing the remaining nodes takes about ln N more rounds. The known result for push is that full dissemination takes about <b>log<sub>2</sub> N + ln N</b> rounds with high probability.</p>
+
+<p>Plug in numbers. For N = 1,000: log<sub>2</sub> 1000 ≈ 10 and ln 1000 ≈ 6.9, so about 17 rounds with fanout 1. For N = 1,000,000: 20 + 13.8 ≈ 34 rounds. A thousand times more nodes costs only twice the rounds. That is the whole appeal of gossip: dissemination time grows with the <i>logarithm</i> of the cluster size. With a one-second round, news reaches 1,000 nodes in under 20 seconds with a single message per node per second.</p>
+
+<p>Raising the fanout to k means the informed set multiplies by about (k + 1) per round early on, so the exponential phase takes log<sub>k+1</sub> N rounds. With k = 3 and N = 1,000, that is log<sub>4</sub> 1000 ≈ 5 rounds for the growth phase, plus a shorter tail, so roughly 8 to 10 rounds in total. Push-pull shortens the tail dramatically, to roughly log<sub>2</sub> N plus a very small additive term (about ln ln N), because in the tail pulls find the news almost immediately.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Gossip spread curve over rounds for N equals 1000">
+  <line class="life" x1="70" y1="250" x2="860" y2="250"/><line class="life" x1="70" y1="30" x2="70" y2="250"/>
+  <text class="t-sm" x="20" y="38">1000</text><text class="t-sm" x="30" y="143">500</text><text class="t-sm" x="46" y="253">0</text>
+  <text class="t-c t-sm" x="465" y="285">Gossip rounds (one round = one gossip interval, e.g. 1 second)</text>
+  <text class="t-sm" x="72" y="22">Nodes that know the news (push, fanout 1, N = 1000)</text>
+  <path class="arrow" d="M70 246 C 150 246, 200 246, 260 240 S 330 200, 380 150 S 450 60, 520 42 S 640 33, 840 32" fill="none"/>
+  <text class="t-sm" x="86" y="238">1, 2, 4, 8 ...</text>
+  <text class="t-sm" x="395" y="175">doubling phase</text>
+  <text class="t-sm" x="560" y="68">tail: stragglers need a few more rounds</text>
+  <line class="life" x1="380" y1="150" x2="380" y2="250"/><text class="t-c t-sm" x="380" y="266">~10</text>
+  <line class="life" x1="640" y1="33" x2="640" y2="250"/><text class="t-c t-sm" x="640" y="266">~17</text>
+</svg>
+<figcaption>The curve is an S shape. Information doubles each round at first (exponential growth), half the cluster is informed after about log2(N) rounds, and the last few nodes take several more rounds because they are rarely chosen as targets. Push-pull cuts the tail.</figcaption>
+</figure>
+
+<h3>2.3 Rumor mongering versus anti-entropy</h3>
+<p>There are two classic gossip styles, named in the 1987 Xerox paper that introduced epidemic algorithms for replicated databases.</p>
+<ul>
+  <li><b>Rumor mongering</b> (also called dissemination). A node that learns a new update treats it as "hot" and forwards it to random peers for a limited number of rounds, or until it hits several peers that already know it, then stops treating it as news. It is cheap and fast because only fresh updates are sent, but it is <b>probabilistic</b>: there is a small chance that a given update dies out before reaching everyone.</li>
+  <li><b>Anti-entropy</b>. Periodically, each node picks a peer and the two <b>compare their entire state</b> and reconcile any differences. It never forgets, so it guarantees that two replicas eventually converge even if every earlier message was lost. It is more expensive per round because it must compare everything, which is exactly where Merkle trees (section 7) come in: they make the comparison cheap.</li>
+</ul>
+<p>Real systems combine them: rumor mongering for speed, and a slower anti-entropy background process as the safety net that repairs whatever the rumors missed. You will see this pattern again in replicated stores, where read repair and hinted handoff play the "fast" role and full anti-entropy repair plays the "safety net" role.</p>
+
+<div class="callout tip"><b>Interview tip</b>
+When asked "how do nodes learn about each other without a coordinator?", say: periodic random exchange, constant cost per node, O(log N) rounds to spread news, and probabilistic rather than absolute guarantees. Then volunteer that gossip is paired with a slower anti-entropy pass for correctness. That shows you understand both speed and eventual guarantees.</div>
+
+<h3>2.4 What gets gossiped</h3>
+<p>The simplest gossip state for membership is a table with one row per node: the node's address, a <b>heartbeat counter</b> that the owner increments regularly, and a local timestamp of when this node last saw the counter increase. When two nodes exchange tables, for each row they keep the entry with the higher heartbeat counter. Because only the owner increments its own counter, a higher counter always means newer information, which sidesteps clock synchronization: nobody compares wall clocks, only counters (more on version conflicts in <a href="27-failure-time-ordering.html">Chapter 27</a>). If a row's counter has not increased for a long time, the observer concludes the owner may be dead. This is the original gossip-style failure detector from van Renesse, Minsky and Hayden (1998).</p>
+
+<p>The problem with sending whole tables is that size grows with N. Production systems therefore exchange <b>digests</b> (just node names and version numbers) first and transfer full rows only for entries that differ. Cassandra's three-message handshake does exactly this and is described in section 3.</p>
+
+<h2 id="real-systems">3. Gossip in real systems</h2>
+
+<h3>3.1 Cassandra (and Dynamo)</h3>
+<p>Amazon's Dynamo paper (2007) popularized using gossip for membership in a key-value store, and Cassandra inherited the idea. In Cassandra, each node runs a gossip task about once per second. In each round it picks one random live node, and with some probability also a random unreachable node (to detect recovery) and a seed node (to prevent the cluster from splitting into islands that never hear of each other). The exchange is a <b>three-message handshake</b>:</p>
+<ol>
+  <li><b>SYN</b>: the initiator sends a digest, a compact list of (node, generation, max version) it knows about.</li>
+  <li><b>ACK</b>: the receiver compares the digest with its own state, replies with full data for entries where it is <i>newer</i>, and with a request for entries where the initiator is newer.</li>
+  <li><b>ACK2</b>: the initiator sends the requested entries.</li>
+</ol>
+<p>That is push-pull with a digest step, so bandwidth is spent only on actual differences. The state gossiped per node includes its status (normal, joining, leaving, moving), its tokens (which hash ranges it owns), its data center and rack, its schema version, its load, and a heartbeat version. Each node has a <b>generation</b> number (the timestamp of its last start) and a <b>version</b> counter that increases with every change; comparing (generation, version) pairs tells which information is newer, even across restarts. <b>Seed nodes</b> are simply well-known addresses given to new nodes so they have somewhere to start gossiping; they are not special leaders.</p>
+
+<h3>3.2 Serf, memberlist and Consul</h3>
+<p>HashiCorp's <b>memberlist</b> library implements a SWIM-based protocol (next section) with extensions, and <b>Serf</b> is a tool built on it that offers cluster membership, failure detection and custom events. <b>Consul</b> uses Serf/memberlist for its agent cluster: every Consul agent in a datacenter joins a "LAN gossip pool", and the servers additionally join a "WAN gossip pool" across datacenters. Gossip handles membership and failure detection among hundreds or thousands of agents, while Consul's actual data (the service catalog and key-value store) is kept consistent by a small group of server nodes using Raft consensus. This division of labour is a pattern worth remembering: <b>use gossip for cheap, wide, approximate knowledge, and consensus for small, critical, exact state</b>. Memberlist also runs periodic full-state push-pull syncs over TCP (typically every tens of seconds) as an anti-entropy backstop for the fast but lossy UDP gossip, and it includes the Lifeguard improvements, which make a node that is itself overloaded less likely to falsely accuse others (section 5.4).</p>
+
+<h3>3.3 Where else you will see it</h3>
+<p>Riak and ScyllaDB use gossip similar to Cassandra's. Redis Cluster nodes exchange gossip over a cluster bus to share slot ownership and failure reports, and a node is marked as failed only when a majority of master nodes report it unreachable. Many service meshes and orchestration tools use SWIM-style membership under the hood. Bitcoin and other peer-to-peer networks use gossip to propagate transactions and blocks. Kubernetes does <i>not</i> use gossip for node health; it uses a central API server with kubelet heartbeats, a good example of the central design working fine because clusters are limited to a few thousand nodes.</p>
+
+<table>
+<tr><th>System</th><th>What is gossiped</th><th>Gossip interval (typical)</th><th>Failure detection</th></tr>
+<tr><td>Cassandra</td><td>Node status, tokens, schema version, load</td><td>1 second, a few peers</td><td>Phi accrual (conviction threshold 8 by default)</td></tr>
+<tr><td>Consul / Serf (memberlist)</td><td>Membership, custom events, tags</td><td>Sub-second gossip, 1 second probes on LAN</td><td>SWIM with suspicion and Lifeguard</td></tr>
+<tr><td>Redis Cluster</td><td>Slot map, node flags, failure reports</td><td>Every 100 ms to random nodes, with pings</td><td>Timeout plus majority agreement of masters</td></tr>
+<tr><td>Dynamo (original)</td><td>Membership history, ring changes</td><td>1 second, random peer</td><td>Local view only, no global failure agreement</td></tr>
+</table>
+<p>Treat the intervals as typical defaults. They are all configurable, and defaults change between versions.</p>
+
+<h2 id="swim">4. SWIM: failure detection scaled and separated from dissemination</h2>
+
+<p>The gossip-heartbeat approach above has a weakness: every node's table grows with N, and detection of a failure waits for a counter to go stale and then for that suspicion to be gossiped. In 2002 Das, Gupta and Motivala proposed <b>SWIM</b> (Scalable Weakly-consistent Infection-style process group Membership), which splits the problem into two independent parts: a <b>failure detector</b> with constant cost per node, and a <b>dissemination component</b> that spreads membership changes.</p>
+
+<h3>4.1 The probe cycle</h3>
+<p>Every protocol period (say 1 second), each node M<sub>i</sub> picks one random member M<sub>j</sub> and sends it a <code>ping</code>. If M<sub>j</sub> replies with an <code>ack</code> within a short timeout, all is well. If not, M<sub>i</sub> does not immediately accuse M<sub>j</sub>. Instead it asks k other randomly chosen members (k is often 3) to probe M<sub>j</sub> on its behalf with <code>ping-req</code>. Each helper sends its own ping to M<sub>j</sub> and, if it receives an ack, relays it back to M<sub>i</sub>. If M<sub>i</sub> hears no ack by the end of the period, either directly or through any helper, it marks M<sub>j</sub> as <b>suspect</b>.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="SWIM probe with ping, ping-req and suspect">
+  <rect class="box" x="60" y="20" width="140" height="34" rx="8"/><text class="t-c t-b" x="130" y="42">Node A (prober)</text>
+  <rect class="cache" x="330" y="20" width="140" height="34" rx="8"/><text class="t-c t-b" x="400" y="42">Node C (helper)</text>
+  <rect class="cache" x="500" y="20" width="140" height="34" rx="8"/><text class="t-c t-b" x="570" y="42">Node D (helper)</text>
+  <rect class="miss" x="720" y="20" width="140" height="34" rx="8"/><text class="t-c t-b" x="790" y="42">Node B (target)</text>
+  <line class="life" x1="130" y1="54" x2="130" y2="370"/><line class="life" x1="400" y1="54" x2="400" y2="370"/><line class="life" x1="570" y1="54" x2="570" y2="370"/><line class="life" x1="790" y1="54" x2="790" y2="370"/>
+  <path class="arrow-r dash" d="M130 90 L784 90"/><text class="t-sm" x="140" y="84">1. ping(B)  - no ack within timeout</text>
+  <path class="arrow" d="M130 140 L396 140"/><text class="t-sm" x="150" y="134">2. ping-req(B) to C</text>
+  <path class="arrow" d="M130 170 L566 170"/><text class="t-sm" x="150" y="164">2. ping-req(B) to D</text>
+  <path class="arrow-r dash" d="M400 200 L786 200"/><text class="t-sm" x="420" y="194">3. C pings B  - silence</text>
+  <path class="arrow-r dash" d="M570 230 L786 230"/><text class="t-sm" x="590" y="224">3. D pings B  - silence</text>
+  <path class="arrow dash" d="M396 270 L134 270"/><text class="t-sm" x="190" y="264">4. nack / nothing from C</text>
+  <path class="arrow dash" d="M566 295 L134 295"/><text class="t-sm" x="250" y="289">4. nack / nothing from D</text>
+  <rect class="miss" x="150" y="318" width="480" height="40" rx="8"/><text class="t-sm" x="162" y="334">5. A marks B SUSPECT and gossips "suspect B" piggybacked</text><text class="t-sm" x="162" y="350">on its next messages. B can refute it. Otherwise it is declared dead.</text>
+</svg>
+<figcaption>If the direct ping fails, A asks other nodes to try from their own network position. Only if all indirect probes also fail does A suspect B. This filters out failures that are only on the A to B link or that are caused by A's own problems.</figcaption>
+</figure>
+
+<p>The indirect probe is the clever part. A single failed ping can mean B is dead, but it can equally mean the A to B link dropped a packet, or A itself is overloaded. Asking k helpers gives k independent vantage points; the chance that all k paths fail by coincidence is small, so false positives drop sharply. And the cost stays constant: per period, each node sends one ping, receives about one ping on average, and only occasionally sends ping-reqs.</p>
+
+<h3>4.2 Dissemination by piggybacking</h3>
+<p>SWIM does not run a separate gossip round for membership updates. It <b>piggybacks</b> them on the ping, ack and ping-req messages that the failure detector is sending anyway. Each message carries a small bounded list of recent membership events ("B suspect", "E joined", "F left"). A node keeps each event in a buffer and attaches it to outgoing messages a limited number of times, roughly λ · log N transmissions for some small constant λ (memberlist uses a "retransmit multiplier" that works this way), preferring events that have been sent fewest times. Because probe targets are random, this is exactly an infection-style spread, and the log N retransmission count is enough for the news to reach all nodes with high probability. Piggybacking means zero extra messages for dissemination and a message size that stays small, which is why this scales so well.</p>
+
+<h3>4.3 Suspicion, incarnation numbers and refutation</h3>
+<p>Declaring a node dead is costly: its data may be re-replicated, its traffic rerouted. SWIM therefore adds a <b>suspicion</b> stage. Rather than going straight from alive to dead, the target is marked suspect and given a grace period (the suspicion timeout) to prove it is alive. During that time:</p>
+<ul>
+  <li>The suspicion is gossiped to everyone, including B itself.</li>
+  <li>If B hears it is suspected, it <b>refutes</b> the claim by broadcasting "I am alive" with an incremented <b>incarnation number</b>.</li>
+  <li>Message precedence is: an alive message with a higher incarnation beats a suspect message with a lower one; a suspect message beats an alive message with the same incarnation; a confirmed-dead message beats everything for that incarnation. So a refutation overrides the suspicion, but a stale refutation cannot override a newer suspicion, and old rumors never resurrect a decision.</li>
+  <li>If the timeout elapses without a refutation, the node is declared <b>dead</b> (a "confirm" message is gossiped). Memberlist scales the suspicion timeout with log N, and it shortens the timeout as more independent nodes confirm the suspicion.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="SWIM node state machine: alive, suspect, dead">
+  <rect class="hit" x="40" y="90" width="170" height="64" rx="12"/><text class="t-c t-b" x="125" y="118">ALIVE</text><text class="t-c t-sm" x="125" y="138">incarnation n</text>
+  <rect class="cache" x="365" y="90" width="170" height="64" rx="12"/><text class="t-c t-b" x="450" y="118">SUSPECT</text><text class="t-c t-sm" x="450" y="138">timer running</text>
+  <rect class="miss" x="690" y="90" width="170" height="64" rx="12"/><text class="t-c t-b" x="775" y="118">DEAD</text><text class="t-c t-sm" x="775" y="138">removed or tombstoned</text>
+  <path class="arrow-r" d="M210 110 L361 110"/><text class="t-c t-sm" x="285" y="100">probe and ping-req fail</text>
+  <path class="arrow-g" d="M365 138 L214 138"/><text class="t-c t-sm" x="290" y="162">node refutes: alive with n+1</text>
+  <path class="arrow-r" d="M535 122 L686 122"/><text class="t-c t-sm" x="610" y="112">suspicion timeout</text>
+  <path class="arrow-g dash" d="M775 154 C 775 220, 125 220, 125 158"/><text class="t-c t-sm" x="450" y="212">node restarts and rejoins with a new incarnation (or generation)</text>
+</svg>
+<figcaption>A node moves from alive to suspect when probes fail, and from suspect back to alive if it refutes with a higher incarnation number. Only a full timeout in the suspect state leads to dead. The extra stage is what keeps momentary slowness from triggering expensive re-replication.</figcaption>
+</figure>
+
+<div class="callout watch"><b>Watch out</b>
+SWIM and gossip detectors give <b>weak</b> guarantees. A node declared dead may still be running (it was just slow or partitioned), and it may keep accepting requests from clients that can still reach it. Never treat "declared dead" as proof that the node has stopped. If you need exclusive ownership, for example a single leader or a lock holder, use consensus and fencing tokens (<a href="27-failure-time-ordering.html">Chapter 27</a>), not a membership view.</div>
+
+<h2 id="failure-detection">5. Failure detection in depth</h2>
+
+<h3>5.1 Why failure detection is fundamentally uncertain</h3>
+<p>From a node's point of view, "B is dead" and "B is slow, or the network between us is slow" look identical: in both cases no message arrives. In an asynchronous network, with no upper bound on delay, it is provably impossible to tell the two apart with certainty (this is part of why consensus is hard). A failure detector can therefore only <i>guess</i>, and it can be wrong in two ways:</p>
+<ul>
+  <li><b>False positive</b> (false suspicion): a healthy node is declared dead. The cluster does needless work, such as moving data, electing a new leader, or failing over traffic, and a healthy node may be shut out.</li>
+  <li><b>False negative / slow detection</b>: a dead node is believed alive for too long. Requests are sent to it and time out, and writes may be lost or delayed.</li>
+</ul>
+<p>The two errors trade against each other. Detect faster and you will make more false positives; wait longer and failures hurt longer. The designer picks a point on this curve to match the cost of each mistake.</p>
+
+<h3>5.2 Fixed timeouts and their weaknesses</h3>
+<p>The simplest detector: if no heartbeat arrives within T seconds, declare the node dead. This is easy to implement and easy to reason about, but a single number T is a poor fit for real networks.</p>
+<ul>
+  <li><b>Network conditions change.</b> A timeout of 2 seconds is fine on a quiet LAN, but during a traffic spike or a garbage-collection pause heartbeats may be delayed by 3 seconds, and every node in the cluster flaps to "dead" at once.</li>
+  <li><b>Different links differ.</b> Heartbeats across regions take 150 ms with high jitter; within a rack, 0.2 ms with little jitter. A single T must be generous enough for the worst link, which makes detection slow on the best links.</li>
+  <li><b>Binary output.</b> A fixed timeout answers only "dead or alive". The application cannot choose its own tolerance: a cache client wants to avoid suspicious nodes quickly, while a data-migration job wants to be very sure before moving 2 TB.</li>
+</ul>
+
+<h3>5.3 The phi-accrual detector</h3>
+<p>The <b>phi accrual failure detector</b> (Hayashibara et al., 2004), used by Cassandra and Akka among others, replaces "dead or alive" with a continuous <b>suspicion level</b> called <b>phi (φ)</b>, computed from the actual heartbeat history. The word accrual means suspicion accumulates the longer a heartbeat is overdue.</p>
+
+<p>Intuition. Suppose heartbeats from node B usually arrive every 1.0 second, give or take 0.1 s. If the last heartbeat was 1.2 s ago, you are not worried; that is within normal variation. If it was 3 s ago, that is far outside anything you have seen, so you are quite suspicious. If B's heartbeats are normally very jittery (anywhere from 0.5 to 4 s), then 3 s of silence is unremarkable. The detector formalises this: it keeps a sliding window of recent inter-arrival times for each peer, estimates their distribution, and asks, "given this history, how probable is it that a healthy node's next heartbeat would be <i>this</i> late?" Then:</p>
+<pre>phi(t) = -log10( P(next heartbeat arrives later than t) )</pre>
+<p>where t is the time since the last heartbeat. Because it is a base-10 logarithm, phi is easy to read: <b>phi = 1</b> means a 10% chance that a healthy node would be this late; <b>phi = 2</b>, 1%; <b>phi = 8</b>, one in a hundred million. As silence continues, the probability of "still healthy" falls and phi rises smoothly without bound.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Phi accrual detector: heartbeat history and suspicion rising with silence">
+  <text class="t-b" x="30" y="24">1. Learn the normal arrival pattern (sliding window)</text>
+  <line class="life" x1="40" y1="70" x2="440" y2="70"/>
+  <rect class="hit" x="60" y="56" width="10" height="28" rx="2"/><rect class="hit" x="120" y="56" width="10" height="28" rx="2"/><rect class="hit" x="178" y="56" width="10" height="28" rx="2"/><rect class="hit" x="240" y="56" width="10" height="28" rx="2"/><rect class="hit" x="298" y="56" width="10" height="28" rx="2"/>
+  <text class="t-c t-sm" x="90" y="108">~1.0 s</text><text class="t-c t-sm" x="150" y="108">~1.0 s</text><text class="t-c t-sm" x="210" y="108">~1.1 s</text><text class="t-c t-sm" x="270" y="108">~1.0 s</text>
+  <text class="t-sm" x="320" y="62">last heartbeat</text><text class="t-sm" x="330" y="76">then silence ...</text>
+  <text class="t-sm" x="30" y="140">Mean about 1.0 s, small spread, so silence beyond a few seconds is very unusual.</text>
+
+  <text class="t-b" x="30" y="178">2. Suspicion phi grows with time since the last heartbeat</text>
+  <line class="life" x1="70" y1="300" x2="560" y2="300"/><line class="life" x1="70" y1="190" x2="70" y2="300"/>
+  <path class="arrow" d="M70 296 C 150 292, 220 270, 300 240 S 440 205, 556 198" fill="none"/>
+  <line class="life" x1="70" y1="248" x2="560" y2="248"/><text class="t-sm" x="12" y="252">phi 8</text>
+  <text class="t-c t-sm" x="315" y="318">seconds since last heartbeat</text>
+  <circle class="box" cx="300" cy="240" r="5"/><text class="t-sm" x="310" y="232">crosses threshold</text>
+  <rect class="cache" x="610" y="180" width="270" height="124" rx="10"/>
+  <text class="t-b" x="624" y="204">Reading the threshold</text>
+  <text class="t-sm" x="624" y="226">phi 1: 10% chance healthy node is late</text>
+  <text class="t-sm" x="624" y="246">phi 3: 0.1% chance</text>
+  <text class="t-sm" x="624" y="266">phi 8: one in 100 million</text>
+  <text class="t-sm" x="624" y="288">Raise threshold: fewer false alarms, slower</text>
+</svg>
+<figcaption>The detector learns the typical gap between heartbeats, then converts the current silence into a probability-based number. Each application picks its own threshold. A crossing at phi 8 happens much sooner for a steady node than for a jittery one, so the detector adapts to each link without manual tuning.</figcaption>
+</figure>
+
+<p>A worked feel for the numbers. Cassandra models heartbeat gaps as roughly exponentially distributed, which simplifies the formula to about <code>phi ≈ 0.434 × t / mean</code>, where mean is the average gap observed. With the default conviction threshold of 8 and a mean gap of 1 second, a node is convicted after about 8 / 0.434 ≈ 18 seconds of silence. If the network gets noisier and the observed mean gap grows to 2 seconds, the same threshold waits about 37 seconds. The timeout stretches automatically with conditions, rather than being a fixed constant.</p>
+
+<p>Two further benefits. First, <b>separation of concerns</b>: the monitoring component outputs a continuous number, and each consumer decides what to do. A load balancer might avoid a node at phi 2, while a repair scheduler waits for phi 10. Second, <b>no manual tuning per link</b>, because the distribution is learned. The costs: it needs a history window per peer (a little memory), it assumes the learned distribution is a reasonable model (heavy-tailed pauses such as long GC stalls or VM freezes can still fool it), and a threshold still has to be chosen.</p>
+
+<h3>5.4 False positives, detection time and Lifeguard</h3>
+<p>It helps to think about the cost of each error. A cache cluster can tolerate false positives (a spurious removal costs a few cache misses), so aggressive detection is fine. A database that re-replicates terabytes on suspicion can be wrecked by false positives, so it prefers a high threshold and longer detection time, accepting that clients may wait on a dead node for 10 to 30 seconds. Common practice is to <b>make a cheap decision fast and an expensive decision slow</b>: stop routing reads to a suspicious node quickly (cheap and reversible), but do not stream data to new replicas until the node has been down for minutes or hours (expensive).</p>
+<p>Detectors suffer especially from <b>self-inflicted false positives</b>: if node A is itself overloaded, swapping, or paused by garbage collection, it processes acks late and wrongly concludes that many healthy peers are dead. HashiCorp's <b>Lifeguard</b> extensions address this by making each node track its own health (a "local health multiplier" raised when its own probes time out or when it is accused), and then lengthening its own probe timeouts and being slower to accuse others while it is unhealthy. The lesson for interviews: a failure detector must also consider that <i>the observer</i> may be the broken one.</p>
+
+<h2 id="membership">6. Membership changes and cluster metadata propagation</h2>
+
+<h3>6.1 Joining, leaving and failing</h3>
+<p>Gossip is not only a failure detector; it is also how structural changes reach everyone. Consider a new node X joining a hash-ring database:</p>
+<ol>
+  <li>X is configured with the addresses of a few seed nodes (or a DNS name that resolves to some existing nodes).</li>
+  <li>X contacts a seed, announces itself with a fresh generation number and a "joining" status, and learns the current member table through an initial push-pull exchange.</li>
+  <li>X claims tokens (its positions on the hash ring, see <a href="57-hashing-probabilistic.html">Chapter 57</a>) and begins streaming the data it will own from the current owners. Its gossip state says "joining", so coordinators do not yet send normal reads to it.</li>
+  <li>When streaming finishes, X changes its status to "normal". This new state spreads by gossip in O(log N) rounds, and from then on nodes route requests to X as an ordinary owner.</li>
+</ol>
+<p>A <b>graceful leave</b> is the mirror image: a node sets "leaving", streams its data to its successors, then announces "left" with a higher version, so peers drop it immediately without waiting for a failure detector. A <b>crash</b> is discovered only through failure detection, and the node is marked down, but it normally remains a <i>member</i> (its tokens still belong to it) until an operator explicitly removes it. This distinction matters: a down node and a removed node are different states, because a node that is merely down for twenty minutes should return to the same ranges and only need to catch up on what it missed (via hints and repair, section 8), not have its data reshuffled.</p>
+
+<h3>6.2 Tombstones for departures</h3>
+<p>When a node is removed, peers cannot simply forget it, since a lagging peer may still gossip the old "alive" entry back and resurrect it. So the "removed" state is retained as a <b>tombstone</b> for a while (Cassandra keeps removed endpoints around for days) so that the deletion wins the version comparison until the whole cluster has heard. This is the same reason deletions in replicated data need tombstones (<a href="24-replication.html">Chapter 24</a>).</p>
+
+<h3>6.3 Metadata propagation and its limits</h3>
+<p>The same machinery carries other small pieces of cluster metadata: the schema version, per-node load, the data-center and rack map, feature flags and software versions. Each is a (key, value, version) entry attached to a node's state, and merging is "higher version wins". Because everything converges in O(log N) rounds, gossip works well for metadata that changes rarely and tolerates a few seconds of disagreement.</p>
+<p>It works badly when the metadata must be <b>exactly the same everywhere at a defined instant</b>. During propagation, node A may use new topology and node B the old one, so two coordinators could route the same key to different replica sets for a few seconds. Systems tolerate this because quorum reads and writes overlap, and repair fixes the damage later. Cassandra's schema changes illustrate the risk: if two nodes apply conflicting schema changes concurrently, gossip may leave nodes with different schema versions ("schema disagreement"), and operators must wait for or force convergence. Newer designs therefore move the most critical metadata (for example, Cassandra's newer transactional cluster metadata work, or Kafka's controller quorum) onto a consensus log, and keep gossip for what tolerates lag. As a rule of thumb: <b>gossip for liveness and soft state; consensus for the authoritative topology and schema</b>.</p>
+
+<h2 id="merkle">7. Anti-entropy and Merkle trees</h2>
+
+<h3>7.1 The problem: finding differences cheaply</h3>
+<p>In a replicated store (<a href="24-replication.html">Chapter 24</a>), copies of the same data can drift apart. A replica was down during writes, a message was dropped, a disk silently corrupted a block. The process of detecting and fixing such drift is <b>anti-entropy</b> repair. The naive way is to have two replicas send each other all their keys and values and compare. With 1 TB per replica that is 1 TB of network traffic and a huge read load, repeated for every pair of replicas, to find perhaps a handful of differing records. We need a way to learn <i>whether</i> two big datasets match, and <i>where</i> they differ, while sending a tiny amount of data.</p>
+
+<h3>7.2 What a Merkle tree is</h3>
+<p>A <b>Merkle tree</b> (hash tree), invented by Ralph Merkle, is a tree of hashes. It is built bottom-up:</p>
+<ol>
+  <li>Split the key space into ranges, and compute a hash of the data in each range. These are the <b>leaves</b>. For example, with 8 leaves, leaf L0 is the hash of all rows whose keys fall in the first eighth of the range.</li>
+  <li>Each parent node holds the hash of the concatenation of its two children's hashes. So H01 = hash(H0 + H1).</li>
+  <li>Continue up to a single <b>root hash</b> that summarizes the entire range. A change to any one row changes its leaf hash, which changes every ancestor up to the root, because hashes of different content differ (with overwhelming probability, assuming a cryptographic or good hash).</li>
+</ol>
+<p>The property that makes it useful: <b>if two replicas have the same root hash, their data is identical</b> (up to hash collisions, which are negligible). One comparison of a few dozen bytes proves a terabyte matches.</p>
+
+<h3>7.3 Comparing two replicas by descending the tree</h3>
+<p>If the roots differ, the replicas compare the two children of the root. A matching child means that whole half is identical, so it is skipped entirely. A differing child is explored further, and so on, until the leaves are reached. Only the leaf ranges that differ are then streamed and reconciled (typically by taking the newest version of each row according to timestamps, see <a href="27-failure-time-ordering.html">Chapter 27</a>).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Two Merkle trees compared; the differing path is highlighted">
+  <text class="t-c t-b" x="230" y="18">Replica A</text><text class="t-c t-b" x="670" y="18">Replica B</text>
+  <rect class="miss" x="170" y="30" width="120" height="34" rx="8"/><text class="t-c t-b" x="230" y="52">root: 9f3c</text>
+  <rect class="hit" x="70" y="110" width="110" height="34" rx="8"/><text class="t-c t-sm" x="125" y="132">H01: 41aa</text>
+  <rect class="miss" x="290" y="110" width="110" height="34" rx="8"/><text class="t-c t-sm" x="345" y="132">H23: c07e</text>
+  <rect class="hit" x="20" y="190" width="70" height="30" rx="8"/><text class="t-c t-sm" x="55" y="210">L0 a1</text>
+  <rect class="hit" x="110" y="190" width="70" height="30" rx="8"/><text class="t-c t-sm" x="145" y="210">L1 b2</text>
+  <rect class="hit" x="250" y="190" width="70" height="30" rx="8"/><text class="t-c t-sm" x="285" y="210">L2 c3</text>
+  <rect class="miss" x="340" y="190" width="70" height="30" rx="8"/><text class="t-c t-sm" x="375" y="210">L3 d4</text>
+  <path class="arrow" d="M200 64 L135 108"/><path class="arrow" d="M260 64 L335 108"/>
+  <path class="arrow" d="M100 144 L58 188"/><path class="arrow" d="M150 144 L145 188"/><path class="arrow" d="M320 144 L288 188"/><path class="arrow" d="M370 144 L375 188"/>
+
+  <rect class="miss" x="610" y="30" width="120" height="34" rx="8"/><text class="t-c t-b" x="670" y="52">root: 5b81</text>
+  <rect class="hit" x="510" y="110" width="110" height="34" rx="8"/><text class="t-c t-sm" x="565" y="132">H01: 41aa</text>
+  <rect class="miss" x="730" y="110" width="110" height="34" rx="8"/><text class="t-c t-sm" x="785" y="132">H23: e9d2</text>
+  <rect class="hit" x="460" y="190" width="70" height="30" rx="8"/><text class="t-c t-sm" x="495" y="210">L0 a1</text>
+  <rect class="hit" x="550" y="190" width="70" height="30" rx="8"/><text class="t-c t-sm" x="585" y="210">L1 b2</text>
+  <rect class="hit" x="690" y="190" width="70" height="30" rx="8"/><text class="t-c t-sm" x="725" y="210">L2 c3</text>
+  <rect class="miss" x="780" y="190" width="70" height="30" rx="8"/><text class="t-c t-sm" x="815" y="210">L3 f7</text>
+  <path class="arrow" d="M640 64 L575 108"/><path class="arrow" d="M700 64 L775 108"/>
+  <path class="arrow" d="M540 144 L498 188"/><path class="arrow" d="M590 144 L585 188"/><path class="arrow" d="M760 144 L728 188"/><path class="arrow" d="M810 144 L815 188"/>
+
+  <rect class="cache" x="40" y="260" width="820" height="124" rx="10"/>
+  <text class="t-b" x="56" y="284">Comparison walk</text>
+  <text class="t-sm" x="56" y="306">1. Roots differ (9f3c vs 5b81), so descend.   2. Left children match (41aa = 41aa): skip half the data.</text>
+  <text class="t-sm" x="56" y="328">3. Right children differ (c07e vs e9d2): descend.   4. L2 matches, L3 differs (d4 vs f7).</text>
+  <text class="t-sm" x="56" y="350">5. Stream only the rows in range L3 and reconcile them. Hashes exchanged: 7 values, not the whole dataset.</text>
+  <text class="t-sm" x="56" y="372">Red = differs, green = matches. Cost is proportional to depth times number of differences, not to data size.</text>
+</svg>
+<figcaption>Replicas exchange hashes level by level. Whenever two subtree hashes match, that entire subtree is skipped. Only the path leading to the differing leaf is explored, and only that leaf range is transferred.</figcaption>
+</figure>
+
+<h3>7.4 Cost savings in numbers</h3>
+<p>Suppose a replica owns 1 billion rows of about 1 KB, so 1 TB. A full comparison transfers 1 TB, or at least 1 billion row hashes of 16 bytes each (16 GB). With a Merkle tree of depth 30 (a binary tree has about 2<sup>30</sup> ≈ 1 billion leaves), if exactly one row differs, the walk exchanges one hash per level on each side: about 30 levels × 2 children × 16 bytes ≈ 1 KB, and then the one differing row. Even with 1,000 scattered differences, the walk touches at most 1,000 × 30 ≈ 30,000 hashes, around 500 KB. That is savings of several orders of magnitude, and the cost scales with <b>the number of differences</b>, not with the size of the data. If the replicas are identical, one root comparison of 16 bytes is all that is needed.</p>
+
+<h3>7.5 Real-world details: ranges, depth, and rebuild cost</h3>
+<ul>
+  <li><b>Trees are per key range.</b> Dynamo keeps a separate Merkle tree for each key range (virtual node) that a node hosts, and two replicas of the same range exchange trees for that range. In Cassandra a repair works on token ranges and builds one tree per range per table being repaired. Comparing replicas of different ranges is meaningless, so the range is the unit of repair.</li>
+  <li><b>Depth is limited.</b> A tree with a billion in-memory leaves is itself large. Cassandra builds trees with a fixed maximum depth (on the order of 2<sup>15</sup> = 32,768 leaves per range in older versions), so each leaf covers a bucket of many rows. When a leaf differs, the whole bucket (here about 30,000 rows if the range has a billion rows) must be streamed or compared row by row, even if only one row changed. So tree depth is a tradeoff between memory and over-streaming.</li>
+  <li><b>Building the tree is expensive.</b> To compute leaf hashes, a node must <b>read and hash all the data in the range</b>. That is a full scan of the table's SSTables (<a href="19-storage-engines.html">Chapter 19</a>), heavy on disk I/O and CPU, which is why repair is a notorious background load and operators schedule it carefully (for example, once per gc_grace period, which is the window by which every replica must have seen deletions so that tombstones are not lost).</li>
+  <li><b>Trees go stale.</b> The data changes while the tree is built or after it is built. Dynamo-style systems either snapshot the data at a point in time (Cassandra builds trees from a snapshot-consistent view) or maintain the tree incrementally: when a key is written, update only the one leaf and its path to the root, an O(log N) update. Incremental trees avoid rescans but cost memory and complicate crash recovery. Riak's active anti-entropy kept persistent on-disk hash trees updated as data was written, which avoided the full scan but added write overhead.</li>
+  <li><b>Hash choice.</b> Anti-entropy trees need only a hash that makes accidental collisions negligible, so fast hashes (even non-cryptographic) are usual. Systems that must resist an adversary (git, certificate transparency, blockchains) use cryptographic hashes such as SHA-256.</li>
+  <li><b>Inconsistency in the tree itself.</b> Because replicas may be constantly receiving writes, a difference seen in the tree may be only a write still in flight. Repairs deal with this by comparing against a point-in-time view and by rechecking before heavy streaming.</li>
+</ul>
+
+<h2 id="repair">8. Repair in practice: read repair, hinted handoff and full repair</h2>
+
+<p>Merkle-tree anti-entropy is the slowest and most thorough of three layers that keep replicas converged in leaderless stores such as Dynamo and Cassandra. Each layer catches what the previous one missed. Replication models and quorum rules are covered in <a href="24-replication.html">Chapter 24</a>; here we focus on how repair works.</p>
+
+<h3>8.1 Hinted handoff</h3>
+<p>When a coordinator writes a key and one of its replicas is down, it still succeeds if enough other replicas acknowledge (the quorum). But the down replica is now missing the write. With <b>hinted handoff</b> the coordinator stores a <b>hint</b>, a note saying "this write belongs to node N; deliver it when N returns", in a local hints store. A node's recovery is noticed through gossip (its status turns alive again), and the holder then replays the hints to it. This repairs short outages quickly and cheaply, because only the missed writes are sent, not a comparison of full state.</p>
+<p>Limits: hints take storage and are kept only for a bounded time (Cassandra's default hint window is about three hours), so a node that is down longer must be repaired by full repair. Hints can also be lost if the node that held them dies. And in Dynamo's "sloppy quorum" variant, hinted writes go to a stand-in node outside the key's normal replica set, so an acknowledged write may not be on any "real" replica yet; hints make it eventually reach them but reads in the meantime may be stale.</p>
+
+<h3>8.2 Read repair</h3>
+<p>When a client reads a key at a consistency level above one, the coordinator asks several replicas (often one for full data and others for digests, which are hashes of the answer). If the digests disagree, the coordinator fetches full values, picks the newest version (by timestamp or version vector), returns it, and <b>writes the winning value back to the stale replicas</b>. This repair is free in the sense that the read already touched those replicas, and it targets exactly the data being accessed, so hot data heals fast. But it fixes nothing about data that is never read, and some systems only run it on a random fraction of reads to limit overhead.</p>
+
+<h3>8.3 Full anti-entropy repair</h3>
+<p>For everything else there is the scheduled, Merkle-tree-based repair from section 7. It finds differences in cold data that is never read and in writes whose hints expired. It is the guarantee of eventual convergence, and the part operators must run regularly, because hints and read repair alone cannot provide it.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Three repair layers ordered by speed and coverage">
+  <rect class="hit" x="30" y="40" width="260" height="200" rx="12"/>
+  <text class="t-c t-b" x="160" y="68">Hinted handoff</text>
+  <text class="t-c t-sm" x="160" y="96">Trigger: replica down at write time</text>
+  <text class="t-c t-sm" x="160" y="118">Fixes: the missed writes</text>
+  <text class="t-c t-sm" x="160" y="140">Speed: seconds after recovery</text>
+  <text class="t-c t-sm" x="160" y="162">Limit: hint window (hours)</text>
+  <text class="t-c t-sm" x="160" y="184">hints can be lost</text>
+  <rect class="cache" x="320" y="40" width="260" height="200" rx="12"/>
+  <text class="t-c t-b" x="450" y="68">Read repair</text>
+  <text class="t-c t-sm" x="450" y="96">Trigger: digests differ on a read</text>
+  <text class="t-c t-sm" x="450" y="118">Fixes: the keys being read</text>
+  <text class="t-c t-sm" x="450" y="140">Speed: at read time</text>
+  <text class="t-c t-sm" x="450" y="162">Limit: never-read data stays stale</text>
+  <text class="t-c t-sm" x="450" y="184">adds read latency and load</text>
+  <rect class="db" x="610" y="40" width="260" height="200" rx="12"/>
+  <text class="t-c t-b" x="740" y="68">Merkle anti-entropy repair</text>
+  <text class="t-c t-sm" x="740" y="96">Trigger: scheduled or manual</text>
+  <text class="t-c t-sm" x="740" y="118">Fixes: any difference at all</text>
+  <text class="t-c t-sm" x="740" y="140">Speed: hours, heavy I/O</text>
+  <text class="t-c t-sm" x="740" y="162">Limit: cost of building trees</text>
+  <text class="t-c t-sm" x="740" y="184">the final safety net</text>
+  <path class="arrow" d="M30 270 L870 270"/><text class="t-c t-sm" x="450" y="290">cheap and narrow  to  expensive and complete</text>
+</svg>
+<figcaption>Each layer covers what the faster one cannot. Operating a leaderless store means relying on the first two for freshness and running the third regularly for correctness.</figcaption>
+</figure>
+
+<h2 id="other-trees">9. Other uses of hash trees</h2>
+
+<p>The idea "summarize a big structure with a hash so that comparison and verification are cheap" appears throughout engineering. Hash trees are also covered in the data-structure survey of <a href="59-sorted-sets-crdt.html">Chapter 59</a>; here are the main applications.</p>
+<ul>
+  <li><b>Git.</b> A commit points at a tree object; a tree object lists entries by name with the hash of each file (blob) or subtree. The commit hash therefore depends on the whole repository state. Two repositories can tell they are identical by comparing one commit id, and fetch/push only need to transfer objects whose hashes the other side lacks. Git's object graph is technically a Merkle DAG (a directed acyclic graph), a generalization of the tree.</li>
+  <li><b>Blockchains.</b> Bitcoin groups the transactions of a block into a Merkle tree and puts the root in the block header. A lightweight client (SPV) that stores only headers can verify that a transaction is in a block by receiving a <b>Merkle proof</b>: the sibling hashes along the path from the leaf to the root, about log<sub>2</sub> N hashes. Verifying inclusion of one of 4,000 transactions needs about 12 hashes.</li>
+  <li><b>Certificate Transparency.</b> Public logs of issued TLS certificates are append-only Merkle trees. A log can give an <b>inclusion proof</b> (this certificate is in the log) and a <b>consistency proof</b> (the new tree extends the old one, nothing was rewritten), both of size O(log N). Auditors can therefore detect a log that tries to hide or alter entries without downloading it all.</li>
+  <li><b>Object stores and deduplication.</b> Backup and sync tools (and the content-addressed stores behind them) split files into chunks, hash each chunk, and combine chunk hashes in a tree. A chunk whose hash already exists is not uploaded again (deduplication), and the root hash verifies an entire file's integrity. S3's multipart uploads and checksums, and download tools that verify large files in pieces, follow the same shape, although S3's multipart ETag is a hash of part hashes rather than a full Merkle tree. Peer-to-peer download tools and distributed file systems also verify blocks against tree hashes.</li>
+  <li><b>Filesystems and databases.</b> ZFS and Btrfs checksum each block and store the checksum in the parent pointer, forming a Merkle-style tree that detects silent corruption ("bit rot") and enables cheap snapshot comparison. Some key-value stores and verifiable databases (such as ones with authenticated data structures) use trees for tamper-evident storage.</li>
+</ul>
+<p>The shared principle: the root hash is a compact <b>commitment</b> to everything beneath it, and a path of siblings is a small <b>proof</b> that some piece belongs to it. Anti-entropy uses the first property to find differences; blockchains and transparency logs use the second to prove membership.</p>
+
+<h2 id="aggregation">10. Gossip for aggregation, configuration and CRDT state</h2>
+
+<h3>10.1 Aggregation (counts, sums, averages)</h3>
+<p>Gossip can compute global quantities without a coordinator. The classic method is <b>push-sum</b> averaging: each node holds a pair (value, weight), and every round it keeps half and sends half to a random peer, which adds the pair into its own. Each node's ratio value/weight converges to the global average, and because mass is conserved, multiplying by N gives the sum. Counting nodes works by having exactly one node start with weight 1 and everyone else with weight 0, so the ratio converges to 1/N. Convergence is again O(log N) rounds to reach a fixed precision. Applications include estimating cluster size, average load for balancing, or the total number of connected clients. The result is approximate and the estimate changes under node failures, since a node that dies while holding mass takes that mass with it. For distinct counts, systems gossip mergeable sketches such as HyperLogLog (<a href="57-hashing-probabilistic.html">Chapter 57</a>), which are idempotent and so survive duplicate delivery, something plain sums do not.</p>
+
+<h3>10.2 Configuration and feature flags</h3>
+<p>Small configuration values can be gossiped as versioned key-value entries, "the highest version wins". This is how a fleet can learn about a new feature flag or a changed rate limit in about log N rounds with no push infrastructure. The caveat is that the flag flips at different times on different nodes, so features must tolerate a mixed-state window.</p>
+
+<h3>10.3 Gossiping CRDT state</h3>
+<p>Gossip pairs naturally with <b>CRDTs</b> (conflict-free replicated data types, see <a href="59-sorted-sets-crdt.html">Chapter 59</a>). A CRDT defines a merge operation that is commutative (order does not matter), associative (grouping does not matter) and idempotent (applying twice is harmless). Those are precisely the properties gossip needs: messages may arrive in any order, be duplicated, or be delayed, and replicas still converge. A node simply gossips its state (or deltas) and merges what it receives. Examples: a grow-only counter (each node holds its own count; merge takes the per-node maximum), an add-wins set, or the per-node "highest version wins" entries used for membership. Riak's data types and Akka Distributed Data use gossip to spread CRDT state this way. Without such a merge, gossiping arbitrary updates can silently lose or reorder writes, which is why timestamps or version vectors are attached (section 11).</p>
+
+<h2 id="pitfalls">11. Pitfalls and failure modes</h2>
+<table>
+<tr><th>Pitfall</th><th>What happens</th><th>Mitigation</th></tr>
+<tr><td>Convergence delay</td><td>Different nodes hold different views for several seconds (about log N rounds). Routing and failure decisions may disagree briefly.</td><td>Design for eventual consistency; use quorum overlap; keep critical metadata on consensus.</td></tr>
+<tr><td>Network partition</td><td>Each side marks the other dead and keeps operating. On healing, the two views conflict. Gossip alone cannot prevent split brain.</td><td>Majority checks (as Redis Cluster does), fencing tokens, consensus for leadership.</td></tr>
+<tr><td>Message storms</td><td>A mass failure triggers many suspicion messages at once, or a thundering reconnect of thousands of nodes floods gossip and heartbeat processing, causing yet more timeouts.</td><td>Bounded message sizes, rate limits, piggybacking, jittered intervals, backoff, Lifeguard-style self-awareness.</td></tr>
+<tr><td>Flapping nodes</td><td>A node that alternates between reachable and unreachable generates repeated alive/dead transitions, triggering repeated data movement and hints.</td><td>Suspicion stage, hysteresis (different thresholds to mark down than up), long delay before re-replication, quarantine.</td></tr>
+<tr><td>Clock and version conflicts</td><td>If entries are ordered by wall-clock time, skewed clocks make an old value look newer. Restarted nodes may reuse low counters.</td><td>Use per-node monotonic counters, generation numbers and incarnations; use vector clocks or hybrid logical clocks where real ordering matters (<a href="27-failure-time-ordering.html">Chapter 27</a>).</td></tr>
+<tr><td>Zombie resurrection</td><td>A lagging node reintroduces a removed member or a deleted key.</td><td>Tombstones with retention longer than the maximum expected propagation or repair interval.</td></tr>
+<tr><td>Seed or bootstrap dependency</td><td>If all seeds are down, new nodes cannot join, and a partitioned cluster may never reunite.</td><td>Multiple seeds per datacenter, DNS-based discovery, periodic contact with seeds.</td></tr>
+<tr><td>Observer is the problem</td><td>An overloaded or paused node wrongly accuses many peers.</td><td>Local health awareness, longer timeouts when unhealthy, require several independent accusations.</td></tr>
+<tr><td>Heavy repair load</td><td>Merkle repair rescans data and competes with production traffic.</td><td>Schedule repair, throttle streaming, repair subranges incrementally, use incremental repair where the store supports it.</td></tr>
+</table>
+
+<h2 id="simulator">12. Try it: gossip spread simulator</h2>
+<p>The simulator below starts with one informed node among N and runs synchronous gossip rounds. In each round every node picks <i>fanout</i> random peers. In <b>push</b> mode, informed nodes send the news to their targets. In <b>pull</b> mode, every node asks its targets and learns the news if a target has it. In <b>push-pull</b> mode both happen. Use it to see the S-curve, the slow tail of push, the slow start of pull, and how little fanout matters compared with the logarithm in N. The run is random, so repeat it to see the variance.</p>
+
+<div class="widget" id="gossipSim">
+  <h4>Try it: gossip spread</h4>
+  <div class="row">
+    <label>Nodes N <input type="number" id="gs-n" value="1000" min="2" max="20000" step="1"></label>
+    <label>Fanout <input type="number" id="gs-k" value="1" min="1" max="10" step="1"></label>
+    <label>Mode <select id="gs-mode"><option value="push">push</option><option value="pull">pull</option><option value="pushpull">push-pull</option></select></label>
+    <label>Message loss % <input type="number" id="gs-loss" value="0" min="0" max="90" step="5"></label>
+  </div>
+  <div class="row">
+    <button id="gs-step" type="button">Step one round</button>
+    <button id="gs-run" type="button">Run to completion</button>
+    <button id="gs-reset" type="button">Reset</button>
+  </div>
+  <div id="gs-out" class="log"></div>
+  <div id="gs-hist" class="log"></div>
+</div>
+
+<h2 id="worked">13. Worked example: a 1,000-node cluster</h2>
+
+<p>Design the membership layer for a 1,000-node key-value store using SWIM-style gossip, with a protocol period of 1 second and a fanout of 3 for dissemination. Let us work out the numbers an interviewer would expect.</p>
+
+<h3>13.1 Message load</h3>
+<ul>
+  <li><b>All-to-all heartbeats</b> at 1 per second: 1,000 × 999 ≈ 1.0 million messages per second cluster-wide, and every node processes about 1,000 incoming messages per second just to say "nothing changed".</li>
+  <li><b>SWIM probing</b>: each node sends 1 ping and receives about 1 ping per second, plus an ack each way. That is about 2 messages sent and 2 received per node per second, or about 2,000 messages per second cluster-wide, 500 times less. It does not grow with N per node.</li>
+  <li><b>Digest-based gossip</b> at fanout 3 (the Cassandra style): each node sends 3 SYN messages per second with a digest of maybe 50 bytes per node known. A 1,000-entry digest is about 50 KB at worst. In practice, digests are compressed or limited, and the data actually transferred is small; assume 20 KB per exchange, so 60 KB per second per node outbound, or 60 MB per second for the cluster, well within a data center network.</li>
+</ul>
+
+<h3>13.2 Detection and dissemination time</h3>
+<ul>
+  <li><b>Detection:</b> A node B dies at time 0. The expected time until some node probes B is about 1 period (each of the 999 other nodes picks one random target per period, so B is probed by about 1 node per period on average, and with high probability within a few periods). Direct ping times out (say 500 ms), ping-req adds up to another timeout, and the node marks B suspect after roughly 1 to 2 seconds. Strictly, the probe-selection scheme in SWIM uses a shuffled round-robin so every node is probed within N periods at worst, which bounds the time even in unlucky cases, but the typical first detection is within a few seconds.</li>
+  <li><b>Suspicion timeout:</b> With a base of about 5 periods scaled by log<sub>10</sub> N (memberlist-style, here 3), the suspicion timer is on the order of 15 seconds, shortened if several peers independently confirm.</li>
+  <li><b>Dissemination:</b> The suspect and dead messages are piggybacked on probe traffic. Each message carries them, and each node retransmits an event about λ log N times (with λ = 4 and ln 1000 ≈ 7, about 28 sends, which fits easily). News reaches all 1,000 nodes in about log<sub>2</sub> 1000 + a few ≈ 12 to 17 periods for fanout 1, or about 8 to 10 periods at the higher fanout. Total time from failure to every node knowing: about 15 + 10 = 25 seconds.</li>
+</ul>
+
+<h3>13.3 Repair costs</h3>
+<p>Say each node stores 500 GB and replication factor 3. A node is down for 20 minutes while the cluster takes 10,000 writes per second, of which that node is a replica for about 3 out of every 1,000 nodes' worth, i.e. around 30 writes per second (10,000 × 3 / 1,000). That is about 36,000 missed writes. Hinted handoff stores these at the coordinators and replays them on recovery in seconds, a few tens of MB. No tree comparison is required. Now say it was down for 8 hours (beyond the 3-hour hint window): about 864,000 missed writes. Hints are gone, so the operator runs repair. Each of its replica ranges builds a Merkle tree (reading perhaps 150 GB of data per range-set in total), exchanges tree hashes in KBs, and streams only the leaf buckets that differ. With trees limited to 32,768 leaves over a range of 100 million rows, each leaf bucket holds about 3,000 rows, so if the 864,000 missed writes were all in one such range, they would land in far more rows than there are leaves (32,768) and so would touch almost every leaf, meaning nearly every bucket differs and the repair streams most of that range. (Spread over many ranges, each range sees fewer differences and the tree saves more.) This shows a real limit: when the number of differences exceeds the tree resolution, the tree stops saving much, and the choice is either deeper trees or simply streaming the data (which is what bootstrapping a fresh replica does).</p>
+<table>
+<tr><th>Quantity</th><th>Value for N = 1,000</th></tr>
+<tr><td>Messages per node per second (SWIM probes)</td><td>about 2 out, 2 in (constant)</td></tr>
+<tr><td>Cluster messages per second, all-to-all vs SWIM</td><td>about 1,000,000 vs about 2,000</td></tr>
+<tr><td>Rounds to spread news, push, fanout 1</td><td>about 17 (log2 N + ln N)</td></tr>
+<tr><td>Rounds, fanout 3, push-pull</td><td>about 6 to 10</td></tr>
+<tr><td>Phi-accrual conviction with mean gap 1 s, threshold 8</td><td>about 18 s of silence</td></tr>
+<tr><td>Merkle comparison, 1 differing row among 1 billion (full-depth tree)</td><td>about 30 levels, about 1 KB of hashes</td></tr>
+</table>
+
+<h2 id="qa">14. Interview Q&amp;A</h2>
+
+<details><summary>Why not just have a central service track which nodes are alive?</summary>
+<p>A central monitor is simple and works well for small or medium clusters, and it is common (Kubernetes does it). At large scale it becomes a single point of failure unless you replicate it with consensus, it can become a bottleneck for heartbeats and for pushing membership changes to everyone, and it observes the cluster from one vantage point, so a broken link between it and a healthy node causes a wrong verdict. Gossip gives each node constant work, has no leader to lose, and forms opinions from many vantage points. The cost is eventual consistency of the view, so I would use gossip for liveness and soft state and keep critical metadata, like leadership and schema, on a consensus-backed store.</p></details>
+
+<details><summary>Why does gossip converge in O(log N) rounds? Give the intuition and a number.</summary>
+<p>In the early phase each informed node infects about one new node per round, so the informed count doubles and half the cluster is informed after about log2 N rounds. In the late phase, the fraction of uninformed nodes shrinks by a constant factor (about e for push with fanout 1) each round, so finishing takes about ln N more rounds. The total is about log2 N + ln N: roughly 17 rounds for 1,000 nodes and about 34 rounds for a million nodes. A thousand times more nodes only doubles the time, which is why it scales. Larger fanout reduces the base of the logarithm, and push-pull shrinks the tail.</p></details>
+
+<details><summary>Compare push, pull and push-pull gossip.</summary>
+<p>Push spreads fast at the beginning because informed nodes actively send, but it has a slow tail since the few uninformed nodes are rarely selected as targets. Pull is slow at the beginning because most pulls hit nodes that know nothing new, but it finishes quickly because an uninformed node usually hits an informed one. Push-pull does both in one exchange and is the usual production choice, requiring slightly more bandwidth per exchange but fewer rounds. Anti-entropy versions of these compare full state, while rumor mongering sends only recent updates.</p></details>
+
+<details><summary>What is the difference between rumor mongering and anti-entropy, and why do real systems use both?</summary>
+<p>Rumor mongering forwards each fresh update to a few random peers for a limited time. It is fast and cheap but probabilistic, so an update may occasionally die out before reaching everyone. Anti-entropy periodically compares full state between pairs of nodes, so it eventually fixes any difference regardless of what was lost earlier, but each exchange is more expensive, which is why Merkle trees are used to make the comparison cheap. Combining them gives speed in the common case and a guarantee in the worst case. In Cassandra the analogues are hinted handoff and read repair for speed, and scheduled Merkle repair as the safety net.</p></details>
+
+<details><summary>Explain how SWIM detects failures and why it uses indirect probes and a suspect state.</summary>
+<p>Each period a node pings one random member. If there is no ack, it asks k other members to ping the target for it, and only if every path fails does it mark the target suspect. Indirect probes give independent network vantage points, so a lost packet on one link, or a problem local to the prober, does not cause a false accusation. The suspect state gives the target time to refute by broadcasting that it is alive with a higher incarnation number, and only after a timeout is it declared dead. Membership changes are piggybacked on the probe messages, so dissemination costs no extra messages. Per-node load stays constant regardless of cluster size.</p></details>
+
+<details><summary>What is the phi-accrual failure detector and why is it better than a fixed timeout?</summary>
+<p>It keeps a window of recent heartbeat inter-arrival times for each peer and outputs phi, the negative base-10 logarithm of the probability that a healthy node would be silent for this long. Phi 1 means a 10% chance, phi 8 means one in a hundred million, and phi grows continuously with silence. A fixed timeout is a single number that cannot fit both quiet and jittery links and gives only a binary answer, so it either flaps under load or is too slow on good links. Phi adapts to each link's measured behaviour, and different consumers can use different thresholds. Its weaknesses are that it assumes a reasonable distribution and can still be fooled by long pauses such as garbage collection or frozen VMs.</p></details>
+
+<details><summary>How do you trade off false positives against detection time?</summary>
+<p>They move in opposite directions: lowering the timeout or threshold finds real failures faster but wrongly condemns more slow nodes, and raising it does the reverse. I choose by the cost of each error. If a wrong "dead" verdict triggers cheap reversible actions like routing around the node, aggressive detection is fine. If it triggers expensive actions like re-replicating terabytes, I use a high threshold and a suspicion stage. A good practice is to make cheap decisions fast and expensive decisions slow: avoid a suspect node immediately, but start data movement only after it has been down for a long time. Also use multiple observers, as SWIM and Redis Cluster do, to cut false positives without slowing detection.</p></details>
+
+<details><summary>How does a Merkle tree make replica comparison cheap? What does it cost?</summary>
+<p>Each leaf hashes a range of keys, each parent hashes its children, and the root summarizes everything, so equal roots mean equal data. If the roots differ, the replicas compare children and descend only into differing subtrees, so the number of hashes exchanged is roughly the tree depth times the number of differences instead of the data size. For a billion rows with one difference, that is about 30 levels and around a kilobyte of hashes. The cost is building the tree, because every row in the range must be read and hashed, which is heavy disk and CPU work, and trees have limited depth so each leaf covers a bucket of rows that must all be compared when it differs. The trees also go stale as writes arrive, so systems use snapshots or incremental updates.</p></details>
+
+<details><summary>Describe hinted handoff and read repair, and when you still need full repair.</summary>
+<p>With hinted handoff, when a replica is down during a write, the coordinator saves a hint and replays it when gossip reports the replica is back, so short outages heal fast. Read repair compares replica responses during a read and writes the newest value back to stale replicas, so hot data heals itself. Neither covers all cases: hints expire after a bounded window or can be lost with the coordinator, and read repair never touches data that is not read. Full Merkle-tree repair, run regularly, is therefore needed for cold data, long outages, and to make sure deletion tombstones reach every replica within the retention window.</p></details>
+
+<details><summary>Where else are Merkle trees used?</summary>
+<p>Git uses a Merkle DAG so that a commit hash identifies the whole repository state and fetches only transfer missing objects. Bitcoin puts a Merkle root of transactions in each block header, so light clients can verify one transaction with a logarithmic-sized proof. Certificate Transparency logs are append-only Merkle trees with inclusion and consistency proofs. Filesystems such as ZFS checksum blocks in a tree to detect silent corruption, and backup or dedup systems hash chunks to avoid re-uploading and to verify integrity. The shared idea is that a root hash commits to everything below it and a short path of sibling hashes proves membership.</p></details>
+
+<details><summary>What can go wrong with gossip in production?</summary>
+<p>Views converge only after several rounds, so nodes briefly disagree about membership. A network partition splits the cluster into two sides that each think the other is dead, and gossip alone does nothing to prevent split brain. Mass failures or reconnect storms can flood the gossip channel and cause more false suspicions, and flapping nodes cause repeated alive/dead transitions and data movement. Version comparisons based on wall-clock time break under clock skew, so systems use per-node counters, generations and incarnation numbers, and need tombstones to stop removed nodes from being resurrected. Mitigations are suspicion stages, bounded messages and jitter, Lifeguard-style local health checks, and keeping critical state on consensus.</p></details>
+
+<details><summary>Can gossip be used for aggregation or for replicating state?</summary>
+<p>Yes. Push-sum gossip computes averages, sums and counts: each node splits its (value, weight) pair with a random peer each round, and the ratio at every node converges to the global average in O(log N) rounds, with approximate results that degrade when nodes fail holding mass. Mergeable sketches such as HyperLogLog are even better for distinct counts because merging is idempotent. For replicated state, gossip works best with CRDTs, whose merge operation is commutative, associative and idempotent, so duplicated, reordered or delayed messages do not matter and all replicas converge. For non-mergeable data you need version vectors or timestamps and a conflict resolution rule.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">15. Recap</h2><ul>
+  <li>Centralized heartbeats create a single point of failure, a bottleneck and a single viewpoint, and all-to-all heartbeats cost N squared messages. Gossip gives each node constant work and many vantage points.</li>
+  <li>Gossip spreads information in O(log N) rounds: about log2 N + ln N for push with fanout 1 (about 17 rounds for 1,000 nodes). Push-pull is fastest overall; rumor mongering is fast but probabilistic, and anti-entropy is the guaranteed safety net.</li>
+  <li>SWIM separates failure detection (ping, then ping-req through k helpers, then suspect) from dissemination (piggybacked on probe messages), with incarnation numbers letting a node refute a false suspicion. Serf, memberlist and Consul use it; Cassandra uses digest-based gossip with phi accrual.</li>
+  <li>Fixed timeouts do not fit variable networks. Phi accrual outputs a continuous suspicion level learned from heartbeat history, and each consumer picks a threshold. The core tradeoff is false positives against detection time, so make cheap decisions fast and expensive ones slow.</li>
+  <li>Membership changes (join, leave, tombstones) and soft metadata travel by gossip, but authoritative topology and schema belong on consensus.</li>
+  <li>Merkle trees compare large replicas by descending only differing subtrees, so cost scales with the number of differences. The price is the scan to build trees, limited depth, and staleness.</li>
+  <li>Repair works in layers: hinted handoff for short outages, read repair for hot data, and scheduled Merkle repair for everything else. Hash trees also underpin git, blockchains, certificate transparency and integrity checking.</li>
+  <li>Gossip can aggregate counts and averages and replicate CRDT state. Pitfalls are convergence delay, partitions, message storms, flapping nodes, clock-based version conflicts and resurrected tombstones.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="24-replication.html">Chapter 24</a> (replication, quorums, leaderless stores that need repair) and <a href="27-failure-time-ordering.html">Chapter 27</a> (partial failure, clocks and version ordering). Uses ideas from <a href="57-hashing-probabilistic.html">Chapter 57</a> (consistent hashing rings, HyperLogLog) and leads to <a href="59-sorted-sets-crdt.html">Chapter 59</a> (CRDTs and Merkle trees as data structures).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+<script>
+(function () {
+  function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+  function setParts(node, parts) { node.textContent = ''; parts.forEach(function (p) { if (typeof p === 'string') node.appendChild(document.createTextNode(p)); else node.appendChild(el('b', null, p.b)); }); }
+  const out = document.getElementById('gs-out');
+  const hist = document.getElementById('gs-hist');
+  let informed = null, round = 0, history = [], N = 0;
+
+  function params() {
+    const n = Math.max(2, Math.min(20000, parseInt(document.getElementById('gs-n').value, 10) || 1000));
+    const k = Math.max(1, Math.min(10, parseInt(document.getElementById('gs-k').value, 10) || 1));
+    const loss = Math.max(0, Math.min(90, parseInt(document.getElementById('gs-loss').value, 10) || 0)) / 100;
+    return { n: n, k: k, loss: loss, mode: document.getElementById('gs-mode').value };
+  }
+  function count() { let c = 0; for (let i = 0; i < N; i++) if (informed[i]) c++; return c; }
+  function reset() {
+    const p = params();
+    N = p.n; informed = new Uint8Array(N); informed[0] = 1; round = 0; history = [1];
+    render(p);
+  }
+  function step() {
+    const p = params();
+    if (!informed || p.n !== N) { reset(); }
+    const next = new Uint8Array(informed);
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j < p.k; j++) {
+        let t = Math.floor(Math.random() * (N - 1));
+        if (t >= i) t++;
+        if (Math.random() < p.loss) continue;
+        if ((p.mode === 'push' || p.mode === 'pushpull') && informed[i]) next[t] = 1;
+        if ((p.mode === 'pull' || p.mode === 'pushpull') && informed[t]) next[i] = 1;
+      }
+    }
+    informed = next; round++;
+    history.push(count());
+    render(p);
+  }
+  function render(p) {
+    const c = count();
+    const pct = Math.round(100 * c / N);
+    const bar = '#'.repeat(Math.round(pct / 2)) + '.'.repeat(50 - Math.round(pct / 2));
+    setParts(out, [{ b: 'Round ' + round }, ': ' + c + ' of ' + N + ' nodes informed (' + pct + '%).  Mode ' + p.mode + ', fanout ' + p.k + ', loss ' + Math.round(p.loss * 100) + '%.  Reference: log2 N + ln N = ' + (Math.log2(N) + Math.log(N)).toFixed(1) + ' rounds (push, fanout 1).']);
+    hist.textContent = '';
+    hist.appendChild(el('div', null, '[' + bar + ']'));
+    const start = Math.max(0, history.length - 25);
+    for (let r = start; r < history.length; r++) {
+      hist.appendChild(el('div', null, 'round ' + r + ': ' + history[r]));
+    }
+  }
+  document.getElementById('gs-step').addEventListener('click', step);
+  document.getElementById('gs-reset').addEventListener('click', reset);
+  document.getElementById('gs-run').addEventListener('click', function () {
+    reset();
+    let guard = 0;
+    while (count() < N && guard < 500) { step(); guard++; }
+  });
+  ['gs-n', 'gs-k', 'gs-mode', 'gs-loss'].forEach(function (id) { document.getElementById(id).addEventListener('change', reset); });
+  reset();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 27: Design Object Storage (S3-like) | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="c27-object-storage-s3">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 27 · Worked solutions</div>
+<h1>Design Object Storage (S3-like)</h1>
+<p class="lead">We design a regional service that stores hundreds of billions of immutable blobs, promises eleven nines of durability, and still answers a listing request in milliseconds. The design hinges on one idea: split the small, strongly consistent index of objects (the metadata path) from the huge, cheap, append-only bytes (the data path), and then make every failure between the two safe.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is "Design an object store like Amazon S3." The product is easy to describe and hard to build. A user creates a <b>bucket</b> (a named container), then uploads <b>objects</b> (an arbitrary sequence of bytes plus a few headers) under a <b>key</b> (a string such as <code>photos/2025/cat.jpg</code>). The user can read an object back by key, delete it, and list the keys in a bucket. There is no in-place edit: to change an object you upload a new one with the same key. That single restriction, immutability of an object once written, is what makes the whole design tractable, because it lets us store data in write-once files and never coordinate partial updates.</p>
+<p>The conceptual background (buckets, storage classes, consistency, typical products) is in <a href="../chapters/21-object-storage.html">Chapter 21</a>. This page is the worked solution: we make concrete numbers and choices. As in the earlier case studies, we start by asking the interviewer questions and fixing assumptions.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>What is the scale?</td><td>One region, 100 PB (petabytes) of logical user data, about 200 billion objects, mean object size about 500 KB, with a long tail up to 5 TB.</td></tr>
+<tr><td>Request rate?</td><td>About 50,000 requests per second on average, 150,000 at peak (3x). Mix: 70 percent GET or HEAD, 20 percent PUT, 5 percent DELETE, 5 percent LIST.</td></tr>
+<tr><td>Durability target?</td><td>Eleven nines (99.999999999 percent) of objects per year. That means we expect to lose at most about 2 of the 200 billion objects in a year, and we aim far better than that.</td></tr>
+<tr><td>Availability target?</td><td>99.99 percent for reads and writes, surviving the loss of one whole availability zone (AZ, an isolated datacenter within a region).</td></tr>
+<tr><td>Consistency?</td><td>Strong read-after-write for new objects, overwrites and deletes, and strong list-after-write. Modern S3 offers this, and clients built without it (eventual listing) are painful to write correctly.</td></tr>
+<tr><td>Object mutability?</td><td>Immutable. Overwrite replaces the whole object atomically. No append, no partial update.</td></tr>
+<tr><td>Large objects?</td><td>Yes. Single PUT up to 5 GB, multipart upload up to 5 TB.</td></tr>
+<tr><td>Versioning, lifecycle?</td><td>Optional bucket versioning and simple lifecycle rules (expire after N days, abort stale multipart uploads). Storage tiers other than the standard one are out of scope.</td></tr>
+<tr><td>Who is the user?</td><td>Applications over HTTPS with signed requests, from internal and external tenants. Multi-tenant, so isolation and abuse matter.</td></tr>
+</table>
+<div class="callout tip"><b>Interview tip</b> Say the central sentence in the first two minutes: "Object storage is two systems glued together: a strongly consistent, sharded metadata index that maps keys to chunk locations, and a durable data plane of dumb storage nodes that hold erasure-coded fragments. The PUT commits when the metadata record is written, and everything else, repair, garbage collection, listing, follows from that commit point."</div>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li><b>Bucket operations.</b> Create, delete (only when empty), list buckets, set configuration (versioning, lifecycle, policy).</li>
+<li><b>Object operations.</b> <code>PUT</code> (whole object), <code>GET</code> (whole or by byte range), <code>HEAD</code> (metadata only), <code>DELETE</code>, <code>COPY</code> (server side, no data movement through the client).</li>
+<li><b>Listing.</b> Return keys in lexicographic order with an optional prefix filter and a delimiter that rolls up "folders", paginated.</li>
+<li><b>Multipart upload.</b> Upload a large object as independent parts in parallel and in any order, then complete it atomically.</li>
+<li><b>Integrity.</b> Verify checksums on upload and detect corruption on read.</li>
+<li><b>Lifecycle.</b> Expire objects and abort abandoned multipart uploads automatically.</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Durability:</b> 11 nines per object per year. The most important requirement and the one that drives the data layout.</li>
+<li><b>Availability:</b> 99.99 percent, tolerate one AZ failure with no data loss and ideally no read impact.</li>
+<li><b>Throughput over latency.</b> First byte under about 100 ms at p99 for a small object. The service is built for bandwidth, not for microsecond reads. A GET of a 1 GB object is dominated by streaming time.</li>
+<li><b>Scalability:</b> adding storage nodes and metadata shards increases capacity linearly with no downtime and without rebalancing everything.</li>
+<li><b>Cost efficiency:</b> raw capacity per user byte should be as low as durability allows. This is where erasure coding earns its place.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>We do not design the identity and access management product, billing, a content delivery network in front (see <a href="../chapters/12-cdn.html">Chapter 12</a>), cold archive tiers with tape or multi-hour retrieval, an S3-compatible query engine such as SQL-on-objects, event notifications, or cross-region replication internals beyond a short mention in section 13. A file system view (POSIX semantics, rename, append) is also out: <a href="c09-file-sync.html">Case study 9</a> covers sync on top of blobs, and <a href="../chapters/23-other-stores.html">Chapter 23</a> covers distributed file systems.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>We follow the method of <a href="../chapters/02-estimation.html">Chapter 2</a>: state assumptions, compute, and check the result against hardware limits. The numbers here drive three decisions: how big the metadata tier is, how much raw disk we buy, and whether disk operations per second become the bottleneck.</p>
+<h3>3.1 Request rates</h3>
+<p>Average 50,000 requests per second, split as 35,000 GET or HEAD, 10,000 PUT, 2,500 DELETE and 2,500 LIST. The read to write ratio is therefore about 3:1 counting only data requests. Peak is 3x: about 105,000 GET, 30,000 PUT, 7,500 DELETE and 7,500 LIST per second, 150,000 in total.</p>
+<h3>3.2 Bandwidth and daily ingest</h3>
+<ul>
+<li><b>Ingest.</b> 10,000 PUT/s x 500 KB = 5 GB/s average, which is 5 GB x 86,400 s = about 432 TB per day of logical ingest. Peak is 15 GB/s.</li>
+<li><b>Egress.</b> 35,000 GET/s x 500 KB = 17.5 GB/s average, which is 140 Gb/s. Peak is 52.5 GB/s, or 420 Gb/s. This is spread across front-end servers: at 25 Gb/s of usable network per server we need at least 17 servers for peak egress, and we will run well over 100 to stay below 30 percent utilization and survive failures.</li>
+<li><b>Net growth.</b> Many objects are overwritten or deleted. Assume net growth of 100 TB per day of logical data, or about 36 PB per year. We plan capacity one year ahead, so we size the fleet for 100 PB now and add roughly a third each year.</li>
+</ul>
+<h3>3.3 Metadata</h3>
+<p>Each object has a metadata record: key (about 100 bytes on average, up to 1 KB), size, ETag, content type, timestamps, user metadata, version id, storage class, and the chunk map (a list of chunk ids and their placement). Assume 500 bytes on average. 200 billion objects x 500 B = <b>100 TB of metadata</b>. With 3 replicas that is 300 TB of SSD, about 40 to 50 servers with 8 TB of usable NVMe each. At peak the metadata tier sees roughly 150,000 operations per second (every data request touches it once; listing touches a range). Spread over 2,000 shards that is about 75 operations per second per shard on average, which is nothing. <b>Metadata is bounded by size, not by request rate</b>, except for hot prefixes (section 12).</p>
+<h3>3.4 Raw storage</h3>
+<p>Raw disk depends on the redundancy scheme, so we do this arithmetic now and justify it in section 8. Assume 90 percent of bytes live in objects of 1 MB or larger and 10 percent in smaller objects (about 70 percent of objects by count, but only a tenth of the bytes). Large objects use erasure coding 9 data + 6 parity fragments (overhead 15/9 = 1.67x). Small objects are 3-way replicated (overhead 3x).</p>
+<p>Raw = 90 PB x 1.67 + 10 PB x 3 = 150 PB + 30 PB = <b>180 PB raw</b>, a blended overhead of 1.8x. With 20 TB drives filled to 70 percent (we keep headroom for repair and growth), usable per drive is 14 TB, so 180,000 TB / 14 TB = about <b>12,900 drives</b>. At 60 drives per storage server that is about 215 servers. For comparison, pure 3x replication would need 300 PB raw, about 21,400 drives. Erasure coding saves about 120 PB, roughly 8,500 drives, which is the economic argument for the whole complication.</p>
+<h3>3.5 Disk operations: the surprise bottleneck</h3>
+<p>A spinning disk delivers roughly 100 to 200 random reads per second. Reading a 9+6 erasure-coded object touches 9 fragments on 9 different disks. At peak, large objects are 30 percent of GETs (by count), small ones are 70 percent and need 1 disk read: average disk reads per GET = 0.7 x 1 + 0.3 x 9 = 3.4. So peak disk reads = 105,000 x 3.4 = about 357,000 per second, over 12,900 drives = <b>about 28 reads per second per drive</b>. That is comfortable. If every object were erasure coded, it would be 105,000 x 9 = 945,000 reads per second, about 73 per drive, uncomfortably near the limit once repair and scrubbing traffic are added. This is why we use the hybrid scheme.</p>
+<h3>3.6 Repair traffic</h3>
+<p>Annual drive failure rate (AFR) is about 2 percent in published fleet studies. 12,900 x 2 percent = about 260 failed drives a year, 0.7 per day. When one 14 TB drive fails, every fragment on it must be rebuilt, which for 9+6 means reading 9 surviving fragments per lost one: 14 TB x 9 = 126 TB read and 14 TB written. Daily repair read traffic is about 0.7 x 126 TB = 90 TB/day, versus client egress of 17.5 GB/s x 86,400 = 1.5 PB/day. Repair is about 6 percent of client traffic. If we want the rebuild done in 6 hours (the repair window used in section 8), the cluster must move 126 TB in 21,600 s = 5.8 GB/s, about 27 MB/s per storage server across 215 servers. Very feasible, but only because repair is <b>declustered</b>: the lost fragments' peers are spread over thousands of drives, not concentrated on a few (section 11).</p>
+<h3>3.7 Summary</h3>
+<table>
+<tr><th>Quantity</th><th>Value</th><th>Decision it drives</th></tr>
+<tr><td>Objects / logical data</td><td>200 billion / 100 PB</td><td>metadata is 100 TB, so it must be sharded</td></tr>
+<tr><td>Requests</td><td>50k/s average, 150k/s peak</td><td>stateless front-end tier, about 100+ servers</td></tr>
+<tr><td>Ingest / egress</td><td>5 GB/s / 17.5 GB/s average</td><td>network is the limit, not CPU (except EC encode)</td></tr>
+<tr><td>Raw capacity</td><td>180 PB, about 12,900 drives, 215 nodes</td><td>erasure coding for large, replication for small</td></tr>
+<tr><td>Disk reads at peak</td><td>357k/s, 28 per drive</td><td>hybrid scheme keeps IOPS in budget</td></tr>
+<tr><td>Failures</td><td>about 260 drives per year</td><td>automatic declustered repair in about 6 hours</td></tr>
+<tr><td>Metadata</td><td>100 TB x 3 replicas, 2,000 shards</td><td>range-sharded replicated KV on NVMe</td></tr>
+</table>
+
+<h2 id="api">4. API design</h2>
+<p>The API is HTTP with resource-style URLs, as in <a href="../chapters/05-api-design.html">Chapter 5</a>. We keep the S3 shape because every client library already speaks it.</p>
+<pre><code>PUT    /{bucket}                                   create bucket
+PUT    /{bucket}/{key}                             upload object (up to 5 GB)
+         headers: Content-Length, Content-MD5 or x-checksum-sha256,
+                  Content-Type, x-meta-*, If-None-Match: *
+         -> 200, ETag, x-version-id
+GET    /{bucket}/{key}[?versionId=...]             download
+         headers: Range: bytes=0-1048575, If-Match, If-None-Match
+         -> 200 or 206 Partial Content
+HEAD   /{bucket}/{key}                             metadata only
+DELETE /{bucket}/{key}[?versionId=...]             delete (marker if versioned)
+GET    /{bucket}?list-type=2&amp;prefix=photos/&amp;delimiter=/
+         &amp;max-keys=1000&amp;continuation-token=...      list keys
+POST   /{bucket}/{key}?uploads                     initiate multipart -> uploadId
+PUT    /{bucket}/{key}?partNumber=7&amp;uploadId=U     upload one part -> ETag of part
+POST   /{bucket}/{key}?uploadId=U                  complete: body lists (partNumber, ETag)
+DELETE /{bucket}/{key}?uploadId=U                  abort
+GET    /{bucket}/{key}?uploadId=U                  list parts so far</code></pre>
+<p>Notes on the choices. Every request is authenticated by a signature over the request (a keyed hash of the method, path, headers and a timestamp), so we never send a long-lived secret and a replayed request expires. Responses are <b>idempotent by construction</b>: a retried PUT of the same key and bytes simply creates the same visible object (and a new version if versioning is on), and a retried multipart part overwrites the earlier copy of that part number. The conditional header <code>If-None-Match: *</code> makes "create only if absent" atomic, which clients use as a cheap compare-and-set primitive (see <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>). Listing returns at most 1,000 keys per page plus an opaque continuation token, because an unbounded list would hold a shard scan open and starve other work. Range GET lets a client fetch part of a large object, which is how video players and parallel downloaders work, and we must support it without reading the whole object (section 7).</p>
+
+<h2 id="data-model">5. Data model and storage choice</h2>
+<p>Three kinds of data with very different shapes, so three stores. Deciding which technology to put where is the heart of the problem.</p>
+<table>
+<tr><th>Data</th><th>Shape</th><th>Store</th><th>Why</th></tr>
+<tr><td>Object metadata (key to chunk map)</td><td>100 TB, ordered by key, small records, strong consistency, point and range reads</td><td>Range-sharded, Raft-replicated ordered key-value store on NVMe SSD</td><td>Listing needs sorted keys, so hash sharding is out. Strong reads need consensus per shard (<a href="../chapters/29-consensus.html">Chapter 29</a>). Records are small and index-like, so an LSM tree engine fits (<a href="../chapters/19-storage-engines.html">Chapter 19</a>).</td></tr>
+<tr><td>Object bytes (fragments)</td><td>180 PB, write once, read many, large sequential</td><td>Append-only extent files on HDD storage nodes, plus a small local index on SSD</td><td>No updates means no random writes. Appending into large files turns millions of small writes into sequential I/O.</td></tr>
+<tr><td>Placement and cluster state (nodes, drives, placement groups, bucket configs)</td><td>Tiny, strongly consistent, rarely changes</td><td>A small consensus group (the same technology as the metadata shards)</td><td>Needs linearizable updates when drives fail and PGs change (<a href="../chapters/30-coordination-locks.html">Chapter 30</a>).</td></tr>
+</table>
+<h3>5.1 The metadata record</h3>
+<p>The metadata table's primary key is <code>(bucket_id, key, version_inverse)</code>. The bucket id comes first so that each bucket is a contiguous key range. The inverse version (a number that decreases as versions get newer, for example the maximum timestamp minus the actual one) sorts the newest version first, so "get the latest version of this key" is the first entry in the key's range. For an unversioned bucket there is exactly one version.</p>
+<pre><code>row key:   (bucket_id, key, inverse_version)
+value:     size, etag, content_type, created_at, user_meta, storage_class,
+           is_delete_marker,
+           layout: [ segment_0 = { chunk_id, scheme: EC(9,6) | REP(3), pg_id, length, checksum },
+                     segment_1 = { ... }, ... ]</code></pre>
+<p>A <b>segment</b> is the unit of erasure coding: we cut the object byte stream into pieces of 9 MB (for erasure-coded objects), and each piece becomes 9 data fragments of 1 MB and 6 parity fragments of 1 MB. The <b>placement group</b> (PG) is a fixed set of 15 drives (for EC) or 3 drives (for replication) that will hold all fragments of a given chunk. The chunk id and PG id are enough to find the data, so storage nodes need no knowledge of object keys at all. This separation, nodes know chunks and the index knows keys, is what lets us repair, move and garbage collect data without touching keys.</p>
+<h3>5.2 Storage-node layout</h3>
+<p>Each storage node manages its drives as a set of <b>extents</b>: large (for example 1 GB) append-only files. A fragment write appends to the drive's currently open extent and records <code>chunk_id, fragment_no -> (extent, offset, length, crc)</code> in a local LSM index on SSD. When an extent is full it is <b>sealed</b> and becomes immutable. Facebook's Haystack paper used this same idea (many photos packed into big files, with an in-memory index) to avoid one filesystem inode per object and to reduce metadata reads per request to one. Immutable sealed extents also make checksumming, scrubbing, copying and compaction simple.</p>
+<div class="callout key"><b>Key idea</b> Because bytes are immutable, the data plane needs no locks and no consensus. A fragment is either fully written and checksummed or it is not there. All the difficult agreement, "is this object visible and where is it?", is concentrated in one small, replicated metadata commit.</div>
+
+<h2 id="architecture">6. From a first design to the real architecture</h2>
+<h3>6.1 First design: one server</h3>
+<p>One web server accepts PUT and writes each object as a file on a local disk, with the key mapped to a file path. This works for a demo. The file system's directory structure is the index, so listing is a directory walk. It breaks immediately: a single disk fails and data is lost, a single machine's capacity is a few hundred TB at most, and a directory with a billion entries cannot be listed. Replicating to a second server does not fix the index scale problem and does not give 11 nines.</p>
+<h3>6.2 The scaled design</h3>
+<p>We apply the split from the lead: a <b>front-end tier</b> that speaks HTTP and orchestrates, a <b>metadata service</b> that owns the key index, a <b>placement manager</b> that decides which drives hold a chunk, <b>storage nodes</b> that hold fragments, and <b>background workers</b> that repair, scrub, garbage collect and apply lifecycle rules. Only the metadata service is strongly consistent. Front-ends are stateless and storage nodes are simple.</p>
+<figure class="diagram">
+<svg viewBox="0 0 920 470" role="img" aria-label="High level architecture of the object store">
+  <rect class="ext" x="20" y="150" width="130" height="60" rx="8"/><text class="t-c t-b" x="85" y="176">Clients</text><text class="t-c t-sm" x="85" y="194">SDK, browsers</text>
+  <rect class="box" x="210" y="130" width="150" height="100" rx="8"/><text class="t-c t-b" x="285" y="164">Front-end tier</text><text class="t-c t-sm" x="285" y="184">auth, routing, EC encode,</text><text class="t-c t-sm" x="285" y="200">checksums, stateless</text>
+  <path class="arrow" d="M150 180 L206 180"/>
+  <rect class="db" x="450" y="30" width="170" height="90" rx="8"/><text class="t-c t-b" x="535" y="62">Metadata service</text><text class="t-c t-sm" x="535" y="82">2,000 range shards,</text><text class="t-c t-sm" x="535" y="98">Raft x3, NVMe, 100 TB</text>
+  <rect class="cache" x="450" y="170" width="170" height="60" rx="8"/><text class="t-c t-b" x="535" y="196">Placement manager</text><text class="t-c t-sm" x="535" y="214">PG map, drive health</text>
+  <path class="arrow" d="M360 150 L446 90"/><text class="t-sm" x="372" y="108">1. key to chunks</text>
+  <path class="arrow" d="M360 190 L446 198"/><text class="t-sm" x="366" y="178">2. pick PG</text>
+
+  <rect class="db" x="700" y="30" width="200" height="110" rx="8"/><text class="t-c t-b" x="800" y="52">AZ-A storage nodes</text>
+  <rect class="hit" x="715" y="66" width="52" height="26" rx="4"/><text class="t-c t-sm" x="741" y="84">D1</text>
+  <rect class="hit" x="772" y="66" width="52" height="26" rx="4"/><text class="t-c t-sm" x="798" y="84">D2</text>
+  <rect class="hit" x="829" y="66" width="52" height="26" rx="4"/><text class="t-c t-sm" x="855" y="84">P1</text>
+  <text class="t-c t-sm" x="800" y="118">extents on HDD + SSD index</text>
+  <rect class="db" x="700" y="170" width="200" height="110" rx="8"/><text class="t-c t-b" x="800" y="192">AZ-B storage nodes</text>
+  <rect class="hit" x="715" y="206" width="52" height="26" rx="4"/><text class="t-c t-sm" x="741" y="224">D4</text>
+  <rect class="hit" x="772" y="206" width="52" height="26" rx="4"/><text class="t-c t-sm" x="798" y="224">D5</text>
+  <rect class="hit" x="829" y="206" width="52" height="26" rx="4"/><text class="t-c t-sm" x="855" y="224">P3</text>
+  <text class="t-c t-sm" x="800" y="258">extents on HDD + SSD index</text>
+  <rect class="db" x="700" y="310" width="200" height="110" rx="8"/><text class="t-c t-b" x="800" y="332">AZ-C storage nodes</text>
+  <rect class="hit" x="715" y="346" width="52" height="26" rx="4"/><text class="t-c t-sm" x="741" y="364">D7</text>
+  <rect class="hit" x="772" y="346" width="52" height="26" rx="4"/><text class="t-c t-sm" x="798" y="364">D8</text>
+  <rect class="hit" x="829" y="346" width="52" height="26" rx="4"/><text class="t-c t-sm" x="855" y="364">P5</text>
+  <text class="t-c t-sm" x="800" y="398">extents on HDD + SSD index</text>
+  <path class="arrow" d="M360 215 C500 300 600 90 696 90"/><path class="arrow" d="M360 220 C500 290 600 230 696 230"/><path class="arrow" d="M360 225 C480 330 600 370 696 370"/>
+  <text class="t-sm" x="395" y="330">3. fragments in parallel</text>
+
+  <rect class="miss" x="210" y="330" width="410" height="110" rx="8"/><text class="t-c t-b" x="415" y="358">Background workers</text>
+  <text class="t-c t-sm" x="415" y="380">repair  |  scrub (checksums)  |  garbage collection</text>
+  <text class="t-c t-sm" x="415" y="400">lifecycle expiry  |  rebalancing  |  replication to other regions</text>
+  <text class="t-c t-sm" x="415" y="420">read metadata, act on storage nodes</text>
+  <path class="arrow dash" d="M535 330 L535 232"/>
+</svg>
+<figcaption>Clients talk only to stateless front-ends. The front-end resolves keys in the metadata service, asks the placement manager where a new chunk goes, and streams fragments directly to storage nodes spread across three AZs. Background workers read the metadata index and act on storage nodes, never in the request path.</figcaption>
+</figure>
+<p>Front-end servers also act as the erasure-coding engine on writes (they compute parity from data as it streams through) and the reconstruction engine on degraded reads. This keeps storage nodes simple and puts CPU where it scales horizontally. Encoding at roughly several GB/s per core with vectorized instructions is typical for Reed-Solomon, so 15 GB/s peak ingest needs only a handful of cores; network is the limit, not coding.</p>
+
+<h2 id="flows">7. Request flows</h2>
+<h3>7.1 PUT of an object (a 40 MB example)</h3>
+<ol>
+<li>The client sends <code>PUT /bkt/video.mp4</code>. The front-end verifies the signature, checks the bucket policy, and starts hashing the stream.</li>
+<li>The front-end cuts the stream into 9 MB segments (here 5 segments: four of 9 MB and one of 4 MB). For each segment it asks the placement manager for a PG, a set of 15 drives with 5 in each AZ, on different servers and racks. In practice placement answers are cached for a batch of chunk ids so this is not a round trip per segment.</li>
+<li>For each segment the front-end splits the bytes into 9 data fragments, computes 6 parity fragments, and sends all 15 fragments in parallel to the 15 drives. Each storage node appends the fragment to its open extent, checksums it, and fsyncs (or group-commits) before acknowledging.</li>
+<li>When at least 12 of 15 fragments are acknowledged for every segment, the segment is considered durable. The remaining slow fragments continue in the background, and if one fails the repair queue gets an entry. Waiting for 12 means that even immediately after the PUT returns, three more fragment losses are survivable.</li>
+<li>The front-end verifies the final checksum against the client-supplied one, then writes the metadata record (the key, the layout of five segments) to the owning metadata shard. This is a single Raft write on that shard, a few milliseconds. <b>This write is the commit point.</b></li>
+<li>The front-end returns <code>200 OK</code> with the ETag. From this instant any GET or LIST on any front-end sees the object, because reads of that shard are linearizable.</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 900 420" role="img" aria-label="Sequence diagram of an object PUT">
+  <rect class="ext" x="30" y="20" width="110" height="32" rx="8"/><text class="t-c t-b" x="85" y="41">Client</text>
+  <rect class="box" x="220" y="20" width="110" height="32" rx="8"/><text class="t-c t-b" x="275" y="41">Front-end</text>
+  <rect class="cache" x="410" y="20" width="120" height="32" rx="8"/><text class="t-c t-b" x="470" y="41">Placement</text>
+  <rect class="db" x="610" y="20" width="130" height="32" rx="8"/><text class="t-c t-b" x="675" y="41">15 drives</text>
+  <rect class="db" x="780" y="20" width="110" height="32" rx="8"/><text class="t-c t-b" x="835" y="41">Metadata</text>
+  <line class="life" x1="85" y1="52" x2="85" y2="410"/><line class="life" x1="275" y1="52" x2="275" y2="410"/><line class="life" x1="470" y1="52" x2="470" y2="410"/><line class="life" x1="675" y1="52" x2="675" y2="410"/><line class="life" x1="835" y1="52" x2="835" y2="410"/>
+  <path class="arrow" d="M85 84 L271 84"/><text class="t-sm" x="100" y="78">1. PUT stream + checksum</text>
+  <path class="arrow" d="M275 124 L466 124"/><text class="t-sm" x="290" y="118">2. allocate PG per segment</text>
+  <path class="arrow-g dash" d="M466 150 L279 150"/><text class="t-sm" x="300" y="166">PG id, 15 drives</text>
+  <path class="arrow" d="M275 196 L671 196"/><text class="t-sm" x="300" y="190">3. 9 data + 6 parity fragments, parallel</text>
+  <path class="arrow-g dash" d="M671 232 L279 232"/><text class="t-sm" x="300" y="226">4. acks, proceed at 12 of 15</text>
+  <rect class="hit" x="190" y="256" width="170" height="40" rx="8"/><text class="t-c t-sm" x="275" y="274">verify end-to-end</text><text class="t-c t-sm" x="275" y="288">checksum</text>
+  <path class="arrow" d="M275 322 L831 322"/><text class="t-sm" x="440" y="316">5. commit record (Raft write, the commit point)</text>
+  <path class="arrow-g dash" d="M831 350 L279 350"/><text class="t-sm" x="600" y="368">committed</text>
+  <path class="arrow-g" d="M271 396 L89 396"/><text class="t-sm" x="100" y="390">6. 200 OK, ETag</text>
+</svg>
+<figcaption>The bytes land on storage nodes first, and only then does a single metadata write make the object visible. A crash anywhere before step 5 leaves orphan fragments but no visible object. The 12-of-15 early acknowledgement is a latency optimization that still keeps three more failures of headroom.</figcaption>
+</figure>
+<h3>7.2 GET of an object, including a range</h3>
+<ol>
+<li>The front-end verifies the signature and reads the metadata record for the key (a point read on one shard). A small hot cache of metadata on the front-ends cuts load, but entries are validated by version or have short lifetimes so a delete is seen quickly (see <a href="../chapters/13-caching-patterns.html">Chapter 13</a>).</li>
+<li>For a range such as bytes 20,000,000 to 29,999,999, the front-end computes from the layout which segments overlap (segments 2 and 3 at 9 MB each) and, within them, which data fragments, since the data fragments are contiguous 1 MB slices of the segment. It reads only those data fragments, in parallel from the drives, not all 15.</li>
+<li>Each fragment is checksum-verified as it is read. On success the bytes stream straight to the client with no parity math.</li>
+<li><b>Degraded read:</b> if a fragment is missing, corrupt or its drive is slow, the front-end also issues reads for parity fragments and reconstructs the missing slice from any 9 of the 15. Hedging, sending the extra read after a short delay such as the p95 latency rather than waiting for a timeout, trims tail latency (<a href="../chapters/40-resilience.html">Chapter 40</a>).</li>
+</ol>
+<p>Small replicated objects are simpler: read any one of 3 replicas, preferring a replica in the local AZ, and fall over to another on a checksum failure or timeout.</p>
+
+<h2 id="ec-vs-replication">8. Deep dive 1: erasure coding vs replication, and the durability math</h2>
+<h3>8.1 How erasure coding works</h3>
+<p>Replication keeps full copies. <b>Erasure coding</b> is the generalization of parity. The simplest example: split a block into halves A and B and store a third block P = A XOR B. Lose any one of the three and you can recompute it (A = B XOR P). That is 3 pieces for 2 pieces of data, 1.5x overhead, tolerating one loss, where 2-way replication has 2x overhead and tolerates one loss too, so we already save space. <b>Reed-Solomon (k, m)</b> extends this using arithmetic in a finite field: from k data fragments it computes m parity fragments such that <b>any k of the k+m fragments suffice to rebuild the original</b>. It tolerates any m simultaneous losses. Overhead is (k+m)/k. The mathematics is a matrix multiplication over GF(256) and the property comes from every k by k sub-matrix of the code matrix being invertible; the interview-level takeaway is "any k of n".</p>
+<table>
+<tr><th>Scheme</th><th>Overhead</th><th>Failures tolerated</th><th>Fragments read per GET</th><th>Repair read per lost fragment</th></tr>
+<tr><td>3x replication</td><td>3.0x</td><td>2</td><td>1</td><td>1 (copy from a peer)</td></tr>
+<tr><td>RS(6,3)</td><td>1.5x</td><td>3</td><td>6</td><td>6</td></tr>
+<tr><td>RS(10,4)</td><td>1.4x</td><td>4</td><td>10</td><td>10</td></tr>
+<tr><td>RS(9,6), 3 AZs x 5</td><td>1.67x</td><td>6, or a whole AZ plus 1</td><td>9</td><td>9</td></tr>
+<tr><td>LRC(12,2,2) (Azure style)</td><td>1.33x</td><td>any 3, many 4</td><td>12</td><td>6 for a single loss, using a local parity</td></tr>
+</table>
+<p><b>Local reconstruction codes (LRC)</b> add local parity fragments each covering a small group of data fragments, so rebuilding a single failed fragment reads only the group (about 6) rather than all k. Because single failures are by far the commonest event, this cuts repair traffic almost in half. We mention LRC as the 10x-scale evolution (section 15), but start with plain Reed-Solomon because it is easier to reason about and test.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Erasure coded segment spread across three availability zones">
+  <rect class="ext" x="20" y="120" width="130" height="70" rx="8"/><text class="t-c t-b" x="85" y="148">9 MB</text><text class="t-c t-b" x="85" y="166">segment</text>
+  <path class="arrow" d="M150 155 L196 155"/>
+  <rect class="box" x="200" y="120" width="130" height="70" rx="8"/><text class="t-c t-b" x="265" y="148">RS(9,6)</text><text class="t-c t-sm" x="265" y="166">encode in front-end</text>
+  <rect class="db" x="400" y="20" width="480" height="90" rx="8"/><text class="t-b" x="412" y="40">AZ-A (5 fragments, distinct servers and racks)</text>
+  <rect class="hit" x="412" y="56" width="80" height="36" rx="6"/><text class="t-c t-sm" x="452" y="79">D1</text>
+  <rect class="hit" x="500" y="56" width="80" height="36" rx="6"/><text class="t-c t-sm" x="540" y="79">D2</text>
+  <rect class="hit" x="588" y="56" width="80" height="36" rx="6"/><text class="t-c t-sm" x="628" y="79">D3</text>
+  <rect class="cache" x="676" y="56" width="80" height="36" rx="6"/><text class="t-c t-sm" x="716" y="79">P1</text>
+  <rect class="cache" x="764" y="56" width="80" height="36" rx="6"/><text class="t-c t-sm" x="804" y="79">P2</text>
+  <rect class="db" x="400" y="120" width="480" height="90" rx="8"/><text class="t-b" x="412" y="140">AZ-B (5 fragments)</text>
+  <rect class="hit" x="412" y="156" width="80" height="36" rx="6"/><text class="t-c t-sm" x="452" y="179">D4</text>
+  <rect class="hit" x="500" y="156" width="80" height="36" rx="6"/><text class="t-c t-sm" x="540" y="179">D5</text>
+  <rect class="hit" x="588" y="156" width="80" height="36" rx="6"/><text class="t-c t-sm" x="628" y="179">D6</text>
+  <rect class="cache" x="676" y="156" width="80" height="36" rx="6"/><text class="t-c t-sm" x="716" y="179">P3</text>
+  <rect class="cache" x="764" y="156" width="80" height="36" rx="6"/><text class="t-c t-sm" x="804" y="179">P4</text>
+  <rect class="db" x="400" y="220" width="480" height="90" rx="8"/><text class="t-b" x="412" y="240">AZ-C (5 fragments)</text>
+  <rect class="hit" x="412" y="256" width="80" height="36" rx="6"/><text class="t-c t-sm" x="452" y="279">D7</text>
+  <rect class="hit" x="500" y="256" width="80" height="36" rx="6"/><text class="t-c t-sm" x="540" y="279">D8</text>
+  <rect class="hit" x="588" y="256" width="80" height="36" rx="6"/><text class="t-c t-sm" x="628" y="279">D9</text>
+  <rect class="cache" x="676" y="256" width="80" height="36" rx="6"/><text class="t-c t-sm" x="716" y="279">P5</text>
+  <rect class="cache" x="764" y="256" width="80" height="36" rx="6"/><text class="t-c t-sm" x="804" y="279">P6</text>
+  <path class="arrow" d="M330 140 L396 70"/><path class="arrow" d="M330 155 L396 165"/><path class="arrow" d="M330 170 L396 260"/>
+</svg>
+<figcaption>Nine data fragments (green) and six parity fragments (amber) of 1 MB each, five per AZ. Losing a whole AZ removes 5 fragments, leaving 10, and any 9 are enough, so the segment stays readable with one more fragment of slack.</figcaption>
+</figure>
+<h3>8.2 Why 9+6 across three AZs</h3>
+<p>The scheme must survive an AZ outage. With RS(10,4) placed across 3 AZs we would put about 5 fragments in an AZ, and losing one AZ loses 5, which is more than the 4 parity fragments, so data is unreadable (not lost, but unavailable) until the AZ returns. To keep reads alive through an AZ loss, the number of fragments per AZ must be at most m, so with 3 AZs and equal spread we need m of at least n/3, which means (k + m) / 3 &lt;= m, or equivalently m &gt;= k/2. For k = 9 we need m = 6 (k/2 = 4.5, and we want one failure of slack beyond the AZ loss, so 6). The price is 1.67x instead of 1.4x. That is the real tradeoff in an interview: <b>cross-AZ tolerance costs extra parity</b>. A cheaper alternative is to erasure-code inside a single AZ and replicate whole objects across regions, which many cold tiers do, but then an AZ outage is a data outage for that bucket.</p>
+<h3>8.3 Why small objects are replicated</h3>
+<p>Two reasons. First, the IOPS arithmetic of section 3.5: erasure coding turns one read into k reads, which is cheap when the object is megabytes (the cost is bandwidth, which is plentiful) but wasteful when the object is 20 KB (the cost is seeks, which are scarce). Second, an object smaller than a fragment cannot be meaningfully split: a 20 KB object coded as 9+6 would write 15 tiny fragments with metadata and checksum overhead per fragment larger than the data. We therefore replicate objects below a threshold (1 MB here) three times, one replica per AZ, and optionally compact many small objects into a shared stripe later in the background. Tuning the threshold is a cost-versus-IOPS decision that can be revisited with real traffic data.</p>
+<h3>8.4 The durability math</h3>
+<p>What does "eleven nines" mean? It is the probability that a given object survives a year: 1 - 10^-11. With 200 billion objects, the expected annual loss is 200 x 10^9 x 10^-11 = 2 objects. Now compute what our schemes deliver under a simple model with independent failures.</p>
+<ul>
+<li>Annual failure rate of a drive: 2 percent (AFR = 0.02).</li>
+<li>Repair window: after a drive fails, the fragments it held are rebuilt in about 6 hours. During that window the object has reduced redundancy.</li>
+<li>Probability that a given other drive fails inside one 6-hour window: p = 0.02 x 6 / 8,760 hours per year = 1.37 x 10^-5.</li>
+</ul>
+<p><b>3x replication.</b> The object has 3 copies. The rate of a first failure is 3 x 0.02 = 0.06 per year. The object is lost only if both other copies fail in the repair window: p^2 = (1.37 x 10^-5)^2 = 1.9 x 10^-10. Annual loss probability = 0.06 x 1.9 x 10^-10 = <b>1.1 x 10^-11</b>, almost exactly 11 nines, with 3x overhead. This is why three copies became the folk standard.</p>
+<p><b>RS(10,4) in one location.</b> 14 fragments, first failure rate 14 x 0.02 = 0.28 per year. Loss needs 4 more of the other 13 fragments to fail within the window (5 total gone, more than m = 4): C(13,4) = 715 combinations x p^4 = 715 x 3.84 x 10^-20 = 2.7 x 10^-17. Times 0.28 gives <b>7.7 x 10^-18</b>, about 17 nines, with only 1.4x overhead.</p>
+<p><b>RS(9,6).</b> 15 fragments, 0.3 first failures per year, loss needs 6 more of the other 14 within the window (7 gone): C(14,6) = 3,003 x p^6 = 3,003 x 6.6 x 10^-30 = 2 x 10^-26, times 0.3 gives about <b>6 x 10^-27</b>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Bar chart of durability in nines for three schemes">
+  <text class="t-b" x="20" y="28">Number of nines of annual per-object durability (independent-failure model, 2 percent AFR, 6 hour repair)</text>
+  <line x1="260" y1="46" x2="260" y2="220" stroke="var(--fg)" stroke-width="1"/>
+  <text class="t-sm" x="20" y="84">3x replication (3.0x cost)</text>
+  <rect class="box" x="260" y="64" width="219" height="30" rx="4"/><text class="t-sm" x="486" y="84">about 11 nines (1.1e-11)</text>
+  <text class="t-sm" x="20" y="144">RS(10,4) (1.4x cost)</text>
+  <rect class="hit" x="260" y="124" width="342" height="30" rx="4"/><text class="t-sm" x="610" y="144">about 17 nines (7.7e-18)</text>
+  <text class="t-sm" x="20" y="204">RS(9,6) (1.67x cost)</text>
+  <rect class="cache" x="260" y="184" width="520" height="30" rx="4"/><text class="t-sm" x="788" y="204">about 26 nines</text>
+  <text class="t-sm" x="260" y="248">bar length is 20 px per nine; the 11-nine target is the first bar</text>
+</svg>
+<figcaption>In the independent-failure model erasure coding beats replication by many orders of magnitude at lower cost. The model is a lower bound on risk, not a promise: correlated failures dominate real loss, as explained below.</figcaption>
+</figure>
+<div class="callout watch"><b>Watch out</b> Do not claim 26 nines to an interviewer as if it were real. The independence assumption is false. Real loss comes from <b>correlated</b> events: a firmware bug that corrupts a whole drive model, a bad software release that writes wrong fragments, an operator deleting the wrong thing, a rack or power failure that takes many fragments at once, silent bit rot found only after the other fragments also rotted, and repair itself falling behind. These make the true figure dominated by software and operations, not by the drive failure model. The design answers them with placement across failure domains (distinct servers, racks, AZs for each fragment), end-to-end checksums, background scrubbing, staged rollouts, and deletion safeguards. The math justifies the scheme; the processes justify the number.</div>
+<h3>8.5 The repair window is the hidden variable</h3>
+<p>Every formula above depends on the repair time T through p = AFR x T / 8,760. Halving T cuts p by half and the 3x loss probability by 4x and the RS(9,6) loss probability by 64x. So durability engineering is largely repair speed engineering: declustered placement (each drive's fragments have peers spread over thousands of other drives, so rebuilding reads from many sources and writes to many targets in parallel), repair prioritization (objects with the fewest remaining fragments are repaired first), and capacity headroom so there is somewhere to rebuild. Section 11 returns to this.</p>
+<h3>8.6 Tradeoff summary</h3>
+<table>
+<tr><th>Criterion</th><th>Replication (3x)</th><th>Erasure coding (9,6)</th></tr>
+<tr><td>Storage overhead</td><td>3.0x</td><td>1.67x</td></tr>
+<tr><td>Read cost, healthy</td><td>1 disk read</td><td>9 disk reads (only the data fragments, no math)</td></tr>
+<tr><td>Read cost, degraded</td><td>1 read from another copy</td><td>9 reads plus a reconstruction on the CPU</td></tr>
+<tr><td>Write cost</td><td>3 sequential writes</td><td>15 writes plus encoding</td></tr>
+<tr><td>Repair cost</td><td>copy 1 fragment</td><td>read 9, write 1 (6x less efficient than copy per byte)</td></tr>
+<tr><td>Small objects</td><td>good</td><td>poor (overhead per fragment)</td></tr>
+<tr><td>Best for</td><td>small and hot objects</td><td>large and warm or cold objects</td></tr>
+</table>
+<p>Choice: hybrid by object size, with the scheme recorded per segment in the metadata so the background mover can later re-encode objects that cool down from replication to erasure coding. Further background on codes and storage trade-offs is in <a href="../chapters/21-object-storage.html">Chapter 21</a> and replication basics are in <a href="../chapters/24-replication.html">Chapter 24</a>.</p>
+
+<h2 id="metadata-listing">9. Deep dive 2: the metadata path and listing</h2>
+<p>If the data plane is dumb, the metadata plane must be right. It must be linearizable (so a GET after a PUT sees the object), sorted (so LIST works), and scalable to 100 TB. Those three requirements point at a range-sharded, consensus-replicated ordered key-value store. Chapter-level background: <a href="../chapters/25-sharding.html">Chapter 25</a> (sharding), <a href="../chapters/24-replication.html">Chapter 24</a>, <a href="../chapters/29-consensus.html">Chapter 29</a>, and a full key-value design in <a href="c04-key-value-store.html">Case study 4</a>.</p>
+<h3>9.1 Range sharding versus hash sharding</h3>
+<table>
+<tr><th>Criterion</th><th>Hash(bucket, key) sharding</th><th>Range sharding on (bucket, key)</th></tr>
+<tr><td>Point GET / PUT</td><td>Even load, one shard</td><td>One shard (look up the range map)</td></tr>
+<tr><td>LIST with prefix</td><td>Must query every shard and merge: scatter-gather of 2,000 shards for one page</td><td>One or two adjacent shards, a sequential scan</td></tr>
+<tr><td>Hot spots</td><td>Rare except a single hot key</td><td>Sequential keys (timestamps, counters) hammer the last range</td></tr>
+<tr><td>Rebalancing</td><td>Consistent hashing moves slices</td><td>Split a hot range in two, move the half</td></tr>
+<tr><td>Fit</td><td>Pure key-value use</td><td>Required when ordered listing is a feature</td></tr>
+</table>
+<p>We choose <b>range sharding</b> because listing is part of the contract. The hotspot downside is handled by <b>automatic range splitting</b>: a shard splits when it exceeds a size (for example 50 GB) or a sustained request rate, and a coordinator moves the new half to a less loaded Raft group. The range map (which key interval lives on which shard) is small, about 2,000 entries plus splits, replicated to every front-end and refreshed through a version check: a shard that receives a request for a key outside its range returns "wrong shard" with the current map version and the front-end retries.</p>
+<h3>9.2 Executing a LIST</h3>
+<p>A request with <code>prefix=photos/2025/</code>, <code>delimiter=/</code> and <code>max-keys=1000</code> becomes an ordered scan of the key range from <code>photos/2025/</code> up to the end of that prefix. The delimiter rolls up keys that share a "folder": if the scan sees <code>photos/2025/jan/a.jpg</code> and the delimiter occurs after the prefix, it emits the common prefix <code>photos/2025/jan/</code> once and then <b>seeks</b> to the first key after that whole prefix (the prefix with its last byte incremented) instead of reading the possibly millions of keys in between. Without the skip, listing a bucket with one deep folder would scan every key under it. The response contains up to 1,000 entries plus a continuation token, which encodes the last key returned. The next request starts the scan strictly after that key, so pages are stable: they are defined by the key order, not by an offset that shifts when objects are inserted (the keyset pagination idea from <a href="../chapters/05-api-design.html">Chapter 5</a>).</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Listing a prefix across range shards with delimiter skipping">
+  <text class="t-b" x="20" y="26">Keys of bucket "bkt" in lexicographic order, split into range shards</text>
+  <rect class="db" x="20" y="44" width="260" height="290" rx="8"/><text class="t-b" x="32" y="66">Shard 41: [ "" , "photos/2025/m" )</text>
+  <text class="t-sm" x="36" y="96">docs/a.txt</text>
+  <text class="t-sm" x="36" y="116">logs/2025-01-01.gz</text>
+  <rect class="hit" x="30" y="128" width="240" height="22" rx="4"/><text class="t-sm" x="36" y="144">photos/2025/jan/a.jpg</text>
+  <rect class="miss" x="30" y="154" width="240" height="22" rx="4"/><text class="t-sm" x="36" y="170">photos/2025/jan/b.jpg  (skipped)</text>
+  <rect class="miss" x="30" y="180" width="240" height="22" rx="4"/><text class="t-sm" x="36" y="196">photos/2025/jan/c.jpg  (skipped)</text>
+  <rect class="hit" x="30" y="206" width="240" height="22" rx="4"/><text class="t-sm" x="36" y="222">photos/2025/feb/a.jpg</text>
+  <rect class="miss" x="30" y="232" width="240" height="22" rx="4"/><text class="t-sm" x="36" y="248">photos/2025/feb/z.jpg  (skipped)</text>
+  <rect class="hit" x="30" y="258" width="240" height="22" rx="4"/><text class="t-sm" x="36" y="274">photos/2025/index.html</text>
+
+  <rect class="db" x="320" y="44" width="260" height="290" rx="8"/><text class="t-b" x="332" y="66">Shard 42: ["photos/2025/m", ...)</text>
+  <rect class="hit" x="330" y="82" width="240" height="22" rx="4"/><text class="t-sm" x="336" y="98">photos/2025/mar/a.jpg</text>
+  <rect class="miss" x="330" y="108" width="240" height="22" rx="4"/><text class="t-sm" x="336" y="124">photos/2025/mar/b.jpg (skipped)</text>
+  <text class="t-sm" x="336" y="154">photos/2026/a.jpg  (outside prefix)</text>
+  <text class="t-sm" x="336" y="174">videos/x.mp4</text>
+
+  <rect class="box" x="630" y="44" width="250" height="290" rx="8"/><text class="t-b" x="642" y="66">Result for prefix photos/2025/</text>
+  <text class="t-sm" x="642" y="92">delimiter "/" , max-keys 1000</text>
+  <text class="t-sm" x="642" y="122">CommonPrefixes:</text>
+  <text class="t-sm" x="654" y="142">photos/2025/jan/</text>
+  <text class="t-sm" x="654" y="160">photos/2025/feb/</text>
+  <text class="t-sm" x="654" y="178">photos/2025/mar/</text>
+  <text class="t-sm" x="642" y="208">Contents:</text>
+  <text class="t-sm" x="654" y="228">photos/2025/index.html</text>
+  <text class="t-sm" x="642" y="262">One shard boundary crossed;</text>
+  <text class="t-sm" x="642" y="280">skips avoid reading 5 keys.</text>
+  <text class="t-sm" x="642" y="304">Token = last key emitted.</text>
+</svg>
+<figcaption>The prefix scan crosses a shard boundary but only touches two adjacent shards. Each time a common prefix is found, the scan seeks past every key beginning with it (red rows are never read). Results come back already sorted, so no merge step is needed.</figcaption>
+</figure>
+<h3>9.3 Consistency of LIST and of the whole commit</h3>
+<p>A PUT that has returned 200 must appear in the next LIST and a DELETE must disappear. Because the object's metadata row lives in exactly one shard and the LIST reads shards with linearizable reads (a read that goes through the Raft leader, with a read-index or lease check, see <a href="../chapters/28-cap-consistency.html">Chapter 28</a>), this holds without further work. The tricky case is a LIST scan that spans several shards at slightly different moments: it can return a result that never existed as a single state (a key added on shard 42 after the scan left shard 41). That is acceptable and matches S3's documented behaviour: a list is a series of ordered reads, each page strongly consistent, not a transactional snapshot of the bucket. Objects whose creation completed before the list started are guaranteed present; objects created during the list may or may not be.</p>
+<p>Operations that touch two keys, such as COPY, are two independent steps: the data is not copied at all (the new metadata row points at the same chunks, with a reference count raised, see section 11), then one metadata write creates the destination key. Bucket deletion needs an emptiness check, which we do by a range scan that returns the first key, protected by marking the bucket "deleting" so no new object can slip in.</p>
+<h3>9.4 Versioning and delete markers</h3>
+<p>With versioning on, a PUT adds a new row with a newer inverse version rather than replacing the old one, and a DELETE without a version id adds a <b>delete marker</b> row (a version with no data) so the latest-version lookup returns "not found" while older versions remain recoverable. A DELETE with a version id physically removes that row, which is when garbage collection becomes responsible for its chunks. Versioning is the reason metadata cannot simply "update in place": the row set of a key is a short ordered list.</p>
+
+<h2 id="multipart">10. Deep dive 3: multipart upload</h2>
+<p>A single PUT of a 2 TB file is a bad idea: one TCP connection limits throughput, a failure at 99 percent restarts from zero, and the front-end would hold the transfer state for hours. Multipart upload solves this by making each part an independent, retryable, parallel upload.</p>
+<h3>10.1 The protocol</h3>
+<ol>
+<li><b>Initiate.</b> The client calls <code>POST ?uploads</code>. The metadata service creates an <i>upload record</i> keyed by <code>(bucket, key, upload_id)</code>, where the upload id is a random string, and returns it. Nothing is visible in the bucket listing yet.</li>
+<li><b>Upload parts.</b> The client uploads parts numbered 1 to 10,000, each from 5 MiB to 5 GiB except that the last may be smaller. Parts can be sent in any order, in parallel, from different machines. Each part is stored exactly like a standalone object (segments, EC or replication, fragments on drives), and a <i>part record</i> <code>(upload_id, part_number) -> {etag, size, layout}</code> is committed to the metadata store. Re-uploading the same part number replaces the earlier copy (last write wins), which makes retries trivial. Part sizes are not required to be equal.</li>
+<li><b>Complete.</b> The client sends the list <code>[(1, etag1), (2, etag2), ...]</code>. The service checks that every listed part exists with a matching ETag, that all parts but the last meet the minimum size, and then performs <b>one atomic metadata transaction</b> that writes the final object row whose layout is simply the concatenation of the part layouts, and deletes the upload record. The data is never copied or re-encoded; completion is a metadata-only operation and takes milliseconds even for terabytes. If the client's Complete call times out and is retried, the service sees the upload id already completed and returns the same result.</li>
+<li><b>Abort.</b> The client may abort. The upload and part records are deleted and the part chunks become garbage.</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="Multipart upload flow with parallel parts and atomic completion">
+  <rect class="ext" x="20" y="150" width="130" height="70" rx="8"/><text class="t-c t-b" x="85" y="178">Client</text><text class="t-c t-sm" x="85" y="196">large file, 4 parts</text>
+  <rect class="box" x="230" y="30" width="170" height="40" rx="8"/><text class="t-c t-sm" x="315" y="55">part 1 (front-end, EC)</text>
+  <rect class="box" x="230" y="90" width="170" height="40" rx="8"/><text class="t-c t-sm" x="315" y="115">part 2 (front-end, EC)</text>
+  <rect class="box" x="230" y="150" width="170" height="40" rx="8"/><text class="t-c t-sm" x="315" y="175">part 3 retried (EC)</text>
+  <rect class="box" x="230" y="210" width="170" height="40" rx="8"/><text class="t-c t-sm" x="315" y="235">part 4 (last, small)</text>
+  <path class="arrow" d="M150 170 L226 50"/><path class="arrow" d="M150 175 L226 110"/><path class="arrow" d="M150 185 L226 170"/><path class="arrow" d="M150 195 L226 230"/>
+  <text class="t-sm" x="40" y="130">2. parts in parallel</text>
+  <rect class="db" x="480" y="40" width="190" height="130" rx="8"/><text class="t-c t-b" x="575" y="64">Upload table (metadata)</text>
+  <text class="t-sm" x="494" y="88">upload U: bucket, key</text>
+  <text class="t-sm" x="494" y="108">part 1: etag, layout</text>
+  <text class="t-sm" x="494" y="128">part 2: etag, layout</text>
+  <text class="t-sm" x="494" y="148">part 3: etag (latest wins)</text>
+  <path class="arrow" d="M400 50 L476 80"/><path class="arrow" d="M400 110 L476 100"/><path class="arrow" d="M400 170 L476 130"/><path class="arrow" d="M400 230 L476 150"/>
+  <rect class="hit" x="730" y="60" width="150" height="110" rx="8"/><text class="t-c t-b" x="805" y="86">Final object row</text><text class="t-c t-sm" x="805" y="108">layout = part 1 +</text><text class="t-c t-sm" x="805" y="124">part 2 + 3 + 4</text><text class="t-c t-sm" x="805" y="148">no data copied</text>
+  <path class="arrow-g" d="M670 110 L726 110"/><text class="t-c t-sm" x="698" y="100">4. Complete</text>
+  <rect class="miss" x="480" y="230" width="400" height="110" rx="8"/><text class="t-c t-b" x="680" y="256">Abandoned or replaced data becomes garbage</text>
+  <text class="t-c t-sm" x="680" y="280">first copy of part 3, parts of aborted uploads,</text>
+  <text class="t-c t-sm" x="680" y="298">uploads never completed (lifecycle: abort after N days)</text>
+  <text class="t-c t-sm" x="680" y="320">found by the collector in section 11</text>
+  <path class="arrow-r dash" d="M575 170 L600 226"/>
+  <text class="t-sm" x="20" y="270">1. Initiate returns upload id U</text>
+  <text class="t-sm" x="20" y="290">3. List parts (optional) to resume</text>
+</svg>
+<figcaption>Parts are ordinary stored chunks, committed one by one into an upload table. Complete is a single metadata transaction that stitches the part layouts into an object row. Superseded and abandoned parts leave garbage behind, which is why lifecycle rules for incomplete uploads matter.</figcaption>
+</figure>
+<h3>10.2 Details interviewers probe</h3>
+<ul>
+<li><b>The ETag of a multipart object.</b> A single-part object's ETag is typically the MD5 of its bytes. For multipart objects it is conventionally the MD5 of the concatenated binary MD5s of the parts followed by a dash and the part count, so it is not a content hash of the whole file. We stick to that convention for compatibility, and offer a stronger additional checksum header per part and per object for end-to-end integrity.</li>
+<li><b>Resuming.</b> After a crash the client calls List Parts, sees which parts are stored with which ETags, and uploads only the missing ones.</li>
+<li><b>Range GET of a multipart object.</b> Easy, because the layout is a list of segments with lengths: the front-end does a prefix-sum search to find which segment holds a byte offset, regardless of part boundaries.</li>
+<li><b>Cost of unfinished uploads.</b> Parts occupy storage until completed or aborted, so a bucket lifecycle rule "abort incomplete uploads after 7 days" is a standard safeguard, and quota accounting must count in-flight parts.</li>
+<li><b>Atomicity at Complete.</b> If the final object's layout and the delete of the upload record live on different shards, we either keep upload records on the same shard as the final key (the upload row key is <code>(bucket, key, upload_id)</code>, so it sorts right next to the object's rows) or use a transaction; co-locating by construction is the simpler and faster choice. Cross-shard transactions are covered in <a href="../chapters/31-distributed-transactions.html">Chapter 31</a>.</li>
+</ul>
+
+<h2 id="gc-repair">11. Deep dive 4: garbage collection, repair and scrubbing</h2>
+<p>Everything above creates chunks. Something must remove the ones nobody references and fix the ones that have lost fragments. The four sources of garbage are: overwritten or deleted objects, aborted or abandoned multipart parts, orphans from PUTs that wrote fragments but crashed before the metadata commit, and replaced chunks after repair or rebalancing. Because the commit is the metadata write, the rule is simple: <b>a chunk is live if and only if some committed metadata record (an object row, a part record, or a copy's shared reference) names it</b>.</p>
+<h3>11.1 Choosing a reclamation approach</h3>
+<table>
+<tr><th>Approach</th><th>How it works</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Synchronous delete</td><td>DELETE removes the row and immediately tells storage nodes to drop the fragments</td><td>Space returns fast, simple mental model</td><td>Crash between steps leaks space; deleting 5 TB blocks the request; cannot handle COPY sharing or in-flight reads</td></tr>
+<tr><td>Reference counting</td><td>Each chunk has a count of rows pointing at it, deleted when it hits zero</td><td>Exact, handles COPY sharing</td><td>Every PUT/DELETE/COPY updates a counter; counters drift after crashes and need reconciliation anyway</td></tr>
+<tr><td>Mark and sweep (scan)</td><td>Periodically enumerate all live chunk ids from metadata, enumerate chunk ids on the nodes, delete the difference older than a grace period</td><td>Self-healing, covers every leak, no hot-path cost</td><td>Delayed reclamation, a heavy scan, needs a careful grace period</td></tr>
+<tr><td>Hybrid</td><td>DELETE writes a tombstone and enqueues the chunks; a worker deletes them after a delay; periodic mark and sweep catches anything missed</td><td>Fast common path plus a safety net</td><td>Two mechanisms to operate</td></tr>
+</table>
+<p>We choose the <b>hybrid</b>. Counting alone is fragile, scanning alone is slow to reclaim, and together each fixes the other's weakness: the queue handles the 99 percent case within minutes, the periodic sweep makes the system self-healing so that no bug or crash can leak space forever.</p>
+<h3>11.2 The delete path</h3>
+<ol>
+<li>DELETE removes (or marks) the metadata row in one Raft write and returns immediately. The object is invisible from this moment.</li>
+<li>The same transaction appends the object's chunk ids to a <i>deletion queue</i> row in the metadata store (or a log) with a timestamp. Writing it in the same transaction means we never lose the intent.</li>
+<li>A GC worker takes entries older than a safety delay (for example 24 hours, which also gives an undelete or recovery window for operator mistakes and lets slow in-flight reads of the old object finish). For a chunk with a shared reference (COPY), it decrements the count and stops unless it reaches zero.</li>
+<li>For each chunk it sends delete commands to the storage nodes in the PG. The node marks the fragment dead in its local index. Space is not freed yet.</li>
+</ol>
+<h3>11.3 Extent compaction</h3>
+<p>Extents are immutable and append-only, so a deleted fragment leaves a hole inside a sealed extent. Reclaiming the space means <b>compaction</b>: when a sealed extent's garbage ratio crosses a threshold (say 50 percent), the node copies the remaining live fragments into a fresh extent, updates its local index, and deletes the old file. This is the same write-amplification trade as in log-structured storage (<a href="../chapters/19-storage-engines.html">Chapter 19</a>): a lower threshold reclaims space sooner but copies more live data. Picking the extent with the highest garbage ratio first (a greedy policy) gives the best space per byte copied. Compaction runs at low priority with a rate limit so it never starves client reads.</p>
+<h3>11.4 Mark and sweep and the grace period</h3>
+<p>The sweep runs per placement-group range, for example weekly. It builds a Bloom filter or sorted set of chunk ids referenced by metadata in that range, asks the storage nodes for their chunk ids, and for each node chunk absent from the live set whose <b>creation time is older than the grace period</b> issues a delete. The grace period is the safety valve for the race that would otherwise delete live data: a PUT writes fragments (time t0) and commits its metadata row seconds or minutes later (t1). A sweep that sees the fragment in the window t0 to t1 would call it garbage. The rule "never delete anything younger than G" with G much larger than the longest legitimate PUT time prevents this. We use 7 days, which also covers multipart parts, because part chunks are kept alive by the upload table, not the final object row, so the live set includes them (they are named by part records) and the sweep must scan upload tables too. Forgetting that is the classic way to delete a customer's in-flight multi-terabyte upload.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Chunk lifecycle from written to reclaimed">
+  <rect class="cache" x="20" y="130" width="140" height="70" rx="8"/><text class="t-c t-b" x="90" y="158">Written</text><text class="t-c t-sm" x="90" y="178">no metadata yet</text>
+  <rect class="hit" x="230" y="130" width="140" height="70" rx="8"/><text class="t-c t-b" x="300" y="158">Live</text><text class="t-c t-sm" x="300" y="178">named by a row</text>
+  <rect class="miss" x="440" y="130" width="140" height="70" rx="8"/><text class="t-c t-b" x="510" y="158">Dead</text><text class="t-c t-sm" x="510" y="178">row deleted, queued</text>
+  <rect class="miss" x="650" y="130" width="140" height="70" rx="8"/><text class="t-c t-b" x="720" y="158">Fragment gone</text><text class="t-c t-sm" x="720" y="178">hole in extent</text>
+  <rect class="db" x="650" y="250" width="140" height="56" rx="8"/><text class="t-c t-b" x="720" y="274">Reclaimed</text><text class="t-c t-sm" x="720" y="292">extent compacted</text>
+  <path class="arrow-g" d="M160 165 L226 165"/><text class="t-c t-sm" x="193" y="152">commit</text>
+  <path class="arrow-r" d="M370 165 L436 165"/><text class="t-c t-sm" x="403" y="152">delete</text>
+  <path class="arrow-r" d="M580 165 L646 165"/><text class="t-c t-sm" x="613" y="152">after 24 h</text>
+  <path class="arrow" d="M720 200 L720 246"/><text class="t-sm" x="728" y="228">garbage over 50 percent</text>
+  <path class="arrow-r dash" d="M90 130 C90 40 450 40 650 130"/>
+  <text class="t-c t-sm" x="360" y="48">orphan: never committed, older than 7 days, found by mark and sweep</text>
+  <path class="arrow dash" d="M300 200 L300 290"/><text class="t-sm" x="30" y="296">scrub verifies live chunks and repair rebuilds missing fragments</text>
+  <path class="arrow dash" d="M300 290 L300 204"/>
+</svg>
+<figcaption>A chunk is written first, becomes live when a metadata row names it, becomes dead when the row is deleted, and is finally physically reclaimed through delayed deletion plus extent compaction. The dashed top path is the leak case, a chunk that never reached the live state, which only the sweep can catch.</figcaption>
+</figure>
+<h3>11.5 Repair and scrubbing</h3>
+<p><b>Repair</b> restores redundancy. Storage nodes report health by heartbeat; the placement manager treats a node as suspected after missing heartbeats (using a failure detector from <a href="../chapters/33-gossip-merkle.html">Chapter 33</a>) and as failed after a longer timeout, for example 15 minutes, to avoid rebuilding everything for a reboot. When a drive or node is declared failed, the manager enumerates the PGs that included it. Placement is <b>declustered</b>: with about 13,000 drives and fixed 15-drive PGs numbering in the hundreds of thousands, each drive belongs to many PGs and its peers are spread across essentially the whole fleet, so rebuilding is a many-to-many transfer rather than one hot replacement disk running at 100 MB/s. A repair worker reads 9 surviving fragments of each affected chunk, recomputes the missing one, writes it to a spare drive chosen in the same AZ and on a different rack than the other fragments, and updates the PG membership. Chunks with the fewest remaining fragments are repaired first.</p>
+<p><b>Scrubbing</b> finds silent corruption (bit rot). Drives can return wrong bytes without any error. Every fragment carries a checksum (CRC32C is typical and hardware accelerated) stored with it in the index. Reads verify it. Because cold data is rarely read, a background scrubber re-reads every fragment on a cycle, for example every two to four weeks, verifies the checksum, and queues a repair for any mismatch. With a 14 TB drive and a 30 day cycle the scrub reads 14 TB / 2.6 million seconds = about 5.4 MB/s per drive, which is under 5 percent of a drive's sequential bandwidth. Scrubbing is what converts "silent" into "repaired within a known window", which keeps the durability math honest.</p>
+
+<h2 id="scaling">12. Scaling, hot spots and caching</h2>
+<ul>
+<li><b>Front-ends</b> are stateless: add servers behind a load balancer (<a href="../chapters/09-load-balancing.html">Chapter 9</a>). Because a large PUT streams for minutes, we use connection-count-aware balancing and drain connections gracefully during deploys.</li>
+<li><b>Storage nodes</b> scale by adding nodes; new empty nodes receive new PGs first, and only a bounded background rebalance moves existing chunks to even utilization. Because PGs are fixed groups, rebalancing moves whole PGs or individual fragments with the placement manager changing only the map.</li>
+<li><b>Metadata hot prefixes.</b> A customer writing a million keys per second with a timestamp prefix concentrates load on one range. The split-on-load mechanism divides the range as soon as sustained load exceeds a threshold, but a range can only split at key boundaries, and all new keys still append at the end. The pragmatic mitigations are to make keys less monotonic (a short hash prefix), and to let the service absorb bursts by returning HTTP 503 "SlowDown" with a retry hint so clients back off with jitter (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>). Splitting reacts in tens of seconds to minutes, so a sudden spike gets throttled briefly.</li>
+<li><b>Hot objects.</b> A viral object is read from the same fragments over and over. Put a CDN in front (<a href="../chapters/12-cdn.html">Chapter 12</a>) and keep a front-end RAM cache for small hot objects. The data plane additionally relies on the drives' page cache and a modest SSD tier for the hottest extents.</li>
+<li><b>Metadata caching.</b> Bucket configuration and the range map are cached everywhere. Object metadata for hot keys is cached on front-ends with short validity. We never cache LIST results across clients.</li>
+<li><b>Multi-tenancy.</b> Per-bucket and per-account request-rate limits protect shared shards, and metadata placement can isolate very large tenants on dedicated shard groups (cell style isolation, <a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>).</li>
+<li><b>Large-object throughput.</b> The client parallelizes with multipart (writes) and with several range GETs (reads). The service does not need to do anything special beyond supporting both.</li>
+</ul>
+
+<h2 id="failures">13. Failure modes, consistency and idempotency</h2>
+<table>
+<tr><th>What fails</th><th>What the user sees</th><th>Mitigation</th></tr>
+<tr><td>One storage drive</td><td>Nothing. Reads of its fragments use others</td><td>Repair rebuilds in about 6 hours, declustered</td></tr>
+<tr><td>One storage node (60 drives)</td><td>Nothing for reads, slightly more tail latency</td><td>Wait 15 minutes before rebuild to ignore reboots, then repair, highest-risk chunks first</td></tr>
+<tr><td>Whole AZ</td><td>Reads continue (10 fragments of 15 remain, enough). Writes continue if the placement manager can find 12 acks, with reduced redundancy marked for repair when the zone returns</td><td>Fragments per AZ at most 5 (RS 9,6); capacity headroom of about 30 percent so remaining AZs can absorb repair</td></tr>
+<tr><td>Slow drive (gray failure)</td><td>High p99</td><td>Hedged reads, 12-of-15 early write ack, per-drive latency tracking and demotion</td></tr>
+<tr><td>Front-end crash mid-PUT</td><td>Request fails, client retries</td><td>Fragments are orphans until the sweep; no half-visible object because the commit is atomic</td></tr>
+<tr><td>Metadata shard leader dies</td><td>A few seconds of errors for that key range</td><td>Raft elects a new leader (election timeout about 1 to 3 seconds); clients retry with backoff</td></tr>
+<tr><td>Metadata shard loses quorum (2 of 3 replicas)</td><td>That range is unavailable, other ranges unaffected</td><td>Replicas in three different AZs; failure domains independent; this is the CP choice of <a href="../chapters/28-cap-consistency.html">Chapter 28</a></td></tr>
+<tr><td>Silent corruption of a fragment</td><td>Checksum fails on read; a degraded read hides it</td><td>Read repair plus background scrubbing</td></tr>
+<tr><td>Bad software deployment writing wrong data</td><td>Potentially catastrophic and correlated</td><td>End-to-end checksum computed by the client and verified on write and read, canary deployments, per-release rollback, delayed delete window</td></tr>
+<tr><td>Placement manager down</td><td>New writes cannot allocate PGs</td><td>Front-ends cache pre-assigned PG batches; run as a replicated group; reads unaffected</td></tr>
+<tr><td>GC bug deletes live chunks</td><td>Permanent data loss, the worst case</td><td>24-hour delay on deletion, 7-day grace on orphans, sweeps in dry-run mode first, an independent check that a chunk is unreferenced just before issuing the delete, rate limits on delete volume with an alarm on anomalies</td></tr>
+</table>
+<h3>13.1 Consistency and idempotency decisions</h3>
+<p>The linearization point of every state change is one metadata write. Reads go through the same shard, so read-after-write holds. Overwrites are last-writer-wins by the order the metadata shard applies them; two concurrent PUTs to the same key both succeed and the later commit wins, and the loser's chunks become garbage, which is the correct behaviour (S3 documents the same). Conditional requests (<code>If-None-Match</code>, <code>If-Match</code>) are evaluated inside the shard's write so they are atomic. Retried PUTs are safe because each attempt writes new chunk ids (a random id per attempt) and commits at most one row; there is no way to produce a duplicate visible object other than by an explicit version. Chunk ids are random 128-bit ids generated by the front-end rather than content hashes, because deduplication by content would require a global lookup and leaks information across tenants (section 14).</p>
+<h3>13.2 Multi-region</h3>
+<p>Cross-region replication is asynchronous. A change feed from each metadata shard (an ordered log of PUT and DELETE events per key) is consumed by replicator workers that copy the object to the destination region's bucket. It requires versioning on both sides to make ordering and idempotency safe: the replicator applies "put version V of key K" and ignores one it has already applied. The destination lags by seconds to minutes (monitor the lag), and the recovery point objective for a regional disaster is that lag. See <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a> and <a href="../chapters/41-ha-dr.html">Chapter 41</a>. Strong consistency is a per-region promise.</p>
+
+<h2 id="security-ops">14. Security, monitoring, SLOs and cost</h2>
+<h3>14.1 Security and abuse</h3>
+<ul>
+<li><b>Authentication and authorization.</b> Signed requests; bucket policies and per-user permissions evaluated at the front-end; default deny and a "block public access" account setting, because misconfigured public buckets are the most common real-world data leak (<a href="../chapters/55-security.html">Chapter 55</a>).</li>
+<li><b>Presigned URLs.</b> A signed, expiring URL lets a browser upload or download one key directly without credentials. The signature covers method, path and expiry.</li>
+<li><b>Encryption.</b> TLS in transit. At rest, envelope encryption: a unique data key per object encrypts the bytes, the data key is encrypted by a bucket or account key held in a key management service, and the wrapped key is stored in the metadata row. Deleting a customer's key makes their data unreadable (crypto-shredding), which helps privacy erasure requests (<a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>).</li>
+<li><b>Dedup caution.</b> Cross-tenant deduplication reveals whether somebody else already stored a file, a known side channel, and conflicts with per-object keys. We do not deduplicate across accounts.</li>
+<li><b>Abuse.</b> Per-account rate limits and quotas, protection against enumeration of keys, and request-size caps to stop a slow-loris style client holding a front-end connection forever.</li>
+<li><b>Operator safety.</b> Two-person review for bulk deletes, object lock or retention (WORM, write once read many) for compliance buckets where deletion is refused until a date.</li>
+</ul>
+<h3>14.2 Monitoring and SLOs</h3>
+<table>
+<tr><th>Signal</th><th>Target or alarm</th></tr>
+<tr><td>Availability (non-5xx fraction of valid requests)</td><td>99.99 percent monthly; page when the burn rate exceeds budget (<a href="../chapters/54-observability-slos.html">Chapter 54</a>)</td></tr>
+<tr><td>GET first-byte latency p50, p99 (small objects)</td><td>about 30 ms and 100 ms</td></tr>
+<tr><td>PUT latency per MB, p99</td><td>tracked per size bucket, since size dominates</td></tr>
+<tr><td>Under-replicated chunk count and the age of the oldest</td><td>The key durability SLI. Alarm if the oldest degraded chunk is older than the 6 hour repair target</td></tr>
+<tr><td>Repair backlog and repair bandwidth</td><td>Backlog should drain faster than failures arrive</td></tr>
+<tr><td>Scrub coverage (percent verified within the last 30 days) and checksum failure rate</td><td>Coverage near 100 percent; a rising failure rate points to a bad drive batch or software fault</td></tr>
+<tr><td>GC: bytes pending deletion, orphan bytes found per sweep</td><td>A sudden jump in orphans means a PUT path bug; a jump in deletes means a possible runaway deletion</td></tr>
+<tr><td>Metadata shard skew and splits per hour</td><td>Detect hot prefixes before customers do</td></tr>
+<tr><td>Capacity: fill percentage per AZ</td><td>Order new hardware at 60 percent, hard stop at 80 percent, as repair needs headroom</td></tr>
+</table>
+<h3>14.3 Cost</h3>
+<p>The bill is dominated by drives, then by power and datacenter space, then by networking. Erasure coding avoids about 8,500 drives versus 3x replication (section 3.4). Cross-AZ bandwidth is a real cost in public clouds and a capacity limit in our own datacenters: each PUT of a 9 MB segment sends 15 MB, of which 10 MB crosses AZ boundaries, so cross-AZ ingest is about 1.1x the user bytes at the segment level and the rest of the 1.67x is intra-AZ spread, and a healthy GET prefers data fragments in the local AZ (5 of 9). Compaction and scrub I/O cost drive time rather than money directly. Storage classes (cold tiers using wider codes like RS(12,4) at 1.33x on slow high-density drives) are the lever for cost versus access latency, and lifecycle rules move data down tiers automatically.</p>
+
+<h2 id="evolution">15. Evolution: first build, 10x scale, alternatives</h2>
+<h3>15.1 What to build first</h3>
+<ol>
+<li><b>Phase 1 (MVP).</b> Front-end, a replicated metadata store on an existing database (a Raft-based SQL or key-value product, ordered by key), 3x replicated chunks on storage nodes with whole-object chunks, checksums, PUT/GET/DELETE/LIST, simple delayed-delete GC. This already reaches 10 PB with 11 nines.</li>
+<li><b>Phase 2.</b> Multipart upload, range GET, versioning, bucket policies, lifecycle, automatic range splitting, scrubbing and declustered repair.</li>
+<li><b>Phase 3.</b> Erasure coding for large objects with a background re-encoder that converts older replicated objects, multi-AZ placement, mark and sweep, cross-region replication.</li>
+<li><b>Phase 4.</b> Storage classes and tiering, local reconstruction codes, object lock, an own metadata engine tuned for the workload.</li>
+</ol>
+<h3>15.2 At 10x scale (1 EB, 2 trillion objects)</h3>
+<ul>
+<li>Metadata becomes 1 PB, so about 20,000 shards. The range map grows large; introduce a two-level (directory) map and move bucket-level routing into a cell-based design (<a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>), where each cell serves a subset of buckets with its own metadata and storage nodes, bounding blast radius.</li>
+<li>Repair traffic grows with the fleet (about 2,600 failed drives per year), so we adopt LRC to halve repair reads and larger spare capacity.</li>
+<li>Drive sizes keep growing (30 TB and larger), and a single failed drive takes longer to rebuild unless declustering gets wider; the larger the drive the more the repair window dominates durability, a trend to mention.</li>
+<li>Shingled (SMR) drives, which are natural fits for append-only extents, lower cost per TB at the price of poor random writes that our design never does.</li>
+<li>Small-object overhead: at 2 trillion objects, per-object metadata dominates; consider packing tiny objects into bundles with an index and keeping a small SSD tier for their metadata and data.</li>
+</ul>
+<h3>15.3 Alternatives not chosen</h3>
+<table>
+<tr><th>Alternative</th><th>Why not (as the primary design)</th></tr>
+<tr><td>Hash sharding the metadata</td><td>Breaks efficient LIST; we could add a secondary sorted index but then updates become two-shard writes</td></tr>
+<tr><td>A distributed file system (HDFS-like) underneath</td><td>Single namenode style metadata limits object count; directories are the wrong abstraction for billions of flat keys. See <a href="../chapters/23-other-stores.html">Chapter 23</a></td></tr>
+<tr><td>Consistent-hash ring with eventual consistency (the original Dynamo-style approach)</td><td>Cheap and available, but exposes stale reads and eventual listing, which complicates every client; strong consistency is now an expected feature</td></tr>
+<tr><td>Content-addressed chunks with global dedup</td><td>Saves space for duplicate data, but needs a global hash index, complicates GC (reference counts across tenants) and leaks cross-tenant information</td></tr>
+<tr><td>Quorum writes of all 15 fragments before acknowledging</td><td>Simpler reasoning but worse tail latency (the slowest drive of 15 sets the PUT time)</td></tr>
+<tr><td>Storing small objects inside metadata rows</td><td>Reasonable for under about 4 KB (saves a disk seek), but bloats the SSD tier; a possible optimization</td></tr>
+</table>
+
+<h2 id="qa">16. Interview Q&amp;A</h2>
+<details><summary>Why separate metadata from data, instead of storing both together in one distributed database?</summary>
+<p>The two have opposite shapes. Metadata is small (about 500 bytes per object), needs strong consistency, sorted order and random access, so it lives on SSD in a consensus-replicated, range-sharded store. Data is huge, write-once, read sequentially, and mostly needs cheap capacity and redundancy rather than consensus, so it lives on HDDs in append-only extents with erasure coding. Putting them in one store would either make bulk data pay for consensus and expensive SSDs, or make the index inherit the data tier's weak consistency. The split also lets us scale and tune each independently: metadata by shard count, data by drive count, and it makes the commit point crisp, one metadata write.</p></details>
+<details><summary>A PUT crashes after writing all fragments but before the metadata commit. What state are we in and who cleans up?</summary>
+<p>The object is not visible, because visibility is defined solely by the metadata row, and the client received no success response, so it will retry. The fragments are orphans: chunks on storage nodes that no metadata row names. They are harmless except for wasted space. The mark-and-sweep collector finds them, since they exist on nodes but are absent from the live set, and deletes them after the grace period (7 days here), which exists so that it cannot confuse an orphan with a PUT that is still in progress. This is why we write data first and metadata last: the failure leaves garbage, never a dangling pointer to missing data.</p></details>
+<details><summary>Why is erasure coding cheaper than replication, and when would you still replicate?</summary>
+<p>Reed-Solomon (k, m) keeps k data and m parity fragments, any k of which rebuild the object, so overhead is (k+m)/k, such as 1.4x or 1.67x, versus 3x for triple replication, while tolerating more simultaneous failures. The costs are CPU for encoding, more disk operations per read (k reads), and repair that must read k fragments to rebuild one. So I replicate small objects (the extra seeks and per-fragment overhead dominate), very hot data where a single read matters, and use erasure coding for large, warm and cold objects. I record the scheme per chunk so objects can be migrated between schemes.</p></details>
+<details><summary>Walk through the durability math for 3 replicas versus a (10,4) code. What assumption could make it wrong?</summary>
+<p>With a 2 percent annual drive failure rate and a 6 hour repair window, the chance a given drive fails inside the window is about 1.4e-5. For 3 replicas, loss needs the other two copies to both fail in the window after a first failure: 0.06 per year times (1.4e-5)^2, about 1.1e-11, so 11 nines. For RS(10,4), loss needs 4 more of 13 other fragments to fail: 0.28 times C(13,4) = 715 times (1.4e-5)^4, about 7.7e-18. The assumption that breaks is independence. Real losses come from correlated events such as a firmware bug, a rack or power failure, a bad software release, or operator error, and from repair being slower than assumed. That is why placement spreads fragments over failure domains, we verify checksums end to end, and we measure the age of the oldest under-redundant chunk as the key durability metric.</p></details>
+<details><summary>How does LIST with a delimiter work efficiently when a bucket has billions of keys?</summary>
+<p>Keys are stored sorted in a range-sharded store, so a prefix is a contiguous range and a list is a sequential scan of one or two adjacent shards. With a delimiter, when the scan meets a key containing the delimiter after the prefix, it records the common prefix once and then seeks directly past all keys that start with it, so the work is proportional to the number of distinct entries returned, not the number of keys underneath. Pagination uses a continuation token holding the last key, which stays correct as keys are inserted. The reason we did not use hash sharding is that it would force a scatter-gather across all 2,000 shards for every page.</p></details>
+<details><summary>How would you implement multipart upload so that Complete is fast and atomic for a 5 TB object?</summary>
+<p>Each part is stored as ordinary chunks and recorded in an upload table keyed by upload id and part number. Complete does not move any data: after checking every listed part exists with the matching ETag and that non-final parts meet the minimum size, it writes one metadata row whose layout is the concatenation of the part layouts and deletes the upload record, in a single transaction on one shard (we co-locate upload records with the final key's range to avoid cross-shard transactions). So it takes milliseconds regardless of size and is retry-safe: a second Complete for the same upload id returns the existing result. Superseded or abandoned parts become garbage, collected by the delayed-delete queue and by a lifecycle rule that aborts incomplete uploads after some days.</p></details>
+<details><summary>What does garbage collection need to be careful about, and what happens if it has a bug?</summary>
+<p>The dangerous direction is deleting live data. Races include a chunk that is written but not yet committed, multipart parts that are named only by upload records, chunks shared by a COPY, and reads still in flight on an object just deleted. We defend with several layers: deletion is delayed 24 hours after the row is removed, orphan cleanup requires a 7 day grace period, the live set includes upload tables and shared references, the worker rechecks that the chunk is unreferenced immediately before deleting, delete volume is rate limited with anomaly alarms, and new GC logic first runs in report-only mode. A GC bug that deletes live data is a data loss incident, so these safeguards matter more than reclamation speed.</p></details>
+<details><summary>Hot prefix: one tenant writes sequential keys at 100k per second. What happens and what do you do?</summary>
+<p>Sequential keys all land in the last range of the key space, so a single metadata shard (one Raft leader) takes all the writes. Automatic splitting divides a range when its load or size crosses a threshold, but because new keys always arrive at the end, the hot range keeps being the newest one. The service therefore returns 503 SlowDown to shed the excess so clients back off with jitter, and splits as quickly as it can, which spreads existing keys but not the append hot spot. The real fix is on the key design: add a short hash or random prefix, or shard by an id, which spreads writes across ranges at the cost of making a time-ordered listing a multi-prefix operation. We also document recommended request rates per prefix.</p></details>
+<details><summary>How do you provide strong read-after-write consistency, and what does it cost?</summary>
+<p>Every object's metadata lives on one shard replicated by Raft, and both the commit and the reads go through that shard's leader (or a lease or read-index confirmed read), so any read after an acknowledged write observes it. The cost is that a metadata read cannot be served from a stale follower or a long-lived cache without validation, so reads pay a leader hop and the shard leader is a bottleneck for a hot key, and a shard that loses quorum becomes unavailable (a CP choice). We soften this with leader leases to avoid a per-read quorum round trip, with CDN and front-end caches only for objects where staleness is acceptable (immutable versioned objects), and with replicas in three AZs so single-AZ failures do not break quorum.</p></details>
+<details><summary>How do you detect and handle silent data corruption?</summary>
+<p>Defense in depth. The client or front-end computes a checksum of the whole object, which is verified before the commit and stored in the metadata. Each fragment has its own CRC computed at write and stored next to it. Every read verifies the fragment CRC, and a mismatch triggers a degraded read from other fragments plus a repair job (read repair). A continuous scrubber re-reads all data about every 30 days so cold data does not rot unnoticed, at a bandwidth of only about 5 MB/s per drive. Corruption becomes an event with a detection time and a repair time, and those two numbers feed straight back into the durability math as the repair window.</p></details>
+<details><summary>How does the design change if the interviewer asks for cross-region durability?</summary>
+<p>I would add asynchronous replication driven by the metadata change feed, requiring versioning so applying an event is idempotent and ordered per key. Replicator workers copy new versions to the destination region, which stores them with its own erasure coding and its own metadata commit. The replication lag becomes an SLO that defines the recovery point objective for a regional disaster, with a priority option for critical buckets. Strong consistency stays within a region; across regions the second copy is eventually consistent, and a failover must decide how to handle the writes not yet replicated.</p></details>
+
+<h2 id="connects">17. Connects to and recap</h2>
+<p class="connects"><b>Connects to:</b> the technology background is <a href="../chapters/21-object-storage.html">Chapter 21</a> (object storage), with <a href="../chapters/19-storage-engines.html">Chapter 19</a> (LSM trees and append-only logs), <a href="../chapters/24-replication.html">Chapter 24</a> and <a href="../chapters/25-sharding.html">Chapter 25</a> (replication and range sharding), <a href="../chapters/29-consensus.html">Chapter 29</a> (Raft for the metadata shards), <a href="../chapters/28-cap-consistency.html">Chapter 28</a> (strong consistency and CP), <a href="../chapters/33-gossip-merkle.html">Chapter 33</a> (failure detection and checksums), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotent retries), <a href="../chapters/41-ha-dr.html">Chapter 41</a> and <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a> (AZ and region failure), <a href="../chapters/12-cdn.html">Chapter 12</a> (CDN in front), and <a href="../chapters/54-observability-slos.html">Chapter 54</a> (SLOs). Related case studies: <a href="c02-pastebin.html">Case study 2</a> (using object storage), <a href="c09-file-sync.html">Case study 9</a> (chunking and dedup on top of blobs), <a href="c04-key-value-store.html">Case study 4</a> (the key-value ideas behind the metadata tier), <a href="c10-video-streaming.html">Case study 10</a> (a large consumer of object storage) and <a href="c21-lock-service.html">Case study 21</a> (the consensus service our placement manager resembles).</p>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2>
+<ul>
+<li>Split the system into a strongly consistent, range-sharded metadata index (100 TB, NVMe, Raft) and a dumb data plane of append-only extents on HDD. The PUT commits with one metadata write, so data goes first and the row goes last.</li>
+<li>Use erasure coding for large objects (RS 9+6 across three AZs, 1.67x) and replication for small ones (3x) to keep both cost and disk operations per second in budget: about 180 PB raw, 12,900 drives, 28 reads per second per drive at peak.</li>
+<li>Durability math: with a 2 percent AFR and a 6 hour repair window, 3 copies give about 11 nines, RS(10,4) about 17, and the real risk is correlated failure, so we place across failure domains, checksum end to end, scrub continuously, and repair fast with declustered placement.</li>
+<li>Listing needs ordered keys, so shard by range, skip common prefixes, paginate by last key, and split hot ranges.</li>
+<li>Multipart upload makes parts independent chunks and Complete a metadata-only atomic stitch. Abandoned parts are garbage.</li>
+<li>Garbage collection is a hybrid of delayed deletion queues, extent compaction and a mark-and-sweep with a long grace period. Its bugs are the most dangerous ones, so layer safeguards.</li>
+<li>Build in phases: replicated chunks first, then multipart and versioning, then erasure coding and tiering, then cells and local reconstruction codes at 10x.</li>
+</ul></div>
+
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

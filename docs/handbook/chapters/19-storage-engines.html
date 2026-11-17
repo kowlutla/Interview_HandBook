@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 19: Storage Engines | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="19-storage-engines">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+
+<main>
+<div class="kicker">Chapter 19 · Module 3 · The Data Layer</div>
+<h1>Storage Engines</h1>
+<p class="lead">Every database, from MySQL to Cassandra, sits on top of a storage engine: the component that decides how bytes are laid out on disk and how reads and writes reach them. This chapter explains the two dominant designs, B-trees and LSM-trees, step by step, along with the hardware facts that shape them, the durability traps (fsync, torn writes), and how to choose an engine for a workload.</p>
+
+<!-- ======================= 1 ======================= -->
+<h2 id="what">1. What a storage engine does</h2>
+
+<p>When you run <code>INSERT</code> or <code>SELECT</code>, several layers cooperate. The top layers parse the query, plan it, and check permissions (Chapter 18 covers query plans, indexes, transactions and isolation). At the very bottom is the <b>storage engine</b>: the part that actually keeps data on durable media and gives it back. Its job can be stated as a small set of promises:</p>
+<ul>
+  <li><b>Store and retrieve by key.</b> Given a key (a primary key, an index key, a row id), write a value and later find it again, quickly, even when the data is far larger than memory.</li>
+  <li><b>Support ordered access.</b> Most engines keep keys sorted so that range scans ("all orders for customer 7 from last week") are efficient.</li>
+  <li><b>Survive crashes.</b> After a power loss, acknowledged writes must still be there and the on-disk structure must not be corrupt.</li>
+  <li><b>Cooperate with concurrency.</b> Many readers and writers run at once. The engine usually provides the building blocks (latches, versions, locks) that the layer above uses for transactions.</li>
+  <li><b>Manage space.</b> Reuse space freed by deletes, compress data, and keep files from growing without bound.</li>
+</ul>
+
+<p>Engines are often pluggable. MySQL historically let you choose InnoDB (a B-tree engine) or MyRocks (an LSM engine built on RocksDB) under the same SQL layer. MongoDB uses WiredTiger. Cassandra and HBase have their own LSM-style engines. Embedded libraries such as RocksDB, LevelDB, LMDB and SQLite are engines that you link into your own process, and many distributed databases are really a replication and routing layer on top of one of them.</p>
+
+<p>Almost every design choice in an engine is a response to one fact: <b>the medium that holds durable data is much slower than memory and strongly prefers certain access patterns</b>. So the chapter begins with the hardware.</p>
+
+<div class="callout key"><b>Key idea</b>
+A storage engine is a data structure designed around the cost model of disks. The two big families differ in <i>when they pay for ordering</i>: a B-tree keeps data sorted on disk at all times and pays at write time by updating pages in place; an LSM-tree buffers writes, writes them out in sorted batches, and pays later by merging files in the background.
+</div>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="hardware">2. Memory hierarchy and disk access patterns</h2>
+
+<h3>2.1 The hierarchy and its costs</h3>
+<p>A computer has layers of storage, each larger, slower and cheaper than the one above (the latency numbers are the ones from <a href="02-estimation.html">Chapter 2</a>, and are approximate):</p>
+<table>
+<tr><th>Layer</th><th>Typical latency</th><th>Typical size</th><th>Survives power loss?</th></tr>
+<tr><td>CPU cache (L1 to L3)</td><td>1 to 40 ns</td><td>KB to tens of MB</td><td>No</td></tr>
+<tr><td>Main memory (DRAM)</td><td>about 100 ns</td><td>GB to TB</td><td>No</td></tr>
+<tr><td>NVMe SSD</td><td>about 20 to 100 microseconds per random read</td><td>hundreds of GB to tens of TB</td><td>Yes</td></tr>
+<tr><td>SATA SSD</td><td>about 100 to 200 microseconds</td><td>similar</td><td>Yes</td></tr>
+<tr><td>Spinning disk (HDD)</td><td>about 5 to 10 ms per random access (seek plus rotation)</td><td>up to tens of TB</td><td>Yes</td></tr>
+<tr><td>Network storage (EBS, SAN)</td><td>about 0.5 to few ms</td><td>effectively unlimited</td><td>Yes</td></tr>
+</table>
+<p>The gap between DRAM and an NVMe SSD is roughly 100 to 1000 times in latency, and between DRAM and a hard disk roughly 100,000 times. An engine that needs one disk access per operation is vastly slower than one that finds its data in memory. So engines try hard to keep the hot part of the data in memory (a <b>buffer pool</b> or a <b>block cache</b>) and to make each unavoidable disk access count.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Memory hierarchy pyramid with latency and durability">
+  <rect class="hit"   x="300" y="14"  width="300" height="40" rx="8"/><text class="t-c t-b" x="450" y="39">CPU caches: ~1-40 ns</text>
+  <rect class="cache" x="230" y="64"  width="440" height="40" rx="8"/><text class="t-c t-b" x="450" y="89">DRAM (buffer pool, memtable): ~100 ns, volatile</text>
+  <rect class="box"   x="150" y="114" width="600" height="40" rx="8"/><text class="t-c t-b" x="450" y="139">SSD: ~20-200 microseconds, durable, wears out with writes</text>
+  <rect class="db"    x="70"  y="164" width="760" height="40" rx="8"/><text class="t-c t-b" x="450" y="189">HDD or network volume: ~1-10 ms random access, durable, cheapest per GB</text>
+  <text class="t-sm" x="20"  y="244">Faster, smaller, more expensive, volatile at the top. Slower, larger, cheaper, durable at the bottom.</text>
+  <text class="t-sm" x="20"  y="260">The engine's job: keep the hot working set above the line, and touch the bottom layers in patterns they like.</text>
+</svg>
+<figcaption>Each step down is roughly 10 to 1000 times slower. Only the lower layers survive a power cut, which is why every engine needs a log (section 8) to make memory-resident changes durable.</figcaption>
+</figure>
+
+<h3>2.2 Sequential versus random access</h3>
+<p>On a hard disk, a random access requires physically moving the read head (seek) and waiting for the platter to rotate under it, about 5 to 10 ms. A hard disk can therefore do only about 100 to 200 random operations per second, but streaming sequentially it can move 100 to 200 MB per second. Sequential access is thus around a thousand times more efficient per byte.</p>
+<p>SSDs have no moving parts, so random reads are fast (tens to hundreds of thousands of operations per second on NVMe). Yet sequential access still wins, for several reasons. Bigger sequential requests amortize per-request overhead and allow the drive to use all its internal parallel flash channels. Sequential writes cause far less internal garbage collection work (see 2.3). And cloud network volumes impose IOPS and throughput limits, so fewer, larger operations stay under the cap. The lesson that shaped LSM-trees is: <b>turn many small random writes into few large sequential ones whenever possible.</b></p>
+
+<h3>2.3 SSD behaviour that engines must respect</h3>
+<p>Flash memory has awkward physical rules, and the SSD's controller hides them behind a <b>flash translation layer (FTL)</b>:</p>
+<ul>
+  <li><b>Pages and blocks.</b> Flash is read and programmed in small <i>pages</i> (commonly 4 to 16 KB) but erased only in much larger <i>erase blocks</i> (often hundreds of KB to several MB). A page cannot be overwritten in place; it must be erased first, and erase works on whole blocks.</li>
+  <li><b>Out-of-place updates and garbage collection.</b> To "overwrite" a logical page, the FTL writes the new content to a fresh page elsewhere and marks the old one stale. Later, garbage collection copies the still-valid pages out of a mostly stale block and erases it. This internal copying is <b>device-level write amplification</b>, and it comes on top of the amplification created by the engine itself.</li>
+  <li><b>Limited endurance.</b> Each cell survives a limited number of erase cycles. Drives are rated in drive writes per day (DWPD) or total bytes written. A write-amplifying engine under a heavy workload can wear out a drive in a couple of years, which is a real cost item.</li>
+  <li><b>Sequential, large, aligned writes help.</b> When an engine writes big files and later deletes them whole (as an LSM does with SSTables), whole erase blocks become stale together and garbage collection has little to copy. Small random overwrites scatter stale pages across blocks and make garbage collection expensive.</li>
+  <li><b>Queue depth.</b> NVMe drives reach full throughput only with many concurrent requests in flight, so engines use background threads and asynchronous I/O.</li>
+</ul>
+
+<h3>2.4 Page size and block size</h3>
+<p>Devices and file systems transfer data in fixed units: disks in 512 byte or 4 KB sectors, file systems in 4 KB blocks, and databases in <b>pages</b> (also called blocks). A page is the unit the engine reads and writes: 16 KB in InnoDB, 8 KB in PostgreSQL, 4 KB in many others, and typically 4 to 64 KB blocks in LSM engines (RocksDB defaults to 4 KB, though many deployments use larger). Reading one byte costs you a whole page. The size is a tradeoff: large pages mean fewer tree levels and more efficient scans, but waste I/O and memory when you only want one small row, and increase the cost of rewriting a page for a small change.</p>
+
+<div class="callout tip"><b>Interview tip</b>
+When asked "why not just update the row in place?", have the cost model ready: a small logical write becomes a whole-page physical write, random placement defeats the disk, and on an SSD the FTL amplifies it again. All the engine designs below are different answers to that one question.
+</div>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="btree">3. B-tree engines</h2>
+
+<h3>3.1 The structure</h3>
+<p>A <b>B-tree</b> (in practice almost always a B+tree) organizes data as a tree of fixed-size <b>pages</b>. Each page holds many sorted keys. <b>Internal pages</b> hold keys that act as signposts plus pointers to child pages ("keys below 400 go left, 400 to 700 go to the middle child, above 700 go right"). <b>Leaf pages</b> at the bottom hold the actual entries (the rows, or the index entries pointing to rows). In a B+tree, leaf pages are also linked to their neighbours, so a range scan finds the start key and then walks along the leaf chain without climbing back up.</p>
+<p>The key property is a very high <b>fanout</b> (children per page). With 16 KB pages and entries of a few tens of bytes, an internal page can point to several hundred children. Three levels can then address on the order of 100 million entries, and four levels well over a hundred billion. The top levels are small enough to stay permanently in memory, so a point lookup in a huge table typically costs one or at most two disk reads (the leaf, and maybe one internal page).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="B+tree with root, internal pages, leaf pages linked, and a lookup path highlighted">
+  <rect class="cache" x="330" y="20" width="240" height="44" rx="8"/><text class="t-c t-b" x="450" y="40">Root page</text><text class="t-c t-sm" x="450" y="56">keys: 400 | 700</text>
+  <rect class="box" x="90"  y="130" width="200" height="44" rx="8"/><text class="t-c t-b" x="190" y="150">Internal</text><text class="t-c t-sm" x="190" y="166">100 | 200 | 300</text>
+  <rect class="box" x="350" y="130" width="200" height="44" rx="8"/><text class="t-c t-b" x="450" y="150">Internal</text><text class="t-c t-sm" x="450" y="166">450 | 550 | 650</text>
+  <rect class="box" x="610" y="130" width="200" height="44" rx="8"/><text class="t-c t-b" x="710" y="150">Internal</text><text class="t-c t-sm" x="710" y="166">750 | 850 | 950</text>
+  <path class="arrow" d="M400 64 L200 126"/><path class="arrow-g" d="M450 64 L450 126"/><path class="arrow" d="M500 64 L700 126"/>
+  <rect class="db" x="30"  y="250" width="130" height="50" rx="8"/><text class="t-c t-b" x="95" y="270">Leaf</text><text class="t-c t-sm" x="95" y="287">rows 1-99</text>
+  <rect class="db" x="180" y="250" width="130" height="50" rx="8"/><text class="t-c t-b" x="245" y="270">Leaf</text><text class="t-c t-sm" x="245" y="287">rows 100-199</text>
+  <rect class="hit" x="330" y="250" width="130" height="50" rx="8"/><text class="t-c t-b" x="395" y="270">Leaf</text><text class="t-c t-sm" x="395" y="287">rows 400-449</text>
+  <rect class="hit" x="480" y="250" width="130" height="50" rx="8"/><text class="t-c t-b" x="545" y="270">Leaf</text><text class="t-c t-sm" x="545" y="287">rows 450-549</text>
+  <rect class="db" x="630" y="250" width="130" height="50" rx="8"/><text class="t-c t-b" x="695" y="270">Leaf</text><text class="t-c t-sm" x="695" y="287">rows 700-749</text>
+  <rect class="db" x="780" y="250" width="100" height="50" rx="8"/><text class="t-c t-b" x="830" y="270">Leaf</text><text class="t-c t-sm" x="830" y="287">rows 750+</text>
+  <path class="arrow-g" d="M430 174 L395 246"/><path class="arrow" d="M190 174 L245 246"/><path class="arrow" d="M720 174 L695 246"/>
+  <path class="arrow dash" d="M160 275 L176 275"/><path class="arrow dash" d="M310 275 L326 275"/><path class="arrow dash" d="M460 275 L476 275"/><path class="arrow dash" d="M610 275 L626 275"/><path class="arrow dash" d="M760 275 L776 275"/>
+  <text class="t-sm" x="30" y="322">Green path: a lookup for key 420 touches root, one internal page, one leaf. Dashed arrows: leaf-to-leaf links used by range scans.</text>
+</svg>
+<figcaption>A B+tree. A lookup descends from the root choosing one child per level (green). Range scans (for example keys 400 to 549) find the first leaf and then follow the dashed sibling links, reading pages in key order.</figcaption>
+</figure>
+
+<h3>3.2 Reads</h3>
+<p>A point read descends from the root: at each page, binary search the sorted keys to find the right child, then fetch that child (from the buffer pool if cached, otherwise from disk). The cost is the tree height, but upper levels are nearly always cached, so the real cost is about one disk read for a cold leaf and zero for a hot one. Reads are predictable: <b>one place</b> holds the latest version of each key, so there is no need to consult multiple files.</p>
+
+<h3>3.3 Writes: in-place update and page splits</h3>
+<p>To insert or update a key, the engine finds the right leaf, loads it into the buffer pool, modifies the page in memory, and marks it <b>dirty</b>. The dirty page is written back to its original location in the data file later (a <b>checkpoint</b> or background flusher does this). This is <b>update in place</b>: the same location on disk is overwritten.</p>
+<p>If the leaf has no room, the engine performs a <b>split</b>: allocate a new page, move about half the entries into it, and add a new signpost key and pointer to the parent. If the parent is full too, it splits as well, and splits may propagate up to the root, in which case the tree grows one level taller. Deletes and shrinking updates may leave pages sparse, and engines merge or rebalance underfull pages (some only lazily). Because splits leave pages roughly half full, a randomly filled B-tree typically settles around 65 to 75 percent page utilization, which is a built-in space overhead.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="B-tree leaf split in three steps">
+  <text class="t-b" x="20" y="22">Before: leaf is full, insert key 47</text>
+  <rect class="box" x="30" y="34" width="190" height="40" rx="8"/><text class="t-c t-sm" x="125" y="49">Parent: ... | 60 | ...</text><text class="t-c t-sm" x="125" y="65">pointer to leaf A</text>
+  <rect class="db" x="30" y="100" width="320" height="42" rx="8"/><text class="t-c" x="190" y="126">Leaf A: 10 20 30 40 50 55  (full)</text>
+  <text class="t-b" x="450" y="22">After: split into two leaves, parent gets a new signpost</text>
+  <rect class="box" x="450" y="34" width="300" height="40" rx="8"/><text class="t-c t-sm" x="600" y="49">Parent: ... | 47 | 60 | ...</text><text class="t-c t-sm" x="600" y="65">two pointers now: A and B</text>
+  <rect class="db" x="450" y="100" width="190" height="42" rx="8"/><text class="t-c" x="545" y="126">Leaf A: 10 20 30 40</text>
+  <rect class="hit" x="670" y="100" width="210" height="42" rx="8"/><text class="t-c" x="775" y="126">Leaf B: 47 50 55</text>
+  <path class="arrow" d="M600 74 L545 98"/><path class="arrow" d="M640 74 L760 98"/>
+  <path class="arrow" d="M352 121 L446 121"/><text class="t-sm" x="355" y="112">split</text>
+  <rect class="cache" x="30" y="180" width="850" height="92" rx="8"/>
+  <text class="t-b" x="46" y="204">Cost of this one logical insert</text>
+  <text class="t-sm" x="46" y="224">Pages dirtied: leaf A, new leaf B, parent (and possibly higher). Each is a whole page (for example 16 KB) written later to its own place.</text>
+  <text class="t-sm" x="46" y="242">A crash in the middle of a split would leave the tree inconsistent (parent points nowhere, or entries lost),</text>
+  <text class="t-sm" x="46" y="260">so splits must be protected by the write-ahead log (3.5) and by latches that keep concurrent readers safe.</text>
+</svg>
+<figcaption>A split touches at least three pages for one inserted key. This is the root of B-tree write amplification and also the reason crash safety needs a log.</figcaption>
+</figure>
+
+<h3>3.4 The buffer pool</h3>
+<p>The <b>buffer pool</b> is a region of memory (InnoDB's <code>innodb_buffer_pool_size</code>, PostgreSQL's <code>shared_buffers</code> plus the OS page cache) holding recently used pages. When a page is requested the engine looks it up in a hash table; on a hit no I/O occurs. On a miss it reads the page from disk, evicting a victim page chosen by an approximate LRU policy (InnoDB uses an LRU split into young and old regions to resist scans flushing out the hot set). If the victim is dirty it must be written first. A good rule for OLTP databases is to size the pool so that the hot working set fits; the cache hit ratio then dominates performance, and a database that "falls off a cliff" is usually one whose working set just outgrew memory.</p>
+<p>Because writes are absorbed in memory and flushed later, many updates to the same page coalesce into a single disk write. That is a real advantage when writes cluster on hot pages, and the opposite when writes are spread across a huge key space and every update dirties a different page.</p>
+
+<h3>3.5 The write-ahead log</h3>
+<p>Updating pages in place creates a dilemma. If the engine acknowledges a write while the change exists only in a dirty buffer pool page, a crash loses it. If it forces the page to disk before acknowledging, every commit costs a random page write (and a multi-page split cannot be written atomically). The standard solution is the <b>write-ahead log (WAL)</b>, called the redo log in InnoDB: before modifying data pages, append a compact description of the change to a sequential log file and flush the log to disk. Commit is acknowledged once the log record is durable. Data pages are written back lazily.</p>
+<p>After a crash, <b>recovery</b> reads the log from the last checkpoint and replays changes so that pages reflect every committed operation (and, in engines with undo, rolls back uncommitted ones). A <b>checkpoint</b> periodically records "all changes up to log position X are safely in the data files", so older log segments can be recycled and recovery starts at X instead of the beginning of time. Checkpoint interval is a tradeoff: frequent checkpoints shorten recovery but cause more flushing; infrequent ones make recovery slow and the log large.</p>
+<p>The WAL converts commit latency from a random page write into a sequential append, usually one flush. It is also the basis of replication in many systems (PostgreSQL streams WAL to replicas; MySQL's binlog plays a related role), and of point-in-time recovery. See <a href="24-replication.html">Chapter 24</a>.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="B-tree write path with WAL and buffer pool, sequence of steps">
+  <rect class="ext"   x="20"  y="20" width="120" height="40" rx="8"/><text class="t-c t-b" x="80" y="45">Client</text>
+  <rect class="box"   x="200" y="20" width="150" height="40" rx="8"/><text class="t-c t-b" x="275" y="45">Engine</text>
+  <rect class="cache" x="410" y="20" width="160" height="40" rx="8"/><text class="t-c t-b" x="490" y="45">Buffer pool (RAM)</text>
+  <rect class="db"    x="630" y="20" width="110" height="40" rx="8"/><text class="t-c t-b" x="685" y="45">WAL file</text>
+  <rect class="db"    x="780" y="20" width="110" height="40" rx="8"/><text class="t-c t-b" x="835" y="45">Data file</text>
+  <line class="life" x1="80" y1="60" x2="80" y2="330"/><line class="life" x1="275" y1="60" x2="275" y2="330"/><line class="life" x1="490" y1="60" x2="490" y2="330"/><line class="life" x1="685" y1="60" x2="685" y2="330"/><line class="life" x1="835" y1="60" x2="835" y2="330"/>
+  <path class="arrow" d="M80 90 L271 90"/><text class="t-sm" x="92" y="84">1. UPDATE key 42</text>
+  <path class="arrow" d="M275 125 L486 125"/><text class="t-sm" x="290" y="119">2. fetch leaf page (disk read if miss)</text>
+  <path class="arrow" d="M275 160 L681 160"/><text class="t-sm" x="400" y="154">3. append redo record, then flush (fsync)</text>
+  <path class="arrow" d="M275 195 L486 195"/><text class="t-sm" x="290" y="189">4. change page in RAM, mark dirty</text>
+  <path class="arrow-g" d="M271 230 L84 230"/><text class="t-sm" x="95" y="224">5. commit acknowledged</text>
+  <rect class="hit" x="400" y="258" width="470" height="60" rx="8"/>
+  <text class="t-sm" x="412" y="278">6. Later, in the background: flush dirty pages to the data file, then</text>
+  <text class="t-sm" x="412" y="296">advance the checkpoint so old WAL can be recycled.</text>
+  <path class="arrow dash" d="M494 300 L831 300"/>
+</svg>
+<figcaption>The client waits only for steps 1 to 5, and the only disk wait is the sequential WAL flush at step 3. The expensive random page write (step 6) happens off the critical path.</figcaption>
+</figure>
+
+<h3>3.6 Write amplification in B-trees</h3>
+<p><b>Write amplification</b> is the ratio of bytes the engine (and below it the SSD) physically writes to the bytes the application logically wrote. A B-tree commonly shows it in these ways: changing a 100 byte row rewrites a whole 16 KB page (up to about 160 times); the same change is also written once in the WAL; in engines that guard against torn pages (section 9) each page is written twice; and splits write extra pages. In practice a small random-update workload on a B-tree can write tens of times more bytes to disk than the application sent. On top of that, the SSD's own garbage collection adds a factor, usually between 1.5 and 3 for random overwrite patterns.</p>
+
+<h3>3.7 Concurrency and variants</h3>
+<p>Many threads traverse and modify the tree at once. Engines use short-lived <b>latches</b> (lightweight internal locks, distinct from transaction locks) on pages, with techniques such as latch coupling (hold the parent only until the child is latched) and optimistic descent. Row-level versioning (MVCC, see <a href="18-relational-internals.html">Chapter 18</a>) is layered on top: InnoDB keeps old row versions in undo logs, while PostgreSQL keeps old tuple versions in the heap and relies on <code>VACUUM</code> to reclaim them. Variants worth knowing by name: <b>copy-on-write B-trees</b> (LMDB, BoltDB) never overwrite pages but write new copies up to a new root, which removes the need for a WAL and gives cheap snapshots at the cost of extra writes; and <b>Fractal tree / B-epsilon trees</b> buffer messages in internal nodes to cut write cost, blending B-tree and LSM ideas.</p>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="lsm">4. LSM-tree engines</h2>
+
+<p>The <b>Log-Structured Merge-tree (LSM-tree)</b> starts from the opposite premise: never update anything in place. All writes go to memory and a sequential log, and are later written to disk as large, sorted, <b>immutable</b> files. The cost of keeping data ordered is paid in the background by merging files. LevelDB, RocksDB, Cassandra, HBase, ScyllaDB, and many others work this way.</p>
+
+<h3>4.1 The components</h3>
+<ul>
+  <li><b>Memtable.</b> An in-memory sorted structure (a skip list or balanced tree) that receives all new writes. Lookups check it first. Because it is in memory, inserts are fast and keep keys sorted.</li>
+  <li><b>WAL (commit log).</b> Every write is also appended to a sequential log file before being acknowledged, so the memtable can be rebuilt after a crash. One log segment corresponds to one memtable and is deleted once that memtable is safely flushed.</li>
+  <li><b>Immutable memtable.</b> When the active memtable reaches a size limit (commonly tens to a few hundred MB), it is frozen (becomes read-only) and a fresh memtable and WAL segment take over, so writers are not blocked while the frozen one is written out.</li>
+  <li><b>SSTable (Sorted String Table).</b> The flushed file: key-value entries in sorted key order, written once and never modified. Internally it is divided into <b>data blocks</b> (typically 4 to 64 KB, usually compressed), followed by an <b>index block</b> mapping each block's first key to its offset, a <b>bloom filter</b> block (see 4.4), and a footer that locates them.</li>
+  <li><b>Levels or tiers.</b> SSTables are organized into groups that compaction (4.5) maintains.</li>
+  <li><b>Manifest.</b> A small log that records which SSTables are currently live, so a restart knows the exact set of files. Swapping old files for new ones is one atomic manifest update.</li>
+</ul>
+
+<h3>4.2 The write path, step by step</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="LSM write path: WAL append, memtable insert, freeze, flush to level 0, compaction">
+  <rect class="ext" x="20" y="150" width="110" height="46" rx="10"/><text class="t-c t-b" x="75" y="178">Client write</text>
+  <rect class="db" x="200" y="40" width="160" height="50" rx="8"/><text class="t-c t-b" x="280" y="62">WAL (disk)</text><text class="t-c t-sm" x="280" y="80">sequential append</text>
+  <rect class="cache" x="200" y="150" width="160" height="50" rx="8"/><text class="t-c t-b" x="280" y="172">Active memtable</text><text class="t-c t-sm" x="280" y="190">RAM, sorted</text>
+  <rect class="cache" x="420" y="150" width="160" height="50" rx="8"/><text class="t-c t-b" x="500" y="172">Immutable memtable</text><text class="t-c t-sm" x="500" y="190">frozen, awaiting flush</text>
+  <rect class="db" x="640" y="150" width="230" height="50" rx="8"/><text class="t-c t-b" x="755" y="172">Level 0 SSTables</text><text class="t-c t-sm" x="755" y="190">may overlap in key range</text>
+  <rect class="db" x="640" y="250" width="230" height="50" rx="8"/><text class="t-c t-b" x="755" y="272">Level 1 SSTables</text><text class="t-c t-sm" x="755" y="290">non-overlapping, sorted</text>
+  <rect class="db" x="640" y="330" width="230" height="50" rx="8"/><text class="t-c t-b" x="755" y="352">Level 2 ... Level N</text><text class="t-c t-sm" x="755" y="370">each about 10x larger</text>
+  <path class="arrow" d="M130 165 L196 70"/><text class="t-sm" x="100" y="108">1</text>
+  <path class="arrow" d="M130 175 L196 175"/><text class="t-sm" x="150" y="168">2</text>
+  <path class="arrow dash" d="M360 175 L416 175"/><text class="t-sm" x="372" y="168">3 full</text>
+  <path class="arrow" d="M580 175 L636 175"/><text class="t-sm" x="590" y="168">4 flush</text>
+  <path class="arrow dash" d="M755 200 L755 246"/><text class="t-sm" x="765" y="228">5 compact</text>
+  <path class="arrow dash" d="M755 300 L755 326"/>
+  <text class="t-sm" x="20" y="250">1. Append record to WAL (fsync per policy).</text>
+  <text class="t-sm" x="20" y="270">2. Insert into the memtable; ack the client.</text>
+  <text class="t-sm" x="20" y="290">3. Memtable reaches its size limit: freeze it,</text>
+  <text class="t-sm" x="20" y="308">    start a new memtable and WAL segment.</text>
+  <text class="t-sm" x="20" y="328">4. Background thread writes it as one sorted</text>
+  <text class="t-sm" x="20" y="346">    SSTable (a sequential write), WAL segment freed.</text>
+  <text class="t-sm" x="20" y="366">5. Compaction merges tables down the levels.</text>
+</svg>
+<figcaption>A write touches only a sequential log append and an in-memory insert before it is acknowledged. All the sorting and disk-layout work happens later, in batches, off the critical path.</figcaption>
+</figure>
+
+<p>Walk through it once in prose. A client writes <code>user:42 = Alice</code>. The engine appends a record to the WAL (one sequential write, flushed according to the durability policy, section 9) and inserts the pair into the memtable, which keeps it sorted. It acknowledges the client. No data file was touched. When the memtable fills up, it is frozen and replaced; a background thread streams the frozen memtable out to disk in key order as a new SSTable at level 0. Once the SSTable is durable and recorded in the manifest, the corresponding WAL segment is discarded. Because the whole flush is one large sequential write, the SSD or disk operates in its best mode.</p>
+<p><b>Updates and deletes are just more writes.</b> Updating key 42 inserts a newer version into the memtable, with a sequence number or timestamp; the old version sits in older files until compaction discards it. A <b>delete</b> cannot remove the old version (the files are immutable), so it inserts a <b>tombstone</b>, a marker meaning "this key is deleted as of this version". Reads that find the tombstone first return "not found". Tombstones themselves are dropped only when compaction is sure no older version of the key remains below them, and in distributed stores (Cassandra) only after a grace period so that replicas that missed the delete do not resurrect the data.</p>
+
+<h3>4.3 The read path, step by step</h3>
+<p>A read cannot know in advance which file holds the newest version of a key, so it must look in order from newest to oldest and stop at the first hit:</p>
+<ol>
+  <li>Check the active memtable.</li>
+  <li>Check any immutable memtables waiting for flush.</li>
+  <li>Check level 0 SSTables, newest first. These may overlap, so several can contain the key range.</li>
+  <li>For each deeper level, which has non-overlapping tables, binary search the table list to find the one table whose key range could contain the key, and check only that one.</li>
+  <li>Inside an SSTable: ask the <b>bloom filter</b> if the key might be present. If it says no, skip the table with zero disk reads. If maybe, use the index block to find the right data block, read it (or hit the block cache), and search within it.</li>
+  <li>The first version found wins. If it is a tombstone, the answer is "not found".</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="LSM read path from memtable through levels with bloom filter checks">
+  <rect class="ext" x="20" y="150" width="110" height="46" rx="10"/><text class="t-c t-b" x="75" y="178">GET key K</text>
+  <rect class="cache" x="190" y="30" width="190" height="44" rx="8"/><text class="t-c t-b" x="285" y="57">1. Memtable (RAM)</text>
+  <rect class="cache" x="190" y="90" width="190" height="44" rx="8"/><text class="t-c t-b" x="285" y="117">2. Immutable memtable</text>
+  <rect class="db" x="190" y="150" width="190" height="44" rx="8"/><text class="t-c t-b" x="285" y="177">3. L0: tables A, B, C</text>
+  <rect class="db" x="190" y="210" width="190" height="44" rx="8"/><text class="t-c t-b" x="285" y="237">4. L1: one table</text>
+  <rect class="db" x="190" y="270" width="190" height="44" rx="8"/><text class="t-c t-b" x="285" y="297">5. L2 ... LN: one each</text>
+  <path class="arrow" d="M130 165 L186 55"/><path class="arrow" d="M130 170 L186 112"/><path class="arrow" d="M130 173 L186 173"/><path class="arrow" d="M130 180 L186 232"/><path class="arrow" d="M130 188 L186 292"/>
+  <rect class="box" x="470" y="90" width="410" height="230" rx="10"/>
+  <text class="t-b" x="486" y="114">Inside each SSTable probe</text>
+  <rect class="miss" x="490" y="128" width="370" height="44" rx="8"/><text class="t-sm" x="502" y="147">a. Bloom filter in RAM: "definitely not here" (about 99% of the</text><text class="t-sm" x="502" y="162">   time for absent keys) means skip the table, no disk I/O.</text>
+  <rect class="cache" x="490" y="182" width="370" height="44" rx="8"/><text class="t-sm" x="502" y="201">b. Index block (usually cached): binary search to find the one</text><text class="t-sm" x="502" y="216">   data block whose key range covers K.</text>
+  <rect class="hit" x="490" y="236" width="370" height="64" rx="8"/><text class="t-sm" x="502" y="255">c. Read that one block (block cache or one disk read), search it.</text><text class="t-sm" x="502" y="271">   Found value: return it. Found tombstone: return not found.</text><text class="t-sm" x="502" y="287">   Not found: continue to the next older table or level.</text>
+  <path class="arrow dash" d="M380 172 L466 172"/>
+  <text class="t-sm" x="20" y="344">Newest data is searched first, so the first match is the current value. A missing key must be ruled out in every level.</text>
+</svg>
+<figcaption>The read path visits every place a newer version could hide. Bloom filters and caches make the common case cheap, but a read still checks more places than a B-tree read does.</figcaption>
+</figure>
+
+<h3>4.4 Bloom filters and block indexes</h3>
+<p>Without help, a key that does not exist (or lives only in the deepest level) would require checking a table at every level, which means a disk read for each. A <b>bloom filter</b> is a compact probabilistic set (see <a href="57-hashing-probabilistic.html">Chapter 57</a>): an array of bits and several hash functions. To add a key, set the bits its hashes point to. To test a key, check those bits: if any bit is zero the key is <i>definitely</i> absent; if all are one the key is <i>probably</i> present. It never gives false negatives, but gives false positives at a tunable rate. Using about 10 bits per key yields roughly a 1 percent false positive rate, which for a 1 billion key table is about 1.2 GB of filter, small compared to the data and normally kept in memory. With filters, a lookup for an absent key usually costs almost no disk reads, and a lookup for a present key costs about one data block read plus rare false-positive reads.</p>
+<p>Bloom filters help <b>point lookups only</b>. They cannot help range scans, which must consult every level that might contain keys in the range (RocksDB offers prefix bloom filters for a partial remedy). The <b>block index</b> inside each SSTable is what makes lookups within a file cheap: it is a small sorted list of "first key of block, offset", so one binary search finds the single block to read. Indexes and filters are the metadata that is worth keeping in RAM; data blocks are cached by a separate block cache.</p>
+
+<h3>4.5 Compaction</h3>
+<p>If flushed files only ever accumulated, reads would slowly degrade (more files to check), obsolete versions and tombstones would never be reclaimed, and space would balloon. <b>Compaction</b> is the background process that merges SSTables: it reads several sorted input files, performs a streaming merge (like the merge step of merge sort, which is why the structure is called "merge tree"), discards overwritten versions and eligible tombstones, and writes new sorted output files, after which the inputs are deleted. Compaction is what makes the LSM-tree work, and also the main source of its operational pain, because it consumes disk bandwidth, CPU and cache.</p>
+<p>The policy that decides which files to merge, and when, is the most important tuning decision. There are three families:</p>
+
+<h4>Leveled compaction (LevelDB, RocksDB default)</h4>
+<p>Data is organized into levels L1, L2, and so on, where each level is a set of SSTables covering <i>disjoint</i> key ranges, and each level is about 10 times larger than the previous one (the <b>size multiplier</b>). Level 0 is the exception: freshly flushed tables there can overlap. When a level exceeds its size budget, the engine picks a table (or a few) from it and merges them with <i>only the overlapping tables</i> in the next level, writing the results into that level. A key therefore lives in at most one table per level, so a read checks at most one table per level (plus the L0 tables). Space overhead is low (about 10 percent extra, because most data sits in the last level). The price is write amplification: with a multiplier of 10, a piece of data is rewritten about 10 times as it moves down each level, so total amplification is often 10 to 30 times.</p>
+
+<h4>Size-tiered compaction (Cassandra default, HBase, older RocksDB "universal")</h4>
+<p>Tables are grouped by <i>size</i>. When enough tables of similar size accumulate (Cassandra's default threshold is four), they are merged into one larger table. Tables of different tiers overlap freely in key range. Each piece of data is rewritten only when it joins a bigger tier, so write amplification is much lower (roughly proportional to the number of tiers, often single digits to low tens). But reads must check many overlapping tables (high read amplification), and space amplification is high: merging four tables temporarily needs room for both inputs and the output, and a merge of the biggest tier can need up to double the disk. A common rule is to keep disks at most about 50 percent full with this strategy.</p>
+
+<h4>FIFO and time-window compaction</h4>
+<p><b>FIFO</b> compaction does no merging at all: when total size or age passes a limit, the oldest SSTables are simply deleted. It suits data that is only valid for a short time (caches, recent logs) and gives write amplification near 1. <b>Time-window compaction</b> (Cassandra's TWCS) groups data by write time into windows, uses size-tiered merging inside the current window, and never merges windows together. Once a window is old, it is a fixed set of files, and when its data expires (TTL), the whole files are dropped with no merge work. This is ideal for time-series and metrics data written once and expired by age, provided you do not update old data.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="Leveled versus size-tiered compaction layouts">
+  <text class="t-b" x="20" y="22">Leveled: one table per key range per level</text>
+  <text class="t-sm" x="20" y="40">L1 (about 100 MB)</text>
+  <rect class="db" x="20"  y="48" width="100" height="30" rx="4"/><text class="t-c t-sm" x="70" y="68">a-d</text>
+  <rect class="db" x="124" y="48" width="100" height="30" rx="4"/><text class="t-c t-sm" x="174" y="68">e-k</text>
+  <rect class="db" x="228" y="48" width="100" height="30" rx="4"/><text class="t-c t-sm" x="278" y="68">l-r</text>
+  <rect class="db" x="332" y="48" width="100" height="30" rx="4"/><text class="t-c t-sm" x="382" y="68">s-z</text>
+  <text class="t-sm" x="20" y="102">L2 (about 1 GB)</text>
+  <rect class="db" x="20"  y="110" width="50" height="30" rx="4"/><text class="t-c t-sm" x="45" y="130">a-b</text>
+  <rect class="db" x="74"  y="110" width="50" height="30" rx="4"/><text class="t-c t-sm" x="99" y="130">c-d</text>
+  <rect class="hit" x="128" y="110" width="50" height="30" rx="4"/><text class="t-c t-sm" x="153" y="130">e-g</text>
+  <rect class="hit" x="182" y="110" width="50" height="30" rx="4"/><text class="t-c t-sm" x="207" y="130">h-k</text>
+  <rect class="db" x="236" y="110" width="50" height="30" rx="4"/><text class="t-c t-sm" x="261" y="130">l-n</text>
+  <rect class="db" x="290" y="110" width="50" height="30" rx="4"/><text class="t-c t-sm" x="315" y="130">o-r</text>
+  <rect class="db" x="344" y="110" width="50" height="30" rx="4"/><text class="t-c t-sm" x="369" y="130">s-v</text>
+  <rect class="db" x="398" y="110" width="34" height="30" rx="4"/><text class="t-c t-sm" x="415" y="130">w-z</text>
+  <path class="arrow" d="M174 78 L174 106"/>
+  <text class="t-sm" x="20" y="170">Compacting L1 table e-k merges with only the two overlapping L2 tables (green),</text>
+  <text class="t-sm" x="20" y="186">rewriting about 10x its own size. Reads check at most one table per level.</text>
+  <text class="t-b" x="470" y="22">Size-tiered: group by size, ranges overlap</text>
+  <text class="t-sm" x="470" y="40">Tier 0: small tables</text>
+  <rect class="db" x="470" y="48" width="48" height="30" rx="4"/><rect class="db" x="522" y="48" width="48" height="30" rx="4"/><rect class="db" x="574" y="48" width="48" height="30" rx="4"/><rect class="db" x="626" y="48" width="48" height="30" rx="4"/>
+  <text class="t-c t-sm" x="494" y="68">a-z</text><text class="t-c t-sm" x="546" y="68">a-z</text><text class="t-c t-sm" x="598" y="68">a-z</text><text class="t-c t-sm" x="650" y="68">a-z</text>
+  <text class="t-sm" x="470" y="102">Tier 1: 4x bigger</text>
+  <rect class="db" x="470" y="110" width="100" height="30" rx="4"/><rect class="db" x="574" y="110" width="100" height="30" rx="4"/><rect class="db" x="678" y="110" width="100" height="30" rx="4"/>
+  <text class="t-c t-sm" x="520" y="130">a-z</text><text class="t-c t-sm" x="624" y="130">a-z</text><text class="t-c t-sm" x="728" y="130">a-z</text>
+  <path class="arrow" d="M560 78 L560 106"/>
+  <text class="t-sm" x="470" y="170">When 4 similar tables exist they merge into one bigger table. Each byte is</text>
+  <text class="t-sm" x="470" y="186">rewritten once per tier, but a read may have to check every table.</text>
+  <rect class="cache" x="20" y="210" width="860" height="150" rx="8"/>
+  <text class="t-b" x="36" y="234">Choosing between them</text>
+  <text class="t-sm" x="36" y="256">Leveled: lowest read amplification and space amplification (about 1.1x), highest write amplification (10-30x). Pick for read-heavy or space-bound data.</text>
+  <text class="t-sm" x="36" y="278">Size-tiered: lowest write amplification (single digits to low tens), higher read amplification, space amplification up to 2x during merges. Pick for write-heavy ingest.</text>
+  <text class="t-sm" x="36" y="300">Time-window / FIFO: near-1x write amplification when data expires in whole time chunks (metrics, logs, events with TTL).</text>
+  <text class="t-sm" x="36" y="322">Hybrids exist: RocksDB can use leveled for the lower levels and a tiered-like approach at L0, and Cassandra offers unified compaction.</text>
+  <text class="t-sm" x="36" y="344">There is no free lunch; section 6 puts all three amplification numbers in one table.</text>
+</svg>
+<figcaption>Left, leveled compaction keeps each level a sorted, non-overlapping run, so a flush down one level rewrites only the overlapping neighbours. Right, size-tiered compaction merges similarly sized tables and tolerates overlap.</figcaption>
+</figure>
+
+<h3>4.6 Write stalls and compaction debt</h3>
+<p>Compaction must keep up with ingest. If writes arrive faster than the background threads can merge, level 0 accumulates tables (each one adds read cost) and pending compaction bytes grow. To protect itself the engine applies <b>backpressure</b>: first it <b>slows</b> writes down (RocksDB's write slowdown triggers when L0 file count or pending compaction bytes cross soft limits), and when hard limits are crossed it <b>stops</b> writes entirely until compaction catches up. This is a <b>write stall</b>, and from the application it looks like sudden multi-second latency spikes or timeouts at a throughput the system sustained a minute earlier. The causes are usually sustained ingest above the compaction budget (section 14), a burst after a slow disk or noisy neighbour, or too few background threads. Mitigations: provision disk bandwidth for the amplified rate, give compaction its own threads and rate limiter so it does not starve foreground I/O (and the reverse), spread load across more nodes (partitions), and alert on pending compaction bytes and L0 file count, which warn well before stalls. A related symptom is <b>read latency creep</b> as table counts grow, and <b>tombstone pile-ups</b> where scans must skip huge numbers of deleted entries (a notorious problem for queue-like workloads in Cassandra).</p>
+
+<div class="callout watch"><b>Watch out</b>
+Deleting data in an LSM-tree does not free space immediately and can make reads slower first. A tombstone is new data. Space returns only after compaction merges it with the data it covers, and bulk deletes by key range can trigger heavy compaction. If you can, expire data by whole files (TTL with time-window or FIFO compaction, or drop whole partitions or tables) instead of deleting rows.
+</div>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="compare">5. B-tree versus LSM-tree: how they differ in practice</h2>
+
+<p>Beyond the headline "B-trees read faster, LSM-trees write faster", the differences affect operations and cost:</p>
+<ul>
+  <li><b>Write pattern.</b> An LSM-tree writes in large sequential bursts (flush and compaction), friendly to SSDs and to the cloud volumes' throughput limits. A B-tree does small random page writes, plus a WAL.</li>
+  <li><b>Write amplification.</b> Often lower for LSM with tiered or time-window compaction, and comparable or higher for LSM with leveled compaction. A B-tree's amplification is mostly page size over row size, plus the log (and doublewrite); it is highest when rows are tiny and updates are randomly spread.</li>
+  <li><b>Space.</b> B-trees waste space through partially filled pages and fragmentation (65 to 75 percent utilization typical). LSM trees waste space on stale versions waiting for compaction but are denser per live byte and compress better, because immutable sorted blocks are compressed in bulk (section 10). Practitioners commonly report LSM-based stores using noticeably less disk than B-tree stores for the same data.</li>
+  <li><b>Latency predictability.</b> B-tree latency is steady until the working set exceeds the buffer pool or a checkpoint storm hits. LSM latency is excellent for writes but can show periodic spikes from compaction and stalls, so tail latency needs care.</li>
+  <li><b>Point lookup, absent keys.</b> B-trees pay a tree descent. LSM pays bloom filter probes per level; cheap with filters.</li>
+  <li><b>Range scans.</b> B-tree leaves are ordered and linked, so a scan is a sequential walk. An LSM range scan must merge iterators over all levels and memtables, which is slower and sensitive to tombstones, though still sequential within each file.</li>
+  <li><b>Transactions and locking.</b> A B-tree has one location per key, which makes row locking and range locking natural. LSM engines can implement transactions (RocksDB does, optimistic and pessimistic) but the multi-version, multi-file layout makes some guarantees (for example gap locks for serializable range reads) more complex.</li>
+  <li><b>Operational model.</b> B-trees need vacuum, bloat management, and index rebuilds. LSM trees need compaction tuning, and disk headroom.</li>
+</ul>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="amplification">6. Read, write and space amplification: the tradeoff</h2>
+
+<p>Three ratios summarise any storage engine design. Their definitions:</p>
+<ul>
+  <li><b>Write amplification (WA):</b> physical bytes written to storage divided by logical bytes the application wrote. It determines SSD wear and the disk bandwidth you must buy.</li>
+  <li><b>Read amplification (RA):</b> the number of disk reads (or bytes read) per logical lookup, or per scanned byte. It determines read latency and throughput.</li>
+  <li><b>Space amplification (SA):</b> bytes on disk divided by bytes of live logical data. It determines the storage bill and the free space needed for maintenance.</li>
+</ul>
+<p>There is a well-known tension, often called the <b>RUM conjecture</b> (Read, Update, Memory): improving two of the three tends to worsen the third. Bloom filters and more levels trade memory and write work for read speed; more compaction lowers read and space amplification but raises write amplification; lazy compaction lowers write amplification but raises the other two.</p>
+
+<table>
+<tr><th>Design</th><th>Write amp.</th><th>Read amp. (point read)</th><th>Space amp.</th><th>Notes</th></tr>
+<tr><td>B-tree, in place</td><td>High for small random rows (page size over row size, plus WAL, plus doublewrite): often 10 to 50x or more</td><td>Low: 1 leaf read, upper levels cached</td><td>About 1.3 to 1.5x (partly empty pages, bloat from old versions)</td><td>Predictable reads, strongest for read-heavy OLTP</td></tr>
+<tr><td>LSM, leveled</td><td>High: about 10 to 30x</td><td>Low to moderate: at most one table per level, bloom filters</td><td>Low: about 1.1x</td><td>Best reads and space among LSM options</td></tr>
+<tr><td>LSM, size-tiered</td><td>Low: roughly 3 to 10x (grows with tiers)</td><td>Higher: many overlapping tables per lookup</td><td>High: up to about 2x during merges</td><td>Best for write-heavy ingest</td></tr>
+<tr><td>LSM, FIFO / time-window</td><td>Near 1 to 2x</td><td>Depends on window count; fine for recent-data queries</td><td>Low if data expires by age</td><td>Time series, logs, TTL data</td></tr>
+<tr><td>Append-only log (no index)</td><td>1x</td><td>Full scan unless indexed</td><td>Grows until compacted</td><td>Building block, section 8</td></tr>
+</table>
+<p>The numbers are typical orders of magnitude, not guarantees: they depend heavily on row size, key distribution, tuning, and the hardware. Treat them as the vocabulary for reasoning, and measure your own workload for real figures.</p>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="examples">7. Real engines and what they are</h2>
+
+<table>
+<tr><th>Engine / system</th><th>Family</th><th>Key characteristics</th></tr>
+<tr><td><b>InnoDB</b> (MySQL)</td><td>B+tree, clustered</td><td>Rows are stored in the leaves of the primary key B+tree (a <i>clustered index</i>); secondary indexes store the primary key, so a secondary lookup is two tree descents. 16 KB pages, redo log (WAL), undo logs for MVCC, doublewrite buffer for torn pages, buffer pool with young/old LRU.</td></tr>
+<tr><td><b>PostgreSQL heap</b></td><td>Heap file plus B-tree indexes</td><td>Rows live unordered in a <i>heap</i> of 8 KB pages; all indexes (including the primary key) point to heap locations (tuple ids). An update writes a new tuple version, old versions are removed by <code>VACUUM</code>. WAL for durability and replication, full page writes after checkpoints to handle torn pages.</td></tr>
+<tr><td><b>LevelDB</b></td><td>LSM, leveled</td><td>Google's embedded library: single writer thread, memtable plus WAL, levels with 10x growth, SSTables. Simple and influential; limited concurrency in compaction.</td></tr>
+<tr><td><b>RocksDB</b></td><td>LSM, leveled / universal / FIFO</td><td>Facebook's fork of LevelDB with multi-threaded compaction, column families, rate limiter, many compaction styles, block cache, transactions, and widespread use as the engine under other systems (MyRocks, CockroachDB's earlier storage, TiKV, Kafka Streams state, Flink state).</td></tr>
+<tr><td><b>Cassandra</b> / ScyllaDB</td><td>LSM, size-tiered default; time-window and leveled options</td><td>Commit log plus memtables plus SSTables per table; per-partition data model; tombstones with a grace period (<code>gc_grace_seconds</code>, default 10 days) for distributed deletes; bloom filters per SSTable.</td></tr>
+<tr><td><b>HBase</b></td><td>LSM on a distributed file system</td><td>Each region has a WAL, a memstore per column family, and HFiles (SSTable-like) stored in HDFS; compactions are minor (merge a few files) and major (rewrite everything, purge deletes).</td></tr>
+<tr><td><b>WiredTiger</b> (MongoDB)</td><td>B-tree by default (LSM option exists)</td><td>Document store engine with in-memory page images and block-level compression (snappy, zstd), checkpoints plus a journal (WAL), document-level concurrency using MVCC and optimistic locking.</td></tr>
+<tr><td><b>LMDB / BoltDB</b></td><td>Copy-on-write B+tree</td><td>Memory-mapped, no WAL: each commit writes new pages and atomically flips a root pointer. Single writer, great readers, small and simple.</td></tr>
+</table>
+<p>Notice how the distributed databases layer on engines: Cassandra, HBase and ScyllaDB are replicated systems whose per-node engine is an LSM; MongoDB's per-node engine is WiredTiger; many newer systems (TiKV, YugabyteDB, and CockroachDB in its earlier versions, which later moved to its own LSM engine, Pebble) put a replication protocol on top of RocksDB or a RocksDB-derived engine. Replication and partitioning are covered in <a href="24-replication.html">Chapter 24</a> and <a href="25-sharding.html">Chapter 25</a>, and the NoSQL families in <a href="20-nosql.html">Chapter 20</a>.</p>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="logs">8. Append-only logs and log-structured designs</h2>
+
+<p>The simplest possible database is a file you only append to. Writing is as fast as the disk allows, because every write is sequential. Reading by key is the problem: you must scan the file, or keep an index. <b>Bitcask</b> (the original Riak engine) shows the minimal fix: keep an in-memory hash table mapping each key to the file offset of its latest value. Writes append a record and update the hash table; reads do one hash lookup and one disk read. Old data accumulates, so a background process rewrites ("compacts") the log keeping only the latest value per key. The limit is that all keys must fit in memory, and there are no range scans.</p>
+<p>The log idea recurs well beyond engines:</p>
+<ul>
+  <li><b>The WAL</b> in every engine is an append-only log of changes used for recovery.</li>
+  <li><b>Replication logs</b> ship the same sequence of changes to followers.</li>
+  <li><b>Kafka</b> and similar systems are distributed append-only logs that consumers read by offset (see <a href="34-queues-kafka.html">Chapter 34</a>).</li>
+  <li><b>Event sourcing</b> stores the log of events as the source of truth and derives current state from it (<a href="36-event-driven.html">Chapter 36</a>).</li>
+  <li><b>Log-structured file systems</b> and flash firmware (the FTL itself) use the same out-of-place principle.</li>
+</ul>
+<p>The common thread is that appending is the one operation hardware does best, and that immutable data is easy to cache, replicate, checksum and reason about. The cost is always <b>garbage</b>: stale entries must be reclaimed by some compaction or cleaning process, and the engine must choose when to pay that cost. SSTables are logs made sorted, so that reading by key is no longer a scan.</p>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="durability">9. Checksums, fsync and durability pitfalls</h2>
+
+<p>An engine promises that once it says "committed", the data survives a crash. Making that true is subtle, because between your application's <code>write()</code> call and the physical flash cells there are several caches, and each can lose data on power failure.</p>
+
+<h3>9.1 The write path to the platter</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Layers between application write and durable media, each with a cache that can lose data">
+  <rect class="ext"   x="10"  y="60" width="140" height="64" rx="8"/><text class="t-c t-b" x="80" y="88">Application</text><text class="t-c t-sm" x="80" y="106">write(fd, data)</text>
+  <rect class="cache" x="190" y="60" width="150" height="64" rx="8"/><text class="t-c t-b" x="265" y="88">OS page cache</text><text class="t-c t-sm" x="265" y="106">RAM, volatile</text>
+  <rect class="cache" x="380" y="60" width="150" height="64" rx="8"/><text class="t-c t-b" x="455" y="88">Drive write cache</text><text class="t-c t-sm" x="455" y="106">volatile unless PLP</text>
+  <rect class="db"    x="570" y="60" width="150" height="64" rx="8"/><text class="t-c t-b" x="645" y="88">Flash or platter</text><text class="t-c t-sm" x="645" y="106">durable</text>
+  <path class="arrow" d="M150 92 L186 92"/><path class="arrow" d="M340 92 L376 92"/><path class="arrow" d="M530 92 L566 92"/>
+  <text class="t-sm" x="190" y="150">write() returns here: data only in RAM.</text>
+  <text class="t-sm" x="190" y="168">fsync() asks the OS to push to the device</text>
+  <text class="t-sm" x="190" y="186">and issue a cache flush command to the drive.</text>
+  <text class="t-sm" x="430" y="212">A drive that acknowledges the flush while data</text>
+  <text class="t-sm" x="430" y="230">is still in volatile cache "lies" about durability.</text>
+  <rect class="miss" x="740" y="60" width="150" height="64" rx="8"/><text class="t-c t-b" x="815" y="88">Power loss</text><text class="t-c t-sm" x="815" y="106">everything volatile gone</text>
+</svg>
+<figcaption>A successful write call only means the OS has the data. Durability needs an fsync (or O_DSYNC style open flags), and a trustworthy drive. Enterprise SSDs with power-loss-protection capacitors can safely acknowledge from cache.</figcaption>
+</figure>
+
+<h3>9.2 fsync and its pitfalls</h3>
+<ul>
+  <li><b>fsync is expensive and is the commit bottleneck.</b> Each durable commit needs a flush, which takes from tens of microseconds on a good NVMe drive with power-loss protection to several milliseconds on a network volume. To avoid paying it per transaction, engines use <b>group commit</b>: gather the log records of many concurrent transactions and flush once for all of them. Throughput then scales with concurrency, at the cost of a small wait.</li>
+  <li><b>Durability knobs trade safety for speed.</b> InnoDB's <code>innodb_flush_log_at_trx_commit=1</code> flushes at every commit (safe); 2 writes to the OS cache each commit and flushes about once per second (can lose a second of data on an OS crash or power loss). PostgreSQL's <code>synchronous_commit=off</code> similarly risks losing the last few commits but never corrupts data. Cassandra's commit log defaults to <code>periodic</code> sync (every 10 seconds), relying on replication on other nodes for durability, while <code>batch</code> mode waits for the flush. Redis's AOF can fsync every write, every second, or never.</li>
+  <li><b>Drives can lie.</b> Some consumer SSDs and RAID controllers report a flush as complete while data still sits in volatile cache. The database did everything right and still loses committed data. Use drives or controllers with power-loss protection, or battery-backed caches, and test with power-pull tests for important systems.</li>
+  <li><b>fsync errors may be unrecoverable.</b> A famous case: PostgreSQL (and others) discovered that after a failed fsync on Linux, the kernel could mark the dirty pages clean and report success on a retry, silently dropping data. The safe response is to treat an fsync error as fatal and crash and recover from the log rather than retry. This is why engines panic on fsync failure.</li>
+  <li><b>Directory entries need syncing too.</b> Creating or renaming a file is durable only after fsync of the containing directory; engines that atomically swap a new manifest file into place must do both.</li>
+  <li><b>Cloud and virtual disks</b> add their own caching and replication layers; durability is whatever the service documents (an EBS write is replicated within an availability zone before it is acknowledged, for example), not what a local disk would imply.</li>
+</ul>
+
+<h3>9.3 Torn writes and the doublewrite buffer</h3>
+<p>A database page (16 KB) is larger than the unit the disk writes atomically (often 512 bytes or 4 KB). If power fails in the middle of a page write, the page on disk may be a mix of old and new bytes: a <b>torn page</b>. The WAL cannot repair it by itself, because redo records describe changes to a <i>consistent</i> old page, and a half-written page is neither old nor new.</p>
+<p>Engines defend in different ways:</p>
+<ul>
+  <li><b>InnoDB's doublewrite buffer.</b> Before writing dirty pages to their final locations, InnoDB first writes them sequentially to a special doublewrite area and flushes it, then writes them in place. After a crash, if a page in the data file is torn, a good copy exists in the doublewrite area; recovery restores it and then replays the redo log. It costs an extra sequential write of each page.</li>
+  <li><b>PostgreSQL full-page writes.</b> The first time a page is modified after a checkpoint, the entire page image is put in the WAL, so recovery can rebuild it from the log. It enlarges the WAL right after each checkpoint.</li>
+  <li><b>Copy-on-write designs</b> (LMDB, and LSM files that are only ever written whole) never overwrite a live page, so a torn write damages only an unreferenced new copy.</li>
+  <li><b>Atomic-write hardware or file systems</b> (some enterprise SSDs and ZFS-style file systems) can let you turn the extra protection off, only if the guarantee is real.</li>
+</ul>
+
+<h3>9.4 Checksums</h3>
+<p>Hardware and software also fail silently: bits flip in memory, firmware bugs write data to the wrong place, disks return stale data. Engines add a <b>checksum</b> (CRC32C or xxHash) to every page, WAL record, and SSTable block, verified on read. A mismatch means corruption was detected, and the system can fail loudly, skip the bad record (WAL tail after a crash legitimately ends with a partial record, detected by checksum or length), or repair from a replica. Without checksums, a corrupted block is silently served or, worse, compacted into new files and replicated. Checksums detect but do not correct errors; repair needs redundancy (replicas, erasure coding as in <a href="21-object-storage.html">Chapter 21</a>). Periodic <b>scrubbing</b> reads all data in the background to find latent corruption before the only good copy is lost.</p>
+
+<div class="callout watch"><b>Watch out</b>
+"Durable" is a property of the whole stack: engine settings, file system, volume type, drive firmware, and replication. A benchmark that shows a database committing 100,000 writes per second on a laptop is probably not flushing at all. When comparing engines, always ask what the sync policy was.
+</div>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="compression">10. Compression and encoding inside engines</h2>
+
+<p>Compression trades CPU for less I/O and less storage. Engines apply it at several levels:</p>
+<ul>
+  <li><b>Block compression.</b> Each SSTable data block (or B-tree page) is compressed independently with a general-purpose codec. LZ4 and Snappy are very fast and give around 2 to 3 times reduction on typical row data; Zstd gives better ratios at moderate CPU cost; zlib is slower. Because blocks are independent, a point read decompresses only one block. RocksDB commonly uses LZ4 for upper levels (hot, rewritten often, so compress cheaply) and Zstd for the bottom level (holds most data and is rewritten rarely).</li>
+  <li><b>Key prefix compression.</b> Sorted keys share long prefixes (<code>user:00042:name</code>, <code>user:00042:email</code>). Storing each key as the length of the shared prefix plus the differing suffix, with periodic full "restart points" for binary search, saves large amounts of space on key-heavy data.</li>
+  <li><b>Delta and dictionary encoding.</b> Sequences of numbers or timestamps are stored as differences from the previous value (delta of delta for regular timestamps), and low-cardinality strings are replaced by small integer codes via a dictionary. These are the foundation of time series and columnar formats (section 11); Facebook's Gorilla paper showed time series values compressing to a couple of bytes per point using delta-of-delta timestamps and XOR-encoded floats.</li>
+  <li><b>Run-length and bit-packing.</b> Repeated values are stored as (value, count), and small integers are packed into fewer bits than a full word.</li>
+  <li><b>Where compression pays off.</b> Compression works best on immutable, sorted, bulk data. That is the LSM case, which is one reason LSM stores often use less disk. B-tree pages are rewritten in place, so compressing them is harder: a changed page may no longer fit in its slot. WiredTiger and InnoDB handle this with page-level schemes (InnoDB's compressed pages, or hole-punching on file systems) at some complexity cost.</li>
+</ul>
+<p>Compression also changes the cache economics: whether the block cache holds compressed or uncompressed blocks decides how many rows fit in RAM versus how much CPU each hit costs. Engines usually cache uncompressed blocks and rely on the OS page cache for compressed ones. See <a href="07-serialization.html">Chapter 7</a> for the general compression tradeoffs in transport formats.</p>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="columnar">11. Row versus column layouts</h2>
+
+<p>Everything so far stored each row's fields together, a <b>row store</b>. That is ideal for OLTP (online transaction processing), where a request reads or writes a whole record by key: one page read returns every column. But analytical queries such as "average order value by country over 2 billion orders" touch a few columns of very many rows, and a row store would read every column of every row off disk to use two of them.</p>
+<p>A <b>column store</b> (Parquet and ORC files, ClickHouse, Redshift, BigQuery, Snowflake, Vertica) stores each column's values contiguously. A query that needs two of fifty columns reads about 4 percent of the bytes. And because a column holds values of one type, often repeated or sorted, it compresses extremely well: dictionary encoding for strings, run-length encoding for sorted low-cardinality columns, delta encoding for timestamps, commonly giving 5 to 10 times reduction or more versus a row layout. Execution engines can then process thousands of values at a time using CPU vector instructions (<b>vectorized execution</b>).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Row layout versus column layout on disk, and which bytes a query reads">
+  <text class="t-b" x="20" y="22">Row store: fields of one row are adjacent</text>
+  <rect class="db" x="20" y="34" width="400" height="30" rx="4"/><text class="t-sm" x="28" y="54">row1: id=1 | US | $20 | 2026-01-03 | ...</text>
+  <rect class="db" x="20" y="68" width="400" height="30" rx="4"/><text class="t-sm" x="28" y="88">row2: id=2 | DE | $35 | 2026-01-03 | ...</text>
+  <rect class="db" x="20" y="102" width="400" height="30" rx="4"/><text class="t-sm" x="28" y="122">row3: id=3 | US | $12 | 2026-01-04 | ...</text>
+  <text class="t-sm" x="20" y="152">Good: fetch or update one whole row = one page.</text>
+  <text class="t-sm" x="20" y="170">Bad for analytics: SUM(amount) still drags all columns off disk.</text>
+  <text class="t-b" x="470" y="22">Column store: values of one column are adjacent</text>
+  <rect class="box" x="470" y="34" width="95" height="98" rx="4"/><text class="t-c t-b" x="517" y="52">id</text><text class="t-c t-sm" x="517" y="76">1 2 3 ...</text><text class="t-c t-sm" x="517" y="96">delta</text>
+  <rect class="hit" x="575" y="34" width="95" height="98" rx="4"/><text class="t-c t-b" x="622" y="52">country</text><text class="t-c t-sm" x="622" y="76">US DE US</text><text class="t-c t-sm" x="622" y="96">dictionary</text>
+  <rect class="hit" x="680" y="34" width="95" height="98" rx="4"/><text class="t-c t-b" x="727" y="52">amount</text><text class="t-c t-sm" x="727" y="76">20 35 12</text><text class="t-c t-sm" x="727" y="96">bit-packed</text>
+  <rect class="box" x="785" y="34" width="95" height="98" rx="4"/><text class="t-c t-b" x="832" y="52">date</text><text class="t-c t-sm" x="832" y="76">01-03 ...</text><text class="t-c t-sm" x="832" y="96">run-length</text>
+  <text class="t-sm" x="470" y="152">Green columns are the only ones read for</text>
+  <text class="t-sm" x="470" y="170">SELECT country, SUM(amount) GROUP BY country.</text>
+  <rect class="cache" x="20" y="196" width="860" height="86" rx="8"/>
+  <text class="t-sm" x="36" y="220">Rows are reconstructed by position (the i-th value in every column file is row i), so single-row lookups and updates are costly.</text>
+  <text class="t-sm" x="36" y="240">Column stores therefore load data in big batches, keep new writes in a small row-oriented buffer (a delta store or memtable), and merge it</text>
+  <text class="t-sm" x="36" y="260">into immutable column segments in the background. That is an LSM idea again, applied to columnar files.</text>
+</svg>
+<figcaption>Same data, two layouts. A row layout favours "get everything about one thing"; a column layout favours "scan a few attributes of many things", and compresses better.</figcaption>
+</figure>
+
+<p>Hybrids exist: PAX layouts store columns inside each page, and HTAP databases keep both a row store for transactions and a column replica for analytics. The warehouse and OLAP side is covered in <a href="23-other-stores.html">Chapter 23</a>; the point for this chapter is that "row versus column" is a storage engine choice just like "B-tree versus LSM", and the two choices are independent: Parquet is column-oriented and immutable like an SSTable, and ClickHouse's MergeTree is both column-oriented and LSM-like.</p>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="inmemory">12. In-memory engines and persistence</h2>
+
+<p>If the whole dataset fits in RAM, the engine can drop the structures built to hide disk latency: no buffer pool, no page-oriented layout, pointer-based structures (hash tables, skip lists, tries) instead of wide B-tree pages. Redis, Memcached, VoltDB, SAP HANA's in-memory store, and Aerospike's index follow this idea. Reads and writes then cost hundreds of nanoseconds to microseconds, and a single node can handle hundreds of thousands to millions of operations per second.</p>
+<p>The obvious problem is that RAM is volatile and expensive (roughly 10 to 20 times the price of SSD per GB). In-memory systems add persistence in ways that stay off the fast path:</p>
+<ul>
+  <li><b>Append-only log (AOF in Redis).</b> Every write is appended to a log, with fsync every write, every second, or left to the OS. After a restart, the log is replayed. The log is periodically rewritten (compacted) into a smaller equivalent one.</li>
+  <li><b>Snapshots.</b> Periodically write a point-in-time dump of the whole dataset (Redis RDB, done in a forked child process using copy-on-write memory so serving continues). Restarting loads the snapshot. A snapshot alone loses everything since the last one.</li>
+  <li><b>Snapshot plus log.</b> The combination: restore the last snapshot, then replay the log tail. This is the same checkpoint plus WAL pattern as in a disk engine.</li>
+  <li><b>Replication.</b> Keep copies on other machines; a replica in another failure domain is often considered "durable enough" for caches and ephemeral state.</li>
+</ul>
+<p>Restart time is the hidden cost: loading hundreds of GB from a snapshot can take many minutes, during which that node serves nothing. Memory fragmentation, the cost of forking a very large process, and the working set limit (when data outgrows RAM, you must shard) matter too. Persistent-memory and "memory-first with disk overflow" engines try to blur the line. Redis internals and its persistence modes are covered in <a href="15-redis.html">Chapter 15</a>, and caching uses in <a href="13-caching-patterns.html">Chapter 13</a>.</p>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="choosing">13. Choosing an engine for a workload</h2>
+
+<p>Start from the dominant operation and the data lifetime, then check the tradeoffs above. The following guide summarises the usual reasoning:</p>
+<table>
+<tr><th>Workload</th><th>Leaning</th><th>Why</th></tr>
+<tr><td>Write-heavy ingest (events, logs, metrics, IoT), few updates, queries mostly recent data or by key</td><td>LSM with size-tiered or time-window compaction (Cassandra, ScyllaDB, HBase, RocksDB)</td><td>Sequential writes, low write amplification, and cheap expiry by dropping whole files.</td></tr>
+<tr><td>Read-heavy OLTP with point reads, secondary indexes, multi-row transactions</td><td>B-tree engine (InnoDB, PostgreSQL)</td><td>One predictable lookup, mature locking and MVCC, strong secondary-index and join support.</td></tr>
+<tr><td>Mixed read/write with large data and tight storage budget</td><td>LSM with leveled compaction (RocksDB, MyRocks)</td><td>Low space amplification and good compression; accept higher write amplification.</td></tr>
+<tr><td>Frequent range scans over ordered data</td><td>B-tree, or leveled LSM with tombstone care</td><td>Sibling-linked leaves give sequential scans; LSM scans must merge levels.</td></tr>
+<tr><td>Heavy updates to the same hot keys (counters, balances)</td><td>B-tree, or in-memory with log</td><td>Updates coalesce in the buffer pool; in an LSM each update is a new version needing later compaction.</td></tr>
+<tr><td>Large analytical scans and aggregations</td><td>Column store (Parquet, ClickHouse, warehouses)</td><td>Reads only needed columns, compresses well, vectorized execution.</td></tr>
+<tr><td>Ephemeral or latency-critical state that fits in RAM</td><td>In-memory engine with snapshot and/or log</td><td>Sub-millisecond latency; persistence off the hot path.</td></tr>
+<tr><td>Small, embedded, mostly-read config or metadata</td><td>Copy-on-write B-tree (LMDB), SQLite</td><td>No server, crash-safe without a WAL, trivial operations.</td></tr>
+</table>
+<p>Two cautions. First, the engine is rarely the whole decision: the data model, the query language, the replication model and the operational skill of your team often outweigh a 2x difference in write amplification. Second, most workloads are mixed and change over time, so favour what you can measure and tune. In an interview, state the dominant operation, name the amplification tradeoff, and say which number you would watch in production (compaction backlog for LSM, buffer pool hit ratio and checkpoint age for B-tree).</p>
+
+<!-- ======================= 14 ======================= -->
+<h2 id="budget">14. Capacity and the compaction I/O budget</h2>
+
+<p>An LSM store is only healthy if its disk has enough spare bandwidth for compaction. The budget calculation is short and worth doing in any interview where an LSM database is on the whiteboard.</p>
+<ol>
+  <li><b>Start with logical ingest.</b> Say each node ingests 20 MB/s of user data.</li>
+  <li><b>Multiply by write amplification.</b> WAL adds 1x, the flush adds 1x, and compaction adds the rest. With leveled compaction and a multiplier of 10 over 4 levels, about 20x in total is realistic: 20 MB/s times 20 is 400 MB/s of device writes. With size-tiered and about 5 tiers, roughly 6 to 8x: 120 to 160 MB/s.</li>
+  <li><b>Add the read side of compaction.</b> Compaction also reads what it merges, about as many bytes as it writes, so the same budget again in reads. Disk bandwidth must cover reads plus writes plus foreground queries.</li>
+  <li><b>Leave headroom.</b> Provision for twice the average so bursts and catch-up after a stall are possible; run at under about 50 to 60 percent of the device's sustained throughput.</li>
+  <li><b>Check endurance.</b> 400 MB/s is about 34 TB per day. A 3.84 TB SSD rated for 1 drive write per day gives 3.84 TB per day, so that single drive would be far out of spec and wear out in weeks; spread the load across more drives or nodes, or choose a less write-amplifying strategy.</li>
+  <li><b>Space.</b> Stored bytes equal logical data (after compression) times space amplification, plus headroom for the largest compaction. With size-tiered, plan for up to 2x; with leveled, about 1.1x plus a margin.</li>
+</ol>
+
+<div class="callout good"><b>Rule of thumb</b>
+Device write rate is roughly (logical ingest) x (write amplification), and you want that to be well under half of what the disk can sustain. If it is not, you have three levers: reduce write amplification (change compaction, bigger memtables and SSTables, larger L1), reduce ingest per node (more shards, see <a href="25-sharding.html">Chapter 25</a>), or buy faster storage.
+</div>
+
+<!-- ======================= 15 ======================= -->
+<h2 id="worked">15. Worked example: a metrics workload on B-tree versus LSM</h2>
+
+<p><b>The workload.</b> A monitoring platform stores samples: <code>(series_id, timestamp, value)</code>. There are 2 million active series, each reporting every 10 seconds, so ingest is 200,000 samples per second. A sample is about 50 bytes logically before compression. Retention is 30 days. Queries are mostly "give me series X for the last hour" (a range scan over one series) and dashboards that aggregate a few hundred series.</p>
+
+<h3>15.1 Volume</h3>
+<p>Raw ingest: 200,000 x 50 bytes = 10 MB/s, which is 864 GB per day and about 26 TB per 30 days uncompressed. With time-series encoding and block compression at roughly 4 to 8 times, call it 5 times: about 5 TB for 30 days logically. This sets the storage budget, and the design must keep space amplification low.</p>
+
+<h3>15.2 Option A: a B-tree engine keyed by (series_id, timestamp)</h3>
+<p>The key order groups each series together, which is good for the range query. But consecutive arrivals belong to <i>different</i> series, so each of the 200,000 inserts per second lands in a different leaf page. Assume 16 KB pages. If the hot leaves (the tail of every one of 2 million series) do not fit in the buffer pool (2 million x 16 KB = 32 GB of tail pages, possible but expensive, and then the working set also includes the pages queries read), many inserts cause a disk read to fetch the leaf and later a 16 KB write to flush it.</p>
+<ul>
+  <li>Worst case, each insert dirties a distinct page: 200,000 x 16 KB = 3.2 GB/s of random page writes, impossible for one drive. Even with the buffer pool coalescing roughly 10 inserts per flush (10-second reporting means a page may absorb a few updates between flushes), it is about 320 MB/s of random writes, plus the same again if the doublewrite buffer is on, plus the WAL at about 10 to 20 MB/s.</li>
+  <li>Write amplification is on the order of 30x or more, and the SSD's garbage collection adds more on top of random overwrites.</li>
+  <li>Space: pages 70 percent full plus poor compression on in-place pages means the 5 TB could become 10 TB or more.</li>
+  <li>Deleting 30-day-old data means deleting billions of rows, which causes huge write and bloat; partitioning by day and dropping partitions mitigates this, adding schema complexity.</li>
+</ul>
+
+<h3>15.3 Option B: an LSM engine with time-window compaction</h3>
+<ul>
+  <li>Writes go to the WAL (10 MB/s sequential) and the memtable. A 256 MB memtable fills about every 25 seconds at 10 MB/s (more with the index overhead) and is flushed as one sequential SSTable, another 10 MB/s.</li>
+  <li>Using time-window compaction with 1-hour windows: within a window, small tables are merged a few times (say 3 to 4 times in total), then the window is left alone. Write amplification is about 1 (WAL) + 1 (flush) + 3 (compaction) = 5x on logical bytes. Counting after compression (about 2 MB/s compressed to the SSTable), device writes are around 10 (WAL) + 2 x (1 + 3) = 18 MB/s, sequential. That is trivial for a single SSD.</li>
+  <li>Expiry: day-sized windows older than 30 days are simply deleted as whole files, costing nearly no I/O and no tombstones.</li>
+  <li>Space: about 5 TB compressed, with space amplification only slightly above 1 plus the current-window merge headroom. Storage is roughly half of Option A.</li>
+  <li>Reads: a query for series X over the last hour touches the current memtable and one or a few SSTables of the recent window, found by key range, with bloom filters excluding unrelated tables. A query over 24 hours touches 24 windows; each is a bounded number of files. Dashboards stay fast. Out-of-order or backfilled old samples are the weak spot: they land in old windows and force extra merges or leave overlapping tables.</li>
+</ul>
+
+<table>
+<tr><th>Metric</th><th>B-tree (in place)</th><th>LSM (time-window)</th></tr>
+<tr><td>Device write rate (approx.)</td><td>300 MB/s or more, random pages</td><td>about 20 MB/s, sequential</td></tr>
+<tr><td>Disk for 30 days</td><td>about 8 to 10 TB</td><td>about 5 TB</td></tr>
+<tr><td>Cost of expiring day 31</td><td>Billions of deletes, or partition drop</td><td>Delete a few files</td></tr>
+<tr><td>Point read of recent data</td><td>1 leaf read if cached</td><td>memtable plus a few tables, bloom filters</td></tr>
+<tr><td>Range scan, one series, last hour</td><td>Excellent, adjacent leaves</td><td>Good, a few tables merged</td></tr>
+<tr><td>Main risk</td><td>Working set over RAM, write stalls from checkpoints, SSD wear</td><td>Compaction backlog, late data causing overlap</td></tr>
+</table>
+<p><b>Conclusion.</b> For high-rate, append-mostly, time-ordered data with age-based expiry, the LSM with time-window compaction wins by roughly an order of magnitude in write cost and a factor of two in space. This is why dedicated time series databases (Prometheus' TSDB, InfluxDB's TSM, and Cassandra with TWCS deployments) are LSM-like or log-structured. If instead the workload were 5,000 updates per second to a modest set of customer records with secondary-index lookups and transactions, the answer would reverse.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Bar comparison of device write rate B-tree vs LSM in the metrics example">
+  <text class="t-b" x="20" y="22">Device write rate for 200,000 samples/s (10 MB/s logical)</text>
+  <rect class="miss" x="190" y="40" width="640" height="38" rx="6"/><text class="t-b" x="200" y="64">B-tree: about 320 MB/s, random 16 KB page writes (plus WAL and doublewrite)</text>
+  <text class="t-sm" x="20" y="64">B-tree</text>
+  <rect class="hit" x="190" y="100" width="40" height="38" rx="6"/><text class="t-sm" x="240" y="124">LSM time-window: about 20 MB/s, sequential</text>
+  <text class="t-sm" x="20" y="124">LSM</text>
+  <rect class="cache" x="190" y="158" width="150" height="38" rx="6"/><text class="t-sm" x="350" y="182">one NVMe drive: roughly 1 GB/s sequential, much less random</text>
+  <text class="t-sm" x="20" y="182">Disk limit</text>
+  <text class="t-sm" x="20" y="226">Bar widths are illustrative (not to a precise scale). The point is the order-of-magnitude gap and the sequential-versus-random difference.</text>
+</svg>
+<figcaption>The same logical workload costs about 16 times more device write bandwidth on a B-tree here, and in a random pattern that SSDs and cloud volumes handle much worse.</figcaption>
+</figure>
+
+<!-- ======================= 16 ======================= -->
+<h2 id="qa">16. Interview Q&amp;A</h2>
+
+<details><summary>Why are LSM-trees better at writes than B-trees, and what do you pay for it?</summary>
+<p>An LSM-tree turns every write into a sequential WAL append plus an in-memory insert, and later writes the data to disk in large sorted batches. The disk sees large sequential I/O, which is its best case, and no page is rewritten for a small change. A B-tree updates pages in place, so a small row change dirties a whole page at a random location and may trigger splits. The price in an LSM is that data must be merged in the background (compaction), which consumes bandwidth and can stall writes, reads must check several files, and deleted or overwritten data takes space until compaction removes it.</p></details>
+
+<details><summary>Walk through what happens when a read comes in to an LSM-tree.</summary>
+<p>The engine checks the active memtable, then immutable memtables, then level 0 tables from newest to oldest, then one table per deeper level chosen by key range. In each SSTable it first asks the in-memory bloom filter; a negative answer skips the table without disk I/O. On a maybe, the block index narrows the search to one data block, which is read from the block cache or disk. The first version found, newest first, is the answer, and a tombstone means the key is deleted. A key that does not exist must be ruled out at every level, which is why bloom filters are essential.</p></details>
+
+<details><summary>What is write amplification, and how do you reduce it in an LSM store?</summary>
+<p>It is the ratio of bytes physically written to bytes the application logically wrote, covering the WAL, memtable flush, and every compaction rewrite, and below that the SSD's own garbage collection. In a leveled LSM with a size multiplier of 10, each byte is rewritten around 10 times per level it descends, so totals of 10 to 30x are normal. To reduce it, use size-tiered or time-window compaction when read and space costs allow, increase memtable and SSTable sizes, lower the number of levels, separate large values from keys (as in WiscKey or RocksDB BlobDB), or use FIFO and TTL so that data is dropped rather than rewritten.</p></details>
+
+<details><summary>Why does a B-tree engine need a write-ahead log, and what does the doublewrite buffer add?</summary>
+<p>Pages are updated in memory and flushed later, and a multi-page operation such as a split cannot be written atomically. Without a log, a crash would lose acknowledged changes or leave the tree inconsistent. The WAL makes commit a sequential append and lets recovery redo changes from the last checkpoint. The WAL is not enough when a page write is torn by a power failure, because redo assumes a consistent page. The doublewrite buffer (InnoDB) or full-page writes (PostgreSQL) keep a good copy of each page so recovery can restore it before replaying the log.</p></details>
+
+<details><summary>Leveled versus size-tiered compaction: when would you choose each?</summary>
+<p>Choose leveled for read-heavy or space-constrained workloads: it limits each key to one table per level, keeps space amplification near 1.1x and gives low read amplification, but rewrites data about 10 times per level, so write amplification is high. Choose size-tiered for write-heavy ingest: it merges similar-sized tables, writes each byte fewer times, but reads must probe many overlapping tables and merges need up to 2x temporary disk space. For data written once and expired by age, such as metrics, use time-window or FIFO compaction, which avoids rewriting old data altogether.</p></details>
+
+<details><summary>What is a tombstone and why can deletes make an LSM database slower?</summary>
+<p>Files are immutable, so a delete is recorded as a new entry, a tombstone, that hides older versions. It is physically removed only when compaction merges it with every older file that might hold the key, and in a distributed database only after a grace period so replicas that missed the delete do not bring the data back. Until then, reads and range scans must read and skip over the tombstones, which can make scans very slow when many rows were deleted in a range, and space is not reclaimed. Avoid queue-like patterns of inserting and deleting the same range, and prefer TTL or dropping whole partitions or files.</p></details>
+
+<details><summary>What does fsync do, and why can a database lose committed data even after calling it?</summary>
+<p>write() only places data in the OS page cache; fsync asks the OS to push it to the device and request a flush of the device's cache, so that data survives power loss. A database can still lose data if the drive acknowledges the flush while data sits in a volatile write cache (a drive that lies, typical of some consumer SSDs and RAID cards without battery), if the engine is configured to flush only periodically, or if an fsync error was retried and the kernel had already dropped the dirty pages. Reliable systems use drives with power-loss protection, treat fsync failure as fatal, use group commit for throughput, and rely on replication for additional safety.</p></details>
+
+<details><summary>How would you choose a storage engine for a high-volume event ingestion system versus an e-commerce order database?</summary>
+<p>For event ingestion with sustained high write rates, mostly appends, time-based queries and expiry by age, I would choose an LSM store with size-tiered or time-window compaction (Cassandra, ScyllaDB, or a time series engine), because it gives sequential writes, low write amplification and cheap deletes by dropping files. For the order database, with transactions across rows, secondary indexes, point reads and moderate writes, a B-tree engine such as InnoDB or PostgreSQL is the safer fit: predictable reads, mature MVCC and locking, and strong index support. I would also mention that the choice must be validated by measuring write amplification, compaction backlog or buffer pool hit ratio.</p></details>
+
+<details><summary>Why do column stores suit analytics but not transaction processing?</summary>
+<p>Analytical queries read a few columns from billions of rows. A column store reads only those columns, compresses each column far better (dictionary, run-length, delta encoding), and can process data in vectorized batches. But fetching or updating a single whole row means touching one location per column, and updates to compressed immutable column segments are expensive. So column stores load in batches and buffer small writes separately, which fits warehouses and reports, while transactional systems keep rows together so that one page read or write handles one record.</p></details>
+
+<details><summary>A Cassandra cluster shows increasing read latency and occasional write timeouts at constant traffic. What would you investigate?</summary>
+<p>I would suspect compaction falling behind. Check pending compactions and the SSTable count per read; many overlapping tables raise read amplification. Check disk utilisation and whether compaction throughput limits or competing repair or streaming jobs consume bandwidth, and whether the disk is above about 50 percent full with size-tiered compaction, which can block big merges. Look for tombstone warnings and wide partitions, and dropped mutations. Remedies include more compaction throughput or concurrency, switching strategy (leveled for read-heavy tables, time-window for TTL data), scaling out to reduce per-node ingest, and fixing the data model that generates tombstones.</p></details>
+
+<!-- ======================= 17 ======================= -->
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">17. Recap</h2>
+<ul>
+  <li>A storage engine stores, finds, orders and protects data on slow durable media; its design is a response to the memory hierarchy and to the preference of disks and SSDs for large sequential I/O.</li>
+  <li><b>B-trees</b> keep sorted pages updated in place, with a buffer pool and a WAL. Reads are predictable (about one leaf read); writes are random page writes with high write amplification for small rows; splits and torn pages need the WAL and doublewrite or full-page writes.</li>
+  <li><b>LSM-trees</b> buffer writes in a memtable and WAL, flush immutable sorted SSTables, and merge them by compaction. Writes are sequential and cheap; reads check several levels aided by bloom filters and block indexes; deletes use tombstones; compaction debt can cause write stalls.</li>
+  <li>Compaction strategy sets the tradeoff: leveled gives low read and space amplification with high write amplification; size-tiered the reverse; time-window and FIFO make expiring data nearly free.</li>
+  <li>Read, write and space amplification cannot all be minimized together (the RUM tradeoff). Know the rough numbers and which one your workload cares about.</li>
+  <li>Durability is a stack property: fsync, drive caches that lie, fsync errors, torn writes, and checksums all matter. Group commit and replication make safe settings affordable.</li>
+  <li>Compression and encoding work best on immutable sorted data; column layouts extend this for analytics. In-memory engines persist with a log, snapshots and replication.</li>
+  <li>Choose by dominant operation: write-heavy ingest and time series lean LSM, read-heavy transactional workloads lean B-tree, scans and aggregates lean columnar, and small hot state leans in-memory. Budget compaction I/O as ingest times write amplification, with at least 2x headroom.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="02-estimation.html">Chapter 2</a> (latency numbers), <a href="17-data-modeling.html">Chapter 17</a> (access patterns drive engine choice) and <a href="18-relational-internals.html">Chapter 18</a> (indexes, MVCC, transactions that sit on top of the engine). Leads to <a href="20-nosql.html">Chapter 20</a> (NoSQL families that mostly use LSM engines), <a href="23-other-stores.html">Chapter 23</a> (columnar warehouses and time-series databases), <a href="24-replication.html">Chapter 24</a> (replicating the WAL) and <a href="25-sharding.html">Chapter 25</a> (splitting ingest across nodes).</p>
+
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

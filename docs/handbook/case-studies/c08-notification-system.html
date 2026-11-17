@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 08: Design a Notification System | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c08-notification-system">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 08 · Worked solutions</div>
+<h1>Design a Notification System</h1>
+<p class="lead">A notification system looks like "call an API and send a message", until you must send two billion a day across push, SMS, email and in-app, honor every user's opt-outs and quiet hours, survive provider outages, never send the same alert twice, and absorb a ten-million-per-minute marketing blast without delaying a password reset code. This page works through that design the way you would at a whiteboard.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is usually one line: "Design a notification system that can send push notifications, SMS and email to users." Before drawing anything, a strong candidate narrows the problem, because a system for sending a few thousand password-reset emails and a system for broadcasting to hundreds of millions of phones are very different. Here are the questions to ask, with the answers this page assumes.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>Who sends notifications?</td><td>Internal product services (orders, social, payments, security) call our API or publish events. A marketing tool can create broadcast campaigns. External customers do not call us directly (it is a platform for one company, not a public SaaS messaging vendor).</td></tr>
+<tr><td>Which channels?</td><td>Mobile push (APNs for iOS, FCM for Android and web), SMS, email, and in-app (a notification inbox shown inside the product, plus a real-time badge).</td></tr>
+<tr><td>Scale?</td><td>About 500 million registered users, 150 million daily active. About 2 billion notifications a day on average, and a peak of 10 million notifications per minute during campaign bursts.</td></tr>
+<tr><td>Latency expectations?</td><td>Critical (login codes, fraud alerts): handed to the provider within 2 seconds at p99. Transactional (order shipped): within 30 seconds. Marketing and digests: within minutes, and often scheduled.</td></tr>
+<tr><td>Are we the delivery guarantor?</td><td>We guarantee that we hand each notification to a provider at least once and suppress duplicates. We cannot guarantee that the phone shows it; APNs, FCM and carriers are best-effort at the last hop.</td></tr>
+<tr><td>Do users control what they get?</td><td>Yes: per-channel and per-category preferences, quiet hours, global opt-out, and legal unsubscribes (email footer, SMS STOP). Some security messages cannot be disabled.</td></tr>
+<tr><td>Templates and languages?</td><td>Yes. Senders pass a template id and variables; we render per user locale. Content is not authored inside the callers.</td></tr>
+<tr><td>Analytics?</td><td>Delivery status, opens and clicks where the channel supports them, aggregated per campaign and per template.</td></tr>
+<tr><td>Regions?</td><td>Three active regions (Americas, Europe, Asia-Pacific) with data residency for EU users.</td></tr>
+</table>
+<p>One more framing point to say aloud: the notification system is a <b>middleman between your own services and third-party delivery networks</b>. Apple, Google, carriers and email providers do the final delivery. Most of the hard engineering is therefore about being a good, resilient, rate-aware client of unreliable external systems, and about not annoying people.</p>
+
+<h2 id="requirements">2. Requirements and out of scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li>Accept a notification request (one user, a list of users, or a segment) from internal services through an API, and also react to internal events (for example "order.shipped") using routing rules.</li>
+<li>Resolve the recipient's channels, device tokens, email address, phone number and locale.</li>
+<li>Render content from versioned, localized templates.</li>
+<li>Apply user preferences, quiet hours, opt-outs, frequency caps and legal suppression before sending.</li>
+<li>Deliver through the proper provider for each channel, with priority handling, retries, failover between providers and a dead letter queue.</li>
+<li>Support scheduling (send at 9 AM local time) and batching into digests.</li>
+<li>Track delivery state per notification and ingest provider callbacks (bounces, delivery receipts, opens, unsubscribes).</li>
+<li>Maintain device tokens: register, refresh, and remove invalid ones.</li>
+<li>Provide an in-app inbox API (list, mark read) and real-time delivery to open apps.</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Availability:</b> the ingestion API should reach 99.99%; we must never lose an accepted notification (durability before acknowledgement).</li>
+<li><b>Latency isolation:</b> a marketing blast must never delay a security code. This is the central scaling requirement.</li>
+<li><b>Throughput:</b> sustain 10 million per minute and scale horizontally beyond it.</li>
+<li><b>No duplicates in the common case:</b> duplicates of the same logical notification are suppressed, although exactly-once at the device is impossible (section 12).</li>
+<li><b>Compliance:</b> an opt-out takes effect immediately; consent and send history are auditable.</li>
+<li><b>Extensibility:</b> adding a channel or provider is a plug-in, not a rewrite.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>We do not design the push providers themselves, the client SDK internals, the content authoring UI, the audience segmentation engine (we consume segments as a list or a query result), two-way conversational messaging (that is chat territory, see <a href="../chapters/06-realtime.html">Chapter 6</a>), or an email deliverability consultancy (IP warming and DKIM setup get a short mention only).</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>Estimates guide choices such as the number of partitions, workers and storage tiers. The method is taught in <a href="../chapters/02-estimation.html">Chapter 2</a>; here are the numbers with the arithmetic shown.</p>
+<h3>3.1 Volume and rate</h3>
+<ul>
+<li>Average: 2 billion notifications per day. 2,000,000,000 / 86,400 seconds is about <b>23,000 per second</b>.</li>
+<li>Normal daily peak: traffic concentrates in waking hours, so use a factor of 3 over the average: about <b>70,000 per second</b>.</li>
+<li>Campaign burst: the stated peak of 10 million per minute is 10,000,000 / 60, about <b>167,000 per second</b>. This is 7 times the average. It is dominated by marketing or breaking-news fan-out, and it can last 10 to 30 minutes.</li>
+</ul>
+<h3>3.2 Channel mix at the peak (167,000 per second)</h3>
+<table>
+<tr><th>Channel</th><th>Share</th><th>Peak per second</th><th>Daily volume</th><th>Notes</th></tr>
+<tr><td>Push (APNs and FCM)</td><td>70%</td><td>about 117,000</td><td>1.4 billion</td><td>Cheapest. Providers allow high concurrency over HTTP/2.</td></tr>
+<tr><td>In-app inbox</td><td>15%</td><td>about 25,000</td><td>300 million</td><td>Our own store; no external provider.</td></tr>
+<tr><td>Email</td><td>12%</td><td>about 20,000</td><td>240 million</td><td>Limited by sender reputation and provider rate caps.</td></tr>
+<tr><td>SMS</td><td>3%</td><td>about 5,000</td><td>60 million</td><td>Most expensive (often a cent or more each) and slowest.</td></tr>
+</table>
+<p>Because one logical event can generate several channel messages (a push plus an email), the channel messages sum to the total above, and the number of <i>events</i> is smaller. We count channel messages as the unit of work because that is what workers process.</p>
+<h3>3.3 Worker sizing</h3>
+<p>A push worker holding a handful of long-lived HTTP/2 connections to APNs or FCM can typically sustain about 2,000 sends per second (each send is a small request with a 100 to 300 ms round trip, multiplexed). For 117,000 per second we need 117,000 / 2,000, about 59 workers; with 2x headroom for retries and a lagging region, plan on <b>120 push workers</b>. Email at 20,000 per second suggests about 40 workers; SMS at 5,000 per second against HTTP gateways suggests about 20. Template rendering is CPU-bound at roughly 5,000 renders per second per core, so about 40 cores handle the peak.</p>
+<h3>3.4 Storage</h3>
+<ul>
+<li><b>Message records:</b> each record (ids, user, channel, template, status, timestamps) is about 500 bytes. 2 billion per day is about <b>1 TB per day</b>. We keep 30 days hot in a sharded NoSQL store (30 TB, about 90 TB with 3 replicas) and archive older records to object storage in columnar files: 365 days is about 365 TB uncompressed, roughly 90 TB compressed.</li>
+<li><b>Queue retention:</b> the broker stores the request payload (about 1 KB) for 3 days to allow replay: 2 TB per day x 3 days x replication 3 is about 18 TB.</li>
+<li><b>Device tokens:</b> 500 million users x about 2.5 devices = 1.25 billion tokens x 200 bytes is about <b>250 GB</b>. This fits a sharded key-value store, with hot tokens cached.</li>
+<li><b>Preferences:</b> 500 million x about 1 KB is about <b>500 GB</b>; the hot working set (150 million DAU) is about 150 GB, cacheable in Redis.</li>
+<li><b>In-app inbox:</b> keep the last 90 days, about 50 notifications per user, 300 bytes each: 500 million x 50 x 300 B is about 7.5 TB.</li>
+</ul>
+<h3>3.5 Bandwidth and provider limits</h3>
+<p>Outbound payloads: push 1 to 4 KB, email 20 to 100 KB (with HTML), SMS 160 characters. At peak, push is 117,000 x 2 KB = 234 MB/s, and email is 20,000 x 50 KB = 1 GB/s (which is why email is often handed to the provider as a template id plus variables when the provider supports it), SMS is negligible. These are within a normal data center's egress. The real limits are not bandwidth but the <b>provider rate limits</b> and <b>per-user fatigue</b>, which later sections handle.</p>
+<div class="callout key"><b>Key idea</b> Peak is 167,000 messages per second, but the design must protect the 100 per second of security codes inside it. Throughput is solved by partitioning and horizontal workers; latency of important messages is solved by <b>priority isolation</b>, not by raw capacity.</div>
+
+<h2 id="api">4. API design</h2>
+<h3>4.1 Send API (internal, service to service)</h3>
+<pre><code>POST /v1/notifications
+Headers: Authorization: service token; Idempotency-Key: 7f3c-...
+{
+  "template_id": "order_shipped",
+  "category": "transactional",          // transactional | security | marketing | social
+  "priority": "high",                    // critical | high | normal | low
+  "recipients": [{"user_id": "u_123"}],  // or {"segment_id": "..."} for broadcasts
+  "variables": {"order_id": "A991", "eta": "2026-11-20"},
+  "channels": ["push", "email"],         // optional override; default from routing rules
+  "send_at": "2026-11-20T09:00:00",      // optional; with "timezone": "recipient"
+  "ttl_seconds": 3600,                   // drop if not sent by then
+  "dedup_key": "order_shipped:A991",     // optional business key
+  "collapse_key": "order:A991"           // newer replaces older on the device
+}
+-> 202 Accepted {"notification_id": "n_01HX...", "status": "queued"}</code></pre>
+<p>The response is <b>202 Accepted</b>, not 200: the notification has been durably stored and queued, but not delivered. The caller must not wait for the phone. The <code>Idempotency-Key</code> header (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>) makes retrying a timed-out call safe, and a <code>dedup_key</code> carries the caller's business meaning of "this is the same notification". The <code>ttl_seconds</code> matters more than it looks: a "your driver is arriving" push delivered after the ride ends is worse than no push, so every message carries an expiry and workers drop stale ones.</p>
+<h3>4.2 Other endpoints</h3>
+<table>
+<tr><th>Endpoint</th><th>Purpose</th></tr>
+<tr><td><code>POST /v1/campaigns</code></td><td>Create a broadcast with a segment, a template, a schedule and a rate limit (messages per second). Returns a campaign id; campaigns can be paused or cancelled with <code>POST /v1/campaigns/{id}/pause</code>.</td></tr>
+<tr><td><code>GET /v1/notifications/{id}</code></td><td>Delivery status per channel: queued, rendered, sent, delivered, failed, suppressed, with reason.</td></tr>
+<tr><td><code>PUT /v1/users/{id}/preferences</code></td><td>Channel and category opt-ins, quiet hours, time zone, locale. User-facing apps call this through the gateway.</td></tr>
+<tr><td><code>POST /v1/devices</code> and <code>DELETE /v1/devices/{token}</code></td><td>Register a device token with platform, app version and locale; remove on logout.</td></tr>
+<tr><td><code>GET /v1/users/{id}/inbox?cursor=</code></td><td>Paginated in-app notifications; <code>POST .../read</code> marks read.</td></tr>
+<tr><td><code>POST /v1/webhooks/{provider}</code></td><td>Inbound callbacks from email and SMS providers (bounces, deliveries, complaints, unsubscribes). Signature-verified.</td></tr>
+</table>
+<p>Besides the API, most internal triggers arrive as <b>events</b> on the company event bus (for example <code>order.shipped</code>). A thin <i>event adapter</i> maps an event to a notification request using routing rules stored as configuration ("order.shipped -> template order_shipped, push+email, category transactional"). This keeps product teams from learning our API and lets rules change without redeploying callers. The event-driven style is covered in <a href="../chapters/36-event-driven.html">Chapter 36</a>; API conventions in <a href="../chapters/05-api-design.html">Chapter 5</a>.</p>
+
+<h2 id="data">5. Data model and storage choices</h2>
+<table>
+<tr><th>Data</th><th>Store</th><th>Why</th></tr>
+<tr><td>Notification requests and per-channel message state</td><td>Wide-column or document store sharded by <code>user_id</code> (Cassandra or DynamoDB style); see <a href="../chapters/20-nosql.html">Chapter 20</a></td><td>Very high write rate, time-series access ("recent messages of user X"), simple lookups by id. No joins needed. TTL deletes old rows.</td></tr>
+<tr><td>Work queues</td><td>Partitioned log or broker (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>)</td><td>Durable, replayable, partitioned for parallel workers; absorbs bursts.</td></tr>
+<tr><td>User preferences and channel addresses</td><td>Relational or key-value store as source of truth, with a Redis cache in front (<a href="../chapters/15-redis.html">Chapter 15</a>)</td><td>Read on every send (hundreds of thousands per second), changed rarely. Needs strong consistency on writes for opt-outs.</td></tr>
+<tr><td>Device tokens</td><td>Key-value store keyed by <code>user_id</code>, secondary index by token</td><td>Lookup by user for sending; lookup by token to delete when a provider reports it invalid.</td></tr>
+<tr><td>Templates</td><td>Relational store with versioning, cached in each renderer process</td><td>Small, read-heavy, needs history and review workflow.</td></tr>
+<tr><td>Dedup and rate counters</td><td>Redis with TTL</td><td>Fast atomic <code>SET NX</code> and <code>INCR</code>; entries expire naturally.</td></tr>
+<tr><td>In-app inbox</td><td>Wide-column store partitioned by user, clustered by time descending</td><td>Cheap range scan for the latest N.</td></tr>
+<tr><td>Analytics events</td><td>Stream into a columnar warehouse via <a href="../chapters/37-batch-stream.html">Chapter 37</a> pipelines</td><td>Aggregations by campaign, template, country; not on the send path.</td></tr>
+</table>
+<p>A message record is shaped like this: <code>(user_id, notification_id, channel, template_id, template_version, status, provider, provider_message_id, attempt_count, created_at, sent_at, delivered_at, error_code)</code>. The partition key is <code>user_id</code>, so one user's history sits together and per-user caps are cheap to evaluate. The <code>provider_message_id</code> is essential: when a webhook says "message abc bounced", we need a way from abc back to our record, so we keep a secondary index (or a small separate table) keyed by it.</p>
+<p>The status field is a small state machine: <code>queued -> rendered -> sent -> delivered</code>, with side exits <code>suppressed</code> (preference, quiet hours, cap), <code>failed</code> (permanent), <code>expired</code> (TTL) and <code>dead</code> (retries exhausted). Updates are monotonic: a late "sent" must never overwrite "delivered". We enforce that with conditional writes that only advance the state rank.</p>
+
+<h2 id="simple">6. A first simple design, then the scaled one</h2>
+<h3>6.1 The naive version</h3>
+<p>Start with the simplest thing that works: the product service calls a notification service synchronously; that service looks up the user's token or email, then calls APNs, FCM, an SMS gateway or an email API directly, and returns. One service, one database.</p>
+<p>It works for demo traffic and breaks in predictable ways, and naming them is how you justify each later component:</p>
+<ul>
+<li>The caller waits for a slow third party (an email provider taking 2 seconds), so product latency now depends on ours.</li>
+<li>A provider outage means failed user requests, and nothing retries.</li>
+<li>A big campaign saturates the same threads and delays password resets.</li>
+<li>A retry after a timeout sends the message twice.</li>
+<li>Nobody checks preferences consistently because each caller does it its own way.</li>
+<li>Provider limits are exceeded and the provider throttles or bans us.</li>
+</ul>
+<p>The fix is the classic pattern: <b>accept quickly, queue durably, process asynchronously</b> through stages that each do one job and can be scaled and failed independently.</p>
+<h3>6.2 The scaled architecture</h3>
+<figure class="diagram">
+<svg viewBox="0 0 960 470" role="img" aria-label="High-level architecture of the notification system">
+  <rect class="ext" x="10" y="40" width="130" height="46" rx="8"/><text class="t-c t-b" x="75" y="68">Product services</text>
+  <rect class="ext" x="10" y="110" width="130" height="46" rx="8"/><text class="t-c t-b" x="75" y="138">Event bus</text>
+  <rect class="ext" x="10" y="180" width="130" height="46" rx="8"/><text class="t-c t-b" x="75" y="208">Campaign tool</text>
+  <rect class="box" x="190" y="90" width="150" height="70" rx="8"/><text class="t-c t-b" x="265" y="118">Ingestion API</text><text class="t-c t-sm" x="265" y="136">auth, validate, dedup</text><text class="t-c t-sm" x="265" y="150">202 after durable write</text>
+  <rect class="box" x="190" y="200" width="150" height="56" rx="8"/><text class="t-c t-b" x="265" y="224">Fan-out service</text><text class="t-c t-sm" x="265" y="242">segment to user shards</text>
+  <rect class="cache" x="400" y="90" width="150" height="70" rx="8"/><text class="t-c t-b" x="475" y="118">Intake log</text><text class="t-c t-sm" x="475" y="136">partitioned by user_id</text><text class="t-c t-sm" x="475" y="150">durable, replayable</text>
+  <rect class="box" x="400" y="200" width="150" height="70" rx="8"/><text class="t-c t-b" x="475" y="224">Pipeline workers</text><text class="t-c t-sm" x="475" y="242">prefs, caps, quiet hours,</text><text class="t-c t-sm" x="475" y="256">render, route</text>
+  <rect class="db" x="400" y="320" width="150" height="56" rx="8"/><text class="t-c t-b" x="475" y="344">Prefs, tokens,</text><text class="t-c t-b" x="475" y="362">templates</text>
+  <rect class="cache" x="610" y="40" width="130" height="40" rx="8"/><text class="t-c t-b" x="675" y="65">Push queues P0-P3</text>
+  <rect class="cache" x="610" y="95" width="130" height="40" rx="8"/><text class="t-c t-b" x="675" y="120">Email queues</text>
+  <rect class="cache" x="610" y="150" width="130" height="40" rx="8"/><text class="t-c t-b" x="675" y="175">SMS queues</text>
+  <rect class="cache" x="610" y="205" width="130" height="40" rx="8"/><text class="t-c t-b" x="675" y="230">In-app queue</text>
+  <rect class="box" x="780" y="40" width="160" height="40" rx="8"/><text class="t-c t-b" x="860" y="65">Push workers</text>
+  <rect class="box" x="780" y="95" width="160" height="40" rx="8"/><text class="t-c t-b" x="860" y="120">Email workers</text>
+  <rect class="box" x="780" y="150" width="160" height="40" rx="8"/><text class="t-c t-b" x="860" y="175">SMS workers</text>
+  <rect class="box" x="780" y="205" width="160" height="40" rx="8"/><text class="t-c t-b" x="860" y="230">In-app writer</text>
+  <rect class="ext" x="780" y="290" width="160" height="46" rx="8"/><text class="t-c t-b" x="860" y="311">APNs, FCM, ESPs,</text><text class="t-c t-b" x="860" y="327">SMS gateways</text>
+  <rect class="db" x="610" y="320" width="130" height="56" rx="8"/><text class="t-c t-b" x="675" y="344">Message state</text><text class="t-c t-b" x="675" y="362">store</text>
+  <rect class="box" x="610" y="410" width="130" height="40" rx="8"/><text class="t-c t-b" x="675" y="435">Webhook receiver</text>
+  <rect class="cache" x="400" y="410" width="150" height="40" rx="8"/><text class="t-c t-b" x="475" y="435">Retry + DLQ</text>
+  <path class="arrow" d="M140 63 L186 115"/><path class="arrow" d="M140 133 L186 130"/><path class="arrow" d="M140 203 L186 228"/>
+  <path class="arrow" d="M340 125 L396 125"/><path class="arrow dash" d="M340 228 L396 233"/>
+  <path class="arrow" d="M475 160 L475 196"/><path class="arrow" d="M475 270 L475 316"/>
+  <path class="arrow" d="M550 225 L606 60"/><path class="arrow" d="M550 230 L606 115"/><path class="arrow" d="M550 235 L606 170"/><path class="arrow" d="M550 240 L606 225"/>
+  <path class="arrow" d="M740 60 L776 60"/><path class="arrow" d="M740 115 L776 115"/><path class="arrow" d="M740 170 L776 170"/><path class="arrow" d="M740 225 L776 225"/>
+  <path class="arrow" d="M860 250 L860 286"/>
+  <path class="arrow dash" d="M780 330 L744 345"/>
+  <path class="arrow dash" d="M860 336 L742 420"/>
+  <path class="arrow-r dash" d="M610 436 L554 436"/>
+</svg>
+<figcaption>Requests enter through the ingestion API (or via events and campaigns), land in a durable intake log partitioned by user, and are processed by stateless pipeline workers that apply preferences and render templates. Each channel has its own priority queues and workers, which talk to external providers. Provider callbacks come back through the webhook receiver and update the message state store. Failed sends go through retry queues and a dead letter queue.</figcaption>
+</figure>
+<p>The intake log is where we separate speed from slowness. The API only validates, deduplicates, writes the request to the log and answers 202. Everything expensive (loading preferences, rendering) happens later, in workers that can fall behind without affecting callers. The pipeline workers then write into <b>per-channel, per-priority queues</b>; this is the structural trick that gives priority isolation. Section 8 explains why we separate the stages.</p>
+
+<h2 id="flows">7. Core request flows</h2>
+<h3>7.1 Single transactional notification</h3>
+<figure class="diagram">
+<svg viewBox="0 0 960 420" role="img" aria-label="Sequence diagram for a transactional notification">
+  <rect class="ext" x="20" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="75" y="32">Caller</text>
+  <rect class="box" x="170" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="225" y="32">Ingestion</text>
+  <rect class="cache" x="320" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="375" y="32">Intake log</text>
+  <rect class="box" x="470" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="525" y="32">Pipeline</text>
+  <rect class="box" x="620" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="675" y="32">Push worker</text>
+  <rect class="ext" x="770" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="825" y="32">APNs / FCM</text>
+  <line class="life" x1="75" y1="44" x2="75" y2="410"/><line class="life" x1="225" y1="44" x2="225" y2="410"/><line class="life" x1="375" y1="44" x2="375" y2="410"/><line class="life" x1="525" y1="44" x2="525" y2="410"/><line class="life" x1="675" y1="44" x2="675" y2="410"/><line class="life" x1="825" y1="44" x2="825" y2="410"/>
+  <path class="arrow" d="M75 70 L221 70"/><text class="t-sm" x="85" y="64">1 POST + Idempotency-Key</text>
+  <path class="arrow" d="M225 100 L371 100"/><text class="t-sm" x="232" y="94">2 SETNX key, append</text>
+  <path class="arrow-g" d="M221 130 L79 130"/><text class="t-sm" x="95" y="124">3 202 Accepted</text>
+  <path class="arrow" d="M375 165 L521 165"/><text class="t-sm" x="385" y="159">4 consume (by user)</text>
+  <path class="arrow" d="M525 195 L585 195 L585 215 L529 215"/><text class="t-sm" x="535" y="189">5 prefs, caps, render</text>
+  <path class="arrow" d="M525 255 L671 255"/><text class="t-sm" x="535" y="249">6 enqueue push P1</text>
+  <path class="arrow" d="M675 290 L821 290"/><text class="t-sm" x="685" y="284">7 HTTP/2 send, token</text>
+  <path class="arrow-g" d="M821 320 L679 320"/><text class="t-sm" x="705" y="314">8 accepted + apns-id</text>
+  <path class="arrow dash" d="M675 355 L529 355"/><text class="t-sm" x="545" y="349">9 status = sent</text>
+  <path class="arrow-r dash" d="M821 390 L679 390"/><text class="t-sm" x="690" y="384">10 later: 410 bad token</text>
+</svg>
+<figcaption>The caller is released at step 3, after the request is durable. Steps 4 to 9 run asynchronously. Step 10 shows an invalid-token response that arrives later and triggers token cleanup.</figcaption>
+</figure>
+<ol>
+<li>The caller sends the request with an idempotency key. The ingestion node authenticates the service, validates the template id and variable schema, and runs <code>SET key NX EX 24h</code> in Redis. If the key already exists, it returns the original notification id instead of enqueueing again.</li>
+<li>It appends the request to the intake log, partitioned by <code>user_id</code>, and waits for the replicated acknowledgement before answering 202. If the log is unavailable it returns 503 so the caller retries; it never says "accepted" without a durable write.</li>
+<li>A pipeline worker consumes the request. For each recipient and each wanted channel it loads preferences (cache first), checks quiet hours, applies per-user frequency caps and the legal suppression list, and decides: send, delay, batch or drop. Dropped messages are recorded as <code>suppressed</code> with a reason, because support will ask "why did I not get it?".</li>
+<li>It loads the template for the user's locale, renders the title and body, and looks up device tokens or the email address.</li>
+<li>It writes the rendered message to the priority queue for that channel. The message state becomes <code>rendered</code>.</li>
+<li>A channel worker pops the message, checks the TTL, calls the provider and records the provider's message id. State becomes <code>sent</code>. Later receipts or webhooks advance it to <code>delivered</code> or <code>bounced</code>.</li>
+</ol>
+<h3>7.2 Broadcast campaign flow</h3>
+<p>A campaign to 80 million users does not enter as 80 million API calls. The campaign tool creates one campaign record; a <b>fan-out service</b> reads the segment in pages (user id ranges or a stored audience snapshot), and for each page publishes batch messages to the intake log, spread across partitions. The campaign has a configured <b>send rate</b> (for example 100,000 per second) enforced by the fan-out service, and a <i>low</i> priority class so these messages ride the lowest queues. Section 9.5 covers the fan-out in depth.</p>
+
+<h2 id="deep-pipeline">8. Deep dive 1: the pipeline, priority queues and channel isolation</h2>
+<h3>8.1 Why split into stages</h3>
+<p>The pipeline stage (preferences, render, route) and the delivery stage (talk to providers) have different bottlenecks. The first is CPU and cache bound and almost always fast; the second is bound by <b>external latency and rate limits</b>. If one process did both, a slow APNs connection would block threads and stall rendering. With a queue between them, delivery can lag and the queue absorbs the difference. Durable queues and consumer groups are described in <a href="../chapters/34-queues-kafka.html">Chapter 34</a> and <a href="../chapters/35-messaging-patterns.html">Chapter 35</a>.</p>
+<h3>8.2 Priority queues per channel</h3>
+<p>Priority is a property of the message set by category and caller: <b>P0 critical</b> (one-time passcodes, fraud alerts), <b>P1 high</b> (transactions, order updates, chat mentions), <b>P2 normal</b> (social activity), <b>P3 low</b> (marketing, digests, bulk). Each channel has four queues. Messages are never mixed in one queue, because a FIFO queue with 20 million marketing messages in front cannot serve an OTP quickly, no matter how many workers you have.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Priority queues and weighted worker consumption">
+  <text class="t-b" x="20" y="24">Push channel: four queues, one worker pool with weighted pulling</text>
+  <rect class="miss" x="30" y="44" width="260" height="42" rx="8"/><text class="t-b" x="44" y="62">P0 critical</text><text class="t-sm" x="44" y="78">OTP, fraud: depth stays near 0</text>
+  <rect class="cache" x="30" y="100" width="260" height="42" rx="8"/><text class="t-b" x="44" y="118">P1 high</text><text class="t-sm" x="44" y="134">transactional: seconds of backlog</text>
+  <rect class="box" x="30" y="156" width="260" height="42" rx="8"/><text class="t-b" x="44" y="174">P2 normal</text><text class="t-sm" x="44" y="190">social, reminders</text>
+  <rect class="hit" x="30" y="212" width="260" height="42" rx="8"/><text class="t-b" x="44" y="230">P3 low</text><text class="t-sm" x="44" y="246">marketing: millions deep, ok</text>
+  <rect class="box" x="400" y="80" width="190" height="120" rx="10"/><text class="t-c t-b" x="495" y="110">Push worker pool</text><text class="t-c t-sm" x="495" y="132">check P0 first, always</text><text class="t-c t-sm" x="495" y="150">then 6:3:1 of P1:P2:P3</text><text class="t-c t-sm" x="495" y="168">reserved workers for P0</text>
+  <rect class="ext" x="700" y="90" width="170" height="100" rx="10"/><text class="t-c t-b" x="785" y="120">Token bucket</text><text class="t-c t-sm" x="785" y="140">per provider and app</text><text class="t-c t-sm" x="785" y="158">then APNs / FCM</text>
+  <path class="arrow" d="M290 65 L396 110"/><path class="arrow" d="M290 121 L396 130"/><path class="arrow" d="M290 177 L396 150"/><path class="arrow" d="M290 233 L396 170"/>
+  <path class="arrow" d="M590 140 L696 140"/>
+  <text class="t-sm" x="30" y="290">Strict priority alone starves P3 during a long P1 spike, so lower tiers get a guaranteed weighted share.</text>
+  <text class="t-sm" x="30" y="312">Critical traffic also has its own small dedicated worker group and provider connections, so nothing can starve it.</text>
+</svg>
+<figcaption>Workers always drain P0 first; for the rest they pull in a fixed ratio so low priority still progresses. Because the marketing backlog sits in P3, a burst of ten million messages only lengthens that queue.</figcaption>
+</figure>
+<table>
+<tr><th>Option</th><th>How it works</th><th>Strength</th><th>Weakness</th></tr>
+<tr><td>One queue, priority field</td><td>Broker orders messages by priority</td><td>Simple</td><td>Most log-based brokers do not order by priority; sorting per message at scale is expensive; head-of-line blocking remains.</td></tr>
+<tr><td>Separate queues, shared worker pool (chosen)</td><td>Workers check P0 first, then weighted pull</td><td>Real isolation, easy to tune weights, uses idle capacity</td><td>More queues and metrics to operate; weights need tuning.</td></tr>
+<tr><td>Fully separate pools per priority</td><td>Own workers and connections for each tier</td><td>Strongest isolation</td><td>Idle capacity in quiet tiers is wasted; cost.</td></tr>
+</table>
+<p>We choose separate queues with a shared pool, plus a <b>dedicated pool only for P0</b> (with its own provider connections and credentials). That small, mostly idle pool is the cost of a firm latency promise. Delayed work is covered in <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>.</p>
+<h3>8.3 Back-pressure</h3>
+<p>If a queue grows beyond a threshold, intake does not slow down for P0 and P1, but P3 producers (the fan-out service) are throttled: the campaign rate limit automatically drops, and the campaign tool shows "slowed due to downstream load". Without that, the intake log would grow without bound. We alert on the age of the oldest message in each queue, which is a better signal than depth.</p>
+
+<h2 id="deep-providers">9. Deep dive 2: provider integration, rate limits, retries and failover</h2>
+<h3>9.1 Workers and provider specifics</h3>
+<p>Each channel worker is a small adapter around a provider interface: <code>send(message) -> Result</code>, where the result is one of <i>accepted</i>, <i>retryable failure</i>, <i>permanent failure</i> (bad token, invalid address), or <i>throttled</i> (with a retry-after). Hiding providers behind this interface is what makes failover possible.</p>
+<ul>
+<li><b>Push (APNs):</b> a long-lived HTTP/2 connection per environment and app, authenticated with a token or certificate. Apple defines a priority header (10 immediate, 5 power-conserving), an expiration time, and a collapse id. A 410 response (token no longer active) or BadDeviceToken tells us to delete the token. We keep connections open and multiplex many streams; opening a connection per message is slow and can look abusive.</li>
+<li><b>Push (FCM):</b> an HTTP API with OAuth credentials; supports collapse keys, TTL and priority (high or normal). Errors such as UNREGISTERED mean remove the token; quota errors mean back off.</li>
+<li><b>Email:</b> an email service provider (ESP) API or SMTP. Concerns are sender reputation, SPF, DKIM and DMARC alignment, separate IP pools for transactional and marketing mail (so a spam complaint wave on marketing does not damage password-reset deliverability), and the unsubscribe header.</li>
+<li><b>SMS:</b> aggregator or carrier HTTP APIs. Throughput is limited per sender number or short code (a long code typically carries about one message per second; short codes and toll-free numbers more), pricing differs by country, and carriers filter content. Messages are segmented at 160 GSM characters (70 for Unicode), which affects cost.</li>
+<li><b>In-app:</b> no external provider; we write into the inbox store and push a real-time event over WebSocket or SSE if the user is online (<a href="../chapters/06-realtime.html">Chapter 6</a>), plus a badge count.</li>
+</ul>
+<h3>9.2 Provider rate limits</h3>
+<p>Providers limit us in several ways: requests per second, concurrent streams, daily quotas, and per-recipient limits. Exceeding them yields 429 responses or silent throttling, and abusive patterns can get credentials suspended. So each worker pool uses a <b>token bucket</b> per provider account (and per app or sender), sized below the documented limit. The buckets are shared across workers using a distributed counter or, more cheaply, each worker gets a static share (limit divided by number of workers) recalculated when the pool resizes. The algorithms are in <a href="../chapters/16-rate-limiting.html">Chapter 16</a>. If a provider answers 429 with a retry-after header, the worker pauses that provider's bucket for that duration instead of retrying blindly.</p>
+<h3>9.3 Retries with backoff and the dead letter queue</h3>
+<p>Failures fall into three classes and each is handled differently.</p>
+<table>
+<tr><th>Class</th><th>Examples</th><th>Action</th></tr>
+<tr><td>Permanent</td><td>Invalid or unregistered token, hard-bounced email, malformed payload</td><td>Do not retry. Mark <code>failed</code>, remove the token or flag the address as undeliverable.</td></tr>
+<tr><td>Transient</td><td>Timeout, 500 or 503 from the provider, connection reset, 429</td><td>Retry with exponential backoff and jitter, bounded by the message TTL.</td></tr>
+<tr><td>Ambiguous</td><td>Timeout after sending (we do not know whether the provider got it)</td><td>Retry with the same collapse id or provider idempotency key if supported; otherwise accept a rare duplicate. For critical types prefer a duplicate over a loss.</td></tr>
+</table>
+<p>Retry delays follow roughly 1 s, 5 s, 30 s, 2 min, 10 min, with random jitter of plus or minus 20% so that thousands of failed messages do not all retry at the same instant (the thundering herd, discussed in <a href="../chapters/40-resilience.html">Chapter 40</a>). The retry itself is a message republished to a delay queue rather than a sleeping thread, because a worker sleeping on 10,000 messages is wasted capacity. After the maximum attempts (for example 5), or when the TTL passes, the message goes to the <b>dead letter queue (DLQ)</b> with the final error. The DLQ is monitored, can be inspected and replayed after a fix, and its depth is an alert. Patterns for retry topics and DLQs are in <a href="../chapters/35-messaging-patterns.html">Chapter 35</a>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="Retry, backoff, and dead letter flow">
+  <rect class="box" x="20" y="100" width="130" height="56" rx="8"/><text class="t-c t-b" x="85" y="124">Channel worker</text><text class="t-c t-sm" x="85" y="142">attempt n</text>
+  <rect class="ext" x="230" y="100" width="130" height="56" rx="8"/><text class="t-c t-b" x="295" y="124">Provider</text><text class="t-c t-sm" x="295" y="142">APNs, ESP, SMS</text>
+  <rect class="hit" x="470" y="20" width="150" height="44" rx="8"/><text class="t-c t-b" x="545" y="40">Success</text><text class="t-c t-sm" x="545" y="56">status = sent</text>
+  <rect class="miss" x="470" y="104" width="150" height="48" rx="8"/><text class="t-c t-b" x="545" y="124">Permanent error</text><text class="t-c t-sm" x="545" y="142">drop token, mark failed</text>
+  <rect class="cache" x="470" y="190" width="150" height="48" rx="8"/><text class="t-c t-b" x="545" y="210">Transient error</text><text class="t-c t-sm" x="545" y="228">retry with jitter</text>
+  <rect class="cache" x="700" y="190" width="170" height="48" rx="8"/><text class="t-c t-b" x="785" y="210">Delay queues</text><text class="t-c t-sm" x="785" y="228">1s, 5s, 30s, 2m, 10m</text>
+  <rect class="miss" x="700" y="104" width="170" height="48" rx="8"/><text class="t-c t-b" x="785" y="124">DLQ</text><text class="t-c t-sm" x="785" y="142">after 5 tries or TTL</text>
+  <path class="arrow" d="M150 128 L226 128"/>
+  <path class="arrow-g" d="M360 118 L468 50"/><path class="arrow-r" d="M360 128 L466 128"/><path class="arrow" d="M360 140 L466 210"/>
+  <path class="arrow" d="M620 214 L696 214"/>
+  <path class="arrow dash" d="M785 190 L785 156"/>
+  <path class="arrow dash" d="M785 262 L85 262 L85 160"/><text class="t-sm" x="250" y="256">delay expires: back to a worker, attempt n+1 (other provider if breaker open)</text>
+</svg>
+<figcaption>Only transient errors are retried. Each retry goes to a delay queue, not a sleeping thread. When attempts or the TTL are exhausted the message lands in the DLQ for inspection and replay.</figcaption>
+</figure>
+<h3>9.4 Failover between providers</h3>
+<p>Providers have outages. Each channel therefore has at least two providers where possible (two ESPs, two SMS aggregators). APNs and FCM have no alternative for their own platforms, so for those the fallback is a different channel (in-app or SMS for critical alerts). The router uses a per-provider <b>circuit breaker</b> (<a href="../chapters/40-resilience.html">Chapter 40</a>): when the error rate over a sliding window exceeds a threshold (for example 20% over 30 seconds) the breaker opens, new sends go to the secondary provider, and a periodic probe tests the primary in a half-open state.</p>
+<table>
+<tr><th>Strategy</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Active-passive (primary, spare)</td><td>Simple; email IP reputation stays concentrated on the primary</td><td>The spare is cold: unproven limits and credentials; cold email IPs deliver poorly at first</td></tr>
+<tr><td>Active-active weighted (for example 80/20)</td><td>Spare is warm and proven; more total capacity; costs can be negotiated by share</td><td>Two integrations with different receipts and error codes to normalize</td></tr>
+<tr><td>Cheapest route per message (SMS)</td><td>Cost optimization by destination country</td><td>More complex routing table; harder to debug</td></tr>
+</table>
+<p>We choose active-active with weights for email and SMS (a 10 to 20% share on the secondary keeps it warm) and an automatic shift of 100% on a breaker trip. Failing over carries a duplicate risk: if the primary accepted a message but its response was lost, the secondary will send it again. For critical messages we accept that; for marketing we may delay and retry on the same provider instead. The failover decision is also bounded by TTL: an OTP that is 5 minutes old is useless.</p>
+<h3>9.5 Fan-out for broadcasts</h3>
+<p>Broadcast has two parts: expanding the audience and pacing the output. Expansion happens in the fan-out service: the segment is processed in shards (by user id range, for example 1,000 shards of 80,000 users each for 80 million users). Each shard task is itself a queue item, so fan-out is parallel and restartable (a checkpoint stores the last user id processed). The service writes messages into the intake log with the <code>campaign_id</code> and a dedup key <code>(campaign_id, user_id)</code> so that a re-run of a failed shard does not double-send. Pacing is handled by the campaign rate limit and by worker token buckets. Timezone-aware campaigns ("9 AM local") split the audience by time zone into waves, which flattens the peak naturally (a wave per hour instead of one 10 million per minute spike).</p>
+<div class="callout tip"><b>Interview tip</b> When asked about the marketing blast, say the key sentence: "bulk traffic is isolated by queue, paced by a campaign rate limit, and shifted to lower-priority workers, so it can be as slow as it wants without touching OTPs."</div>
+
+<h2 id="deep-prefs">10. Deep dive 3: preferences, compliance, dedup, throttling and batching</h2>
+<h3>10.1 Preference evaluation</h3>
+<p>For each (user, channel, category) the pipeline runs a decision function. It is deliberately one shared library or service, so no caller can bypass it.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Decision pipeline applied to each notification before sending">
+  <rect class="box" x="20" y="30" width="150" height="50" rx="8"/><text class="t-c t-b" x="95" y="52">1 Dedup check</text><text class="t-c t-sm" x="95" y="68">same key in 24h?</text>
+  <rect class="box" x="200" y="30" width="150" height="50" rx="8"/><text class="t-c t-b" x="275" y="52">2 Opt-out, consent</text><text class="t-c t-sm" x="275" y="68">global, channel, category</text>
+  <rect class="box" x="380" y="30" width="150" height="50" rx="8"/><text class="t-c t-b" x="455" y="52">3 Legal suppression</text><text class="t-c t-sm" x="455" y="68">STOP list, bounced</text>
+  <rect class="box" x="560" y="30" width="150" height="50" rx="8"/><text class="t-c t-b" x="635" y="52">4 Quiet hours</text><text class="t-c t-sm" x="635" y="68">user local time</text>
+  <rect class="box" x="740" y="30" width="140" height="50" rx="8"/><text class="t-c t-b" x="810" y="52">5 Frequency cap</text><text class="t-c t-sm" x="810" y="68">per user, category</text>
+  <path class="arrow" d="M170 55 L196 55"/><path class="arrow" d="M350 55 L376 55"/><path class="arrow" d="M530 55 L556 55"/><path class="arrow" d="M710 55 L736 55"/>
+  <rect class="miss" x="20" y="130" width="150" height="46" rx="8"/><text class="t-c t-b" x="95" y="150">Drop</text><text class="t-c t-sm" x="95" y="166">log: duplicate</text>
+  <rect class="miss" x="200" y="130" width="330" height="46" rx="8"/><text class="t-c t-b" x="365" y="150">Suppress (never send)</text><text class="t-c t-sm" x="365" y="166">except mandatory security category on an allowed channel</text>
+  <rect class="cache" x="560" y="130" width="150" height="46" rx="8"/><text class="t-c t-b" x="635" y="150">Delay</text><text class="t-c t-sm" x="635" y="166">until window ends</text>
+  <rect class="cache" x="740" y="130" width="140" height="46" rx="8"/><text class="t-c t-b" x="810" y="150">Batch or drop</text><text class="t-c t-sm" x="810" y="166">into a digest</text>
+  <path class="arrow-r" d="M95 80 L95 126"/><path class="arrow-r" d="M275 80 L330 126"/><path class="arrow-r" d="M455 80 L420 126"/><path class="arrow" d="M635 80 L635 126"/><path class="arrow" d="M810 80 L810 126"/>
+  <rect class="hit" x="20" y="240" width="860" height="56" rx="8"/><text class="t-c t-b" x="450" y="264">6 Pass: pick channel by user preference order (push, then email), render, enqueue by priority</text><text class="t-c t-sm" x="450" y="284">critical security messages bypass quiet hours and caps, never legal suppression</text>
+  <text class="t-sm" x="20" y="340">Every rejection is recorded with a reason code in the message state store, so support can answer "why did I not get it?".</text>
+  <text class="t-sm" x="20" y="362">Order matters: cheap checks first, and legal checks run before any content is rendered.</text>
+</svg>
+<figcaption>The ordered checks applied to each notification. Cheap, high-rejection checks run first. The outcome for each rejected message is recorded rather than silently dropped.</figcaption>
+</figure>
+<p><b>Opt-out and compliance.</b> Rules vary by law (CAN-SPAM and GDPR for email, TCPA for US SMS, GDPR and ePrivacy for push and tracking), but the system pattern is the same: store a <b>consent record</b> per user, channel and category with timestamp, source and text version; keep a separate global <b>suppression list</b> keyed by address (email hash, phone) so even a deleted account's address is not re-mailed. SMS STOP keywords and email unsubscribe links arrive as webhooks and must update the suppression list within seconds; for email, one-click unsubscribe headers are expected by large mailbox providers. Opt-out writes go straight to the primary store with immediate cache invalidation (publish an event or delete the cache key), because a stale "yes" in a cache is a legal problem, whereas a stale "no" is only a lost message. Transactional and security categories are legitimate to send without marketing consent but still respect channel-level legal blocks. EU data residency means preferences and addresses for EU users are stored and processed in the EU region (<a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>).</p>
+<p><b>Quiet hours</b> require the user's time zone, taken from the profile or device. The check is "local now is inside the user's window and the message is not critical". The outcome is <i>delay</i> into the scheduler with a release time at the end of the window, bounded by TTL (an expiring message is dropped, not delayed). To avoid everyone's messages releasing at the same second at 8:00 local, the release time gets jitter of a few minutes.</p>
+<h3>10.2 Deduplication and idempotency</h3>
+<p>Duplicates come from three places: callers retrying (the same request twice), our own at-least-once pipeline (a consumer crashed after sending but before committing its offset), and failover. Defenses are layered, following <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>.</p>
+<ol>
+<li><b>Request level:</b> <code>Idempotency-Key</code> to a Redis <code>SET NX</code> with 24-hour expiry at ingestion. The stored value is the notification id, so a retry gets the same answer.</li>
+<li><b>Business level:</b> <code>dedup_key</code> (for example <code>order_shipped:A991</code>) checked per user and channel within a window, catching the case where two different upstream services both emit "shipped".</li>
+<li><b>Send level:</b> the message id is deterministic: <code>hash(notification_id, user_id, channel, device)</code>. Before calling the provider, the worker does a conditional write that moves state from <code>rendered</code> to <code>sending</code> with its attempt number; a second worker handling the same message loses that compare-and-set. If the worker crashes after the provider call, the message is retried, and for push we pass the same collapse id or FCM collapse key, so the device shows one notification even if the provider receives two.</li>
+</ol>
+<p>The crash window between "provider accepted" and "we recorded sent" cannot be closed completely, which is why the honest claim is <b>at-least-once delivery with duplicate suppression</b>, not exactly-once (section 12).</p>
+<h3>10.3 Frequency caps, throttling and digests</h3>
+<p>Users who receive 40 pushes a day uninstall the app. The pipeline therefore enforces per-user caps: for example at most 5 marketing messages per week, at most 10 pushes per day outside critical categories, and at most 1 notification per type per 10 minutes. Counters are Redis keys such as <code>cap:{user}:{category}:{window}</code> using <code>INCR</code> with expiry (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>). Because the intake log is partitioned by user, all of one user's messages arrive at one consumer in order, which lets the counter be a local cache with periodic write-back instead of a Redis call per message.</p>
+<p><b>Batching and digests.</b> Instead of dropping a capped message, a lower-importance one can be absorbed into a digest. "Alice, Bob and 7 others liked your post" replaces nine pushes. Implementation: a <i>buffer</i> keyed by <code>(user, digest_type)</code> holds items, and a timer is set. The first item opens a window (for example 15 minutes for social, daily 8 AM for summaries) and schedules a flush; later items append to the buffer; at flush a single message is rendered from the items. The buffer can live in Redis lists with a sorted set of flush times (<a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>). Scheduled messages are stored durably in a time-bucketed table that a scheduler scans every few seconds for due items and republishes to the intake log (<a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>).</p>
+<table>
+<tr><th>Option for time-delayed sends</th><th>How</th><th>Tradeoff</th></tr>
+<tr><td>Broker delay features</td><td>Delay queues or per-message delivery time</td><td>Easy, but long delays (days) and cancellation are poorly supported</td></tr>
+<tr><td>Durable scheduled table (chosen)</td><td>Rows keyed by (time bucket, id); scheduler polls current bucket; publish when due</td><td>Handles days or weeks of delay and cancellation; needs sharded pollers and careful claim logic</td></tr>
+<tr><td>In-memory timers</td><td>Timer wheel inside workers</td><td>Fast, but lost on crash; unsuitable alone</td></tr>
+</table>
+
+<h2 id="templates">11. Templates, localization and device tokens</h2>
+<p>A <b>template</b> has an id, a version, a channel-specific body per locale, and a schema of required variables. For example <code>order_shipped</code> v7 has an en-US push body "Your order {{order_id}} shipped, arriving {{eta}}", a French email in HTML, and a short SMS form. Rendering is done in the pipeline, not in the caller, for three reasons: consistent branding and legal footers, the ability to change copy without code changes, and localization by the <i>recipient's</i> locale rather than the sender's. Fallback is exact locale, then language, then default, then fail validation (preferably at template publish time, not at send time). Variables are escaped for the target format (HTML for email, plain for push), plural and date formats follow locale rules (ICU message format), and a render failure is a permanent error that goes to the DLQ with the variable that was missing, not a silent blank. The template version is stored on the message record so an old message can be reproduced exactly. Templates are cached in renderer memory with version-based invalidation.</p>
+<p><b>Device token management.</b> A token identifies one app install on one device with a provider. Lifecycle events: the app registers a token at login and whenever the OS rotates it; we upsert <code>(user_id, device_id) -> token, platform, app_version, locale, last_seen</code>; logout removes it. A token can become invalid silently (app uninstalled, device reset), and the only signal is the provider's later error (APNs 410, FCM UNREGISTERED), at which point we delete it. Without this cleanup the token table fills with dead entries and wasted sends rise. We also expire tokens not seen for about 60 days, and handle the shared-device problem: if user B logs in on a phone, the same token must be removed from user A (unique index on token). Multiple devices per user mean one logical push sends to all active tokens (or only the most recently active, for message types where that is better).</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Device token lifecycle">
+  <rect class="ext" x="20" y="90" width="130" height="56" rx="8"/><text class="t-c t-b" x="85" y="114">App install</text><text class="t-c t-sm" x="85" y="132">gets token from OS</text>
+  <rect class="box" x="220" y="90" width="150" height="56" rx="8"/><text class="t-c t-b" x="295" y="114">Register API</text><text class="t-c t-sm" x="295" y="132">upsert, unique token</text>
+  <rect class="db" x="440" y="90" width="150" height="56" rx="8"/><text class="t-c t-b" x="515" y="114">Token store</text><text class="t-c t-sm" x="515" y="132">by user, index by token</text>
+  <rect class="box" x="660" y="90" width="130" height="56" rx="8"/><text class="t-c t-b" x="725" y="114">Push worker</text><text class="t-c t-sm" x="725" y="132">sends to provider</text>
+  <rect class="ext" x="660" y="190" width="130" height="44" rx="8"/><text class="t-c t-b" x="725" y="217">APNs / FCM</text>
+  <path class="arrow" d="M150 118 L216 118"/><path class="arrow" d="M370 118 L436 118"/><path class="arrow" d="M590 118 L656 118"/><path class="arrow" d="M725 146 L725 186"/>
+  <path class="arrow-r dash" d="M660 215 L515 215 L515 150"/><text class="t-sm" x="400" y="236">410 or UNREGISTERED: delete token</text>
+  <path class="arrow dash" d="M515 90 L515 50 L85 50 L85 86"/><text class="t-sm" x="190" y="42">token refresh on app start, logout removes</text>
+</svg>
+<figcaption>Tokens are registered and refreshed by the app, and removed in two ways: explicitly on logout, and reactively when the provider reports the token dead.</figcaption>
+</figure>
+
+<h2 id="tracking">12. Delivery tracking, analytics, ordering and exactly-once</h2>
+<h3>12.1 Delivery tracking and webhooks</h3>
+<p>States are described in section 5. The channels differ in what they can tell us. APNs and FCM tell us only "accepted for delivery" synchronously; delivery confirmation requires a client SDK ping (the app reports "received" and "opened" back through an event API). Email providers send webhooks: delivered, bounced (hard or soft), complained (spam report), opened (tracking pixel, increasingly unreliable because of mail privacy features), clicked (rewritten link). SMS gateways send delivery receipts (DLRs) with carrier status codes, often delayed by minutes or missing. So our status model has "sent" (provider took it) and "delivered" (confirmed where possible), and dashboards must treat the second as a lower bound.</p>
+<p>The <b>webhook receiver</b> is a separate, lightweight service that verifies the provider signature, immediately puts the raw event on a queue and answers 200 (providers retry on non-2xx, and may disable slow endpoints). A consumer then maps <code>provider_message_id</code> to our record and applies the state change idempotently. Hard bounces and complaints add the address to the suppression list; unsubscribes update consent. Webhooks arrive out of order and duplicated, so updates are conditional on state rank and keyed by provider event id.</p>
+<h3>12.2 Analytics</h3>
+<p>Every state change is also emitted as an event to the stream pipeline (<a href="../chapters/37-batch-stream.html">Chapter 37</a>) and aggregated in a warehouse and a real-time store: send count, delivery rate, bounce rate and open and click rate per campaign, template, provider and country. Per-provider delivery rate is also fed back into routing weights. Analytics is intentionally off the send path: if it fails, sends continue and events are replayed from the log.</p>
+<h3>12.3 Ordering</h3>
+<p>Do users need notifications in order? Mostly no: two unrelated pushes can arrive in any order, and providers do not guarantee order anyway. Cases that do need it, such as "payment started" before "payment succeeded", are handled by (a) partitioning the intake log by <code>user_id</code> so a user's events are processed in order, (b) a sequence number or timestamp in the payload so the client or collapse key shows only the newest, and (c) dropping a message whose state is obsolete (an "order packed" push after "delivered" is suppressed by a business rule). We explicitly do not promise end-to-end order across retries, since a retried message necessarily arrives after later ones.</p>
+<h3>12.4 Exactly-once expectations</h3>
+<p>The honest answer: <b>exactly-once delivery to a human is impossible</b>, because the last hop is a network of third parties whose acknowledgements can be lost. What we offer is <i>at-least-once processing inside the pipeline plus idempotent effects</i>, which results in <i>effectively once</i> for the common case: idempotency keys at the edge, conditional state transitions, deterministic message ids, collapse keys at the device, and provider idempotency features where they exist. The residual duplicate rate is small (a target of under 0.01%) and acceptable for push and email. See <a href="../chapters/36-event-driven.html">Chapter 36</a> and <a href="../chapters/31-distributed-transactions.html">Chapter 31</a> for the general treatment.</p>
+
+<h2 id="scaling">13. Scaling, bottlenecks, hot spots and caching</h2>
+<ul>
+<li><b>Intake log:</b> partition by <code>user_id</code> hash. At 167,000 messages per second and 1 KB each that is about 167 MB/s; with a per-partition budget of about 5 MB/s we need at least 34 partitions, so provision 256 to allow consumer parallelism and growth. Changing partition count later is disruptive, so overshoot at the start (<a href="../chapters/25-sharding.html">Chapter 25</a>).</li>
+<li><b>Hot partitions:</b> user-based keys are balanced, but a campaign written in sorted user id order could concentrate on a few partitions at a time; the fan-out service writes by hash and the pacing controller spreads load. A "celebrity" notification (one event to 50 million followers) is handled as a campaign, never as 50 million API calls.</li>
+<li><b>Preferences cache:</b> a Redis cluster with about a 150 GB working set sharded across nodes; a hit rate above 99% is expected. A local in-process cache (TTL 30 seconds) removes most Redis calls for chatty users, with explicit invalidation for opt-outs. At 167,000 per second with 99% hits there are about 1,700 database reads per second, trivial for the store. See <a href="../chapters/13-caching-patterns.html">Chapter 13</a> and <a href="../chapters/14-caching-failures.html">Chapter 14</a> for stampede protection when a cache node dies.</li>
+<li><b>Message state store:</b> about 3 state updates per message at peak means roughly 500,000 writes per second. Sharded wide-column storage handles this with enough nodes; to reduce cost we write only on state change (not every retry attempt) and batch status updates from workers.</li>
+<li><b>Workers:</b> stateless and autoscaled on queue age (<a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>); connection pools to providers are the slow-to-scale resource, so we pre-warm them.</li>
+<li><b>Team isolation:</b> separate budgets per sending team so one team's bug (a loop sending a push every second) hits its own quota and not the shared system, the same idea as the cells in <a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>.</li>
+</ul>
+
+<h2 id="failures">14. Failure modes, consistency and multi-region</h2>
+<table>
+<tr><th>Component</th><th>If it fails or slows</th><th>Mitigation</th></tr>
+<tr><td>Ingestion API node</td><td>Callers get errors or timeouts</td><td>Stateless behind a load balancer; callers retry with the same idempotency key; autoscale.</td></tr>
+<tr><td>Intake log (broker)</td><td>Cannot accept new work</td><td>Replication factor 3 across zones, min in-sync replicas 2; if the cluster is down, ingestion returns 503 and the security service falls back to a direct-send emergency path for OTPs only.</td></tr>
+<tr><td>Redis (prefs or dedup) down</td><td>Slower lookups or lost dedup keys</td><td>Fall back to the primary store at reduced rate; dedup falls back to the send-level state check; a failed cap check fails open for critical, closed for marketing.</td></tr>
+<tr><td>Template wrong or missing</td><td>Garbage or failed messages</td><td>Versioned templates, schema validation at publish, canary a new version on 1% before full rollout, in-memory last known good.</td></tr>
+<tr><td>Pipeline worker crash</td><td>Messages in flight redelivered</td><td>At-least-once consumption, offsets committed after enqueue; duplicates suppressed by the send-level compare-and-set.</td></tr>
+<tr><td>APNs, FCM or one ESP down</td><td>Growing queue for that channel, errors</td><td>Circuit breaker, failover to secondary provider where one exists, queues absorb the backlog; low priority paused first; TTL drops obsolete messages.</td></tr>
+<tr><td>Provider slow (not down)</td><td>Worker threads stuck, latency rises</td><td>Strict request timeouts (2 to 5 seconds), bulkheads per provider so a slow one cannot consume the whole pool.</td></tr>
+<tr><td>Provider returns wrong data</td><td>False "delivered" or bounce webhooks</td><td>Signature checks, schema validation, anomaly alerts when a rate swings sharply, correction through DLQ replay.</td></tr>
+<tr><td>Bug in preference logic</td><td>Messages sent to opted-out users (serious)</td><td>Defence in depth: a final cheap check against the suppression list just before sending; a kill switch per category.</td></tr>
+<tr><td>Runaway producer</td><td>Floods the system</td><td>Per-service quotas at ingestion, per-user caps, campaign pause API.</td></tr>
+<tr><td>Scheduler outage</td><td>Delayed sends and digests do not release</td><td>Multiple scheduler shards with leases; on recovery, scan overdue buckets and apply TTL (some sends are now stale and dropped).</td></tr>
+<tr><td>Message state store slow</td><td>Status lag, possible repeated sends if the compare-and-set fails</td><td>Treat a failed CAS as "unknown" and re-read; for critical, prefer send-and-risk-duplicate over drop.</td></tr>
+</table>
+<h3>14.1 Consistency choices</h3>
+<p>Different data deserves different guarantees. Opt-outs, suppression and idempotency keys need strong, read-your-write consistency (single-key linearizable writes to the primary; <a href="../chapters/28-cap-consistency.html">Chapter 28</a>). Message state needs only per-key monotonic updates. Analytics is eventually consistent. Device tokens are last-writer-wins by timestamp with the unique token constraint. This split lets us use cheap, available stores wherever strictness is not required.</p>
+<h3>14.2 Multi-region</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 310" role="img" aria-label="Multi-region deployment">
+  <rect x="20" y="20" width="270" height="250" rx="10" fill="none" stroke="var(--fg)" stroke-dasharray="5 4"/><text class="t-b" x="34" y="42">Region: Americas</text>
+  <rect x="320" y="20" width="270" height="250" rx="10" fill="none" stroke="var(--fg)" stroke-dasharray="5 4"/><text class="t-b" x="334" y="42">Region: Europe (EU data stays)</text>
+  <rect x="620" y="20" width="260" height="250" rx="10" fill="none" stroke="var(--fg)" stroke-dasharray="5 4"/><text class="t-b" x="634" y="42">Region: Asia-Pacific</text>
+  <rect class="box" x="40" y="60" width="230" height="40" rx="8"/><text class="t-c t-b" x="155" y="85">Ingestion, pipeline, workers</text>
+  <rect class="cache" x="40" y="115" width="230" height="40" rx="8"/><text class="t-c t-b" x="155" y="140">Regional intake log, queues</text>
+  <rect class="db" x="40" y="170" width="230" height="40" rx="8"/><text class="t-c t-b" x="155" y="195">Prefs, tokens of home users</text>
+  <rect class="box" x="340" y="60" width="230" height="40" rx="8"/><text class="t-c t-b" x="455" y="85">Ingestion, pipeline, workers</text>
+  <rect class="cache" x="340" y="115" width="230" height="40" rx="8"/><text class="t-c t-b" x="455" y="140">Regional intake log, queues</text>
+  <rect class="db" x="340" y="170" width="230" height="40" rx="8"/><text class="t-c t-b" x="455" y="195">Prefs, tokens of home users</text>
+  <rect class="box" x="640" y="60" width="220" height="40" rx="8"/><text class="t-c t-b" x="750" y="85">Ingestion, pipeline, workers</text>
+  <rect class="cache" x="640" y="115" width="220" height="40" rx="8"/><text class="t-c t-b" x="750" y="140">Regional intake log, queues</text>
+  <rect class="db" x="640" y="170" width="220" height="40" rx="8"/><text class="t-c t-b" x="750" y="195">Prefs, tokens of home users</text>
+  <text class="t-c t-sm" x="155" y="240">Router: user id to home region</text><text class="t-c t-sm" x="455" y="240">Cross-region: forward only</text><text class="t-c t-sm" x="750" y="240">Campaigns replicated, not users</text>
+  <text class="t-sm" x="20" y="295">A request for a user homed elsewhere is forwarded to that user's region; only campaign definitions and templates replicate everywhere.</text>
+</svg>
+<figcaption>Each region owns the users homed in it, along with their preferences, tokens and queues. A global entry point routes by user. Only campaign definitions and templates replicate across regions.</figcaption>
+</figure>
+<p>We use a <b>home-region-per-user</b> design (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>, <a href="../chapters/41-ha-dr.html">Chapter 41</a>): every user's data and processing live in one region, which respects EU residency and keeps sends close to the right provider endpoints (APNs and FCM are global services; SMS routes are country-specific, so SMS aggregators are chosen by destination). The ingestion API is reachable from anywhere (callers hit the nearest region) and forwards by user id when needed. A campaign is expanded <i>in each region for its own users</i>, so the fan-out is local and parallel. Within a region we spread across three zones. If a region fails, its queued messages are in a log mirrored to a second region (for non-EU data); critical OTP traffic can be rerouted to another region using a pre-warmed standby, while EU data stays in the EU unless explicitly allowed. Replication across regions is asynchronous, so preferences changed in a failover window are re-checked at the final send step against a replicated suppression list.</p>
+
+<h2 id="security">15. Security, abuse, monitoring and cost</h2>
+<h3>15.1 Security and abuse</h3>
+<ul>
+<li><b>Service authentication and authorization:</b> each caller has credentials restricted to allowed categories and templates. Only the security service may send P0.</li>
+<li><b>No arbitrary content:</b> callers pass a template id and variables, so a compromised service cannot send phishing text to every user. Free-text bodies need approval.</li>
+<li><b>PII:</b> addresses and phone numbers encrypted at rest, tokens treated as secrets, logs mask them, and sensitive payloads (one-time codes) are not stored in clear beyond delivery. Provider credentials live in a secrets manager and rotate (<a href="../chapters/55-security.html">Chapter 55</a>).</li>
+<li><b>SMS pumping fraud:</b> attackers trigger OTP requests to premium-rate numbers to earn revenue share. Mitigate with per-number and per-account rate limits, country allowlists, and anomaly detection on spend.</li>
+<li><b>Webhook spoofing:</b> verify signatures and source addresses.</li>
+<li><b>User-triggered sends:</b> features like "invite a friend by SMS" are rate-limited per user.</li>
+</ul>
+<h3>15.2 Monitoring and SLOs</h3>
+<table>
+<tr><th>SLI</th><th>Target</th></tr>
+<tr><td>P0 time from API accept to provider hand-off</td><td>p99 under 2 seconds</td></tr>
+<tr><td>P1 hand-off time</td><td>p99 under 30 seconds</td></tr>
+<tr><td>Ingestion availability</td><td>99.99% monthly</td></tr>
+<tr><td>Accepted notifications lost</td><td>0 (audited by reconciling intake log counts to the state store)</td></tr>
+<tr><td>Duplicate rate</td><td>under 0.01%</td></tr>
+<tr><td>Opt-out violations</td><td>0; any one is an incident</td></tr>
+<tr><td>Provider delivery and bounce rates</td><td>watched per provider with alerts on sudden change</td></tr>
+</table>
+<p>Dashboards: queue age by channel and priority, provider error rate and latency, breaker state, DLQ depth, token invalidation rate (a spike means a bug or an OS change), cap and suppression counts, cost per channel. Tracing carries <code>notification_id</code> through all stages so one id explains a missing message (<a href="../chapters/54-observability-slos.html">Chapter 54</a>).</p>
+<h3>15.3 Cost notes</h3>
+<p>The dominant cost is not compute but providers: SMS at 60 million per day times roughly a cent each is about $600,000 per day, dwarfing everything else, so the system favors cheaper channels (push before SMS), SMS only for critical or opted-in cases, and per-country route optimization. Email costs fractions of a cent each; push is nearly free. Storage is secondary (about 1 TB per day). Compute is roughly 200 worker instances at peak, autoscaled down at night. Reducing unwanted notifications (caps, digests) saves money and retains users, which is the best cost lever.</p>
+
+<h2 id="evolution">16. Evolution, phasing and alternatives not chosen</h2>
+<h3>16.1 What to build first</h3>
+<ol>
+<li><b>Phase 1 (MVP):</b> ingestion API with idempotency, one durable queue, one worker per channel, one provider each, basic template rendering, preferences table, status table. Handles a few hundred per second.</li>
+<li><b>Phase 2:</b> priority queues, retries with backoff and DLQ, device token cleanup, webhooks and suppression, frequency caps. This is where reliability and compliance appear.</li>
+<li><b>Phase 3:</b> second providers with circuit breakers and weighted routing, scheduling and digests, campaign fan-out with pacing, localization.</li>
+<li><b>Phase 4:</b> multi-region with home-region routing, per-team quotas, analytics and auto-tuned routing.</li>
+</ol>
+<h3>16.2 At 10x scale (100 million per minute)</h3>
+<p>The main changes: the intake log and state store grow to thousands of partitions and a few hundred nodes; per-provider connection counts become a primary constraint, so we negotiate higher limits, use dedicated regional endpoints, and add a third email and SMS provider; the preferences check moves to an embedded in-process cache with streaming invalidation rather than Redis calls; fan-out becomes a separate cell-based system so a campaign cannot affect others (<a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>); and per-message state writes are replaced with batched logs for non-critical traffic (store only terminal states and sampled intermediate states for marketing).</p>
+<h3>16.3 Alternatives not chosen</h3>
+<ul>
+<li><b>Direct provider calls from each caller via an SDK:</b> fastest to build, but no consistent preferences, caps or failover; every caller owns retries.</li>
+<li><b>One queue per user:</b> perfect ordering but millions of queues is unworkable; partitioning by user hash gives the same per-user ordering with far fewer queues.</li>
+<li><b>Using the provider's own scheduling for delayed sends:</b> cheaper to build, but not cancellable on opt-out, and loses control over quiet hours and caps.</li>
+<li><b>One global queue without priorities:</b> simplest operationally; fails the "blast must not delay an OTP" requirement.</li>
+<li><b>Synchronous preference service call per send:</b> consistent, but at 167,000 per second it becomes the largest dependency; cached reads with explicit invalidation scale better.</li>
+<li><b>A managed multi-channel vendor service:</b> good for small scale and quick start; at this scale we need control over routing, cost, residency and failover.</li>
+</ul>
+
+<h2 id="qa">17. Interview Q&amp;A</h2>
+<details><summary>How do you make sure a marketing campaign does not delay password reset codes?</summary><p>Isolation happens at several layers. Bulk traffic carries a low priority label from the caller and the campaign tool, and low-priority messages go to separate queues for each channel, so a multi-million backlog sits in its own queue rather than in front of critical messages. Workers always drain the critical queue first, and a small dedicated worker group with its own provider connections and credentials serves only P0, so even a bad day for the shared pool does not touch it. The fan-out service paces campaigns with a rate limit and slows itself when downstream queue age grows. Finally we use separate email IP pools and SMS routes for transactional traffic. The measurable promise is the queue age for P0, which should stay under a second.</p></details>
+<details><summary>What happens when APNs or an email provider goes down?</summary><p>The channel workers see rising error rates, and the circuit breaker for that provider opens after the error rate crosses a threshold within a short window. For email and SMS, traffic shifts to the secondary provider that is kept warm with a small share of traffic. APNs and FCM have no equivalent for their platform, so messages wait in the queue with their TTLs, and critical ones can fall back to another channel such as SMS or in-app. Low-priority queues are paused first so capacity and provider rate budgets are preserved for important traffic. When the provider recovers, a half-open probe verifies it and traffic ramps back; messages whose TTL expired are dropped because stale notifications are harmful.</p></details>
+<details><summary>How do you prevent duplicate notifications?</summary><p>We layer the defences because no single one is enough. At the API, an idempotency key stored with a set-if-absent command makes caller retries safe. A business dedup key catches two services reporting the same event. Inside the pipeline, the message id is deterministic and a conditional state change ensures only one worker proceeds to send it. At the device, collapse ids or keys make a duplicate delivery to the provider show as a single notification. We still describe the guarantee as at-least-once with duplicate suppression, because a crash between the provider accepting a message and us recording it cannot be fully eliminated, and I would rather duplicate an OTP than lose it.</p></details>
+<details><summary>Why partition the queue by user id?</summary><p>It gives three benefits at once. All messages for one user reach the same consumer in order, so per-user caps, quiet-hour decisions and digests see a consistent, ordered stream and can use local state instead of distributed locks. It spreads load evenly because users are numerous and hash uniformly. And the state store is partitioned the same way, so per-user history reads are local. The cost is that a single extremely heavy user could make a hot partition, which is rare; broadcasts avoid hot spots because the fan-out service writes each user's message through the hash rather than by sorted id ranges.</p></details>
+<details><summary>How would you implement quiet hours and "send at 9 AM local time"?</summary><p>Both need the user's time zone, taken from the profile or the device. For quiet hours, the pipeline checks whether the user's local time falls in their window and the message is not critical; if so it writes the message to the scheduler with a release time at the end of the window plus jitter, unless the TTL would expire first, in which case it drops it. For "9 AM local" campaigns, the fan-out splits the audience by time zone into waves and schedules each wave at that zone's 9 AM, which also flattens the peak load. Scheduled items sit in a durable, time-bucketed table that sharded pollers scan, so delays of days and cancellations (for example because the user opts out meanwhile) work. The opt-out check runs again at release time.</p></details>
+<details><summary>How do you handle invalid device tokens?</summary><p>The provider tells us when a token is dead, usually on a later send: APNs returns 410 or BadDeviceToken, and FCM returns UNREGISTERED. The worker classifies this as a permanent error, does not retry, and deletes the token through a token store call keyed by token. We also remove a token when the app logs out and reassign it if another user logs into the same device. Tokens that have not been refreshed in about 60 days are expired by a background job. Cleaning matters because dead tokens waste send capacity and provider quota and can make providers throttle us. A sudden spike in invalidations is monitored, since it often signals our own bug or an app release problem.</p></details>
+<details><summary>How do you scale to a broadcast to 100 million users?</summary><p>Broadcast is a different workload than a single send, so it enters through a campaign object, not as individual API calls. A fan-out service reads the audience in shards, publishes batches to the intake log with a deterministic per-campaign key to make re-runs safe, and checkpoints progress. A configured rate limits the output, say 100,000 messages per second, so 100 million takes about 17 minutes. Messages ride the lowest priority queues, so they cannot damage the latency of other traffic. The campaign can be paused, canceled or throttled when queue age rises. Where possible, the audience is split by time zone and by region so each region fans out its own users in parallel.</p></details>
+<details><summary>Can you guarantee exactly-once delivery? What would you say to a product manager who asks for it?</summary><p>No system that depends on APNs, FCM, carriers and mailbox providers can promise that a human sees a message exactly once, because acknowledgements can be lost at any hop and the final display is controlled by the device. What we can promise is that we process each accepted request at least once, suppress duplicates through idempotency keys, deterministic ids and conditional state changes, and use collapse keys so that duplicates at the provider do not produce two visible notifications. I would present it as effectively-once with a measured duplicate rate under a small target, and add a rule that critical messages prefer a rare duplicate to a loss.</p></details>
+<details><summary>How do user preferences stay fast and still legally correct?</summary><p>Preferences are read on every send, so we cache them in Redis and in process. For correctness, opt-out writes go to the primary store and immediately invalidate or update the cache keys through an event, and there is a global suppression list keyed by address that the worker consults again just before sending as a final defence. A stale cache that says "opted in" is the risk, so the cache TTL for suppression is short, and the invalidation path is monitored. Consent changes are stored with timestamps, source and text version so we can prove what the user agreed to. Mandatory security notifications use a separate category that is allowed on certain channels, but legal blocks such as an SMS STOP still apply.</p></details>
+<details><summary>How would you track whether a notification was delivered or opened?</summary><p>Each channel gives different signals. For push, the provider only acknowledges acceptance, so the client SDK reports received and opened events through an event endpoint that includes the notification id. Email providers deliver webhooks for delivered, bounced, complaint, open and click; SMS gateways deliver receipts from carriers, sometimes delayed. We receive webhooks in a small service that verifies the signature, queues the raw event and answers quickly, and a consumer maps the provider message id to our record and advances the state monotonically, ignoring duplicates and out-of-order events. The events stream to analytics for aggregation by campaign and template, and the delivery rates per provider also feed routing decisions. Open rates are treated as approximate because of privacy features that preload tracking pixels.</p></details>
+
+<h2 id="wrap">18. Connects to, and recap</h2>
+<p class="connects"><b>Connects to:</b> <a href="../chapters/02-estimation.html">Chapter 2</a> (estimation method), <a href="../chapters/05-api-design.html">Chapter 5</a> (API conventions), <a href="../chapters/06-realtime.html">Chapter 6</a> (in-app real-time delivery), <a href="../chapters/13-caching-patterns.html">Chapter 13</a> and <a href="../chapters/15-redis.html">Chapter 15</a> (caches for preferences and counters), <a href="../chapters/16-rate-limiting.html">Chapter 16</a> (caps and provider token buckets), <a href="../chapters/34-queues-kafka.html">Chapter 34</a> and <a href="../chapters/35-messaging-patterns.html">Chapter 35</a> (queues, retries, DLQ), <a href="../chapters/20-nosql.html">Chapter 20</a> and <a href="../chapters/25-sharding.html">Chapter 25</a> (message store), <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a> and <a href="../chapters/41-ha-dr.html">Chapter 41</a> (regions), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotency), <a href="../chapters/36-event-driven.html">Chapter 36</a> (event triggers), <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a> (scheduling), <a href="../chapters/40-resilience.html">Chapter 40</a> (circuit breakers, backoff), <a href="../chapters/42-multitenancy-cells.html">Chapter 42</a> (isolation), <a href="../chapters/54-observability-slos.html">Chapter 54</a> (SLOs), <a href="../chapters/55-security.html">Chapter 55</a> and <a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a> (security, privacy).</p>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>The system is a middleman to unreliable third parties: accept fast, store durably, process asynchronously through stages, and return 202.</li>
+<li>Numbers: 2 billion per day, 23,000 per second average, 167,000 per second at the 10 million per minute peak; about 120 push workers, 1 TB per day of state, 250 GB of tokens.</li>
+<li>Priority isolation uses separate queues per channel and tier, weighted worker pulling, a dedicated pool for critical traffic, and paced campaigns.</li>
+<li>Provider integration needs token buckets, classified errors, jittered backoff through delay queues, a DLQ, and circuit breakers with active-active failover.</li>
+<li>Preferences, consent, suppression, quiet hours, caps and digests live in one ordered decision pipeline whose every rejection is recorded.</li>
+<li>Duplicates are suppressed in layers (idempotency key, business key, conditional state, collapse key), yet the honest guarantee is at-least-once with effective once.</li>
+<li>Webhooks update delivery state monotonically; analytics stays off the send path.</li>
+<li>Multi-region uses a home region per user for residency and locality; fan-out happens per region.</li>
+<li>Money goes to SMS, so favor cheap channels; fewer unwanted messages is the best optimization.</li>
+</ul></div>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

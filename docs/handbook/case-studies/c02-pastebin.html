@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 2: Design Pastebin | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c02-pastebin">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 2 · Worked solutions</div>
+<h1>Design Pastebin</h1>
+<p class="lead">Pastebin lets anyone store a chunk of text, get a short link, and share it. It looks like a toy, but it hides the classic split between small hot metadata and large cold content, a key-generation problem, expiry at scale, and an abuse problem. This page solves it the way a strong candidate would in a 45-minute interview.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is usually one sentence: "Design Pastebin." A user pastes text (code, a log, a config file), the service stores it, and returns a URL such as <code>https://paste.example/aZ3kP9xQ</code>. Anyone with the URL (or only the owner, for private pastes) can open it later and see the text, usually with syntax highlighting. Pastes can expire after a time the user chooses.
+
+The first five minutes of the interview are for questions, following the framework in <a href="../chapters/01-interview-framework.html">Chapter 1</a>. Here are the questions worth asking, with the answers I will assume for the rest of the page.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>How many users and pastes?</td><td>About 1 million new pastes per day. Reads dominate at 10 reads per write, so 10 million reads per day.</td></tr>
+<tr><td>How big is a paste?</td><td>Average 10 KB. Hard maximum 1 MB per paste (anything bigger is a file-sharing problem, not a paste problem).</td></tr>
+<tr><td>Anonymous or logged-in users?</td><td>Both. Anonymous pastes are allowed (that is the main use), logged-in users get a history list and can delete or edit their pastes.</td></tr>
+<tr><td>Visibility?</td><td>Three levels: public (listed and indexable), unlisted (anyone with the link), private (owner only).</td></tr>
+<tr><td>Expiry?</td><td>The user picks: 10 minutes, 1 hour, 1 day, 1 week, 1 month, or never. Default one month for anonymous users, so storage does not grow forever.</td></tr>
+<tr><td>Custom URLs?</td><td>Optional for logged-in users; the core design uses generated keys.</td></tr>
+<tr><td>Syntax highlighting?</td><td>Yes, for common languages. It must not slow the read path down.</td></tr>
+<tr><td>Edits and history?</td><td>Logged-in owners can create new versions; older versions stay readable at a version-specific URL.</td></tr>
+<tr><td>Availability and latency?</td><td>Reads 99.95 percent available, p99 under 200 ms for a cached read. Writes can be slightly slower (under 500 ms).</td></tr>
+<tr><td>Durability?</td><td>A paste that has not expired must not be lost. This is the one hard promise.</td></tr>
+<tr><td>Global?</td><td>Yes, readers are worldwide, writers mostly the same. One primary region with a CDN in front is enough to start.</td></tr>
+</table>
+<div class="callout tip"><b>Interview tip</b> Say out loud which assumption is the dominant one. Here it is "reads are ten times writes, and most pastes are read only a few times." That one sentence drives caching, CDN use, and the storage split.</div>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li>Create a paste from text with optional title, language, visibility, and expiry, and receive a short key and URL.</li>
+<li>Read a paste by key, as an HTML page with highlighting and as raw text.</li>
+<li>Delete a paste (owner only, or anonymous with a secret delete token returned at creation).</li>
+<li>Expire pastes automatically at their chosen time; after expiry reads return "gone".</li>
+<li>List a logged-in user's pastes; list recent public pastes.</li>
+<li>Create new versions of an existing paste, and read old versions.</li>
+<li>Report abusive pastes; moderators can remove them.</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Read-heavy and highly available.</b> A link that was shared in a chat must open quickly, from anywhere.</li>
+<li><b>Durable.</b> Non-expired pastes are never lost (object storage with replication gives eleven nines of annual durability, typically).</li>
+<li><b>Cheap per paste.</b> Storage is the dominant cost, so size limits, expiry, and deduplication are cost features, not extras.</li>
+<li><b>Unguessable for unlisted pastes.</b> The key is the only secret, so keys must not be sequential or predictable.</li>
+<li><b>Abuse-resistant.</b> A free anonymous write endpoint is a magnet for spam, malware hosting, and leaked credentials.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Binary file hosting, collaborative real-time editing (that is a different design, see <a href="../chapters/06-realtime.html">Chapter 6</a>), full-text search over all pastes, comments, and payments. I will mention search and collaboration only as evolution options.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>Estimation technique is covered in <a href="../chapters/02-estimation.html">Chapter 2</a>. The goal is not precision but to find out which resource is the bottleneck. Round numbers are fine; show the arithmetic.</p>
+<h3>3.1 Traffic</h3>
+<table>
+<tr><th>Quantity</th><th>Arithmetic</th><th>Result</th></tr>
+<tr><td>Writes per day</td><td>given</td><td>1,000,000</td></tr>
+<tr><td>Average write QPS</td><td>1,000,000 / 86,400</td><td>about 12 per second</td></tr>
+<tr><td>Peak write QPS (5x)</td><td>12 x 5</td><td>about 60 per second</td></tr>
+<tr><td>Reads per day</td><td>10 x writes</td><td>10,000,000</td></tr>
+<tr><td>Average read QPS</td><td>10,000,000 / 86,400</td><td>about 116 per second</td></tr>
+<tr><td>Peak read QPS (5x)</td><td>116 x 5</td><td>about 600 per second</td></tr>
+</table>
+<p>These are tiny numbers. One decent database could serve 600 reads per second. That is a useful finding: this system is not hard because of QPS. It is hard because of <b>storage growth</b>, <b>key generation correctness</b>, <b>expiry</b>, and <b>abuse</b>. If an interviewer wants more drama, scale users 100x (100 million pastes per day, 60,000 peak reads per second) and the same architecture still works because every component is horizontally scalable.</p>
+<h3>3.2 Storage</h3>
+<table>
+<tr><th>Quantity</th><th>Arithmetic</th><th>Result</th></tr>
+<tr><td>Content per day</td><td>1,000,000 x 10 KB</td><td>10 GB per day</td></tr>
+<tr><td>Content per year</td><td>10 GB x 365</td><td>about 3.65 TB per year</td></tr>
+<tr><td>Content over 5 years, no expiry at all</td><td>3.65 TB x 5</td><td>about 18 TB</td></tr>
+<tr><td>Metadata per paste</td><td>key 8 B, owner 8 B, timestamps 16 B, flags, hash 32 B, pointer, title; about 500 B with indexes</td><td>500 B</td></tr>
+<tr><td>Metadata per year</td><td>1,000,000 x 500 B x 365</td><td>about 182 GB per year</td></tr>
+</table>
+<p>Content is 20 times bigger than metadata (10 KB versus 500 B). The metadata of five years (about 900 GB) still fits on one large database server, though we will shard or replicate for availability. The content (18 TB, and more with a 100x scale-up) belongs in object storage, which is why the central design decision is the split in section 6.</p>
+<h3>3.3 Bandwidth and cache memory</h3>
+<ul>
+<li><b>Read bandwidth:</b> 116 reads per second x 10 KB = about 1.2 MB per second average, which is about 9 megabits per second. Peak is 600 x 10 KB = 6 MB per second, about 50 megabits per second. Trivial for one region, which again shows the CDN is for latency and origin protection, not bandwidth.</li>
+<li><b>Write bandwidth:</b> 12 x 10 KB = 120 KB per second average.</li>
+<li><b>Hot set:</b> reads follow a skewed distribution; a paste shared in a popular thread gets most of its reads in the first day. Suppose 3 million distinct pastes are read each day and the top 20 percent (600,000) take most traffic. Content 600,000 x 10 KB = 6 GB; with metadata 600,000 x 0.5 KB = 0.3 GB. About 6 to 7 GB of cache holds the working set. One Redis node (see <a href="../chapters/15-redis.html">Chapter 15</a>) holds that easily.</li>
+</ul>
+<h3>3.4 Key space</h3>
+<p>Keys use the 62 characters 0-9, a-z, A-Z. With 8 characters there are 62^8 = about 2.18 x 10^14 keys. We create 365 million pastes per year (1,000,000 x 365), so ten years use 3.65 billion keys, which is 0.0017 percent of the space. That sparse usage is what makes random keys unguessable: an attacker who tries a random 8-character key hits a live paste with probability about 1 in 60,000 for each guess, and rate limits make scanning impractical. The related short-link design in <a href="c01-url-shortener.html">Case study 1</a> goes deeper on encodings; here the focus is the pre-generated key service.</p>
+<h3>3.5 Rough cost</h3>
+<p>Prices change, so treat these as order of magnitude. Object storage standard tier typically costs about 2 to 3 cents per GB-month. 18 TB is 18,000 GB, so about $400 to $550 per month after five years with no expiry. Requests cost about $0.005 per 1,000 PUTs: 30 million PUTs per month is about $150. GETs cost about $0.0004 per 1,000; with a 90 percent CDN hit ratio only 1 million per day reach the origin, about 30 million per month, around $12. Egress to the internet dominates if you serve from storage directly (about 9 cents per GB at list price), which is another reason to put a CDN in front: 300 GB per month of reads is only a few dollars either way, but at 100x scale it matters. The summary: <b>storage and its lifetime are the cost</b>, which expiry and dedup attack directly.</p>
+
+<h2 id="api">4. API design</h2>
+<p>A REST API over HTTPS (principles in <a href="../chapters/05-api-design.html">Chapter 5</a>). Write calls need an API key or session cookie (anonymous calls get strict IP rate limits). Every create call accepts an <code>Idempotency-Key</code> header so client retries do not make duplicate pastes (see <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>).</p>
+<pre><code>POST /v1/pastes
+Idempotency-Key: 7f1c...
+{
+  "content": "print('hello')",
+  "title": "demo",              // optional, max 100 chars
+  "language": "python",         // optional, "auto" runs detection
+  "visibility": "unlisted",     // public | unlisted | private
+  "expires_in": "1d"            // 10m | 1h | 1d | 1w | 1m | never
+}
+201 Created
+{ "key": "aZ3kP9xQ", "url": "https://paste.example/aZ3kP9xQ",
+  "version": 1, "expires_at": "2026-11-18T10:00:00Z",
+  "delete_token": "d_9c1f..." }       // only for anonymous pastes
+
+GET  /v1/pastes/{key}               -> metadata + content (JSON)
+GET  /raw/{key}                     -> text/plain, the bytes only
+GET  /{key}                         -> HTML page with highlighting
+GET  /v1/pastes/{key}/versions/{n}  -> a specific version
+PUT  /v1/pastes/{key}               -> new version (owner only), returns version n+1
+DELETE /v1/pastes/{key}             -> owner session or delete_token
+GET  /v1/users/me/pastes?cursor=... -> owner's list, cursor-paginated
+GET  /v1/pastes/recent?cursor=...   -> public recent list
+POST /v1/pastes/{key}/report        -> abuse report {reason}
+</code></pre>
+<p>Design notes. The create call returns <code>413 Payload Too Large</code> above 1 MB and <code>429 Too Many Requests</code> when rate limited. Reads return <code>404</code> for unknown keys, <code>410 Gone</code> for expired or deleted pastes (clients and crawlers learn the difference), and <code>403</code> only for authenticated users who are not allowed; for private pastes of other users, return <code>404</code> to avoid confirming that the key exists. List endpoints use cursor pagination, not offsets, because offsets get slower and unstable as data changes.</p>
+
+<h2 id="data">5. Data model and storage choice</h2>
+<p>There are two different kinds of data with opposite properties, so they get different stores.</p>
+<table>
+<tr><th></th><th>Metadata</th><th>Content (the text)</th></tr>
+<tr><td>Size per paste</td><td>about 500 B</td><td>about 10 KB (up to 1 MB)</td></tr>
+<tr><td>Access</td><td>point lookups by key, queries by owner, range queries by expiry time</td><td>whole-object read or write, never partial update</td></tr>
+<tr><td>Mutability</td><td>changes (view count, status, expiry)</td><td>immutable once written</td></tr>
+<tr><td>Best store</td><td>database (relational or wide-column key-value)</td><td>object storage</td></tr>
+</table>
+<h3>5.1 Metadata in a database</h3>
+<p>The metadata row is small, queried by key, and queried in other ways (by owner, by expiry). A sharded relational database or a key-value store such as DynamoDB or Cassandra works (compare in <a href="../chapters/20-nosql.html">Chapter 20</a> and <a href="../chapters/17-data-modeling.html">Chapter 17</a>). I would pick a relational database with a read replica per region at this scale: the data is small, we want secondary indexes and transactions for the version counter, and sharding by key hash is available when needed (<a href="../chapters/25-sharding.html">Chapter 25</a>).</p>
+<pre><code>pastes(
+  key            CHAR(8)  PRIMARY KEY,
+  owner_id       BIGINT   NULL,            -- NULL for anonymous
+  title          VARCHAR(100),
+  language       VARCHAR(20),
+  visibility     SMALLINT,                 -- 0 public, 1 unlisted, 2 private
+  status         SMALLINT,                 -- 0 active, 1 expired, 2 deleted, 3 blocked
+  current_version INT,
+  created_at     TIMESTAMP,
+  expires_at     TIMESTAMP NULL,           -- NULL = never
+  delete_token_hash BYTEA NULL,
+  size_bytes     INT,
+  view_count     BIGINT                    -- approximate, updated asynchronously
+)
+paste_versions(
+  key            CHAR(8),
+  version        INT,
+  content_hash   CHAR(64),                 -- SHA-256 hex, also the object name
+  size_bytes     INT,
+  created_at     TIMESTAMP,
+  PRIMARY KEY (key, version)
+)
+blobs(
+  content_hash   CHAR(64) PRIMARY KEY,
+  object_key     VARCHAR(100),             -- e.g. blobs/ab/cd/abcd...
+  ref_count      BIGINT,                   -- number of versions pointing here
+  first_seen_at  TIMESTAMP
+)
+INDEX pastes(owner_id, created_at DESC)
+INDEX pastes(expires_at) WHERE status = 0 AND expires_at IS NOT NULL
+</code></pre>
+<p>Notice what is <b>not</b> in the table: the text. The row holds the hash, and the hash is the name of the object in storage.</p>
+<h3>5.2 Content in object storage</h3>
+<p>Object stores such as Amazon S3, Google Cloud Storage, or Azure Blob (<a href="../chapters/21-object-storage.html">Chapter 21</a>) are built for exactly this: large numbers of immutable blobs, cheap per GB, replicated across availability zones for durability, and with built-in lifecycle rules and CDN integration. Putting 10 KB blobs in the relational database would work for a year, but then you pay for expensive database storage, the buffer pool fills with cold text, backups and replicas become huge and slow, and every replica copies all of it. Moving the text out keeps the database small, which means it stays in memory and stays fast.</p>
+<p>Object key layout matters. Object stores partition by key prefix, so avoid prefixes that all start the same way, and avoid timestamps as the first element. Using the hash gives a uniform spread: <code>blobs/ab/cd/abcdef...</code>. Small pastes are written as a single PUT. For text, store gzip or zstd compressed (text typically compresses 3x to 5x, a direct 70 percent cost cut) and mark <code>Content-Encoding</code> so it can be served as-is.</p>
+<div class="callout key"><b>Key idea</b> Metadata is small, hot, queried, and mutable, so it lives in a database. Content is large, cold, immutable, and fetched as a whole, so it lives in object storage. The row points to the blob by content hash. This split is the answer to "where do you store the paste?"</div>
+<h3>5.3 Why not store small pastes inline?</h3>
+<p>A reasonable optimization: pastes under 2 KB (a sizeable share of all pastes) could be stored inline in the metadata row, saving one network hop to object storage on every read. The cost is two code paths and a migration problem when a paste grows via edit. I would not do it first; a Redis cache of the content makes the second hop disappear for hot pastes anyway. Mention it as an optimization, not the baseline.</p>
+
+<h2 id="first">6. A first simple design</h2>
+<p>Start with the simplest thing that works, then find where it breaks.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 200" role="img" aria-label="Simple first design: client, one app server, one database holding both metadata and text">
+  <rect class="ext" x="30" y="70" width="150" height="60" rx="8"/><text class="t-c t-b" x="105" y="105">Browser / client</text>
+  <rect class="box" x="330" y="70" width="190" height="60" rx="8"/><text class="t-c t-b" x="425" y="97">App server</text><text class="t-c t-sm" x="425" y="115">generate key, validate</text>
+  <rect class="db" x="680" y="60" width="190" height="80" rx="8"/><text class="t-c t-b" x="775" y="92">One database</text><text class="t-c t-sm" x="775" y="112">metadata and text together</text>
+  <path class="arrow" d="M180 100 L326 100"/>
+  <path class="arrow" d="M520 100 L676 100"/>
+  <text class="t-sm" x="190" y="90">POST / GET</text>
+</svg>
+<figcaption>One app server generates a random key, writes metadata and text into one database row, and reads them back. Correct, simple, and fine for a hobby project.</figcaption>
+</figure>
+<p>Where it breaks: (1) the database grows by 10 GB per day, mostly cold text, so backups and replicas become slow and expensive; (2) a single app server and a single database are single points of failure; (3) random key generation in the app needs a collision check against the database on every write, which is a read-before-write race under concurrency; (4) nothing removes expired data; (5) every read hits the database even though most reads are for the same few hot pastes; (6) no abuse controls. Each of these gives one component in the scaled design.</p>
+
+<h2 id="architecture">7. Scaled high-level architecture</h2>
+<figure class="diagram">
+<svg viewBox="0 0 900 470" role="img" aria-label="Scaled architecture of Pastebin with CDN, API servers, key service, cache, metadata DB, object storage, cleanup workers and abuse pipeline">
+  <rect class="ext" x="20" y="200" width="110" height="50" rx="8"/><text class="t-c t-b" x="75" y="230">Clients</text>
+  <rect class="cache" x="170" y="200" width="110" height="50" rx="8"/><text class="t-c t-b" x="225" y="222">CDN</text><text class="t-c t-sm" x="225" y="239">public reads</text>
+  <rect class="box" x="320" y="200" width="110" height="50" rx="8"/><text class="t-c t-b" x="375" y="222">Load balancer</text><text class="t-c t-sm" x="375" y="239">+ rate limit</text>
+  <rect class="box" x="470" y="120" width="120" height="50" rx="8"/><text class="t-c t-b" x="530" y="142">Write API</text><text class="t-c t-sm" x="530" y="159">stateless x N</text>
+  <rect class="box" x="470" y="280" width="120" height="50" rx="8"/><text class="t-c t-b" x="530" y="302">Read API</text><text class="t-c t-sm" x="530" y="319">stateless x N</text>
+  <rect class="box" x="470" y="20" width="120" height="50" rx="8"/><text class="t-c t-b" x="530" y="42">Key service</text><text class="t-c t-sm" x="530" y="59">pre-made keys</text>
+  <rect class="cache" x="650" y="280" width="110" height="50" rx="8"/><text class="t-c t-b" x="705" y="302">Redis cache</text><text class="t-c t-sm" x="705" y="319">meta + hot text</text>
+  <rect class="db" x="650" y="120" width="110" height="50" rx="8"/><text class="t-c t-b" x="705" y="142">Metadata DB</text><text class="t-c t-sm" x="705" y="159">primary + replicas</text>
+  <rect class="db" x="790" y="200" width="100" height="60" rx="8"/><text class="t-c t-b" x="840" y="225">Object</text><text class="t-c t-b" x="840" y="242">storage</text>
+  <rect class="box" x="650" y="400" width="130" height="50" rx="8"/><text class="t-c t-b" x="715" y="422">Cleanup workers</text><text class="t-c t-sm" x="715" y="439">expiry + blob GC</text>
+  <rect class="box" x="300" y="400" width="150" height="50" rx="8"/><text class="t-c t-b" x="375" y="422">Abuse pipeline</text><text class="t-c t-sm" x="375" y="439">async scan + reports</text>
+  <rect class="cache" x="470" y="400" width="130" height="50" rx="8"/><text class="t-c t-b" x="535" y="422">Queue</text><text class="t-c t-sm" x="535" y="439">events (Kafka/SQS)</text>
+  <path class="arrow" d="M130 225 L166 225"/>
+  <path class="arrow dash" d="M280 225 L316 225"/>
+  <path class="arrow" d="M430 215 L466 150"/>
+  <path class="arrow" d="M430 235 L466 300"/>
+  <path class="arrow dash" d="M530 120 L530 74"/>
+  <path class="arrow" d="M590 145 L646 145"/>
+  <path class="arrow" d="M590 145 L786 215"/>
+  <path class="arrow" d="M590 305 L646 305"/>
+  <path class="arrow dash" d="M705 280 L705 174"/>
+  <path class="arrow dash" d="M760 305 L840 264"/>
+  <path class="arrow" d="M715 400 L715 174" />
+  <path class="arrow dash" d="M650 425 L604 425"/>
+  <path class="arrow dash" d="M470 425 L454 425"/>
+  <path class="arrow dash" d="M530 170 L535 396"/>
+</svg>
+<figcaption>Reads and writes are split into separate stateless services. The CDN absorbs public reads, Redis holds hot metadata and text, the database holds metadata only, object storage holds the text, and workers outside the request path expire data and scan for abuse through a queue.</figcaption>
+</figure>
+<p>Component roles, in the order a request meets them:</p>
+<ul>
+<li><b>CDN</b> (<a href="../chapters/12-cdn.html">Chapter 12</a>): caches raw and HTML responses of public and unlisted pastes at the edge. Never caches private pastes.</li>
+<li><b>Load balancer and rate limiter</b> (<a href="../chapters/09-load-balancing.html">Chapter 9</a>, <a href="../chapters/16-rate-limiting.html">Chapter 16</a>): spreads traffic, enforces per-IP and per-account limits, and rejects oversize bodies before they reach the app.</li>
+<li><b>Write API and Read API</b>: separated because their scaling, caching, and failure behavior differ. Reads are 10x more frequent and must stay up even if writes are degraded.</li>
+<li><b>Key service</b>: hands out unique pre-generated keys (section 9).</li>
+<li><b>Metadata database</b>: source of truth for key, owner, visibility, expiry, status.</li>
+<li><b>Object storage</b>: source of truth for text.</li>
+<li><b>Redis cache</b> (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>): read-through cache of metadata and small hot content.</li>
+<li><b>Queue and workers</b> (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>): asynchronous work (abuse scanning, view-count aggregation, expiry deletion, blob garbage collection).</li>
+</ul>
+
+<h2 id="flows">8. Request flows</h2>
+<h3>8.1 Create a paste</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Sequence diagram for creating a paste">
+  <rect class="ext" x="30" y="10" width="110" height="30" rx="8"/><text class="t-c t-b" x="85" y="30">Client</text>
+  <rect class="box" x="230" y="10" width="110" height="30" rx="8"/><text class="t-c t-b" x="285" y="30">Write API</text>
+  <rect class="box" x="430" y="10" width="110" height="30" rx="8"/><text class="t-c t-b" x="485" y="30">Key service</text>
+  <rect class="db" x="630" y="10" width="110" height="30" rx="8"/><text class="t-c t-b" x="685" y="30">Object store</text>
+  <rect class="db" x="780" y="10" width="100" height="30" rx="8"/><text class="t-c t-b" x="830" y="30">Meta DB</text>
+  <line class="life" x1="85" y1="40" x2="85" y2="390"/><line class="life" x1="285" y1="40" x2="285" y2="390"/><line class="life" x1="485" y1="40" x2="485" y2="390"/><line class="life" x1="685" y1="40" x2="685" y2="390"/><line class="life" x1="830" y1="40" x2="830" y2="390"/>
+  <path class="arrow" d="M85 70 L281 70"/><text class="t-sm" x="95" y="64">1. POST text, options</text>
+  <path class="arrow" d="M285 110 L285 130 L289 130"/><text class="t-sm" x="298" y="120">2. validate size, rate, hash</text>
+  <path class="arrow" d="M285 160 L481 160"/><text class="t-sm" x="300" y="154">3. next key</text>
+  <path class="arrow dash" d="M481 190 L289 190"/><text class="t-sm" x="300" y="184">key aZ3kP9xQ</text>
+  <path class="arrow" d="M285 225 L681 225"/><text class="t-sm" x="330" y="219">4. PUT blob if hash is new (compressed)</text>
+  <path class="arrow dash" d="M681 255 L289 255"/><text class="t-sm" x="440" y="249">200 OK</text>
+  <path class="arrow" d="M285 290 L826 290"/><text class="t-sm" x="360" y="284">5. one transaction: insert paste, version 1, blob ref_count + 1</text>
+  <path class="arrow dash" d="M826 320 L289 320"/><text class="t-sm" x="520" y="314">committed</text>
+  <path class="arrow dash" d="M281 360 L89 360"/><text class="t-sm" x="100" y="354">6. 201, url, delete token; async scan queued</text>
+</svg>
+<figcaption>The blob is written before the metadata row. If the process dies in between, the only damage is an orphan blob, which garbage collection removes later. The opposite order could leave a row pointing at a missing blob, which is a user-visible failure.</figcaption>
+</figure>
+<ol>
+<li>The edge or load balancer rejects bodies over 1 MB and applies rate limits.</li>
+<li>The Write API validates fields, normalizes line endings, compresses, and computes the SHA-256 of the content.</li>
+<li>It takes the next unused key from its local batch (section 9).</li>
+<li>It checks the blobs table for the hash; if absent it PUTs the object (deduplication, section 12). Object PUT is idempotent for the same name and bytes.</li>
+<li>In one database transaction it inserts the paste row and the version row and increments the blob's reference count.</li>
+<li>It returns the URL, and publishes a "paste created" event to the queue for asynchronous abuse scanning and indexing of public pastes.</li>
+</ol>
+<h3>8.2 Read a paste</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 420" role="img" aria-label="Sequence diagram for reading a paste through CDN, cache, database and object store">
+  <rect class="ext" x="20" y="10" width="100" height="30" rx="8"/><text class="t-c t-b" x="70" y="30">Client</text>
+  <rect class="cache" x="190" y="10" width="100" height="30" rx="8"/><text class="t-c t-b" x="240" y="30">CDN</text>
+  <rect class="box" x="360" y="10" width="100" height="30" rx="8"/><text class="t-c t-b" x="410" y="30">Read API</text>
+  <rect class="cache" x="530" y="10" width="100" height="30" rx="8"/><text class="t-c t-b" x="580" y="30">Redis</text>
+  <rect class="db" x="690" y="10" width="90" height="30" rx="8"/><text class="t-c t-b" x="735" y="30">Meta DB</text>
+  <rect class="db" x="800" y="10" width="90" height="30" rx="8"/><text class="t-c t-b" x="845" y="30">Object</text>
+  <line class="life" x1="70" y1="40" x2="70" y2="410"/><line class="life" x1="240" y1="40" x2="240" y2="410"/><line class="life" x1="410" y1="40" x2="410" y2="410"/><line class="life" x1="580" y1="40" x2="580" y2="410"/><line class="life" x1="735" y1="40" x2="735" y2="410"/><line class="life" x1="845" y1="40" x2="845" y2="410"/>
+  <path class="arrow" d="M70 70 L236 70"/><text class="t-sm" x="80" y="64">1. GET /aZ3kP9xQ</text>
+  <path class="arrow-g" d="M236 100 L74 100"/><text class="t-sm" x="80" y="94">2a. edge hit: done</text>
+  <path class="arrow dash" d="M240 140 L406 140"/><text class="t-sm" x="250" y="134">2b. edge miss: forward</text>
+  <path class="arrow" d="M410 180 L576 180"/><text class="t-sm" x="420" y="174">3. get meta+content</text>
+  <path class="arrow-g" d="M576 205 L414 205"/><text class="t-sm" x="440" y="199">4a. cache hit</text>
+  <path class="arrow dash" d="M410 245 L731 245"/><text class="t-sm" x="470" y="239">4b. miss: read metadata</text>
+  <path class="arrow dash" d="M410 285 L841 285"/><text class="t-sm" x="560" y="279">5. check status, expiry; GET blob</text>
+  <path class="arrow dash" d="M410 325 L576 325"/><text class="t-sm" x="420" y="319">6. fill cache (TTL capped)</text>
+  <path class="arrow" d="M406 365 L244 365"/><text class="t-sm" x="250" y="359">7. 200 + Cache-Control</text>
+  <path class="arrow" d="M236 395 L74 395"/><text class="t-sm" x="110" y="389">8. response, edge stores it</text>
+</svg>
+<figcaption>Three layers of caching sit in front of the database and object store. For a popular public paste almost every read ends at step 2a.</figcaption>
+</figure>
+<p>At step 5 the Read API must check <code>status</code> and <code>expires_at</code> against the clock before returning anything. That check is the "lazy" half of expiry (section 10). Raw reads return the bytes with <code>Content-Type: text/plain; charset=utf-8</code>, <code>X-Content-Type-Options: nosniff</code> and a <code>Content-Disposition</code> that stops browsers from rendering pasted HTML as a page on our domain (a classic stored-XSS trap; see section 14).</p>
+
+<h2 id="keygen">9. Deep dive 1: key generation</h2>
+<p>Every paste needs a unique, short, unguessable key. The interviewer will probe this because "just generate a random string" hides a race.</p>
+<h3>9.1 Options</h3>
+<table>
+<tr><th>Option</th><th>How</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>A. Random 8 chars plus uniqueness check</td><td>Each app server picks a random key, tries INSERT, retries on duplicate-key error</td><td>No extra service; stateless; unguessable</td><td>A collision costs a retry; collision probability rises as the table fills (small here: at 3.65 billion keys the chance per try is 0.0017 percent); hot path depends on the database being the arbiter</td></tr>
+<tr><td>B. Hash of content, truncated</td><td>MD5 or SHA-256 of text, take first 8 chars</td><td>Free dedup</td><td>Same text from two users gets the same key (bad for private and for delete); truncation collisions between different texts; guessable if you know the text</td></tr>
+<tr><td>C. Counter plus base62</td><td>Global increasing id encoded in base62</td><td>No collisions, shortest keys</td><td>Sequential keys are enumerable, so unlisted pastes are scannable; the counter is a coordination point</td></tr>
+<tr><td>D. Pre-generated key service (KGS)</td><td>A separate service creates random unique keys offline into a pool; app servers fetch batches</td><td>No collision handling on the hot path; keys random; fast writes; failure of the generator does not stop writes immediately</td><td>One more component to operate; must not hand the same key out twice</td></tr>
+</table>
+<p>Option C with a shuffling function (an id permuted by a keyed block cipher so output looks random) is a neat variant, but it adds cryptographic details. I choose <b>D</b>, because it removes the contention from the write path and the cost of the component is small. Option A is a reasonable fallback and I would say so out loud: at 12 writes per second the simple approach would work, and picking D is about demonstrating how to remove a race at scale. The core idea matches the ID-generation material in <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>.</p>
+<h3>9.2 How the key service works</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Key generation service with unused and used key tables and batch allocation to app servers">
+  <rect class="box" x="30" y="30" width="170" height="60" rx="8"/><text class="t-c t-b" x="115" y="55">Generator job</text><text class="t-c t-sm" x="115" y="73">random 8-char keys</text>
+  <rect class="db" x="290" y="20" width="180" height="80" rx="8"/><text class="t-c t-b" x="380" y="48">unused_keys</text><text class="t-c t-sm" x="380" y="68">pool kept above 100M</text><text class="t-c t-sm" x="380" y="84">sharded by key prefix</text>
+  <rect class="db" x="290" y="190" width="180" height="70" rx="8"/><text class="t-c t-b" x="380" y="218">allocated_keys</text><text class="t-c t-sm" x="380" y="238">batch id, owner, time</text>
+  <rect class="box" x="570" y="100" width="150" height="60" rx="8"/><text class="t-c t-b" x="645" y="125">Key allocator</text><text class="t-c t-sm" x="645" y="143">hands out batches</text>
+  <rect class="box" x="760" y="30" width="120" height="50" rx="8"/><text class="t-c t-b" x="820" y="60">Write API 1</text>
+  <rect class="box" x="760" y="110" width="120" height="50" rx="8"/><text class="t-c t-b" x="820" y="140">Write API 2</text>
+  <rect class="box" x="760" y="190" width="120" height="50" rx="8"/><text class="t-c t-b" x="820" y="220">Write API 3</text>
+  <path class="arrow" d="M200 60 L286 60"/>
+  <path class="arrow" d="M470 60 L566 120"/>
+  <path class="arrow dash" d="M570 150 L474 205"/>
+  <path class="arrow dash" d="M720 120 L756 60"/>
+  <path class="arrow dash" d="M720 130 L756 135"/>
+  <path class="arrow dash" d="M720 145 L756 210"/>
+  <text class="t-sm" x="30" y="290">Allocation: in one atomic step move 1,000 rows from unused to allocated and return them. Servers use their batch from memory.</text>
+  <text class="t-sm" x="30" y="312">If a server dies, its unused keys are lost. That wastes at most 1,000 of 218 trillion keys per crash, which is harmless.</text>
+</svg>
+<figcaption>The generator fills a pool of unused keys offline. The allocator moves a batch atomically to the allocated table and hands it to one app server, which serves keys from memory with no database round trip per paste.</figcaption>
+</figure>
+<p>Details that matter:</p>
+<ul>
+<li><b>Uniqueness is guaranteed by the pool.</b> The generator inserts into <code>unused_keys</code> with the key as primary key; duplicates are rejected there, once, offline. After that no two batches ever share a key because rows are moved, not copied.</li>
+<li><b>Atomic hand-out.</b> The allocator runs a transaction (delete 1,000 rows from <code>unused_keys</code> returning them, insert into <code>allocated_keys</code>), or uses a primitive such as <code>SELECT ... FOR UPDATE SKIP LOCKED</code> so two allocators never take the same row. This is the one place where a double hand-out could occur, so test it hardest.</li>
+<li><b>Server crash.</b> Keys held in memory by a crashed server are simply never used. With 2.18 x 10^14 keys, losing thousands is irrelevant. Do <b>not</b> try to recover them; recovery logic is where double-use bugs are born.</li>
+<li><b>Batch size.</b> At 60 writes per second peak across, say, 6 write servers, one server uses about 10 keys per second, so a 1,000-key batch lasts about 100 seconds and the allocator sees under one request per second per server. A server also prefetches the next batch when 20 percent remain, so the allocator being briefly down does not block writes.</li>
+<li><b>Sharding the pool.</b> If the allocator becomes a bottleneck at 100x scale, partition the pool by first character and assign each write server a partition; no coordination at all.</li>
+<li><b>Last line of defence.</b> The <code>pastes.key</code> primary key still rejects a duplicate. If that ever fires, the server discards the key, takes the next one, and raises an alert, because it means the key service has a bug.</li>
+<li><b>Unguessability.</b> Keys must come from a cryptographically secure random source, not a linear generator whose output could be predicted from a few samples.</li>
+</ul>
+<div class="callout watch"><b>Watch out</b> The KGS is a single point of failure only if you make it one. Run the allocator as several stateless instances over a replicated database, keep prefetched batches in the writers, and keep a fallback path (option A: random key plus insert-and-retry) so that creation still works if the allocator is down for minutes.</div>
+<p>Should keys ever be reused after a paste expires? With 62^8 keys, no. Reuse creates a nasty class of bugs: stale links, search engine caches, and CDN copies suddenly show someone else's text. Never recycling keys also keeps the "410 Gone" answer meaningful.</p>
+
+<h2 id="expiry">10. Deep dive 2: expiry and cleanup</h2>
+<p>Expiry has two jobs: <b>correctness</b> (an expired paste must not be served) and <b>cost</b> (expired data must eventually be deleted, so storage does not grow without bound). Those two jobs are handled by two different mechanisms, which is the standard answer: <b>lazy expiry for correctness, background cleanup for space</b>.</p>
+<h3>10.1 Lazy expiry (correctness)</h3>
+<p>Every read checks <code>expires_at</code> (and <code>status</code>) against the current time. If the paste has expired, the API returns <code>410 Gone</code> and does not touch the object store. This is exact to the second, needs no scanning, and works even if the background job is behind or broken. The check costs a comparison on a row we already loaded.</p>
+<p>The cache layers must respect expiry too. When the Read API fills Redis or sends a response to the CDN, it caps the TTL: <code>TTL = min(default_ttl, expires_at - now)</code>. A paste that expires in 10 minutes is cached for at most 10 minutes, so no layer keeps serving it afterwards, and no purge call is needed. The HTTP response carries <code>Cache-Control: public, max-age=N</code> and an <code>Expires</code> consistent with that cap (see <a href="../chapters/12-cdn.html">Chapter 12</a> on cache headers, and <a href="../chapters/14-caching-failures.html">Chapter 14</a> for what goes wrong when TTLs are wrong). Early deletion (owner deletes, moderator blocks) is different: no TTL covers it, so those events trigger an explicit CDN purge by key plus a Redis delete.</p>
+<h3>10.2 Background cleanup (space)</h3>
+<p>Lazy expiry alone never reclaims space, because nobody reads an expired paste again. A background sweeper does the deletion.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Paste lifecycle timeline: active, expired but present, metadata tombstoned, blob deleted">
+  <line x1="40" y1="110" x2="860" y2="110" stroke="var(--fg)" stroke-width="2"/>
+  <rect class="hit" x="40" y="70" width="260" height="40" rx="6"/><text class="t-c t-b" x="170" y="95">Active: served normally</text>
+  <rect class="miss" x="300" y="70" width="190" height="40" rx="6"/><text class="t-c t-b" x="395" y="95">Expired: 410, not deleted</text>
+  <rect class="cache" x="490" y="70" width="190" height="40" rx="6"/><text class="t-c t-b" x="585" y="95">Tombstoned: row marked</text>
+  <rect class="db" x="680" y="70" width="180" height="40" rx="6"/><text class="t-c t-b" x="770" y="95">Blob deleted by GC</text>
+  <text class="t-sm" x="300" y="135">expires_at</text>
+  <text class="t-sm" x="490" y="135">sweeper (within minutes)</text>
+  <text class="t-sm" x="680" y="135">grace period 24 h, then GC</text>
+  <text class="t-sm" x="40" y="180">Lazy check makes the paste unreadable at expires_at. The sweeper and GC only reclaim space, so being late costs money, not correctness.</text>
+  <text class="t-sm" x="40" y="205">Metadata rows can be dropped entirely after a retention window (for example 30 days) to keep 410 answers and abuse evidence.</text>
+</svg>
+<figcaption>Expiry is a state machine with a gap between "not readable" and "physically gone". Splitting them removes any need for the sweeper to be precise.</figcaption>
+</figure>
+<p>Three ways to implement the sweeper, compared:</p>
+<table>
+<tr><th>Approach</th><th>How</th><th>Tradeoff</th></tr>
+<tr><td>Periodic query</td><td>Every minute: select rows where status is active and <code>expires_at &lt; now</code> in batches of 1,000 using the partial index; mark them expired; enqueue blob release</td><td>Simple; the index scan is cheap; but deleting millions of rows individually creates write amplification and table bloat</td></tr>
+<tr><td>Time-partitioned tables</td><td>Partition metadata by expiry day; when a whole partition is past its retention window, drop it as one cheap operation</td><td>Very cheap bulk deletion; but the expiry date must be known at creation and "never" pastes need their own partition; changing an expiry moves the row</td></tr>
+<tr><td>Store-native TTL</td><td>DynamoDB TTL on the metadata item; S3 lifecycle rules on an <code>expiry-day</code> tag or prefix</td><td>Almost no code; deletion is best effort and can lag by hours or days, which is why lazy checks still matter</td></tr>
+</table>
+<p>I would use the periodic query for metadata at this scale (1,000,000 expiring rows per day is about 12 per second, nothing) with a daily partition scheme as the planned scale-up. For blobs, deletion is gated by a reference count (section 12): the sweeper decrements the count, and a separate garbage collection job deletes blobs whose count has been zero for more than a grace period. The grace period guards against the race where a new paste with the same content arrives just as the old one is released.</p>
+<p>Sweeper requirements: it must be <b>idempotent</b> (running a batch twice is harmless, because marking an already expired row expired changes nothing), <b>resumable</b> (it keeps a high-water mark, or simply re-queries), and it must <b>rate limit itself</b> so a backlog does not flood the database or the object store. Schedule and orchestrate it as in <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>; run it as several workers each owning a key-hash range so they do not overlap, or use <code>SKIP LOCKED</code> to claim batches.</p>
+<div class="callout key"><b>Key idea</b> Never make correctness depend on a background job. The read path enforces expiry by comparing timestamps; the sweeper is only a cost optimization. A broken sweeper then produces a bigger bill, not a data leak.</div>
+
+<h2 id="caching">11. Deep dive 3: read-heavy caching and the CDN</h2>
+<p>Reads are 10 times writes, and pasted content is immutable per version. Immutable content is the best possible thing to cache: there is nothing to invalidate on update, because an update creates a new version. The layers, from the user inward:</p>
+<ol>
+<li><b>Browser cache.</b> <code>Cache-Control: public, max-age=300</code> for the paste page, longer for versioned raw URLs.</li>
+<li><b>CDN edge.</b> Caches public and unlisted pastes by URL. A viral link is served by the edge with near-zero origin load (this is the "thundering herd" protection; enable request collapsing so that 10,000 simultaneous misses on one new URL produce one origin fetch; see <a href="../chapters/14-caching-failures.html">Chapter 14</a>).</li>
+<li><b>Redis.</b> Read-through cache (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>) keyed by paste key holding metadata and, for content under 64 KB, the text. Larger content is not cached in Redis; it goes to object storage, which is fast enough and expensive to hold in memory. Eviction is LRU.</li>
+<li><b>Database replica and object store.</b> The authoritative layers, only reached on a miss.</li>
+</ol>
+<h3>11.1 What may the CDN cache?</h3>
+<table>
+<tr><th>Visibility</th><th>CDN</th><th>Redis</th><th>Notes</th></tr>
+<tr><td>Public</td><td>Cache, TTL capped by expiry</td><td>Yes</td><td>Listed and indexable</td></tr>
+<tr><td>Unlisted</td><td>Cache, TTL capped by expiry, <code>X-Robots-Tag: noindex</code></td><td>Yes</td><td>Anyone with the link; caching does not weaken this because the key is the credential</td></tr>
+<tr><td>Private</td><td>Never (<code>Cache-Control: private, no-store</code>)</td><td>Metadata only, content fetched after the auth check</td><td>A shared cache must never answer an authorization question for someone else</td></tr>
+</table>
+<p>The danger is a cache serving a private paste to a stranger. Two defences: the Read API sets <code>private, no-store</code> on every private response, and the CDN configuration also bypasses cache when an auth cookie or <code>Authorization</code> header is present, so a header mistake in one place cannot leak data. For private pastes whose blobs are fetched directly, hand out short-lived signed object-store URLs (valid 60 seconds) after the authorization check; the signature is the proof of authorization, and the bytes flow object store to client without passing through our servers.</p>
+<h3>11.2 Cost and hit ratios</h3>
+<p>If the CDN hit ratio for public pastes is 90 percent and Redis catches 90 percent of what is left, then of 10 million daily reads, about 1 million reach Redis and about 100,000 reach the database and object store. That is about 1 read per second at the origin. The database and object store are then sized for writes and durability, not reads. Hit ratios are lower for long-tail pastes (a paste read once is never a hit), which is why Redis uses a short TTL for pastes not yet proven hot, and why we do not pre-warm anything.</p>
+<h3>11.3 Syntax highlighting</h3>
+<p>Two options. <b>Server-side highlighting</b> (a library such as Pygments) produces ready HTML: it works without JavaScript and can be cached at the CDN, but costs CPU on the read path or needs a pre-render step. <b>Client-side highlighting</b> (a JavaScript library in the page) moves the work to the user's browser: the server returns raw text, which is cheaper and gives you the raw endpoint for free, though the first paint is plain text and very large pastes can freeze a browser tab.</p>
+<p>I choose client-side highlighting by default, with the page and script bundle cached for a long time, and a hard cap (for example no highlighting over 200 KB, the user sees plain text with a "highlight anyway" button). Language is taken from the user's choice or from a cheap detector at write time (file extension in the title, shebang line, or a heuristic), stored in the metadata so reads never detect. If SEO for public pastes matters, pre-render highlighted HTML in a background worker after creation and store it as a second object; then the CDN serves that. This is a good example of moving CPU from the read path to the write path, where traffic is 10x lower.</p>
+
+<h2 id="dedup">12. Deep dive 4: dedup, versioning, and size limits</h2>
+<h3>12.1 Deduplication by content hash</h3>
+<p>Many pastes are identical: the same stack trace pasted by many developers, the same install script, spam sent a million times. Because the blob's name is the SHA-256 of its (compressed or normalized) content, writing the same content twice produces the same object name, so the second write needs no storage at all.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="Deduplication: several paste keys and versions point to one content-hash blob with a reference count">
+  <rect class="box" x="30" y="30" width="170" height="44" rx="8"/><text class="t-c t-b" x="115" y="57">paste aZ3kP9xQ v1</text>
+  <rect class="box" x="30" y="100" width="170" height="44" rx="8"/><text class="t-c t-b" x="115" y="127">paste Qm81LbT2 v1</text>
+  <rect class="box" x="30" y="170" width="170" height="44" rx="8"/><text class="t-c t-b" x="115" y="197">paste aZ3kP9xQ v2</text>
+  <rect class="cache" x="360" y="70" width="210" height="70" rx="8"/><text class="t-c t-b" x="465" y="97">blobs row 9f2c...e1</text><text class="t-c t-sm" x="465" y="117">ref_count = 2</text>
+  <rect class="cache" x="360" y="170" width="210" height="50" rx="8"/><text class="t-c t-b" x="465" y="192">blobs row 1b7d...04</text><text class="t-c t-sm" x="465" y="210">ref_count = 1</text>
+  <rect class="db" x="700" y="60" width="170" height="60" rx="8"/><text class="t-c t-b" x="785" y="85">Object</text><text class="t-c t-b" x="785" y="103">blobs/9f/2c/9f2c...e1</text>
+  <rect class="db" x="700" y="160" width="170" height="60" rx="8"/><text class="t-c t-b" x="785" y="185">Object</text><text class="t-c t-b" x="785" y="203">blobs/1b/7d/1b7d...04</text>
+  <path class="arrow" d="M200 52 L356 95"/>
+  <path class="arrow" d="M200 122 L356 115"/>
+  <path class="arrow" d="M200 192 L356 195"/>
+  <path class="arrow dash" d="M570 105 L696 90"/>
+  <path class="arrow dash" d="M570 195 L696 190"/>
+  <text class="t-sm" x="30" y="260">Each paste keeps its own key, owner, visibility and expiry. Only the text bytes are shared.</text>
+</svg>
+<figcaption>Keys and metadata stay per paste. Only the content object is shared, with a reference count of how many versions use it.</figcaption>
+</figure>
+<p>What the design must get right:</p>
+<ul>
+<li><b>Dedup is on content, not on identity.</b> Two users pasting the same text get two keys and two metadata rows. Never dedupe at the key level (option B in section 9) or one user's delete or expiry would affect another's paste.</li>
+<li><b>Reference counting.</b> Insert increments the count inside the same transaction as the metadata insert; release (expiry, delete, new version replacing) decrements. A blob is deleted only when the count is zero and has stayed zero for the grace period. A periodic reconciliation job recounts references from <code>paste_versions</code> and fixes drift, because counters in a distributed system eventually drift after crashes.</li>
+<li><b>Race on the first write.</b> Two writers upload the same new content simultaneously: both PUT the same name with identical bytes, the second overwrite is harmless, and the blob row insert uses "insert if not exists". Idempotent writes make the race safe.</li>
+<li><b>Privacy leak.</b> Dedup can reveal that someone already stored a given file: if the server answers "already exists, skipped upload" to a client that sent only the hash, an attacker confirms a secret document is stored. Because our clients always upload full content and the server answers identically either way, this side channel does not exist. Never expose a "upload by hash" shortcut.</li>
+<li><b>Hash collisions.</b> SHA-256 collisions are not a practical concern. A shorter or weak hash (MD5) would be, because attackers can craft colliding inputs. Use SHA-256.</li>
+<li><b>Expected savings.</b> Honest estimate: on a general paste site perhaps 10 to 30 percent of bytes are duplicates, dominated by spam and logs. Real, not magical. It also gives a cheap abuse feature: when a blob hash is flagged as malicious, every paste referencing it can be blocked in one update.</li>
+</ul>
+<h3>12.2 Versioning</h3>
+<p>An edit never changes a blob. It writes a new blob (or reuses one if the text equals an earlier version), inserts <code>paste_versions(key, n+1, hash)</code>, and updates <code>pastes.current_version</code> in one transaction. Optimistic concurrency avoids lost updates: the client sends the version it edited (<code>If-Match: 3</code>), and the update fails with <code>409 Conflict</code> if the current version has moved on. The same URL <code>/aZ3kP9xQ</code> shows the latest version; <code>/aZ3kP9xQ/v2</code> shows version 2.</p>
+<p>Caching consequences: version-specific URLs are fully immutable, so they carry <code>Cache-Control: public, max-age=31536000, immutable</code> (still capped by the paste's expiry). The unversioned URL changes when a new version is created, so it has a short TTL (60 seconds) and the write path deletes the Redis entry and purges the CDN URL on edit. Storage cost of history is bounded by limiting versions per paste (say 50) and by diffs only if cost demands it; with a 1 MB cap, storing full versions is simpler and the dedup mechanism already removes unchanged repeats. An expired paste expires with all its versions.</p>
+<h3>12.3 Size limits</h3>
+<p>Size limits are a safety feature as well as a cost feature. Enforce at every layer, cheapest first:</p>
+<ul>
+<li>Edge or load balancer: reject requests with <code>Content-Length</code> above 1 MB plus overhead, and stop reading the stream at that limit even if the header lies (chunked uploads).</li>
+<li>API: validate again after decoding, count characters and bytes, reject invalid UTF-8 or null bytes (a hint of binary uploads).</li>
+<li>Tiered limits: anonymous 512 KB, logged-in 1 MB, paid or verified 10 MB (stored in multipart form). Limits also apply per day per account in bytes, not only in requests.</li>
+<li>Reading side: highlighting cap and line length cap so that one pathological paste (a 1 MB single line) cannot hang browsers.</li>
+</ul>
+
+<h2 id="access">13. Private and public pastes: access control</h2>
+<p>Access rules are simple but must be enforced in one place, not scattered. A single function <code>canRead(user, paste)</code> is called by every read path (HTML, raw, JSON, versions, signed URL issuance). Its logic:</p>
+<table>
+<tr><th>Condition</th><th>Result</th></tr>
+<tr><td><code>status</code> is deleted or blocked</td><td>410 for everyone except moderators</td></tr>
+<tr><td>Expired (<code>expires_at</code> in the past)</td><td>410</td></tr>
+<tr><td>Visibility public or unlisted</td><td>Allow</td></tr>
+<tr><td>Visibility private and caller is the owner</td><td>Allow</td></tr>
+<tr><td>Visibility private and anyone else</td><td>404 (not 403, so existence is not confirmed)</td></tr>
+</table>
+<p>Unlisted pastes are protected by <b>secrecy of the key</b> (a capability URL). That works only if the key is random (section 9), if keys are not shown in public indexes, and if we send <code>noindex</code> and <code>Referrer-Policy: no-referrer</code> so the link is not leaked to third-party sites via the Referer header. Warn users that unlisted is not private: anyone who gets the link can see it, and the link may be forwarded or appear in logs and browser history.</p>
+<p>Changing visibility after creation is an access-control event with cache consequences: public to private must purge CDN and Redis entries immediately (a TTL is not enough, because the owner expects the paste to vanish now). Account-level authentication and session handling follow <a href="../chapters/55-security.html">Chapter 55</a>: session cookies with <code>HttpOnly</code> and <code>SameSite</code>, API tokens hashed in the database, CSRF protection for state-changing calls. Anonymous deletion uses the <code>delete_token</code>, stored only as a hash in the row, like a password.</p>
+
+<h2 id="abuse">14. Security and abuse</h2>
+<p>A free, anonymous write endpoint that publishes text on your domain attracts spam, phishing pages, malware command-and-control configs, doxxing, and leaked credentials. Abuse is not a footnote; it decides whether the service survives. Layers of defence:</p>
+<ul>
+<li><b>Rate limits</b> (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>): per IP and per account on creates (for example 20 per hour anonymous, 200 per hour logged-in) and on reads of keys that return 404 (to stop scanning for valid keys). Token bucket in Redis. Add a proof-of-work or CAPTCHA step when an IP crosses a threshold.</li>
+<li><b>Content scanning, asynchronously.</b> After a successful create, an event goes to the abuse pipeline: signature and pattern checks (known malware hashes, private keys, credential formats like cloud access keys), URL reputation lookups, spam classifiers. Hits flip <code>status</code> to blocked and purge caches within seconds or minutes. Scanning is asynchronous so a slow scanner never blocks users; for highest-risk accounts (new, anonymous, flagged IP) it may be synchronous.</li>
+<li><b>Hash blocklist.</b> Because blobs are content-addressed, a blocklist of bad hashes rejects known-bad content at upload for free and blocks all existing duplicates.</li>
+<li><b>Reports and moderation.</b> A report endpoint feeds a review queue; several reports from independent users raise priority. Moderator actions are audited.</li>
+<li><b>Stored XSS and content sniffing.</b> A pasted HTML file served as <code>text/html</code> on your domain would run attacker scripts with your cookies. Always serve raw content as <code>text/plain</code> with <code>nosniff</code>, escape text when rendering the page, use a strict Content-Security-Policy, and serve raw content from a separate domain without cookies (for example <code>raw.paste-usercontent.example</code>), the standard defence.</li>
+<li><b>Secrets and privacy.</b> Detect and warn on pasted secrets, honor deletion requests and legal takedowns (including from backups and CDN, with a documented retention window), and log access to private pastes only with minimal fields. See <a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>.</li>
+<li><b>Encryption.</b> TLS in transit, server-side encryption at rest for object storage and database. Optional end-to-end encrypted pastes (the key stays in the URL fragment after <code>#</code> and is never sent to the server) trade away server-side scanning, highlighting and search; offer them as a clearly labelled mode.</li>
+</ul>
+
+<h2 id="scaling">15. Scaling, bottlenecks, and hot spots</h2>
+<ul>
+<li><b>Stateless API tier.</b> Scale out behind the load balancer (<a href="../chapters/08-scalability-concurrency.html">Chapter 8</a>, <a href="../chapters/09-load-balancing.html">Chapter 9</a>); auto-scale on CPU and request latency (<a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>).</li>
+<li><b>Metadata DB.</b> One primary plus read replicas serves the first several years (900 GB, 60 writes per second peak, a few hundred reads per second after caches). When it outgrows one machine, shard by hash of the key (<a href="../chapters/25-sharding.html">Chapter 25</a>); because every hot lookup is by key, the shard is trivially routed, and random keys spread load evenly. The only cross-shard queries are "my pastes" (solved with a secondary table keyed by <code>owner_id</code>, an index maintained asynchronously) and the expiry sweep (each shard sweeps itself).</li>
+<li><b>Object storage.</b> Effectively unlimited. The thing to watch is request-rate limits per prefix; hash-prefixed names spread load. Small-object overhead matters at billions of objects (per-request costs, minimum billable object size on some tiers); at extreme scale pack many small pastes into larger log-structured segment files, which is how some stores internally avoid the small-object cost.</li>
+<li><b>Hot keys.</b> A paste linked from a front page may take thousands of reads per second. The CDN absorbs it; if the CDN is bypassed, a single Redis key can still serve tens of thousands of reads per second, and an in-process LRU cache in each Read API instance removes even that. Request coalescing on a cache miss prevents a stampede.</li>
+<li><b>Hot writes.</b> View counters would turn each read into a database write on the same row. Instead buffer counts in Redis (<code>INCR</code>) and flush to the database every minute, accepting that the number is approximate (or take counts from CDN logs).</li>
+<li><b>Recent and public lists.</b> The "recent public pastes" feed is a time-ordered list of the last N public keys, kept in Redis as a capped list or sorted set (see <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>), not computed by scanning the database.</li>
+</ul>
+
+<h2 id="failures">16. Failure modes and consistency</h2>
+<table>
+<tr><th>Component</th><th>Failure</th><th>Effect</th><th>Mitigation</th></tr>
+<tr><td>CDN</td><td>Edge down or purge failing</td><td>Latency up, origin load up; stale content after delete</td><td>Multi-CDN or fallback to origin; short TTL for deletions; purge retries; origin sized for 10x the normal miss rate</td></tr>
+<tr><td>Redis</td><td>Node lost or slow</td><td>More reads reach the database and storage</td><td>Treat cache as optional with timeouts and circuit breaker (<a href="../chapters/40-resilience.html">Chapter 40</a>); replicas; jittered TTL to avoid synchronized expiry</td></tr>
+<tr><td>Metadata DB primary</td><td>Crash</td><td>Writes fail; reads continue from replicas and caches</td><td>Automatic failover (<a href="../chapters/24-replication.html">Chapter 24</a>); reads stay available because they use replicas; the write API returns 503 with retry-after</td></tr>
+<tr><td>Metadata replica</td><td>Lag</td><td>A just-created paste returns 404 on a replica that has not caught up</td><td>Read-your-writes: after create, the creator's first reads go to the primary or carry a short-lived "recent write" cookie; otherwise fall back to the primary on a miss once before returning 404</td></tr>
+<tr><td>Object storage</td><td>Regional outage or elevated errors</td><td>Content cannot be fetched or written</td><td>Cache hides most reads; replicate buckets cross-region and fail reads over; writes queue or fail cleanly (503) because we write blob first</td></tr>
+<tr><td>Key service</td><td>Allocator down</td><td>Writers run out of prefetched keys after minutes</td><td>Prefetch, several allocators, fallback to random key plus insert-and-retry</td></tr>
+<tr><td>Write API</td><td>Crash between blob PUT and DB commit</td><td>Orphan blob, no user-visible harm</td><td>Blob-first ordering; GC removes blobs with no references older than the grace period</td></tr>
+<tr><td>Client retries</td><td>Timeout after server committed</td><td>Duplicate paste</td><td><code>Idempotency-Key</code> stored with the response for 24 hours returns the original key (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>)</td></tr>
+<tr><td>Sweeper / GC</td><td>Falls behind or dies</td><td>Storage cost rises</td><td>Alert on lag; correctness unaffected because of lazy expiry</td></tr>
+<tr><td>Ref count drift</td><td>Count too low</td><td>Premature blob delete (data loss)</td><td>Grace period, never delete on a count alone without a reconciliation check, object versioning or soft-delete retention for a few days before permanent removal</td></tr>
+<tr><td>Abuse pipeline</td><td>Slow or down</td><td>Bad content stays up longer</td><td>Queue buffers events; fail closed for risky accounts (hold content as pending)</td></tr>
+</table>
+<p><b>Consistency decisions.</b> Metadata is strongly consistent within the primary; reads from replicas and caches are eventually consistent, and that is acceptable because content is immutable, with two exceptions that get explicit handling: deletion/blocking (explicit purge) and visibility changes (explicit purge). <b>Order of writes</b> is blob, then metadata; <b>order of deletes</b> is metadata state change, then cache purge, then blob release. These orders are chosen so that any crash leaves garbage (cheap) rather than dangling pointers (user visible), and the principles echo <a href="../chapters/31-distributed-transactions.html">Chapter 31</a>: no distributed transaction across the database and the object store, only ordered, idempotent steps plus reconciliation.</p>
+<p><b>Multi-region.</b> Start with one primary region and a CDN. For disaster recovery, replicate the database asynchronously to a second region and enable cross-region replication on the bucket; the recovery point objective is the replication lag (seconds) and the failover is manual or automated per <a href="../chapters/41-ha-dr.html">Chapter 41</a>. Active-active writes are not worth it: key allocation, reference counts and expiry all become harder. If writers are global, route writes to the home region and let reads fan out through CDN and regional replicas (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>).</p>
+
+<h2 id="ops">17. Monitoring, SLOs, and cost</h2>
+<p>Following <a href="../chapters/54-observability-slos.html">Chapter 54</a>, pick a few indicators that reflect user pain:</p>
+<table>
+<tr><th>SLI</th><th>SLO</th></tr>
+<tr><td>Read success rate (non-5xx, excluding legitimate 404 and 410)</td><td>99.95 percent over 30 days</td></tr>
+<tr><td>Read latency at the origin, cache miss path</td><td>p99 under 200 ms</td></tr>
+<tr><td>Create success rate</td><td>99.9 percent</td></tr>
+<tr><td>Create latency</td><td>p99 under 500 ms</td></tr>
+<tr><td>Durability audit: sampled non-expired pastes whose blob is readable</td><td>100 percent (any miss pages someone)</td></tr>
+<tr><td>Expiry lag: age of the oldest expired but undeleted row</td><td>under 1 hour</td></tr>
+</table>
+<p>Also graph: CDN and Redis hit ratio, key pool size and allocation rate (alert if the unused pool falls below 20 million, which is about 55 days of supply at 1 million per day, then top up), blob GC backlog, orphan count, abuse queue depth, and the 404 rate per IP (scanning detector).</p>
+<p><b>Cost levers, in order of impact:</b> (1) default expiry for anonymous pastes, because most pastes are never read after a week; (2) compression (about 70 percent of text bytes); (3) dedup (10 to 30 percent); (4) object storage lifecycle tiers: move pastes older than 30 days that are rarely read to an infrequent-access tier, with the caveat of retrieval fees and minimum storage durations; (5) CDN offload to cut egress and origin requests; (6) size and quota limits. Combined, a 5-year footprint of 18 TB falls to a few TB and cost to well under a hundred dollars a month for storage. Check the claim with your own sizing rather than quoting it blindly.</p>
+
+<h2 id="evolution">18. Evolution and phasing</h2>
+<h3>18.1 What to build first</h3>
+<ol>
+<li><b>Phase 1 (week 1):</b> app servers, one relational database, one bucket, random-key-plus-retry, expiry check on read, CDN in front, size limit, IP rate limits.</li>
+<li><b>Phase 2:</b> Redis cache, background sweeper and blob GC, read replicas, delete tokens, user accounts and private pastes, basic abuse scanner and report queue.</li>
+<li><b>Phase 3:</b> key service, dedup with reference counts, versioning, separate raw-content domain, cross-region replication.</li>
+<li><b>Phase 4:</b> sharding, search, pre-rendered highlighting, tiered storage.</li>
+</ol>
+<h3>18.2 At 10x and 100x</h3>
+<p>At 10x (10 million pastes per day, 6,000 peak reads per second, 100 GB of new text per day): the CDN absorbs read growth; the database still fits on a big primary, but backups and replica rebuilds get painful, so shard metadata by key hash. Storage is 36 TB a year before compression and expiry; lifecycle tiering becomes important. The key pool needs a bigger refill rate and possibly per-shard pools. At 100x the sweeper must be sharded and partition-drop based, the abuse pipeline needs real machine learning and human moderation staffing, and object-store request costs (not bytes) dominate, which justifies packing small pastes into segment files.</p>
+<h3>18.3 Alternatives not chosen</h3>
+<ul>
+<li><b>Everything in one database.</b> Simplest, but bloats the database and mixes hot and cold data. Fine under 100 GB.</li>
+<li><b>Everything in a key-value store such as DynamoDB, including text.</b> Works up to the item size limit (400 KB in DynamoDB), forces our 1 MB cap into another design, and costs more per GB than object storage.</li>
+<li><b>Counter-based keys.</b> Shorter, but enumerable, so a poor fit for unlisted pastes.</li>
+<li><b>Client-side encryption by default.</b> Strong privacy, but breaks scanning, highlighting on the server, and dedup.</li>
+<li><b>Global search over pastes.</b> A search engine (<a href="../chapters/22-search-engines.html">Chapter 22</a>) fed from the queue, public pastes only; a feature with real abuse and cost implications, so deliberately later.</li>
+</ul>
+
+<h2 id="qa">19. Interview Q&amp;A</h2>
+<details><summary>Why not just store the paste text in the database row?</summary><p>You can, and for a small project you should. At 10 GB of new text per day the database would grow about 3.65 TB per year of cold, immutable bytes. That bloats backups, slows replica rebuilds, fills the buffer pool with data nobody reads, and costs several times more per GB than object storage. Splitting lets the database hold only a small metadata table that stays in memory, while object storage provides cheap, highly durable, effectively unlimited capacity for content. The cost of the split is two systems to keep consistent, which we handle with blob-first write ordering and garbage collection.</p></details>
+<details><summary>How do you guarantee two users never get the same key?</summary><p>Uniqueness is enforced in two places. The key service guarantees it by moving keys from an unused table to an allocated table atomically, so a key is only ever handed to one writer. Independently, the primary key on the paste table rejects a duplicate insert, and if that ever triggers the writer takes a new key and alerts on the bug. Pure random generation with insert-and-retry also works at this scale, but pre-generation takes collision handling off the hot path and avoids a read-before-write race.</p></details>
+<details><summary>What happens to keys held by a crashed app server?</summary><p>They are abandoned. Each server holds a batch of about 1,000 keys in memory; if it crashes the keys are never used. Out of 218 trillion possible keys, losing a few thousand per crash costs nothing, while trying to recover them would require tracking exactly which keys were consumed and invite double-allocation bugs. Simplicity wins: leak, never reuse.</p></details>
+<details><summary>How do you make expired pastes disappear and still keep the system correct if cleanup is delayed?</summary><p>The read path compares <code>expires_at</code> to the current time on every request and returns 410 for anything expired, so correctness never depends on the cleanup job. Cache TTLs are capped at the remaining lifetime, so Redis and the CDN also stop serving the paste on time. A background sweeper then marks rows expired and releases blob references, and a garbage collector deletes unreferenced blobs after a grace period. If the sweeper falls behind, you pay for extra storage, but nobody sees expired data.</p></details>
+<details><summary>How would you stop a private paste from leaking through the CDN?</summary><p>Private responses carry <code>Cache-Control: private, no-store</code>, and the CDN is configured to bypass cache for any request with an auth cookie or authorization header, so one misconfiguration cannot cause a leak. The authorization check happens on every request at the origin, and for large content the origin issues a short-lived signed URL to the blob only after that check. For not-found cases it returns 404 rather than 403 so existence of private keys is not revealed. When a paste changes from public to private, we explicitly purge the CDN and Redis rather than waiting for a TTL.</p></details>
+<details><summary>Is content deduplication worth it, and what are its pitfalls?</summary><p>It saves storage on repeated content (spam, common logs, scripts), perhaps 10 to 30 percent on a general site, and gives a nice bonus: blocking one bad hash blocks every paste with that content. Pitfalls are reference counting (counts must be updated transactionally, reconciled periodically, and deletion must use a grace period or you lose data on a race), the privacy side channel if the API ever tells a client "this already exists" without full upload, and the need to keep identity and permissions per paste while only the bytes are shared. I would add it after the basic system works.</p></details>
+<details><summary>How do you handle edits without breaking caches?</summary><p>Treat each version as an immutable blob and an immutable URL. A version-specific URL can be cached for a year because it never changes. The unversioned URL points to the latest version, so it gets a short TTL, and the edit operation deletes the Redis entry and purges the CDN URL. Concurrent editors are handled with optimistic concurrency: the client says which version it edited, and a mismatch returns 409 so no update is silently lost.</p></details>
+<details><summary>How would you add search over public pastes?</summary><p>Publish a "paste created" event to a queue and have an indexing consumer write only public, non-blocked pastes into a search engine; deletes, expiry and blocks must emit events too so the index does not serve removed content. Index limited text (the first N KB) to control cost, and re-check status on result display. This is eventually consistent by design, and search is a separate, optional system, so its outage does not affect creating or reading pastes. The abuse risk is larger, since search makes bad content discoverable, so scanning must complete before indexing.</p></details>
+<details><summary>What if the interviewer says traffic is 100 times higher?</summary><p>Reads are handled by CDN and cache scaling, which are horizontally scalable. The metadata database is sharded by key hash, which is easy because lookups are by key; "my pastes" goes through an owner-keyed secondary table. The key service pool is partitioned by prefix to remove the allocator as a bottleneck. Expiry becomes partition-drop based, and object-store request cost rather than bytes becomes the major bill, which pushes toward batching small pastes into segment files. Abuse handling needs automation and human moderation capacity, which is usually the real scaling limit.</p></details>
+<details><summary>How do you make sure a created paste is never lost?</summary><p>The blob is written to a replicated object store first, and only after that succeeds is the metadata row committed, so a visible paste always has its content. The store keeps copies across availability zones, and we replicate the bucket and database to a second region for disaster recovery. A scheduled audit reads a sample of non-expired blobs and verifies their hash, and deletions go through a grace period and soft-delete retention to protect against counter bugs. Together these give the durability promise the requirements demand.</p></details>
+
+<h2 id="recap-sec">20. Connects to and recap</h2>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>The system is small in QPS (about 12 writes and 116 reads per second average) but large in stored bytes (10 GB per day), so the design is about storage, keys, expiry, and abuse.</li>
+<li>Split data by nature: metadata (about 500 B, queried, mutable) in a database; text (about 10 KB, immutable) in object storage, named by content hash.</li>
+<li>Generate keys from a pre-generated pool handed out in batches: unique by construction, no collision handling on the hot path, unguessable, never reused.</li>
+<li>Expiry is lazy for correctness (check on read, cap cache TTLs) and background for cost (sweeper, reference-counted blob garbage collection with a grace period).</li>
+<li>Cache in layers: browser, CDN for public and unlisted pastes, Redis for metadata and small text; never cache private responses in shared caches.</li>
+<li>Dedup by SHA-256 saves bytes and enables hash blocklists, but needs reference counting, reconciliation, and care about privacy side channels.</li>
+<li>Versions are immutable; edits create new versions with optimistic concurrency; versioned URLs cache for a year.</li>
+<li>Enforce size limits at every layer; serve raw text from a cookieless domain with <code>nosniff</code>; rate limit, scan asynchronously, and block by hash.</li>
+<li>Order operations so that crashes leave garbage, not dangling pointers: blob first, then metadata; on delete, metadata state first, then purge, then blob release.</li>
+</ul></div>
+<p class="connects"><b>Connects to:</b> builds on <a href="../chapters/01-interview-framework.html">Chapter 1</a> (framework), <a href="../chapters/02-estimation.html">Chapter 2</a> (estimation) and <a href="../chapters/05-api-design.html">Chapter 5</a> (API design). Storage and caching: <a href="../chapters/17-data-modeling.html">Chapter 17</a>, <a href="../chapters/20-nosql.html">Chapter 20</a>, <a href="../chapters/21-object-storage.html">Chapter 21</a>, <a href="../chapters/12-cdn.html">Chapter 12</a>, <a href="../chapters/13-caching-patterns.html">Chapter 13</a>, <a href="../chapters/14-caching-failures.html">Chapter 14</a>, <a href="../chapters/15-redis.html">Chapter 15</a>. Scale and reliability: <a href="../chapters/24-replication.html">Chapter 24</a>, <a href="../chapters/25-sharding.html">Chapter 25</a>, <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>, <a href="../chapters/40-resilience.html">Chapter 40</a>, <a href="../chapters/41-ha-dr.html">Chapter 41</a>. Abuse and operations: <a href="../chapters/16-rate-limiting.html">Chapter 16</a>, <a href="../chapters/55-security.html">Chapter 55</a>, <a href="../chapters/54-observability-slos.html">Chapter 54</a>. A close relative is <a href="c01-url-shortener.html">Case study 1: URL shortener</a>, which shares the key-generation problem.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

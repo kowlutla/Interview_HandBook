@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 38: Scheduling and Workflows | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="38-scheduling-workflows">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Chapter 38 · Module 5 · Asynchronous Architecture</div>
+<h1>Scheduling and Workflows</h1>
+<p class="lead">Many systems must do something later: send a reminder next Tuesday, retry a payment in ten minutes, run a report every night, or drive an order through ten steps that take days. This chapter explains how to build distributed schedulers and delayed-job systems that do not lose or duplicate work, and how workflow engines such as Temporal, Step Functions and Airflow turn long-running business processes into reliable code.</p>
+
+<h2 id="usecases">1. What "do it later" means: the use cases</h2>
+
+<p>Almost every production system eventually needs work that is not triggered by a user request arriving right now. The work is triggered by <b>time</b>, or by a <b>long chain of events</b>, or by a <b>failure that needs another attempt</b>. These look similar from far away, but they have different requirements, and a good design starts by naming which kind you have.</p>
+
+<ul>
+  <li><b>Recurring jobs (cron jobs).</b> "Every night at 02:00 build the billing report." "Every five minutes refresh the leaderboard." The schedule is a rule (a cron expression such as <code>0 2 * * *</code>) and the job fires again and again forever. The number of distinct schedules is usually modest (thousands), but each one must fire reliably.</li>
+  <li><b>Delayed or one-off jobs.</b> "Cancel this unpaid order in 30 minutes." "Send the welcome email 24 hours after sign-up." Each job fires exactly once at a specific future instant. The number of pending jobs can be enormous (millions or billions), because every user action may create one.</li>
+  <li><b>Reminders and notifications.</b> A special case of delayed jobs where the fire time is chosen by the user ("remind me at 9 am tomorrow"), is often tied to a time zone, and where firing late is a visible product bug while firing twice is an annoyance. Section 18 designs this fully.</li>
+  <li><b>Retries.</b> "The payment provider timed out, try again in 30 seconds, then 2 minutes, then 10." A retry is just a delayed job whose delay grows. Retry scheduling is the most common hidden user of a delay mechanism.</li>
+  <li><b>Timeouts and expirations.</b> "If the driver does not accept in 20 seconds, offer the ride to someone else." "Release the seat hold after 10 minutes." Each is a delayed job that is usually <i>cancelled</i> because the happy path happens first.</li>
+  <li><b>Long-running business processes.</b> "Onboard a customer: verify identity, wait for a human to approve, create accounts in four systems, send a welcome kit, check in after a week." The process takes days, spans many services, must survive deploys and crashes, and may wait for outside events. This is what workflow engines are for (sections 13 to 15).</li>
+</ul>
+
+<p>The common thread is that the system must <b>remember an intention across time and failure</b>. A web request lives for milliseconds and keeps its state in memory; scheduled work lives for hours or months, so its state must be stored durably, and something must reliably notice when the moment arrives. Everything in this chapter is a variation on two questions: <i>where do we store the pending intention, and who is responsible for waking it up and making sure it is carried out exactly as intended?</i></p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Map of scheduling use cases and which mechanism fits each">
+  <text class="t-b" x="20" y="22">Kind of work</text><text class="t-b" x="360" y="22">Typical volume</text><text class="t-b" x="560" y="22">Mechanism that fits</text>
+  <rect class="box" x="20" y="34" width="320" height="38" rx="8"/><text x="32" y="58">Recurring cron rule (nightly report)</text>
+  <text class="t-sm" x="360" y="58">hundreds to thousands of rules</text>
+  <rect class="cache" x="560" y="34" width="320" height="38" rx="8"/><text x="572" y="58">Distributed cron with leader or shards</text>
+  <rect class="box" x="20" y="82" width="320" height="38" rx="8"/><text x="32" y="106">One-off delayed job (cancel unpaid order)</text>
+  <text class="t-sm" x="360" y="106">millions to billions pending</text>
+  <rect class="cache" x="560" y="82" width="320" height="38" rx="8"/><text x="572" y="106">Durable due-time index plus pollers</text>
+  <rect class="box" x="20" y="130" width="320" height="38" rx="8"/><text x="32" y="154">Retry with backoff</text>
+  <text class="t-sm" x="360" y="154">proportional to failures</text>
+  <rect class="cache" x="560" y="130" width="320" height="38" rx="8"/><text x="572" y="154">Queue delay or retry topics, DLQ</text>
+  <rect class="box" x="20" y="178" width="320" height="38" rx="8"/><text x="32" y="202">Timeout that is usually cancelled</text>
+  <text class="t-sm" x="360" y="202">one per in-flight operation</text>
+  <rect class="cache" x="560" y="178" width="320" height="38" rx="8"/><text x="572" y="202">Timer service or timing wheel</text>
+  <rect class="box" x="20" y="226" width="320" height="38" rx="8"/><text x="32" y="250">Multi-step process lasting days</text>
+  <text class="t-sm" x="360" y="250">thousands to millions of instances</text>
+  <rect class="cache" x="560" y="226" width="320" height="38" rx="8"/><text x="572" y="250">Workflow engine (durable execution)</text>
+</svg>
+<figcaption>Read each row left to right: the kind of work, how many pending items to expect, and the mechanism the rest of the chapter develops for it.</figcaption>
+</figure>
+
+<h2 id="single-node">2. Why single-node cron breaks</h2>
+
+<p><b>cron</b> is the classic Unix scheduler. A daemon wakes up once a minute, reads a table of <code>(schedule, command)</code> lines, and starts any command whose schedule matches the current minute. It is simple and fine for one machine. The trouble begins when the machine is a single point in a system that must be reliable. Walk through the failure modes one by one.</p>
+
+<ul>
+  <li><b>The machine dies.</b> No machine, no cron. The nightly report silently does not run, and nobody notices until a customer asks. A single host gives you the availability of a single host.</li>
+  <li><b>You add a second machine for safety and both run the job.</b> Now every schedule fires twice: two invoices, two emails. Classic cron has no notion of "only one of us should do this".</li>
+  <li><b>The machine was down at the scheduled minute.</b> When it comes back, cron does <i>not</i> run the job it missed (this is called a <b>misfire</b>). Some systems want the missed run executed on recovery, some want it skipped; plain cron offers neither explicit choice.</li>
+  <li><b>Overlap.</b> A job scheduled every minute that sometimes takes three minutes will start a second copy while the first is still running. Two copies may corrupt shared state or double-process the same rows.</li>
+  <li><b>No visibility and no retries.</b> If the command fails, cron just mails stderr to a mailbox nobody reads. There is no history, no retry with backoff, no alert, no way to ask "did last night's run succeed?".</li>
+  <li><b>No scale-out.</b> The job runs on the machine that owns the crontab. If you have 100,000 per-customer jobs, one box cannot run them, and cron is not designed to hand work to a fleet.</li>
+  <li><b>Clock and time-zone issues.</b> Daylight saving time makes "02:30 local" happen twice or not at all on transition days. Clock drift on one box makes it fire early or late relative to others.</li>
+</ul>
+
+<div class="callout watch"><b>Watch out</b>
+The tempting fix, "run cron on every app server and let each one fire", gives you duplicates. The other tempting fix, "run it on one designated server", gives you a single point of failure. A correct design needs <b>exactly one active owner at a time, with automatic takeover on failure</b>, and <b>jobs that tolerate being run twice anyway</b>, because takeover is never perfectly clean.
+</div>
+
+<p>These failure modes define the requirements for the rest of the chapter: durable storage of schedules, a single logical owner (or partitioned owners) for firing, explicit policies for misfire and overlap, retries with a dead-letter store, and observability. A system that provides these is a <b>distributed scheduler</b>. The case study <a href="../case-studies/c18-job-scheduler.html">Design a Job Scheduler</a> applies them end to end as an interview answer; this chapter provides the building blocks.</p>
+
+<h2 id="architecture">3. Anatomy of a distributed scheduler</h2>
+
+<p>Every scheduler, from a homegrown one to Quartz clusters to Kubernetes CronJobs, splits into the same four roles. Separating them in your head makes every design choice easier.</p>
+
+<ol>
+  <li><b>Job store.</b> A durable database holding every job definition and every pending occurrence: its id, owner (tenant), payload, schedule or fire time, state, attempt count, and lease information. This is the source of truth. If the scheduler crashes, the store is all that remains, so the store is what must be replicated and backed up.</li>
+  <li><b>Due-time index.</b> A structure that answers "which jobs are due now or soon?" efficiently. In a relational store this is an index on <code>(fire_at)</code> for jobs in state <code>PENDING</code>. In Redis it is a sorted set scored by fire time. In memory it may be a priority queue or a timing wheel (section 6). Without an index the scheduler would scan every job every second.</li>
+  <li><b>Trigger loop (the scheduler proper).</b> The component that watches the due-time index and, when a job becomes due, <i>claims</i> it and hands it to the executors. It does not run the job. Its work is cheap: find due items, mark them, enqueue them.</li>
+  <li><b>Executors (workers).</b> A scalable fleet that actually runs the job's code, reports success or failure, extends leases while running, and is allowed to crash at any time.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Distributed scheduler architecture: API, job store, due index, trigger loop, queue, workers, DLQ">
+  <rect class="ext" x="20" y="130" width="130" height="50" rx="10"/><text class="t-c t-b" x="85" y="152">Clients</text><text class="t-c t-sm" x="85" y="169">create / cancel jobs</text>
+  <rect class="box" x="200" y="130" width="130" height="50" rx="10"/><text class="t-c t-b" x="265" y="152">Scheduler API</text><text class="t-c t-sm" x="265" y="169">validate, persist</text>
+  <rect class="db" x="380" y="40" width="170" height="60" rx="10"/><text class="t-c t-b" x="465" y="64">Job store</text><text class="t-c t-sm" x="465" y="82">definitions + occurrences</text>
+  <rect class="db" x="380" y="210" width="170" height="60" rx="10"/><text class="t-c t-b" x="465" y="234">Due-time index</text><text class="t-c t-sm" x="465" y="252">sorted by fire_at</text>
+  <rect class="cache" x="610" y="130" width="130" height="50" rx="10"/><text class="t-c t-b" x="675" y="152">Trigger loop</text><text class="t-c t-sm" x="675" y="169">leader or per shard</text>
+  <rect class="box" x="780" y="40" width="100" height="50" rx="10"/><text class="t-c t-b" x="830" y="62">Queue</text><text class="t-c t-sm" x="830" y="79">ready jobs</text>
+  <rect class="box" x="780" y="130" width="100" height="50" rx="10"/><text class="t-c t-b" x="830" y="152">Workers</text><text class="t-c t-sm" x="830" y="169">run + heartbeat</text>
+  <rect class="miss" x="780" y="220" width="100" height="50" rx="10"/><text class="t-c t-b" x="830" y="242">DLQ</text><text class="t-c t-sm" x="830" y="259">gave up</text>
+  <path class="arrow" d="M150 155 L196 155"/>
+  <path class="arrow" d="M330 145 L378 85"/>
+  <path class="arrow" d="M330 165 L378 225"/>
+  <path class="arrow" d="M550 235 L640 184"/>
+  <path class="arrow dash" d="M550 75 L640 126"/>
+  <path class="arrow" d="M740 145 L776 70"/>
+  <path class="arrow" d="M830 90 L830 126"/>
+  <path class="arrow-r dash" d="M830 180 L830 216" marker-end="url(#ahr)"/>
+  <path class="arrow dash" d="M780 160 L744 160"/>
+  <text class="t-sm" x="590" y="300">Workers report results back to the store (success, failure, next attempt).</text>
+</svg>
+<figcaption>Jobs are written to the store and index; the trigger loop finds due items and moves them to a queue; workers execute and report back, and exhausted jobs land in a dead-letter queue (DLQ).</figcaption>
+</figure>
+
+<p>An important design principle: <b>the trigger loop and the executors are decoupled by a queue</b> (see <a href="34-queues-kafka.html">Chapter 34</a>). The trigger loop decides <i>when</i>; the queue and workers decide <i>how much parallelism and where</i>. This lets you scale each independently, and it keeps slow jobs from delaying the clock.</p>
+
+<h2 id="distributed-cron">4. Distributed cron: who fires, and how to avoid two owners</h2>
+
+<p>For recurring schedules the first design question is: <b>which node evaluates the schedule and fires jobs?</b> There are three standard answers, in increasing order of scalability.</p>
+
+<h3>4.1 One active leader, standbys on watch</h3>
+
+<p>Run several scheduler instances but allow only one, the <b>leader</b>, to fire. The others are warm standbys. Leader election is the problem of having the group agree on exactly one such node, and automatically choosing a new one when it dies. You rarely implement the consensus yourself; you rent it from a coordination service such as ZooKeeper, etcd or Consul, or from a database row with a lease. Chapter <a href="29-consensus.html">29</a> explains the underlying consensus ideas, and Chapter <a href="30-coordination-locks.html">30</a> covers locks and leases in detail. The essentials for a scheduler:</p>
+
+<ul>
+  <li>The leader holds a <b>lease</b>: a lock that expires automatically after, say, 15 seconds unless renewed. It renews every 5 seconds. If the leader crashes or freezes, renewals stop, the lease expires, and a standby acquires it.</li>
+  <li>The danger is a <b>zombie leader</b>: a process that was paused (a long garbage-collection pause, a VM freeze, a network partition) and still <i>believes</i> it is the leader after the lease expired and a new leader was elected. For a moment two nodes fire jobs. The standard defence is a <b>fencing token</b>: each lease acquisition gets a monotonically increasing number, and the store rejects writes carrying an old number. A zombie's stale writes are then refused. Chapter 30 explains fencing in depth.</li>
+  <li>Even with fencing, treat the job itself as possibly-duplicated and make it idempotent (section 8), because the handover window cannot be made fully zero.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Leader election with lease and fencing token timeline">
+  <text class="t-b" x="20" y="22">Time moves right</text>
+  <text class="t-sm" x="20" y="64">Node A</text><line x1="90" y1="60" x2="880" y2="60" stroke="var(--muted)" stroke-width="1"/>
+  <text class="t-sm" x="20" y="164">Node B</text><line x1="90" y1="160" x2="880" y2="160" stroke="var(--muted)" stroke-width="1"/>
+  <text class="t-sm" x="20" y="254">Lock store</text><line x1="90" y1="250" x2="880" y2="250" stroke="var(--muted)" stroke-width="1"/>
+  <rect class="hit" x="100" y="40" width="240" height="40" rx="8"/><text class="t-c t-b" x="220" y="65">A leader, token 41</text>
+  <rect class="miss" x="340" y="40" width="190" height="40" rx="8"/><text class="t-c t-b" x="435" y="65">A frozen (GC pause)</text>
+  <rect class="box" x="530" y="40" width="200" height="40" rx="8"/><text class="t-c t-b" x="630" y="65">A wakes, thinks it leads</text>
+  <rect class="box" x="100" y="140" width="400" height="40" rx="8"/><text class="t-c t-sm" x="300" y="165">B standby, polls the lock</text>
+  <rect class="hit" x="500" y="140" width="380" height="40" rx="8"/><text class="t-c t-b" x="690" y="165">B leader, token 42</text>
+  <path class="arrow dash" d="M340 80 L340 232"/><text class="t-sm" x="348" y="215">A stops renewing</text>
+  <path class="arrow dash" d="M500 232 L500 184"/><text class="t-sm" x="400" y="206">lease expires, B wins</text>
+  <path class="arrow-r" d="M680 82 L680 232" marker-end="url(#ahr)"/><text class="t-sm" x="690" y="232" style="fill:var(--bad)">A writes with token 41: rejected</text>
+</svg>
+<figcaption>Node A stops renewing while frozen, B takes over with a higher token. When A wakes up, the store refuses its writes because its token is older.</figcaption>
+</figure>
+
+<p>The leader design is attractive because it is easy to reason about: one brain, no coordination on each firing. Its limits are throughput (one node evaluates all schedules, though evaluating a schedule is cheap) and the <b>failover gap</b>: between the leader dying and a standby noticing, up to a lease length of delay, during which nothing fires. For cron granularity of one minute, a 15-second gap is usually acceptable.</p>
+
+<h3>4.2 Sharded scheduling</h3>
+
+<p>When there are millions of jobs, one leader cannot scan and fire all of them. The standard answer is the same as for any large data set (<a href="25-sharding.html">Chapter 25</a>): <b>partition the jobs</b>, for example by <code>hash(job_id) % N</code> into N shards, and give each shard exactly one owner at a time. A coordinator (or the lease mechanism applied per shard) assigns shards to scheduler nodes. If a node dies, its shards are redistributed. When nodes join, shards move. Each shard owner runs its own small trigger loop over only its slice of the due-time index.</p>
+
+<p>Typical choices are many more shards than nodes (say 256 shards on 8 nodes), so rebalancing moves small, even chunks and one hot shard does not overwhelm a node. This is exactly how Kafka assigns partitions to consumers, and many schedulers literally reuse a Kafka consumer group or a Raft group per shard for ownership.</p>
+
+<h3>4.3 No owner, just claim with the database</h3>
+
+<p>The third approach avoids explicit ownership. Every scheduler instance polls the shared store and <b>claims</b> due jobs using an atomic database operation, so that two instances never claim the same row. The claim itself is the mutual exclusion. This is the SKIP LOCKED pattern of section 7.1. It scales horizontally with no election, and failover is automatic (a dead node simply stops claiming). Its cost is that the database is in the hot path and all instances poll it.</p>
+
+<table>
+  <tr><th>Approach</th><th>Strength</th><th>Weakness</th><th>Good for</th></tr>
+  <tr><td>Single leader + standbys</td><td>Simple to reason about, no per-job coordination</td><td>One node's throughput, failover gap, zombie risk</td><td>Up to thousands of cron rules</td></tr>
+  <tr><td>Sharded owners</td><td>Scales with shard count, even load, fast local loops</td><td>Needs shard assignment and rebalancing logic</td><td>Millions of timers, multi-tenant platforms</td></tr>
+  <tr><td>Claim via database</td><td>No election, trivial failover, easy to build</td><td>Database load from polling, contention at extreme rates</td><td>Moderate volume, teams already on a relational DB</td></tr>
+</table>
+
+<h3>4.4 Turning a cron rule into occurrences</h3>
+
+<p>A recurring job is stored as a <b>rule</b>, not as infinitely many rows. The scheduler computes the <b>next occurrence</b> from the rule and writes it into the due-time index as a concrete pending row. When that occurrence fires, the scheduler computes the following one and writes that. This "materialize only the next occurrence" approach keeps storage proportional to the number of rules, makes edits to the rule take effect naturally, and makes misfire handling (what if several occurrences were missed?) an explicit decision rather than an accident. Store the time zone with the rule and compute in that zone using a proper library, because the offset to UTC changes with daylight saving. Fire times themselves are stored in UTC.</p>
+
+<h2 id="due-index">5. The due-time index: how to find work that is due</h2>
+
+<p>The key operation of any delay system is: <i>"give me everything whose fire time is at most now, in order."</i> The data structure behind that operation decides the cost of everything else. There are four common choices.</p>
+
+<ul>
+  <li><b>Indexed table scan (polling).</b> Keep jobs in a relational table with an index on <code>(state, fire_at)</code>. Every second each poller runs <code>SELECT ... WHERE state='PENDING' AND fire_at &lt;= now() ORDER BY fire_at LIMIT 500</code>. With the index this reads only due rows, in O(log n + k) where k is the batch size, regardless of how many millions are pending in the future. It is durable by nature and very common.</li>
+  <li><b>Sorted set (Redis ZSET).</b> The member is the job id, the score is the fire time in epoch milliseconds. <code>ZRANGEBYSCORE key -inf now LIMIT 0 500</code> returns the due members; adding and removing are O(log n). Fast, but memory-bound and only as durable as the Redis persistence and replication you configure (section 7.2).</li>
+  <li><b>In-memory priority queue (heap).</b> A binary min-heap keyed by fire time gives O(log n) insert and O(log n) remove-min and O(1) peek at the next due item. The scheduler can sleep until exactly the top item's time. Good inside a single process; memory limits the count, and it must be rebuilt from the store after a restart.</li>
+  <li><b>Timing wheel.</b> A structure that trades a small loss of precision for O(1) insert and O(1) expiry. Section 6.</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b>
+The durable store is the source of truth; the fast in-memory structure is a <b>cache of the near future</b>. A common high-scale pattern is two tiers: all jobs live in the database; every minute a loader pulls the jobs due in the next few minutes into a timing wheel or heap that fires them precisely. If the process dies, the loader rebuilds the wheel from the database.
+</div>
+
+<h3>5.1 Polling versus event-driven wakeups</h3>
+
+<p><b>Polling</b> means asking "is anything due?" on a fixed interval (every 1 second, say). It is trivial and robust: it cannot miss work, because the next poll always finds whatever is due. Its costs are constant background load on the store and a latency floor equal to the poll interval (on average half of it). You can tighten the interval, but a million idle pollers hammering a database is wasteful. A refinement is <b>adaptive sleeping</b>: peek at the earliest pending fire time and sleep until then (bounded by a maximum, so newly inserted earlier jobs are noticed). Another is <b>notify on insert</b> (a database LISTEN/NOTIFY or a message) to wake the poller early for short delays.</p>
+
+<p>For almost all products, a one-second poll over an index is precise enough, and the simplest design that meets requirements should win in an interview. Reach for timing wheels when you need millions of timers with very cheap creation and cancellation, such as per-connection or per-request timeouts.</p>
+
+<h2 id="timing-wheel">6. Timing wheels and priority queues</h2>
+
+<p>Suppose a server holds one million open connections and each needs an idle timeout. Putting a million timers in a binary heap costs O(log n), about 20 comparisons, per insert and per cancel, and most timers are cancelled before they fire (the connection becomes active again, the request completes). A <b>timing wheel</b> makes both operations O(1).</p>
+
+<h3>6.1 The simple wheel</h3>
+
+<p>Picture a clock face with a fixed number of slots, say 60, where each slot represents one tick of 1 second. A hand points at the current slot and advances one slot per tick. To schedule a timer that fires in 25 seconds, compute <code>(current_slot + 25) mod 60</code> and append the timer to that slot's list. When the hand reaches a slot, every timer in the list fires. Insertion is one array index plus a list append; cancellation is a list removal (O(1) if the list is doubly linked and you hold a handle). The work per tick is proportional to the timers that actually expire, not to the total.</p>
+
+<p>The limit: a single wheel only covers <code>slots × tick</code> of future (60 seconds here). A timer 90 seconds away would wrap around and fire too early, unless you store a "rounds remaining" counter in the entry and decrement it each time the hand passes. That works but makes each tick re-examine every entry in the slot.</p>
+
+<h3>6.2 The hierarchical timing wheel</h3>
+
+<p>The elegant fix mirrors a clock with hour, minute and second hands. Use several wheels of increasing granularity. A seconds wheel with 60 slots, a minutes wheel with 60 slots (each slot is 60 seconds), and an hours wheel with 24 slots. A timer 3 hours and 25 minutes away is placed in the hours wheel. When the hour hand reaches its slot, the timers in it are not fired; they are <b>cascaded</b> (re-inserted) into the minutes wheel at their remaining offset. When the minute hand reaches that slot they cascade into the seconds wheel, and finally fire. Each timer is moved at most once per level, so the amortized cost stays O(1) per timer, and total memory is the sum of the wheel sizes (60 + 60 + 24 slots) rather than one array covering a whole day at one-second precision. This design is used in the Linux kernel timers, Netty's <code>HashedWheelTimer</code> (single wheel with rounds), Kafka's broker purgatory (for delayed produce and fetch requests) and many RPC frameworks.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 310" role="img" aria-label="Hierarchical timing wheel with cascading from hours to minutes to seconds">
+  <text class="t-b" x="20" y="22">Three wheels; a timer set for 3h 25m 10s ahead starts in the outer wheel</text>
+  <rect class="cache" x="30" y="50" width="240" height="90" rx="10"/><text class="t-c t-b" x="150" y="76">Hours wheel (24 slots)</text><text class="t-c t-sm" x="150" y="96">each slot = 1 hour</text><text class="t-c t-sm" x="150" y="116">timer waits in slot +3</text>
+  <rect class="cache" x="330" y="50" width="240" height="90" rx="10"/><text class="t-c t-b" x="450" y="76">Minutes wheel (60 slots)</text><text class="t-c t-sm" x="450" y="96">each slot = 1 minute</text><text class="t-c t-sm" x="450" y="116">timer lands in slot +25</text>
+  <rect class="cache" x="630" y="50" width="240" height="90" rx="10"/><text class="t-c t-b" x="750" y="76">Seconds wheel (60 slots)</text><text class="t-c t-sm" x="750" y="96">each slot = 1 second</text><text class="t-c t-sm" x="750" y="116">timer lands in slot +10</text>
+  <path class="arrow" d="M270 95 L326 95"/><text class="t-c t-sm" x="298" y="86">cascade</text>
+  <path class="arrow" d="M570 95 L626 95"/><text class="t-c t-sm" x="598" y="86">cascade</text>
+  <rect class="hit" x="630" y="190" width="240" height="50" rx="10"/><text class="t-c t-b" x="750" y="212">Fire: hand reaches slot</text><text class="t-c t-sm" x="750" y="229">run callback or enqueue</text>
+  <path class="arrow-g" d="M750 140 L750 186" marker-end="url(#ahg)"/>
+  <rect class="db" x="30" y="190" width="540" height="90" rx="10"/>
+  <text class="t-b" x="46" y="214">Why it works</text>
+  <text class="t-sm" x="46" y="236">Insert and cancel are O(1): compute the slot, add to or remove from its list.</text>
+  <text class="t-sm" x="46" y="256">Each timer is moved at most once per level, so total work stays small.</text>
+  <text class="t-sm" x="46" y="274">Precision is one tick; a timer fires at most one tick late.</text>
+</svg>
+<figcaption>A far-away timer is parked in a coarse wheel and cascades to finer wheels as time passes, until it lands in the seconds wheel and fires.</figcaption>
+</figure>
+
+<h3>6.3 Wheel versus heap, and the durability caveat</h3>
+
+<table>
+  <tr><th>Property</th><th>Binary heap / priority queue</th><th>Hierarchical timing wheel</th></tr>
+  <tr><td>Insert</td><td>O(log n)</td><td>O(1)</td></tr>
+  <tr><td>Cancel</td><td>O(log n) or lazy deletion</td><td>O(1) with a handle</td></tr>
+  <tr><td>Fire the next timer</td><td>O(log n)</td><td>O(1) amortized per expiry</td></tr>
+  <tr><td>Precision</td><td>Exact (down to the clock)</td><td>One tick</td></tr>
+  <tr><td>Best for</td><td>Few thousand to a million timers, exact time</td><td>Millions of timers, heavy churn and cancellation</td></tr>
+</table>
+
+<p>Both are <b>in-memory</b>. A crash loses every timer they hold. That is acceptable for ephemeral timeouts (the connection died with the process anyway) but unacceptable for "email this customer in 30 days". So a durable scheduler always keeps the authoritative copy in a database or log, and treats the wheel as a recoverable cache of the near term. After a restart it reloads from the store everything due within its horizon.</p>
+
+<h2 id="delayed-designs">7. Delayed job designs</h2>
+
+<p>"Run this job in N seconds" can be built several ways. Each design places the waiting job in a different system, and each has a characteristic strength and weakness. Know all of them and pick by volume, delay length, precision, and the infrastructure you already run.</p>
+
+<h3>7.1 Database polling with SKIP LOCKED</h3>
+
+<p>Store each job as a row: <code>id, payload, fire_at, state, attempts, locked_until, shard</code>. Pollers repeatedly claim a batch of due rows. The difficulty is letting many pollers run in parallel without two claiming the same row. Plain <code>SELECT</code> then <code>UPDATE</code> has a race between the two statements. The solution in PostgreSQL, MySQL 8 and Oracle is <code>FOR UPDATE SKIP LOCKED</code>: lock the rows you select, and <b>skip</b> any row another transaction already locked instead of waiting for it.</p>
+
+<pre><code>BEGIN;
+SELECT id, payload FROM jobs
+ WHERE state = 'PENDING' AND fire_at &lt;= now()
+ ORDER BY fire_at
+ LIMIT 100
+ FOR UPDATE SKIP LOCKED;
+-- mark them in-flight with a lease, then commit quickly
+UPDATE jobs SET state='RUNNING', locked_until = now() + interval '60 seconds'
+ WHERE id IN (...);
+COMMIT;</code></pre>
+
+<p>Two pollers running this at the same moment receive disjoint batches, with no blocking and no duplicates, which makes the table behave like a work queue. Keep the transaction short (claim and commit, then do the work outside the transaction, otherwise you hold locks and a connection for the whole job). The index on <code>(state, fire_at)</code> makes the query cheap; a <b>partial index</b> restricted to <code>state='PENDING'</code> keeps the index small because completed rows (the vast majority over time) are excluded. Archive or delete old completed rows, or partition the table by time, so the table does not grow without bound. This design is durable, transactional (you can insert the job in the same transaction as the business change, which is the idea behind the outbox pattern, see <a href="35-messaging-patterns.html">Chapter 35</a>), and easy to inspect and cancel. Its limit is database write throughput and polling load; a single PostgreSQL primary comfortably handles thousands of claims per second, and sharding extends beyond that.</p>
+
+<h3>7.2 Redis sorted set</h3>
+
+<p>Use one sorted set whose members are job ids and whose scores are fire times. A poller runs <code>ZRANGEBYSCORE jobs -inf &lt;now&gt; LIMIT 0 100</code>, then removes the ones it will process. Doing "read then remove" as two commands races between pollers, so the claim is made atomic with a small Lua script (or with <code>ZPOPMIN</code> and re-insert if too early, or <code>ZREM</code> returning 1 only for the one poller that removed the member: whoever's <code>ZREM</code> succeeds owns the job). The payload is typically stored in a hash keyed by job id. To get at-least-once behaviour a claimed job is moved to a second "in-flight" sorted set scored by its lease expiry; a reaper moves expired in-flight jobs back. This is how libraries like Sidekiq (scheduled and retry sets) and many Redis-based queues work.</p>
+
+<p>Strengths: very fast (tens of thousands of operations per second per node), simple, precise to the millisecond. Weaknesses: capacity is bounded by RAM (a billion jobs of 100 bytes is 100 GB), and durability depends on persistence settings. Redis replication is asynchronous, so a failover can lose the most recent writes, meaning a reminder created a moment before the primary died may vanish. Use Redis as a fast index in front of a durable store, not as the only copy, when losing a job is unacceptable (see <a href="15-redis.html">Chapter 15</a>).</p>
+
+<h3>7.3 Queue-native delay: SQS delay and visibility timeout</h3>
+
+<p>Amazon SQS has two related features. <b>Delay seconds</b> (per queue or per message) hides a message from consumers for up to <b>15 minutes</b> after it is sent. The <b>visibility timeout</b> hides a message for a period after a consumer receives it; if the consumer does not delete it in time, the message reappears and is delivered again (this is at-least-once delivery, and the basis for retries). Together they give simple, fully managed short delays and retries. The 15-minute cap means that for longer delays you need a pattern: store the real fire time in the message, and when it arrives early, re-send it with a new delay (a hop that repeats until due), or keep long-term jobs in a database and enqueue them only when they are within 15 minutes of firing. RabbitMQ offers similar tools (per-message TTL with a dead-letter exchange, or a delayed-message plugin). The strength is zero infrastructure to run; the weakness is the delay cap and no way to inspect or cancel a specific delayed message cheaply.</p>
+
+<h3>7.4 Kafka: delayed topics in tiers</h3>
+
+<p>Kafka (<a href="34-queues-kafka.html">Chapter 34</a>) is an append-only log with no native per-message delay: consumers read in order, and a consumer cannot skip ahead past a not-yet-due message without blocking the partition behind it. The usual workaround is <b>delay tiers</b>: create topics such as <code>retry-5s</code>, <code>retry-1m</code>, <code>retry-10m</code>, <code>retry-1h</code>. A message is published to the tier closest to (but not longer than) its remaining delay. A consumer of that topic reads the message, and if it is not yet due it <i>pauses the partition</i> and sleeps until due (the partition holds messages in order of arrival, and because every message in the tier has the same delay, arrival order equals due order). When due, the message is forwarded to the next smaller tier or the real work topic. Because each tier has a fixed delay, ordering is preserved and no sorting is needed. Strengths: high throughput and durability, fits retry pipelines naturally. Weaknesses: delays are quantized to the tier sizes, arbitrary per-message fire times need many tiers, and cancelling a delayed message is impractical.</p>
+
+<h3>7.5 A dedicated timer service</h3>
+
+<p>At very large scale, companies build an internal <b>timer service</b>: other services call <code>schedule(key, fire_at, callback)</code> and <code>cancel(key)</code>. Internally it combines the previous ideas: durable storage of timers partitioned by time bucket (for example, one partition per minute of fire time), a loader that pulls the next few minutes into memory, a timing wheel that fires precisely, and delivery of the firing event to a queue or an RPC endpoint with retries. Callers get a simple API and the platform team owns the hard parts (sharding, leases, backfill after outages). This is the architecture behind the reminder service in section 18 and the case study <a href="../case-studies/c18-job-scheduler.html">Design a Job Scheduler</a>.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Comparison of four delayed-job designs: database, Redis, SQS, Kafka tiers">
+  <text class="t-c t-b" x="112" y="22">DB + SKIP LOCKED</text>
+  <rect class="db" x="20" y="34" width="185" height="70" rx="8"/><text class="t-c t-sm" x="112" y="58">jobs table, index</text><text class="t-c t-sm" x="112" y="76">(state, fire_at)</text><text class="t-c t-sm" x="112" y="94">durable, queryable</text>
+  <rect class="box" x="20" y="130" width="185" height="50" rx="8"/><text class="t-c t-sm" x="112" y="152">N pollers claim</text><text class="t-c t-sm" x="112" y="168">disjoint batches</text>
+  <path class="arrow" d="M112 104 L112 126"/>
+
+  <text class="t-c t-b" x="340" y="22">Redis ZSET</text>
+  <rect class="cache" x="245" y="34" width="190" height="70" rx="8"/><text class="t-c t-sm" x="340" y="58">score = fire time</text><text class="t-c t-sm" x="340" y="76">ZRANGEBYSCORE due</text><text class="t-c t-sm" x="340" y="94">fast, RAM bound</text>
+  <rect class="box" x="245" y="130" width="190" height="50" rx="8"/><text class="t-c t-sm" x="340" y="152">atomic claim (Lua,</text><text class="t-c t-sm" x="340" y="168">ZREM wins)</text>
+  <path class="arrow" d="M340 104 L340 126"/>
+
+  <text class="t-c t-b" x="570" y="22">SQS delay</text>
+  <rect class="cache" x="475" y="34" width="190" height="70" rx="8"/><text class="t-c t-sm" x="570" y="58">DelaySeconds up to 15 min</text><text class="t-c t-sm" x="570" y="76">visibility timeout retry</text><text class="t-c t-sm" x="570" y="94">fully managed</text>
+  <rect class="box" x="475" y="130" width="190" height="50" rx="8"/><text class="t-c t-sm" x="570" y="152">consumer receives,</text><text class="t-c t-sm" x="570" y="168">deletes when done</text>
+  <path class="arrow" d="M570 104 L570 126"/>
+
+  <text class="t-c t-b" x="790" y="22">Kafka delay tiers</text>
+  <rect class="cache" x="700" y="34" width="185" height="70" rx="8"/><text class="t-c t-sm" x="792" y="58">retry-5s, 1m, 10m, 1h</text><text class="t-c t-sm" x="792" y="76">same delay per topic</text><text class="t-c t-sm" x="792" y="94">order = due order</text>
+  <rect class="box" x="700" y="130" width="185" height="50" rx="8"/><text class="t-c t-sm" x="792" y="152">consumer pauses until</text><text class="t-c t-sm" x="792" y="168">due, forwards down</text>
+  <path class="arrow" d="M792 104 L792 126"/>
+
+  <rect class="hit" x="20" y="210" width="865" height="130" rx="10"/>
+  <text class="t-b" x="36" y="234">Choosing</text>
+  <text class="t-sm" x="36" y="256">DB: default choice up to thousands per second, needs durability, cancel and query, transactional with business data.</text>
+  <text class="t-sm" x="36" y="276">Redis: millisecond precision and high rates, but pair with a durable store, since async replication can lose recent writes.</text>
+  <text class="t-sm" x="36" y="296">SQS: short delays and retries with no servers; use another store for delays longer than 15 minutes.</text>
+  <text class="t-sm" x="36" y="316">Kafka tiers: retry pipelines at very high throughput; poor at arbitrary fire times and cancellation.</text>
+</svg>
+<figcaption>Four ways to wait: the top rows show where the delayed job rests and how it is claimed, the bottom panel states when each is the right pick.</figcaption>
+</figure>
+
+<h2 id="at-least-once">8. At-least-once execution and exactly-once effects</h2>
+
+<p>Whatever mechanism you pick, a fundamental fact shapes the design: <b>a scheduler cannot guarantee that a job runs exactly once</b>. It can only choose between "at most once" (lose the job if anything goes wrong) and "at least once" (retry until sure it finished, accepting duplicates). The reason is the classic uncertainty of distributed systems (<a href="27-failure-time-ordering.html">Chapter 27</a>): when a worker calls an external service and the connection dies before the reply arrives, the worker cannot tell whether the call happened. The scheduler sees only silence. It must either retry (risking a duplicate effect) or give up (risking a lost effect).</p>
+
+<p>Almost every system chooses <b>at-least-once</b>, because losing a payment or a reminder is usually worse than running it twice, and then makes duplicates harmless. The goal is not exactly-once <i>execution</i> (impossible) but <b>exactly-once effect</b>: no matter how many times the job body runs, the observable outcome happens once. Chapter <a href="32-idempotency-ids.html">32</a> develops idempotency in general; here are the techniques specific to jobs.</p>
+
+<ul>
+  <li><b>Idempotency key per occurrence.</b> Give every job occurrence a stable id such as <code>(job_id, scheduled_for)</code>. The job passes that id to every downstream call (a payment provider's idempotency key, a unique constraint in your database). The second attempt hits the same key and returns the first result instead of acting again.</li>
+  <li><b>Record completion transactionally with the effect.</b> If the effect is a database write, write the effect and a row in a <code>processed_jobs</code> table with a unique key in the same transaction. A duplicate run fails the unique constraint and does nothing.</li>
+  <li><b>Make operations naturally idempotent.</b> "Set status to SHIPPED" is safe to repeat; "increment counter" is not. "Insert if absent" and "upsert" are safe. Prefer absolute writes to relative ones.</li>
+  <li><b>Check state before acting.</b> A reminder job first reads the reminder; if it is already marked sent or cancelled, it exits. This also handles the cancel race naturally.</li>
+  <li><b>Outbox for message effects.</b> If the effect is publishing a message, write the message to an outbox table in the job's transaction and let a relay publish it (Chapter 35); consumers deduplicate by message id.</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b>
+Treat "at-least-once delivery plus idempotent processing" as the single recipe that produces "exactly-once effects". The scheduler's job is never to lose a trigger; the job's job is to be safe to repeat. Design both halves explicitly in an interview and say so out loud.
+</div>
+
+<h2 id="policies">9. Misfire and overlap policies</h2>
+
+<p>Two situations need an explicit, configurable policy because the right answer depends on the job.</p>
+
+<h3>9.1 Misfire: the job was due while the scheduler was away</h3>
+
+<p>The scheduler may be down, a shard may be mid-rebalance, or the workers may be saturated, so a job's scheduled time passes without it running. When the system recovers, the job is <b>late</b>. Common policies (Quartz uses these names for its misfire instructions, and most schedulers have equivalents):</p>
+
+<ul>
+  <li><b>Fire now (run once, immediately).</b> Run the job once as soon as possible, then continue with the normal schedule. Right for "refresh the cache" or "send the reminder" (a late reminder beats none).</li>
+  <li><b>Skip.</b> Ignore the missed occurrence and wait for the next. Right for "every minute, sample metrics" where a stale run has no value.</li>
+  <li><b>Catch up (fire all missed).</b> If the job was scheduled every hour and three hours were missed, run it three times, once per missed slot, in order. Right for jobs that process a time window, such as "aggregate the hour 14:00 to 15:00", where each window must be done.</li>
+  <li><b>Grace period.</b> Fire if late by less than a threshold (say five minutes), else skip. Right for "good morning" notifications that are worthless at noon.</li>
+</ul>
+
+<h3>9.2 Overlap: the previous run is still going</h3>
+
+<p>When occurrence N+1 is due while occurrence N is still running, you need a <b>concurrency policy</b>. Kubernetes CronJob names three, which are a good vocabulary:</p>
+
+<ul>
+  <li><b>Allow.</b> Run them concurrently. Safe only if jobs are independent and idempotent.</li>
+  <li><b>Forbid (skip).</b> If the previous run is still active, skip the new occurrence. Good for "sync from external system", where running two syncs would conflict.</li>
+  <li><b>Replace.</b> Cancel the running one and start the new one. Good when only the latest result matters.</li>
+</ul>
+
+<p>A fourth, common in enterprise schedulers, is <b>queue (serialize)</b>: hold the new occurrence until the previous completes, then run it. To implement "forbid" or "queue" you need a per-job mutual exclusion, typically a row lock or a lease keyed by job id (Chapter 30), plus a record of the running occurrence in the store so any scheduler node can check.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Timeline showing overlap and misfire policies for an hourly job">
+  <text class="t-b" x="20" y="22">Hourly job; the scheduler is down from 14:50 to 16:20, and run 17:00 starts while 16:00 catch-up still runs</text>
+  <line x1="40" y1="70" x2="880" y2="70" stroke="var(--muted)" stroke-width="1.5"/>
+  <text class="t-c t-sm" x="100" y="60">14:00</text><text class="t-c t-sm" x="260" y="60">15:00</text><text class="t-c t-sm" x="420" y="60">16:00</text><text class="t-c t-sm" x="580" y="60">17:00</text><text class="t-c t-sm" x="740" y="60">18:00</text>
+  <circle cx="100" cy="70" r="5" fill="var(--good)"/><circle cx="260" cy="70" r="5" fill="var(--bad)"/><circle cx="420" cy="70" r="5" fill="var(--bad)"/><circle cx="580" cy="70" r="5" fill="var(--good)"/><circle cx="740" cy="70" r="5" fill="var(--good)"/>
+  <rect class="miss" x="220" y="90" width="260" height="30" rx="6"/><text class="t-c t-sm" x="350" y="110">scheduler down (15:00 and 16:00 misfire)</text>
+  <text class="t-b" x="20" y="152">Policy on recovery at 16:20</text>
+  <rect class="box" x="20" y="164" width="200" height="40" rx="8"/><text class="t-c t-b" x="120" y="188">Skip</text>
+  <text class="t-sm" x="236" y="188">15:00 and 16:00 dropped; next real run 17:00</text>
+  <rect class="box" x="20" y="212" width="200" height="40" rx="8"/><text class="t-c t-b" x="120" y="236">Fire once now</text>
+  <text class="t-sm" x="236" y="236">one run at 16:20 covers the gap, then 17:00 as normal</text>
+  <rect class="box" x="20" y="260" width="200" height="34" rx="8"/><text class="t-c t-b" x="120" y="282">Catch up all</text>
+  <text class="t-sm" x="236" y="282">runs for 15:00 then 16:00 in order, then 17:00 (overlap policy applies)</text>
+</svg>
+<figcaption>The timeline shows when the scheduler was down; each policy row says what runs after recovery. Overlap policy then decides what happens if a catch-up run is still active when the next one is due.</figcaption>
+</figure>
+
+<h2 id="leases">10. Job leases, heartbeats and zombie detection</h2>
+
+<p>Once a worker takes a job, what if it dies halfway? Nobody tells the scheduler. The standard mechanism is the same lease idea as leader election, applied per job.</p>
+
+<ol>
+  <li>When the worker claims a job, the store records <code>locked_by = worker-7</code> and <code>locked_until = now + L</code> (the <b>lease</b>, say 60 seconds).</li>
+  <li>While the job runs, the worker sends a <b>heartbeat</b> every L/3 (here, 20 seconds) that extends <code>locked_until</code>. A heartbeat is a small update, not the job's progress report (though it may carry progress).</li>
+  <li>If the worker crashes, the heartbeats stop. After L seconds the lease expires. A <b>reaper</b> (a periodic query for <code>state='RUNNING' AND locked_until &lt; now()</code>) resets the job to <code>PENDING</code> and increments its attempt count, so another worker picks it up. This is the same as the SQS visibility timeout, expressed in a database.</li>
+</ol>
+
+<p>The lease length is a tradeoff. A short lease detects dead workers quickly but risks declaring a healthy, slow worker dead during a pause, so the same job may run twice at once. A long lease avoids that but delays recovery. Heartbeats let you pick a short lease without limiting job duration: a four-hour job heartbeats for four hours, but a crash is noticed within a minute.</p>
+
+<p>A <b>zombie</b> is a worker that lost its lease but keeps running (frozen, partitioned, or simply slow to notice). It may finish and try to write a result after another worker was given the job. Defences, in order of strength: (1) the worker checks, before committing its result, that it still holds the lease (a conditional update: <code>UPDATE ... WHERE id=? AND locked_by=? AND attempt=?</code>, which fails if the job moved on, a compare-and-set using the attempt number as a fencing token); (2) the downstream effect is idempotent so a double run is harmless; (3) long jobs periodically self-check their own deadline and abort when the heartbeat call fails.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Job state machine with lease, heartbeat, expiry and DLQ">
+  <rect class="box" x="20" y="130" width="130" height="50" rx="10"/><text class="t-c t-b" x="85" y="152">PENDING</text><text class="t-c t-sm" x="85" y="169">waiting for fire_at</text>
+  <rect class="cache" x="230" y="130" width="130" height="50" rx="10"/><text class="t-c t-b" x="295" y="152">CLAIMED</text><text class="t-c t-sm" x="295" y="169">lease L, attempt n</text>
+  <rect class="cache" x="440" y="130" width="130" height="50" rx="10"/><text class="t-c t-b" x="505" y="152">RUNNING</text><text class="t-c t-sm" x="505" y="169">heartbeat every L/3</text>
+  <rect class="hit" x="680" y="40" width="130" height="50" rx="10"/><text class="t-c t-b" x="745" y="62">SUCCEEDED</text><text class="t-c t-sm" x="745" y="79">terminal</text>
+  <rect class="miss" x="680" y="220" width="130" height="50" rx="10"/><text class="t-c t-b" x="745" y="242">DEAD (DLQ)</text><text class="t-c t-sm" x="745" y="259">attempts exhausted</text>
+  <path class="arrow" d="M150 155 L226 155"/><text class="t-c t-sm" x="188" y="146">due</text>
+  <path class="arrow" d="M360 155 L436 155"/><text class="t-c t-sm" x="398" y="146">start</text>
+  <path class="arrow-g" d="M570 140 L676 80" marker-end="url(#ahg)"/><text class="t-sm" x="600" y="100">ack</text>
+  <path class="arrow-r" d="M570 170 L676 230" marker-end="url(#ahr)"/><text class="t-sm" x="560" y="215">fail, no attempts left</text>
+  <path class="arrow dash" d="M505 130 C505 60 85 60 85 126"/><text class="t-c t-sm" x="295" y="64">fail or lease expired: back off, attempt + 1, re-queue</text>
+  <path class="arrow dash" d="M505 180 C505 270 295 270 295 184" marker-end="url(#ah)"/><text class="t-c t-sm" x="400" y="290">heartbeat renews the lease</text>
+  <text class="t-sm" x="20" y="326">A reaper returns RUNNING jobs with an expired lease to PENDING; the attempt number acts as a fencing token.</text>
+</svg>
+<figcaption>A job moves left to right toward success. Failure or a dead worker sends it back to PENDING with a larger attempt number; after the last allowed attempt it becomes DEAD.</figcaption>
+</figure>
+
+<h2 id="retries">11. Retries, backoff and dead-letter queues</h2>
+
+<p>Failures are of two kinds. <b>Transient</b> failures (timeout, 503, deadlock, network blip) are likely to succeed on a retry. <b>Permanent</b> failures (malformed payload, a deleted customer, a bug) will never succeed no matter how many times you retry. A good job framework lets the job code tell them apart (for example, throwing a "non-retryable" error) and retries only the first kind.</p>
+
+<h3>11.1 Exponential backoff with jitter</h3>
+
+<p>Retrying immediately in a tight loop hammers a struggling dependency and makes recovery harder. <b>Exponential backoff</b> waits longer after each failure: delay = base × 2^attempt, capped (for example 1 s, 2 s, 4 s, 8 s ... up to 10 minutes). Without randomness, a thousand jobs that failed together retry together and cause a synchronized spike. <b>Jitter</b> adds randomness: wait a random time between 0 and the exponential value ("full jitter"), or half plus a random half. Chapter <a href="40-resilience.html">40</a> gives the full treatment. In a scheduler, a retry is simply a new fire time written back to the job row (<code>fire_at = now + backoff(attempt)</code>) or a message in a delay tier, so retries reuse the same delay machinery.</p>
+
+<h3>11.2 Retry budgets and limits</h3>
+
+<p>Set a maximum attempt count and a maximum total age (give up after 24 hours even if attempts remain). Also limit retry <i>volume</i> system-wide: if a downstream is fully down, a million jobs each retrying makes a retry storm. A <b>retry budget</b> (retries may be at most 10% of first-attempt volume) and a circuit breaker that pauses a whole job type while its dependency is unhealthy keep the scheduler from amplifying an outage.</p>
+
+<h3>11.3 Dead-letter queue</h3>
+
+<p>When attempts are exhausted, or the failure is permanent, the job is moved to a <b>dead-letter queue (DLQ)</b>, a durable holding area for items that need human or special handling (<a href="35-messaging-patterns.html">Chapter 35</a> covers DLQs and poison messages). A DLQ without alarms is a place where data quietly dies, so: alert when its depth is above zero, store the error and attempt history with each entry, provide a tool to inspect, fix and <b>redrive</b> (re-submit) items after the root cause is repaired, and keep the payload long enough for engineers to respond (days, not hours).</p>
+
+<h2 id="fairness">12. Priorities, fairness, multi-tenant quotas and rate limiting</h2>
+
+<p>A shared scheduler serves many teams or customers. Without controls, one tenant who schedules ten million jobs at midnight delays everyone else's urgent jobs. Four tools address this.</p>
+
+<ul>
+  <li><b>Priority lanes.</b> Separate queues (or priority values) for critical, normal and bulk work, with workers pulling from the higher lanes first. Pure strict priority can starve low priority forever when high-priority load is constant, so mix in a guarantee: for example, reserve 10% of workers for low-priority lanes, or "age" jobs so their effective priority rises the longer they wait.</li>
+  <li><b>Per-tenant fairness.</b> Round-robin or weighted-fair dequeuing across tenants: the dispatcher takes a bounded batch from each tenant in turn rather than first-come-first-served overall. Implementations include one logical sub-queue per tenant (or per tenant hash bucket) and a dispatcher that cycles through them, or "shuffle sharding", where each tenant maps to a small random subset of workers so one tenant's flood affects only a slice.</li>
+  <li><b>Quotas.</b> Cap each tenant's number of pending jobs, creation rate and concurrent running jobs. Reject over-quota creation with a clear error rather than accepting and silently delaying it. Concurrency caps are enforced with a counter (in Redis or the store) incremented on claim and decremented on finish, with expiry so crashed workers do not leak slots.</li>
+  <li><b>Rate limiting job execution.</b> Jobs often call something with its own limit: a third-party email API at 100 requests per second, or a customer's own endpoint. A <b>token bucket</b> (Chapter <a href="16-rate-limiting.html">16</a>) per downstream target gates dispatch; when no token is available the job is not run but re-delayed by a short interval, so workers are not blocked sleeping on a limiter.</li>
+</ul>
+
+<div class="callout tip"><b>Interview tip</b>
+When asked how you stop one noisy tenant from harming others, name three layers: admission control (quotas at creation), isolation at dispatch (per-tenant fair queues or shuffle sharding), and protection of downstreams (per-target rate limits and circuit breakers). Then mention you would watch queue age per tenant to detect it early.
+</div>
+
+<h2 id="engines">13. Workflow orchestration engines</h2>
+
+<p>A scheduler runs <i>one job at a time</i> at a moment in time. A <b>workflow</b> is a whole business process made of many steps with ordering, branching, waiting, retries and compensation, running for seconds to months. Examples: order fulfilment, loan approval, user onboarding, data pipelines, cloud resource provisioning. You could build one by hand with queues and a state table: after each step, write the new state and enqueue the next step. That works at first, then accumulates a dozen special cases (crash between writing state and enqueuing, timeouts per step, retries, cancellation, versions of the process in flight, "what step is order 123 on?"). A <b>workflow engine</b> packages all of that so you write the process as code or as a declared graph and the engine guarantees it completes.</p>
+
+<table>
+  <tr><th>Engine</th><th>How you define a workflow</th><th>Model</th><th>Typical fit</th></tr>
+  <tr><td>Temporal (and its ancestor Cadence)</td><td>Ordinary code (Go, Java, TypeScript, Python, .NET) using the SDK</td><td>Durable execution: the engine records history and replays code</td><td>Long-running business processes, sagas, anything with complex logic and waiting</td></tr>
+  <tr><td>AWS Step Functions</td><td>JSON state machine (Amazon States Language) built in a console or with CDK</td><td>Managed state machine; each transition is billed and recorded</td><td>Orchestrating AWS services with little custom code; standard workflows run up to a year</td></tr>
+  <tr><td>Apache Airflow</td><td>Python files defining a DAG (directed acyclic graph) of tasks</td><td>Scheduler runs tasks on a cron-like cadence per DAG run</td><td>Batch data pipelines and ETL on a schedule; not low-latency business flows</td></tr>
+  <tr><td>Camunda (Zeebe)</td><td>BPMN diagrams, a graphical standard for business processes</td><td>Engine executes the diagram; human tasks are first-class</td><td>Processes that business analysts model and review, with approvals</td></tr>
+</table>
+
+<p>Think of a spectrum. At one end are <b>data-pipeline orchestrators</b> (Airflow, Dagster, Prefect): the unit is a scheduled batch run of a DAG, tasks pass data by reference, and the focus is backfills and dependencies between datasets. At the other end are <b>durable-execution engines</b> (Temporal, Cadence) and <b>state-machine services</b> (Step Functions, Camunda): the unit is a long-lived instance of a business process, triggered by an event, that must never lose its place. In an interview, say which category you are choosing and why.</p>
+
+<h2 id="durable">14. Durable execution: how a workflow survives anything</h2>
+
+<p>The core idea of Temporal-style engines is <b>durable execution</b>: your workflow function appears to run continuously, even though the process executing it may be killed and restarted on a different machine at any time, days apart. The trick is <b>event sourcing plus replay</b> (see <a href="36-event-driven.html">Chapter 36</a> for event sourcing in general).</p>
+
+<h3>14.1 Event history and replay</h3>
+
+<p>The engine keeps, for every workflow instance, an append-only <b>event history</b>: <i>WorkflowStarted, ActivityScheduled(chargeCard), ActivityCompleted(chargeCard, result), TimerStarted(24h), TimerFired, SignalReceived(approved) ...</i> The workflow code runs on a <b>worker</b> process. The worker does not hold the state; the history does. When the worker needs to continue a workflow (it was evicted from the cache, crashed, or a timer fired), it loads the history and <b>re-executes the workflow function from the top</b>. As the code reaches each point where it would call an activity, the SDK checks the history: "has this already happened?" If yes, it returns the recorded result instantly without calling anything. If no, it records a command ("schedule this activity") and suspends. When the code reaches the end of recorded history, it is exactly where the previous execution left off, and new work proceeds from there. The effect is that local variables and the program counter are reconstructed purely from the log, so the code can sleep for 30 days with no thread, memory or process dedicated to it.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Durable execution replay sequence between worker, service and history">
+  <rect class="box" x="40" y="14" width="160" height="34" rx="8"/><text class="t-c t-b" x="120" y="36">Workflow worker</text>
+  <rect class="db" x="370" y="14" width="160" height="34" rx="8"/><text class="t-c t-b" x="450" y="36">Engine + history</text>
+  <rect class="cache" x="700" y="14" width="160" height="34" rx="8"/><text class="t-c t-b" x="780" y="36">Activity worker</text>
+  <line class="life" x1="120" y1="48" x2="120" y2="390"/><line class="life" x1="450" y1="48" x2="450" y2="390"/><line class="life" x1="780" y1="48" x2="780" y2="390"/>
+  <path class="arrow" d="M120 80 L446 80"/><text class="t-sm" x="130" y="74">1. run workflow, command: schedule chargeCard</text>
+  <path class="arrow" d="M450 112 L776 112"/><text class="t-sm" x="460" y="106">2. task: chargeCard (history: Scheduled)</text>
+  <path class="arrow dash" d="M776 144 L454 144"/><text class="t-sm" x="470" y="138">3. result recorded (history: Completed)</text>
+  <path class="arrow" d="M450 176 L124 176"/><text class="t-sm" x="140" y="170">4. wake workflow with new history</text>
+  <path class="arrow" d="M120 208 L446 208"/><text class="t-sm" x="130" y="202">5. command: start timer 24h</text>
+  <rect class="miss" x="40" y="226" width="160" height="40" rx="8"/><text class="t-c t-sm" x="120" y="250">worker crashes or evicted</text>
+  <rect class="hit" x="370" y="226" width="160" height="40" rx="8"/><text class="t-c t-sm" x="450" y="250">timer fires after 24h</text>
+  <path class="arrow" d="M450 290 L124 290"/><text class="t-sm" x="140" y="284">6. any worker: history + new TimerFired</text>
+  <rect class="box" x="40" y="304" width="400" height="44" rx="8"/>
+  <text class="t-sm" x="52" y="324">7. Replay from the top: chargeCard returns its recorded result</text>
+  <text class="t-sm" x="52" y="340">without calling the card API; execution continues after the timer.</text>
+  <path class="arrow" d="M120 372 L446 372"/><text class="t-sm" x="130" y="366">8. next command: schedule shipOrder</text>
+</svg>
+<figcaption>Steps 1 to 5 build the history. After a crash and a 24 hour wait, step 7 replays the code against the history, skipping completed activities, and continues at the first step with no recorded result.</figcaption>
+</figure>
+
+<h3>14.2 Determinism constraints</h3>
+
+<p>Replay only works if re-running the workflow code against the same history makes the <b>same decisions</b> in the same order. If the code behaved differently on replay (for example, took a different branch), the commands would not match the history and the engine would report a non-determinism error. Therefore workflow code has strict rules:</p>
+
+<ul>
+  <li>No direct use of the system clock, random numbers, or generated UUIDs. Use the SDK's versions (<code>workflow.now()</code>, <code>workflow.random()</code>), which are recorded in history and return the same value on replay.</li>
+  <li>No network calls, file or database access, and no threads or unmanaged concurrency in workflow code. Anything with side effects goes in an <b>activity</b>.</li>
+  <li>No iteration over data structures with unstable order (some languages' hash maps) when the order affects commands.</li>
+  <li>Use the SDK's own sleep, timer and wait primitives, never the language's.</li>
+</ul>
+
+<p>Workflow code is thus the <b>orchestration logic</b>: deterministic glue deciding what to do next. Activities are the <b>doing</b>: arbitrary code that touches the world.</p>
+
+<h3>14.3 Activities, retries and timeouts</h3>
+
+<p>An <b>activity</b> is a single unit of real work (charge a card, call an API, send an email). The engine, not your code, retries it according to a policy you declare: initial interval, backoff coefficient, maximum interval, maximum attempts, and which error types are non-retryable. Several timeouts bound its life: <i>schedule-to-start</i> (how long it may wait for a worker), <i>start-to-close</i> (how long one attempt may run), and <i>heartbeat timeout</i> (how long a long-running activity may go without reporting liveness, which is the lease mechanism from section 10, built in). Because activities are retried and may run more than once, <b>they must be idempotent</b> (section 8), which is why engines provide the activity's id and attempt number for use as an idempotency key. The guarantee is at-least-once for activities and effectively exactly-once for the workflow's own logic and state.</p>
+
+<h3>14.4 Timers and signals</h3>
+
+<p>A <b>durable timer</b> is a history event, not a sleeping thread. "Sleep for 30 days" writes <i>TimerStarted</i>; the engine stores it in its own timer queue (a scalable due-time index of the kind in sections 5 to 7) and, when it fires, appends <i>TimerFired</i> and wakes the workflow. One engine can hold millions of such timers because each is just a row.</p>
+
+<p>A <b>signal</b> is an asynchronous message delivered into a running workflow from outside ("customer approved", "address changed", "cancel"). It is appended to the history and the workflow code receives it at a well-defined point. A <b>query</b> reads the current workflow state without changing it. A common pattern is "wait for a signal or a timeout, whichever comes first": for example, wait up to 7 days for approval, then escalate. Because both the timer and the signal are history events, the race is resolved deterministically on replay.</p>
+
+<h3>14.5 Versioning workflows</h3>
+
+<p>Here is the hard operational problem. A workflow started last month is still running (waiting on a timer). You now deploy new code that adds a step or reorders two steps. When the old instance wakes and replays its old history against the new code, the commands differ from the history: non-determinism failure. Strategies:</p>
+
+<ul>
+  <li><b>Version markers / patching.</b> The SDK offers a call such as <code>getVersion("add-fraud-check", minSupported, maxSupported)</code>. Old histories take the old branch; new executions take the new one; the decision is recorded in history so replays agree. After all old instances finish, you remove the old branch.</li>
+  <li><b>Worker versioning / task queue per build.</b> Pin a running workflow to the code version it started on by routing it to workers built from that version, and let old workers drain. New workflows start on the new version.</li>
+  <li><b>Start-new-and-migrate.</b> For very long-lived workflows, finish the old one at a safe point and continue-as-new with the updated code, carrying state across.</li>
+  <li><b>Replay tests in CI.</b> Download real histories from production and replay them against the new code in a test, failing the build if any are non-deterministic. This catches mistakes before deploy.</li>
+</ul>
+
+<p>Also note <b>history size</b>: each event takes storage and replay time. Engines cap history length (tens of thousands of events), so loops that run forever (a subscription billed monthly for years) use <b>continue-as-new</b>: the workflow ends and immediately restarts itself with a fresh, empty history and the carried-over state.</p>
+
+<h3>14.6 Step Functions and Airflow compared</h3>
+
+<p><b>Step Functions</b> externalizes the same ideas as a declarative state machine: states (Task, Choice, Wait, Parallel, Map), built-in Retry and Catch blocks per state, and a managed execution history. Versioning is easier (an execution runs the definition it started with) because the engine interprets data rather than replaying your code, but complex logic becomes verbose JSON, and standard workflows are billed per state transition, which matters at high volume. There is also an express mode for short, high-rate workflows with different guarantees (at-least-once, shorter duration limits). <b>Airflow</b> is built around a scheduler that creates DAG runs on a cron schedule, each task instance has state in a metadata database, and workers execute tasks via an executor. It is excellent for dependencies between batch tasks, retries, backfills over historical dates, and a UI of runs, but a poor fit for millions of tiny event-driven instances or sub-second latency, because each task has scheduling overhead of seconds.</p>
+
+<h2 id="sagas">15. Sagas, orchestration versus choreography, and humans in the loop</h2>
+
+<h3>15.1 Sagas as workflows</h3>
+
+<p>A <b>saga</b> is a business transaction spanning several services, each with its own database, where a global ACID transaction is unavailable (<a href="31-distributed-transactions.html">Chapter 31</a>). Instead, each step is a local transaction, and when a later step fails, <b>compensating actions</b> undo the earlier ones: if "book flight" and "book hotel" succeeded but "charge card" failed, run "cancel hotel" and "cancel flight". <a href="48-sagas.html">Chapter 48</a> develops sagas in depth. A workflow engine is the natural runtime for an orchestrated saga: the workflow code is the saga coordinator, with try/catch around steps and a list of compensations to run in reverse order on failure. Durable execution means the coordinator itself cannot be lost mid-saga, which was the hard part of hand-built sagas; and activity retries with idempotency keys make each step and each compensation safe to repeat. Compensation steps themselves must be retried until they succeed (they have no further undo), so they deserve generous retry policies and alerts.</p>
+
+<h3>15.2 Orchestration versus choreography</h3>
+
+<p>There are two ways to coordinate multi-service processes (the same pair is contrasted for event-driven systems in <a href="36-event-driven.html">Chapter 36</a>).</p>
+
+<ul>
+  <li><b>Orchestration.</b> A central coordinator (the workflow) explicitly tells each service what to do next and tracks progress. The whole process is in one place: easy to read, to change, to monitor ("which step is order 123 on?"), and to implement timeouts and compensation. Cost: the orchestrator is a critical dependency and can become a coupling point where services depend on one team's workflow code.</li>
+  <li><b>Choreography.</b> There is no central brain. Each service reacts to events published by others (order placed, then inventory reserves and publishes "reserved", then payment charges and publishes "paid", and so on). Services are loosely coupled and there is no single bottleneck. Cost: the process is implicit, scattered over many services, hard to see end to end, easy to create cyclic event chains, and difficult to add timeouts or compensation consistently.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Orchestration versus choreography comparison">
+  <text class="t-c t-b" x="225" y="22">Orchestration</text>
+  <rect class="cache" x="165" y="40" width="120" height="50" rx="10"/><text class="t-c t-b" x="225" y="62">Workflow</text><text class="t-c t-sm" x="225" y="79">knows the steps</text>
+  <rect class="box" x="30" y="200" width="110" height="46" rx="10"/><text class="t-c t-b" x="85" y="228">Inventory</text>
+  <rect class="box" x="170" y="200" width="110" height="46" rx="10"/><text class="t-c t-b" x="225" y="228">Payment</text>
+  <rect class="box" x="310" y="200" width="110" height="46" rx="10"/><text class="t-c t-b" x="365" y="228">Shipping</text>
+  <path class="arrow" d="M190 90 L100 196"/><path class="arrow" d="M225 90 L225 196"/><path class="arrow" d="M260 90 L350 196"/>
+  <text class="t-c t-sm" x="225" y="274">The workflow calls each in turn,</text><text class="t-c t-sm" x="225" y="292">handles failures and compensation.</text>
+
+  <text class="t-c t-b" x="675" y="22">Choreography</text>
+  <rect class="db" x="520" y="120" width="360" height="40" rx="8"/><text class="t-c t-b" x="700" y="145">Event bus / Kafka topics</text>
+  <rect class="box" x="480" y="200" width="110" height="46" rx="10"/><text class="t-c t-b" x="535" y="228">Inventory</text>
+  <rect class="box" x="640" y="200" width="110" height="46" rx="10"/><text class="t-c t-b" x="695" y="228">Payment</text>
+  <rect class="box" x="800" y="200" width="100" height="46" rx="10"/><text class="t-c t-b" x="850" y="228">Shipping</text>
+  <rect class="ext" x="600" y="40" width="150" height="46" rx="10"/><text class="t-c t-b" x="675" y="68">OrderPlaced</text>
+  <path class="arrow" d="M675 86 L675 116"/>
+  <path class="arrow dash" d="M560 164 L545 196"/><path class="arrow dash" d="M695 164 L695 196"/><path class="arrow dash" d="M840 164 L850 196"/>
+  <text class="t-c t-sm" x="690" y="274">Each service reacts to events and publishes</text><text class="t-c t-sm" x="690" y="292">its own; nobody owns the whole flow.</text>
+</svg>
+<figcaption>On the left one coordinator drives each step. On the right services only listen and publish on a bus, so the flow is emergent.</figcaption>
+</figure>
+
+<p>Guidance: use choreography for simple, short, loosely related reactions (send a confirmation email when an order is paid). Use orchestration when the process has many steps, branches, timeouts, human steps or compensation, or when product owners must see where each instance stands. Many real systems mix: orchestrate the core business process and let it publish events that other services subscribe to by choreography.</p>
+
+<h3>15.3 Human-in-the-loop</h3>
+
+<p>Many processes wait for people: a manager approving an expense, a reviewer checking a document. Humans respond in hours or days, may never respond, and may change their mind. Durable execution handles this well because waiting costs nothing. The pattern: the workflow creates an approval task (an activity that writes it into a task inbox and notifies the approver), then waits for a signal "approved" or "rejected" <b>raced against a timer</b>. On timeout it escalates (reminds, then reassigns to the manager's manager, then auto-rejects). Signals must be idempotent and carry a task id, so a double click or retry does not advance the process twice; and approvers should be able to act through an ordinary API that translates their decision into a signal on the right workflow id. Camunda makes this a first-class concept (user tasks); in Temporal it is the signal and timer pattern; in Step Functions it is the "wait for task token" callback pattern, where the state pauses until some outside system calls back with a token.</p>
+
+<h2 id="observability">16. Observability of jobs and workflows</h2>
+
+<p>Background work fails silently. Nobody sees a 500 in a browser; the report just never arrives. So observability must be designed in, and monitored by the platform rather than discovered by users.</p>
+
+<ul>
+  <li><b>Lateness (scheduling lag).</b> The difference between a job's intended fire time and its actual start time. This is the single best health metric of a scheduler. Track p50, p99 and max, per job type and per tenant, and alert when p99 exceeds your promise (for example 30 seconds).</li>
+  <li><b>Queue depth and age of oldest ready job.</b> Depth alone misleads; the oldest-item age shows real delay.</li>
+  <li><b>Success, failure and retry rates</b> per job type, duration histograms, attempts per job, DLQ depth and inflow.</li>
+  <li><b>Missing runs ("dead man's switch").</b> A job that silently stops being scheduled produces no error. For critical recurring jobs, alert when the last success is older than the expected period (a heartbeat or "canary" check).</li>
+  <li><b>Zombie and stuck detection.</b> Count of RUNNING jobs whose lease expired or that exceeded their expected duration by a multiple.</li>
+  <li><b>Tracing and correlation ids.</b> Carry a trace id from the request that created the job through to the execution so you can follow "user clicked at 10:00" to "email sent at 10:30".</li>
+  <li><b>Audit history per instance.</b> For each workflow or job: every attempt, its error, its start and end, who or what cancelled it. Temporal's event history and Step Functions' execution history give this for free; with a database design, write an <code>attempts</code> table.</li>
+  <li><b>Operator tools.</b> Pause a job type, drain a tenant, cancel, retry now, redrive the DLQ, and see a single instance's state. These matter during incidents more than any dashboard.</li>
+</ul>
+
+<h2 id="scale">17. Scale numbers</h2>
+
+<p>These are order-of-magnitude figures to reason with, not guarantees; always label them as assumptions.</p>
+
+<ul>
+  <li><b>Timers outstanding.</b> A platform with 100 million users, each with an average of 10 pending future items (reminders, trial expirations, retries, scheduled posts), holds <b>1 billion</b> pending timers. At about 200 bytes per row that is 200 GB of data plus index: fits a sharded relational store, or is held in a handful of Redis nodes only if cache-tier durability is acceptable.</li>
+  <li><b>Fire rate.</b> If 200 million of those fire per day, the average is 200,000,000 / 86,400 ≈ <b>2,300 per second</b>. Human-related schedules cluster on the hour and half hour (9:00 am is everyone's favorite), so peak may be 10 to 50 times average: 25,000 to 100,000 per second for a minute. Design for the peak, since sending a "9 am" reminder at 9:07 is a visible failure.</li>
+  <li><b>Polling cost.</b> 256 shards, each polled once per second, is only 256 indexed queries per second in total, regardless of how many billions are pending. Polling cost scales with shards and interval, not with timers.</li>
+  <li><b>Timing wheel capacity.</b> A single in-memory wheel handles millions of timers per process (limited by memory: 1 million timers at about 100 bytes is 100 MB) with O(1) churn; it keeps only the near-term window, such as the next five minutes.</li>
+  <li><b>Workflow engines.</b> A Temporal cluster backed by a database such as Cassandra or PostgreSQL commonly runs from thousands up to tens of thousands of workflow state transitions per second, and holds millions of open (sleeping) workflows, since an idle workflow costs only its stored history. Each history event is a database write, so the cost of a workflow is proportional to its number of events; avoid putting large payloads in history (store blobs externally and pass references).</li>
+  <li><b>Granularity.</b> Promise a realistic precision: "within a few seconds of the target" is cheap; "to the millisecond" requires wheels, careful clocks and dedicated capacity.</li>
+</ul>
+
+<h2 id="reminder">18. Worked example: a reminder service</h2>
+
+<p><b>Requirements.</b> Users (and other services) create reminders that must notify a user (push, email or SMS) at a chosen instant, possibly months ahead, optionally recurring. Support create, update, cancel. Scale: 100 million users; 1 billion pending reminders; 200 million fire per day. Targets: a reminder fires within 5 seconds of its time at the 99th percentile; never lost once acknowledged to the creator; duplicates are rare and tolerable but should be minimized; cancellation takes effect within seconds.</p>
+
+<h3>18.1 Back-of-envelope</h3>
+<ul>
+  <li>Average fire rate 200,000,000 / 86,400 ≈ 2,300 per second; plan for a peak of 30x = about 70,000 per second at round times.</li>
+  <li>Storage: 1,000,000,000 rows × about 250 bytes (id, user, fire time, channel, payload ref, state, shard) = 250 GB, plus an index of roughly 50 GB. Replicated three times: about 1 TB. A 256-shard cluster is about 1.2 GB per shard of table, small enough to be fast.</li>
+  <li>Creation rate: roughly equal to the fire rate in steady state, 2,300 writes per second, trivial for a sharded store.</li>
+</ul>
+
+<h3>18.2 Design</h3>
+<ol>
+  <li><b>API and store.</b> <code>POST /reminders</code> validates, assigns a reminder id, computes <code>shard = hash(reminder_id) mod 256</code> (or by user id if you want per-user queries to hit one shard), converts the fire time to UTC (storing the original time zone for recurring ones), and writes the row with state <code>PENDING</code> to a sharded, replicated database. Only after the durable write is acknowledged does the API return success. This is the "never lost" guarantee.</li>
+  <li><b>Due-time index per shard.</b> A partial index on <code>(fire_at)</code> where <code>state='PENDING'</code>. Far-future reminders sit in the table at no cost.</li>
+  <li><b>Shard owners and loaders.</b> Each of the 256 shards has exactly one active owner (a scheduler node holding a lease, per section 4.2; leases managed in etcd or ZooKeeper, <a href="30-coordination-locks.html">Chapter 30</a>). Every 30 seconds the owner loads reminders due in the next 2 minutes into an in-memory <b>hierarchical timing wheel</b>, marking them <code>LOADED</code> with the owner's fencing token so a replacement owner can reload after a crash.</li>
+  <li><b>Firing.</b> When the wheel's hand reaches a reminder, the owner publishes it to a Kafka topic <code>reminders.due</code> partitioned by user id (<a href="34-queues-kafka.html">Chapter 34</a>), then marks it <code>DISPATCHED</code> with a conditional update (<code>WHERE state='LOADED' AND token=?</code>). The queue decouples timing from the slow, rate-limited notification providers.</li>
+  <li><b>Delivery workers.</b> Consumers read <code>reminders.due</code>, re-read the reminder (to detect cancel or update), check a delivery table for an existing row with key <code>(reminder_id, occurrence_time)</code> for idempotency, send via the provider using that key as the provider's idempotency key where supported, and write <code>SENT</code>. Failures go to a retry topic tier with exponential backoff and jitter; after N attempts or 6 hours they land in a DLQ with an alert.</li>
+  <li><b>Recurring reminders.</b> On <code>SENT</code> of an occurrence, compute the next occurrence from the rule in the stored time zone and insert it as a new pending row in the same transaction (the "materialize only the next" approach of 4.4).</li>
+  <li><b>Cancellation and updates.</b> Cancel sets state to <code>CANCELLED</code> (conditional on not yet <code>SENT</code>). If the reminder is already in the wheel or the queue, the delivery worker's pre-send re-read sees <code>CANCELLED</code> and drops it, so cancellation is effective within seconds even though the wheel cannot be reached directly. An update to the time is cancel plus create with the same logical id.</li>
+  <li><b>Recovery and zombies.</b> A reaper per shard resets <code>LOADED</code> rows older than the lease (owner died before dispatch) and <code>DISPATCHED</code> rows without a <code>SENT</code> receipt after a timeout (the delivery side lost the message) back to <code>PENDING</code>, which causes at-least-once; the idempotency key stops double delivery.</li>
+  <li><b>Fairness.</b> Per-tenant quotas on creation (for example 1,000 pending per user for the consumer product, higher for API customers); separate Kafka topics or partition assignment for bulk marketing sends versus transactional alerts, with a priority lane for the latter; a token bucket per notification provider.</li>
+  <li><b>Misfire policy.</b> If a shard owner outage delays reminders by less than 10 minutes, fire late; beyond a threshold set per type (marketing: skip; "your flight is boarding": still send but marked late), as policy in section 9.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="Reminder service architecture">
+  <rect class="ext" x="20" y="150" width="110" height="50" rx="10"/><text class="t-c t-b" x="75" y="172">Clients</text><text class="t-c t-sm" x="75" y="189">create / cancel</text>
+  <rect class="box" x="170" y="150" width="120" height="50" rx="10"/><text class="t-c t-b" x="230" y="172">Reminder API</text><text class="t-c t-sm" x="230" y="189">quota, validate</text>
+  <rect class="db" x="330" y="60" width="180" height="70" rx="10"/><text class="t-c t-b" x="420" y="84">Sharded DB (256)</text><text class="t-c t-sm" x="420" y="102">row per reminder</text><text class="t-c t-sm" x="420" y="118">index (fire_at) PENDING</text>
+  <rect class="cache" x="330" y="230" width="180" height="70" rx="10"/><text class="t-c t-b" x="420" y="254">Shard owners</text><text class="t-c t-sm" x="420" y="272">lease + fencing token</text><text class="t-c t-sm" x="420" y="288">timing wheel (next 2 min)</text>
+  <rect class="box" x="570" y="150" width="120" height="50" rx="10"/><text class="t-c t-b" x="630" y="172">Kafka</text><text class="t-c t-sm" x="630" y="189">reminders.due</text>
+  <rect class="box" x="730" y="150" width="150" height="50" rx="10"/><text class="t-c t-b" x="805" y="172">Delivery workers</text><text class="t-c t-sm" x="805" y="189">idempotent send</text>
+  <rect class="ext" x="730" y="60" width="150" height="50" rx="10"/><text class="t-c t-b" x="805" y="82">Push / email / SMS</text><text class="t-c t-sm" x="805" y="99">rate-limited providers</text>
+  <rect class="miss" x="730" y="250" width="150" height="50" rx="10"/><text class="t-c t-b" x="805" y="272">Retry tiers + DLQ</text><text class="t-c t-sm" x="805" y="289">backoff, alert</text>
+  <rect class="cache" x="170" y="300" width="120" height="50" rx="10"/><text class="t-c t-b" x="230" y="322">Reaper</text><text class="t-c t-sm" x="230" y="339">stuck LOADED rows</text>
+  <path class="arrow" d="M130 175 L166 175"/>
+  <path class="arrow" d="M290 165 L326 120"/>
+  <path class="arrow dash" d="M420 130 L420 226"/><text class="t-sm" x="428" y="182">load next 2 min</text>
+  <path class="arrow" d="M510 265 L600 204"/>
+  <path class="arrow" d="M690 175 L726 175"/>
+  <path class="arrow" d="M805 150 L805 114"/>
+  <path class="arrow-r dash" d="M805 200 L805 246" marker-end="url(#ahr)"/>
+  <path class="arrow dash" d="M290 330 L350 300"/>
+</svg>
+<figcaption>Writes land in the sharded database first. Each shard's owner pulls near-term reminders into a wheel, fires them to Kafka, and idempotent workers deliver, with retries and a DLQ on failure.</figcaption>
+</figure>
+
+<h3>18.3 Alternative: use a workflow engine</h3>
+<p>For smaller scale, or reminders that are really processes (remind, wait 24 h, remind again unless acknowledged, escalate), model each reminder as a Temporal workflow: sleep until the time, run the send activity with a retry policy, and handle a <code>cancel</code> signal racing against the timer. The engine provides durability, timers, retries and history, at the price of writing one workflow instance per reminder: fine for millions, but a billion pending items makes the engine's own storage the cost driver, which is why very large reminder fleets use a purpose-built timer store like the one above.</p>
+
+<h2 id="failures">19. Failure modes and mitigations</h2>
+
+<table>
+  <tr><th>Failure</th><th>Symptom</th><th>Mitigation</th></tr>
+  <tr><td>Two schedulers both fire (split brain, zombie leader)</td><td>Duplicate jobs, double emails</td><td>Leases with fencing tokens, conditional claim updates, idempotent jobs</td></tr>
+  <tr><td>No scheduler active (failover gap, bad election)</td><td>Jobs late or missing for the gap</td><td>Short leases with fast renewal, standbys in different zones, dead-man alerts on lateness, misfire policy</td></tr>
+  <tr><td>Worker dies mid-job</td><td>Job stuck RUNNING</td><td>Lease and heartbeat, reaper returns to PENDING</td></tr>
+  <tr><td>Job is slow, not dead; lease expires</td><td>Concurrent duplicate runs</td><td>Heartbeats, conditional result writes, idempotent effects</td></tr>
+  <tr><td>Thundering herd at round times (midnight, top of hour)</td><td>Spike of due jobs, workers saturated, lateness</td><td>Add jitter to user-agnostic schedules, autoscale workers on queue age, priority lanes, spread cron times</td></tr>
+  <tr><td>Retry storm after dependency outage</td><td>Recovery prevented by retry load</td><td>Backoff with jitter, retry budgets, circuit breaker per job type</td></tr>
+  <tr><td>Poison job (always crashes the worker)</td><td>Worker restarts repeatedly, blocks partition</td><td>Attempt cap, DLQ, per-job timeouts, isolate by process</td></tr>
+  <tr><td>Hot shard or noisy tenant</td><td>One tenant's flood delays others</td><td>Per-tenant quotas and fair dequeuing, shuffle sharding, more shards</td></tr>
+  <tr><td>Clock skew or DST error</td><td>Early or late firing, doubled or skipped local-time runs</td><td>Store UTC plus zone, use database or one time source for "now", NTP, explicit DST policy</td></tr>
+  <tr><td>Redis or cache tier loses data</td><td>Pending timers vanish</td><td>Durable database as source of truth, rebuild index periodically</td></tr>
+  <tr><td>Workflow non-determinism after deploy</td><td>Stuck workflows with replay errors</td><td>Version markers, worker versioning, replay tests in CI</td></tr>
+  <tr><td>Unbounded workflow history</td><td>Slow replay, hitting event limits</td><td>Continue-as-new, small payloads, child workflows</td></tr>
+  <tr><td>Cancel arrives after fire</td><td>Cancelled reminder still sent</td><td>Pre-send state check, conditional state transitions, accept and document the race window</td></tr>
+</table>
+
+<h2 id="qa">20. Interview Q&amp;A</h2>
+
+<details><summary>Why can a scheduler not give exactly-once execution, and what do you promise instead?</summary>
+<p>When a worker performs an external action and the connection drops before it hears the result, nothing in the system can tell whether the action happened. The scheduler must either retry, which risks a duplicate, or not retry, which risks a loss. Since losing a payment or a reminder is usually worse, systems choose at-least-once delivery of the trigger. We then make the job idempotent, using a stable occurrence id as an idempotency key or a unique constraint written in the same transaction as the effect, so duplicates are harmless. What we promise is exactly-once <i>effect</i> built from at-least-once execution plus idempotency.</p></details>
+
+<details><summary>How would you build a delayed-job system for a billion pending jobs?</summary>
+<p>I would store every job in a sharded, replicated database with a partial index on fire time for pending rows, so far-future jobs cost only storage. Each shard has one owner holding a lease with a fencing token. Every few seconds the owner loads jobs due in the next minutes into an in-memory timing wheel or heap, fires them to a queue when due, and conditionally marks them dispatched. Workers consume from the queue, are idempotent, heartbeat on long jobs, and failures go through backoff tiers to a DLQ. Polling cost scales with shard count rather than with the billion pending, and a crash only requires reloading near-term jobs from the database.</p></details>
+
+<details><summary>Explain FOR UPDATE SKIP LOCKED and why it suits job queues.</summary>
+<p>A normal select-then-update has a race where two pollers read the same due row. With FOR UPDATE the selected rows are locked, but other pollers would then block waiting for those locks. SKIP LOCKED tells the database to skip rows locked by someone else and return the next unlocked ones, so concurrent pollers get disjoint batches without blocking each other. You claim and mark rows with a lease inside a short transaction, commit, then run the work outside it. It gives a durable, queryable, transactional queue with no extra infrastructure, bounded by database throughput.</p></details>
+
+<details><summary>How do timing wheels beat a priority queue, and when would you not use one?</summary>
+<p>A heap costs O(log n) per insert and cancel, which matters when there are millions of timers and most are cancelled before they fire, such as request timeouts. A timing wheel computes the target slot directly, so insert and cancel are O(1), and the hierarchical version cascades far-future timers through coarser wheels with each timer moved only a few times. The costs are tick-level precision and that it is in memory only. I would not use it as the sole store for business-critical timers, since a crash loses them; there it is a cache of the near term over a durable database.</p></details>
+
+<details><summary>A worker takes a job, freezes for a minute, wakes up and finishes. Another worker already ran it. What protects you?</summary>
+<p>First, the lease and heartbeat design means the first worker's lease expired and the reaper gave the job to another worker, which is by design. Second, the zombie's final write should be a conditional update that checks it still owns the job, using the attempt number as a fencing token, so a stale result is rejected. Third, side effects should be idempotent via a per-occurrence key so even if both ran the body, the external effect happened once. No single layer is perfect, so I use all three.</p></details>
+
+<details><summary>What are misfire and overlap policies and how do you choose?</summary>
+<p>Misfire means a scheduled run was missed because the system was down or saturated. The choice depends on what the job means: a metrics sample is skipped, a reminder fires late, an hourly aggregation must catch up every missed window in order. Overlap is when the next run is due while the previous still runs: allow if independent, forbid or skip for syncs that must not run concurrently, replace if only the latest matters, or queue to serialize. Implementing forbid or queue needs a per-job lock or lease and a record of the running occurrence in the shared store. Make both policies per-job configuration with sensible defaults.</p></details>
+
+<details><summary>How does Temporal make a workflow survive crashes, and what are the determinism rules?</summary>
+<p>Temporal records every decision and result in an event history. The workflow code holds no durable state itself; when a worker needs to continue it, it loads the history and re-runs the code from the start, with the SDK returning recorded results for steps already done and suspending at the first step without a result. For that to work the code must make the same decisions on every replay, so it cannot read the wall clock, random numbers, or do I/O directly; it uses SDK-provided time, random and timers, and puts side effects in activities, which are retried and must be idempotent. Changing workflow code for in-flight instances needs versioning or patching, verified by replay tests.</p></details>
+
+<details><summary>Orchestration or choreography for an order process?</summary>
+<p>For a process with several steps, compensation, timeouts and the need to answer "where is order 123", I choose orchestration with a workflow engine: the flow is explicit in one place and failure handling like saga compensation is consistent. Choreography suits simple, loosely coupled reactions such as sending a confirmation or updating analytics when an event is published. In practice I orchestrate the core path and let the workflow also publish domain events so other services can subscribe by choreography, avoiding both a tangle of implicit event chains and a god service.</p></details>
+
+<details><summary>How do you handle a user changing or cancelling a reminder that is already queued?</summary>
+<p>The row in the store remains the source of truth. Cancel or update sets the state conditionally, only if it has not already been sent. The wheel and queue may still hold a stale copy, so the delivery worker re-reads the reminder just before sending and drops it if cancelled or if its fire time changed. That makes cancellation effective within seconds without having to reach into every in-memory structure. A tiny race remains if cancel arrives within milliseconds of sending; we document that window, and for irreversible actions we require the stronger approach of making the send itself conditional on the state.</p></details>
+
+<details><summary>How would you stop one tenant from starving the others on a shared scheduler?</summary>
+<p>I would apply control at three points. At admission, quotas on pending count and creation rate per tenant reject abuse early. At dispatch, fair queuing takes bounded batches per tenant in rotation instead of strict global FIFO, optionally with shuffle sharding so each tenant uses only a small random subset of workers; and priority lanes protect urgent work from bulk work, with some capacity reserved to avoid starving low priority. At the downstream, token buckets per target prevent a tenant from overwhelming a shared provider. I would monitor oldest-ready-job age per tenant to detect problems early.</p></details>
+
+<details><summary>When would you pick Airflow versus Temporal versus Step Functions?</summary>
+<p>Airflow when the work is scheduled batch data pipelines with dependencies between tasks, backfills across dates and a run UI; it is not meant for millions of small event-driven instances. Temporal when the processes are long-lived, event-driven, and have complex logic, waiting and compensation that you prefer to write as normal code with strong durability and testing. Step Functions when most steps are calls to AWS services and you want a managed, low-operations state machine and can accept per-transition cost and a declarative definition. The deciding factors are the trigger (schedule versus event), the logic complexity, the instance volume, and how much infrastructure the team can run.</p></details>
+
+<details><summary>How do you detect that a scheduled job has silently stopped running?</summary>
+<p>Errors only show up when something runs and fails, so I add positive signals. For each critical recurring job I record the last success time and alert if it is older than the period plus a tolerance, a dead-man's switch that can be an external check not dependent on the scheduler being healthy. I also track scheduling lag (actual start minus intended time) and the age of the oldest ready job, which rise when the trigger loop or workers are stuck. Finally, I count expected versus actual occurrences per window, so a missing shard owner shows up as a gap rather than silence.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">21. Recap</h2>
+<ul>
+  <li>Scheduled work is an intention that must survive failure: store it durably, index it by due time, and have exactly one logical owner trigger it, with takeover on failure.</li>
+  <li>Single-node cron fails on availability, duplicates, misfires, overlap, visibility and scale; distributed schedulers add a job store, due-time index, trigger loop, queue and workers.</li>
+  <li>Ownership is by a leased leader with fencing tokens, by shards each with one owner, or by atomic claim in the database; leases and fencing guard against zombies.</li>
+  <li>Index choices: indexed table polling, Redis sorted set, in-memory heap, and timing wheels (hierarchical wheels give O(1) insert and cancel for millions of timers); keep a durable source of truth.</li>
+  <li>Delay designs: SKIP LOCKED database queues, Redis ZSETs, SQS delay and visibility timeout (15 minute cap), Kafka delay tiers, or a dedicated timer service.</li>
+  <li>Execution is at-least-once; use idempotency keys and transactional completion for exactly-once effects. Set explicit misfire and overlap policies, leases with heartbeats, backoff with jitter, retry budgets and an alarmed DLQ.</li>
+  <li>Multi-tenant platforms need quotas, fair dequeuing, priority lanes with starvation protection and per-target rate limits.</li>
+  <li>Workflow engines turn long processes into durable code: event history and deterministic replay, activities with retries, durable timers, signals, versioning, continue-as-new. Sagas run naturally on them; choose orchestration for complex flows and choreography for simple reactions; human steps race a signal against a timer.</li>
+  <li>Observe scheduling lag, oldest ready age, DLQ depth, stuck leases and missing runs; scale by shards, not by polling frequency.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="34-queues-kafka.html">Chapter 34</a> (queues and logs that carry fired jobs) and <a href="35-messaging-patterns.html">Chapter 35</a> (retries, DLQ and the outbox), relies on <a href="29-consensus.html">Chapter 29</a> and <a href="30-coordination-locks.html">Chapter 30</a> for leader election, leases and fencing, and on <a href="32-idempotency-ids.html">Chapter 32</a> for idempotency. Workflow sagas continue in <a href="48-sagas.html">Chapter 48</a>; the end-to-end interview design is <a href="../case-studies/c18-job-scheduler.html">Design a Job Scheduler</a>.</p>
+
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 18: Design a Job Scheduler | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c18-job-scheduler">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 18 · Worked solutions</div>
+<h1>Design a Job Scheduler</h1>
+<p class="lead">A job scheduler runs your code at the right time, exactly when a cron expression, a delay, or a dependency says it should, even when machines crash and clocks disagree. This worked solution designs one that holds 10 million job definitions: how due jobs are found, how two schedulers are stopped from firing the same job, how workers run it safely, and how retries, priorities, and catch-up behave.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is short: "Design a distributed job scheduler." Like most interview prompts, it hides several different products. A scheduler that runs a nightly report for one company is a very different thing from a platform where thousands of teams register millions of jobs. So the first job of the candidate is to ask questions and write down the answers that will be assumed for the rest of the design (this is the opening step of the framework in <a href="../chapters/01-interview-framework.html">Chapter 1</a>).</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>Who are the users?</td><td>Internal engineering teams and external customers of a SaaS platform. Each is a <b>tenant</b>. Tenants register jobs through an API; they do not run the machines.</td></tr>
+<tr><td>What kinds of jobs?</td><td>Three kinds: <b>cron</b> (recurring, for example "every day at 02:00 in Europe/Berlin"), <b>one-off</b> (run once at a given absolute time) and <b>delayed</b> (run once, N seconds from now). Delayed jobs are one-off jobs with the time computed at submission.</td></tr>
+<tr><td>What does "run a job" mean?</td><td>The scheduler calls a registered target: an HTTP endpoint, or a queue topic, or a container image with arguments. The job body is the tenant's code. The scheduler does not look inside it.</td></tr>
+<tr><td>How accurate must timing be?</td><td>A job should start within about 1 second of its due time at the 99th percentile, and within 5 seconds at the 99.9th. It is a "soft real-time" system, not a hard one.</td></tr>
+<tr><td>How many jobs?</td><td>10 million active job definitions, about 100 million executions per day.</td></tr>
+<tr><td>Delivery guarantee?</td><td>At-least-once <i>dispatch</i> and execution. A due job must never be silently lost. A job may occasionally run twice, so jobs must be idempotent, and the platform helps with an idempotency key (section 8.3).</td></tr>
+<tr><td>Do jobs depend on each other?</td><td>Yes, optionally: a job can say "run only after jobs A and B succeeded" (a DAG, a directed graph with no cycles).</td></tr>
+<tr><td>Long-running jobs?</td><td>Yes. Typical jobs run seconds to minutes; a few run hours. The scheduler needs timeouts and a way to know a worker is still alive.</td></tr>
+<tr><td>Multi-region?</td><td>One primary region with a warm standby. Jobs are not pinned to a region; the scheduler is not a global active-active system.</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li>Create, update, pause, resume, cancel, and delete a job definition: cron, one-off, or delayed, with a time zone, a target, a payload, a retry policy, a timeout, and a priority.</li>
+<li>Run each job at its due time, creating an <b>execution</b> (also called a run or an attempt group) with a visible state: scheduled, queued, running, succeeded, failed, cancelled, timed out.</li>
+<li>Retry failed executions with exponential backoff, up to a limit, then move them to a dead state the tenant can inspect and re-run manually.</li>
+<li>Support dependencies between jobs (DAGs) and a <b>catch-up policy</b> that says what to do when runs were missed because the system was down.</li>
+<li>Support cancellation of a scheduled or running execution.</li>
+<li>Show history, logs, and metrics per job; allow a manual "run now".</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>No lost jobs:</b> a due run is never dropped by a crash of a scheduler, a worker, or a queue broker.</li>
+<li><b>Bounded duplicates:</b> a run is dispatched by exactly one scheduler at a time; duplicates are only possible from rare, well-understood failure windows, and they are made harmless by idempotency.</li>
+<li><b>Timing:</b> start latency p99 under 1 second after the due time in normal operation.</li>
+<li><b>Availability:</b> 99.95 percent for the scheduling path. A short outage must be recoverable by catching up, not by losing runs.</li>
+<li><b>Fairness:</b> one tenant who creates 5 million jobs at midnight must not delay everyone else's 02:00 jobs.</li>
+<li><b>Scale:</b> 10 million job definitions, 100 million executions per day, and spikes where many cron jobs share the same instant (the top of the hour).</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>The tenant's job code itself, container image building, a full workflow authoring UI, billing, and cross-region active-active scheduling. We also do not build a general stream processor. Long multi-step business processes with human steps belong to a workflow engine; this page only touches that boundary in section 8 and in <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>Estimation here answers three questions: how many due-job events per second must the scheduler find and dispatch, how big is the store, and how many workers are needed. The method is in <a href="../chapters/02-estimation.html">Chapter 2</a>.</p>
+<h3>3.1 Throughput</h3>
+<ul>
+<li>Executions per day: 100,000,000. A day has 86,400 seconds, so the average is 100,000,000 ÷ 86,400 ≈ <b>1,157 executions per second</b>.</li>
+<li>Peaks: humans choose round times. Many cron jobs are "0 * * * *" (top of the hour) or "0 0 * * *" (midnight). Assume that at the top of the hour about 3 percent of one hour's runs land in the same second. An average hour has 100,000,000 ÷ 24 ≈ 4,170,000 runs; 3 percent is about 125,000 runs in one second. That is a 100x spike, and it is much more than a flat 10x. We do not need to start all of them within one second: we accept spreading them over about 10 seconds (jitter, sections 9.2 and 10.2), giving a design peak of about <b>12,500 dispatches per second</b>, roughly 10x the average.</li>
+<li>Reads versus writes: each execution causes about 6 state writes (scheduled, queued, running, heartbeat batches, final state, next-run update) and the dashboards cause few reads. The workload is <b>write-heavy and time-indexed</b>; the read:write ratio is roughly 1:5 by operations.</li>
+<li>State writes: 100,000,000 × 6 ≈ 600 million per day ≈ 6,900 per second average, peaking near 70,000 per second.</li>
+</ul>
+<h3>3.2 Storage</h3>
+<ul>
+<li>Job definitions: 10,000,000 × about 1 KB (cron, payload up to a few hundred bytes, retry policy, target, labels) = <b>10 GB</b>.</li>
+<li>Schedule index (job id, next run time, state, shard): 10,000,000 × about 100 bytes = <b>1 GB</b>. This is the hot data and fits in memory of a handful of database nodes.</li>
+<li>Execution history: 100,000,000 per day × about 300 bytes = <b>30 GB per day</b>. Keep 7 days hot: 210 GB. Keep 90 days in cheaper storage: 2.7 TB (see <a href="../chapters/21-object-storage.html">Chapter 21</a>). Per year about 11 TB, which is why history is aged out.</li>
+<li>Queue messages: 100,000,000 × about 500 bytes (job id, run id, target, small payload pointer) = 50 GB per day passing through the queue, but the queue only holds the backlog, typically seconds to minutes: at a 12,500-per-second peak and a one-minute backlog, 750,000 messages × 500 B = 375 MB. Tiny.</li>
+</ul>
+<h3>3.3 Workers</h3>
+<ul>
+<li>Concurrency by Little's law (average concurrent work = arrival rate × average duration): 1,157 per second × 30 seconds average runtime ≈ <b>34,700 jobs running at once</b>.</li>
+<li>If a worker process runs 50 jobs concurrently (most jobs wait on network calls), that is 34,700 ÷ 50 ≈ 700 workers on average. Provision for 2x headroom: about 1,400, with autoscaling on queue depth (<a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>).</li>
+<li>Heartbeats: each running job renews its lease every 10 seconds. 34,700 ÷ 10 ≈ <b>3,500 heartbeat writes per second</b>. We batch them per worker (one write per worker per interval covering all its jobs), cutting this to 700 ÷ 10 = 70 per second.</li>
+</ul>
+<h3>3.4 Sharding arithmetic</h3>
+<p>The schedule index is partitioned into 64 shards by hash of job id. Each shard holds 10,000,000 ÷ 64 ≈ 156,000 jobs and dispatches 1,157 ÷ 64 ≈ 18 runs per second on average, about 200 per second at the design peak. Both numbers are small for one database node and one scheduler instance. So we are not limited by capacity per shard; the point of 64 shards is parallelism, failure isolation, and room to grow 10x.</p>
+
+<h2 id="api">4. API design</h2>
+<p>A REST API with JSON bodies (principles in <a href="../chapters/05-api-design.html">Chapter 5</a>). Every create call accepts an <code>Idempotency-Key</code> header so a client that retries after a timeout does not create two jobs.</p>
+<pre><code>POST /v1/jobs
+{
+  "name": "nightly-report",
+  "schedule": { "type": "cron", "expr": "0 2 * * *", "timezone": "Europe/Berlin" },
+              // or { "type": "once", "at": "2026-12-01T09:30:00Z" }
+              // or { "type": "delay", "seconds": 600 }
+  "target":   { "kind": "http", "url": "https://tenant.example/run", "method": "POST" },
+  "payload":  { "report": "daily" },
+  "retry":    { "max_attempts": 5, "backoff": "exponential", "base_ms": 2000, "max_ms": 600000 },
+  "timeout_s": 900,
+  "priority": "normal",                   // high | normal | low
+  "catch_up": "run_latest",               // skip | run_latest | run_all (bounded)
+  "concurrency": "forbid",                // forbid | allow | replace overlapping runs
+  "depends_on": ["job_123"]               // optional
+}
+-> 201 { "job_id": "job_881", "next_run_at": "2026-11-18T01:00:00Z" }
+
+GET    /v1/jobs/{id}                       definition + next_run_at + state
+PATCH  /v1/jobs/{id}                       update schedule/payload; bumps "version"
+POST   /v1/jobs/{id}/pause | /resume
+DELETE /v1/jobs/{id}                       cancel future runs, keep history
+POST   /v1/jobs/{id}/run                   run now (manual trigger)
+GET    /v1/jobs/{id}/executions?cursor=... history, newest first
+POST   /v1/executions/{run_id}/cancel
+POST   /v1/executions/{run_id}/retry       manual re-run of a dead execution</code></pre>
+<p>Workers use an internal protocol (usually gRPC) with three calls: <code>Poll/Receive</code> (get work), <code>Heartbeat(run_id, lease_token)</code> (extend the lease) and <code>Complete(run_id, lease_token, result)</code>. The <b>lease token</b> is a number that increases each time the run is handed out; it is what lets the store reject a stale worker later (section 8.1).</p>
+
+<h2 id="model">5. Data model and storage choice</h2>
+<h3>5.1 Tables</h3>
+<table>
+<tr><th>Table</th><th>Key and important columns</th><th>Notes</th></tr>
+<tr><td><code>job_def</code></td><td>PK <code>job_id</code>; tenant_id, schedule, target, payload, retry policy, timeout, priority, catch_up, version, state (active/paused/deleted)</td><td>Source of truth for what the tenant asked. Rarely written, read often. Cached.</td></tr>
+<tr><td><code>schedule</code></td><td>PK <code>(shard, next_run_at, job_id)</code>; tenant_id, def_version, scheduled_for, status</td><td>One row per job that has a future run. The <b>index by time</b>. Hot and small.</td></tr>
+<tr><td><code>execution</code></td><td>PK <code>(job_id, run_id)</code>; scheduled_for, state, attempt, lease_owner, lease_token, lease_expires_at, started_at, finished_at, error</td><td>One row per run. Large; partitioned by time; aged out.</td></tr>
+<tr><td><code>dep_edge</code></td><td>PK <code>(downstream_job, upstream_job)</code>; plus run-level <code>dep_state</code></td><td>For DAGs (section 8).</td></tr>
+<tr><td><code>shard_owner</code></td><td>PK <code>shard</code>; owner_id, epoch, lease_until</td><td>Who is allowed to dispatch this shard (section 7). Lives in the coordination store.</td></tr>
+</table>
+<h3>5.2 Why these stores</h3>
+<p>The central access pattern is "give me the jobs in shard S whose next run time is at or before now, oldest first". That is a range scan on a sorted index, which a relational database with a B-tree index answers well (<a href="../chapters/18-relational-internals.html">Chapter 18</a>). Alternatives are a wide-column store keyed by (shard, time bucket) (<a href="../chapters/20-nosql.html">Chapter 20</a>) or a sorted set in Redis (<a href="../chapters/15-redis.html">Chapter 15</a>). Our choice:</p>
+<ul>
+<li><b>Job definitions and the schedule index:</b> a sharded relational database (for example PostgreSQL or MySQL, 64 logical shards on 8 to 16 physical primaries, each with replicas). Reasons: transactions let us "claim a due row and create the execution row" atomically; the data is small; secondary indexes are easy. Sharding rules are in <a href="../chapters/25-sharding.html">Chapter 25</a> and replication in <a href="../chapters/24-replication.html">Chapter 24</a>.</li>
+<li><b>Execution history:</b> the same database for the recent window (the hot partitions), then moved to object storage or a column store for older data. Time-partitioned tables mean dropping old data is a cheap metadata operation, not a giant delete.</li>
+<li><b>Coordination (shard ownership, leader election):</b> a small consensus-backed store such as etcd or ZooKeeper (<a href="../chapters/29-consensus.html">Chapter 29</a>, <a href="../chapters/30-coordination-locks.html">Chapter 30</a>). It stores a few hundred small keys, not job data.</li>
+<li><b>Dispatch queue:</b> a durable log or queue, for example Kafka or SQS-like service (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>), with separate topics or queues per priority class.</li>
+</ul>
+<div class="callout key"><b>Key idea</b>
+The database row is the truth about a job's schedule and the execution state. The queue is only a delivery pipe and may be lost and rebuilt from the database. Every design choice below keeps this direction: the database decides, the queue carries.</div>
+
+<h2 id="first">6. A first, simple design and why it fails</h2>
+<p>The simplest scheduler is one process with one table. Every second it runs <code>SELECT * FROM schedule WHERE next_run_at &lt;= now()</code>, runs each job in a thread, then updates the row with the next cron time. This is what a single-machine cron or a library such as Quartz does in its simplest form.</p>
+<p>It breaks in predictable ways. (1) The process is a single point of failure: when it dies, nothing runs. (2) If we start two copies for safety, both see the same due rows and both run them: double execution. (3) Running jobs inside the scheduler means a slow job starves scheduling, and a crash loses in-flight work with no record. (4) One table and one machine cap throughput. (5) A crash between "ran the job" and "updated next_run_at" either loses or repeats a run. The rest of the page repairs these one by one: separate finding from running, partition ownership, durable leases, and idempotent effects.</p>
+
+<h3>6.1 The scaled architecture</h3>
+<figure class="diagram">
+<svg viewBox="0 0 960 400" role="img" aria-label="Scaled job scheduler architecture">
+  <rect class="ext" x="20" y="30" width="130" height="50" rx="10"/><text class="t-c t-b" x="85" y="60">Tenants</text>
+  <rect class="box" x="200" y="30" width="150" height="50" rx="10"/><text class="t-c t-b" x="275" y="52">API service</text><text class="t-c t-sm" x="275" y="68">create / cancel / query</text>
+  <rect class="db" x="400" y="20" width="190" height="70" rx="10"/><text class="t-c t-b" x="495" y="46">Sharded job store</text><text class="t-c t-sm" x="495" y="64">defs + schedule index</text><text class="t-c t-sm" x="495" y="78">64 shards</text>
+  <rect class="cache" x="650" y="20" width="170" height="70" rx="10"/><text class="t-c t-b" x="735" y="46">Coordination</text><text class="t-c t-sm" x="735" y="64">shard owner leases</text><text class="t-c t-sm" x="735" y="78">(etcd / ZooKeeper)</text>
+  <path class="arrow" d="M150 55 L196 55"/><path class="arrow" d="M350 55 L396 55"/>
+
+  <rect class="box" x="400" y="150" width="190" height="70" rx="10"/><text class="t-c t-b" x="495" y="176">Scheduler tier</text><text class="t-c t-sm" x="495" y="194">each owns some shards</text><text class="t-c t-sm" x="495" y="208">finds due rows, dispatches</text>
+  <path class="arrow" d="M495 90 L495 146"/><text class="t-sm" x="503" y="122">scan + claim</text>
+  <path class="arrow dash" d="M650 80 L594 156"/><text class="t-sm" x="640" y="130">own</text>
+
+  <rect class="cache" x="400" y="270" width="190" height="60" rx="10"/><text class="t-c t-b" x="495" y="296">Dispatch queues</text><text class="t-c t-sm" x="495" y="314">high / normal / low per tenant</text>
+  <path class="arrow" d="M495 220 L495 266"/>
+  <rect class="box" x="660" y="270" width="190" height="60" rx="10"/><text class="t-c t-b" x="755" y="296">Worker fleet</text><text class="t-c t-sm" x="755" y="314">lease, run, heartbeat</text>
+  <path class="arrow" d="M590 300 L656 300"/>
+  <path class="arrow dash" d="M755 270 L755 100" /><text class="t-sm" x="762" y="190">heartbeat + complete</text>
+  <rect class="ext" x="880" y="270" width="70" height="60" rx="10"/><text class="t-c t-b" x="915" y="296">Target</text><text class="t-c t-sm" x="915" y="314">tenant</text>
+  <path class="arrow" d="M850 300 L876 300"/>
+
+  <rect class="hit" x="20" y="150" width="330" height="70" rx="10"/><text class="t-b" x="34" y="176">Reaper / recovery</text><text class="t-sm" x="34" y="194">finds expired leases, requeues,</text><text class="t-sm" x="34" y="208">applies retry and timeout policy</text>
+  <path class="arrow dash" d="M350 185 L396 185"/>
+  <rect class="ext" x="20" y="270" width="330" height="60" rx="10"/><text class="t-b" x="34" y="296">Observability</text><text class="t-sm" x="34" y="314">lag, queue depth, miss rate, per-tenant metrics</text>
+</svg>
+<figcaption>The API writes definitions and the first schedule row. Scheduler instances, each owning a subset of shards under a lease, find due rows and push them to priority queues. Workers pull, run, heartbeat, and write the result back. A reaper handles expired leases.</figcaption>
+</figure>
+<p>Separation of duties is the main idea. The <b>scheduler</b> is small and fast: it never runs tenant code. The <b>queue</b> absorbs spikes. The <b>workers</b> are the only place work runs, and they can be scaled and sandboxed separately. The <b>reaper</b> is the repair loop that makes failures non-fatal.</p>
+
+<h3>6.2 Request flows</h3>
+<h4>Flow A: create a cron job</h4>
+<ol>
+<li>The API authenticates the tenant, checks quotas (maximum jobs, minimum interval) and validates the cron expression and time zone.</li>
+<li>It computes the first run time: the next instant after now that matches the expression in the given zone, converted to UTC.</li>
+<li>In one database transaction on shard <code>hash(job_id) mod 64</code> it inserts the <code>job_def</code> row and the <code>schedule</code> row with <code>next_run_at</code>. Because both rows are in the same shard, the transaction is local, not distributed.</li>
+<li>It returns 201 with the first <code>next_run_at</code>. If the client retries with the same idempotency key, the API returns the stored response rather than creating a second job.</li>
+</ol>
+<h4>Flow B: a run becomes due and executes</h4>
+<figure class="diagram">
+<svg viewBox="0 0 960 440" role="img" aria-label="Sequence of a job run from due to complete">
+  <rect class="box" x="30" y="10" width="140" height="30" rx="8"/><text class="t-c t-b" x="100" y="30">Scheduler</text>
+  <rect class="db" x="230" y="10" width="140" height="30" rx="8"/><text class="t-c t-b" x="300" y="30">Job store</text>
+  <rect class="cache" x="430" y="10" width="140" height="30" rx="8"/><text class="t-c t-b" x="500" y="30">Queue</text>
+  <rect class="box" x="630" y="10" width="140" height="30" rx="8"/><text class="t-c t-b" x="700" y="30">Worker</text>
+  <rect class="ext" x="810" y="10" width="130" height="30" rx="8"/><text class="t-c t-b" x="875" y="30">Target</text>
+  <line class="life" x1="100" y1="40" x2="100" y2="430"/><line class="life" x1="300" y1="40" x2="300" y2="430"/><line class="life" x1="500" y1="40" x2="500" y2="430"/><line class="life" x1="700" y1="40" x2="700" y2="430"/><line class="life" x1="875" y1="40" x2="875" y2="430"/>
+  <path class="arrow" d="M100 70 L296 70"/><text class="t-sm" x="110" y="64">1. claim due rows (next_run_at &lt;= now)</text>
+  <path class="arrow dash" d="M296 100 L104 100"/><text class="t-sm" x="130" y="94">2. rows + execution created</text>
+  <path class="arrow" d="M100 140 L496 140"/><text class="t-sm" x="190" y="134">3. enqueue run_id (priority queue)</text>
+  <path class="arrow" d="M100 170 L296 170"/><text class="t-sm" x="110" y="164">4. set next_run_at = next cron time</text>
+  <path class="arrow" d="M700 210 L504 210"/><text class="t-sm" x="520" y="204">5. receive run_id</text>
+  <path class="arrow" d="M700 250 L304 250"/><text class="t-sm" x="320" y="244">6. take lease (token n), state=running</text>
+  <path class="arrow" d="M700 290 L871 290"/><text class="t-sm" x="720" y="284">7. call target with idempotency key</text>
+  <path class="arrow dash" d="M700 330 L304 330"/><text class="t-sm" x="360" y="324">8. heartbeat (renew lease) every 10 s</text>
+  <path class="arrow dash" d="M871 370 L704 370"/><text class="t-sm" x="740" y="364">9. result</text>
+  <path class="arrow" d="M700 410 L304 410"/><text class="t-sm" x="340" y="404">10. complete(token n): succeed / retry / fail</text>
+</svg>
+<figcaption>Steps 1 to 4 are the scheduler's job and happen in one short transaction plus an enqueue. Steps 5 to 10 belong to the worker. The lease token in steps 6 and 10 stops a slow worker from overwriting a newer owner's result.</figcaption>
+</figure>
+<h4>Flow C: cancel</h4>
+<p>For a not-yet-due run, the API deletes or marks the schedule row cancelled in one transaction; the scheduler's claim query ignores cancelled rows. For a queued run, the execution state becomes <code>cancelled</code> and the worker checks state when it takes the lease and drops the run. For a running run, the API sets a <code>cancel_requested</code> flag; the next heartbeat response tells the worker, which sends a cancel to the target or kills the process, then reports <code>cancelled</code>. Cancellation of running work is always best effort, because the tenant's code may already have produced external effects.</p>
+
+<h2 id="finding">7. Deep dive 1: finding due jobs, and not double-scheduling</h2>
+<p>This is the part an interviewer probes first. It has two halves: how a scheduler locates the jobs that are due now, cheaply, among 10 million; and how it makes sure only one scheduler instance does so for a given job. The scheduling chapter is <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>; here we apply it.</p>
+<h3>7.1 Three ways to find due jobs</h3>
+<figure class="diagram">
+<svg viewBox="0 0 960 330" role="img" aria-label="Polling with time buckets, timer wheel, and delay queue">
+  <text class="t-b" x="20" y="22">A. Poll an indexed table</text>
+  <rect class="db" x="20" y="34" width="270" height="130" rx="10"/>
+  <text class="t-sm" x="34" y="58">time-sorted index (shard 17)</text>
+  <text class="t-sm" x="34" y="80">12:00:00  job 91</text><text class="t-sm" x="34" y="98">12:00:00  job 4412</text><text class="t-sm" x="34" y="116">12:00:01  job 77</text><text class="t-sm" x="34" y="134">12:00:05  job 8</text>
+  <path class="arrow" d="M290 100 L330 100"/><text class="t-sm" x="34" y="152">query: next_run_at &lt;= now + 1s, LIMIT</text>
+
+  <text class="t-b" x="350" y="22">B. Timer wheel (in memory)</text>
+  <circle cx="470" cy="100" r="62" fill="none" stroke="var(--fg)"/><circle cx="470" cy="100" r="28" fill="none" stroke="var(--fg)"/>
+  <text class="t-c t-sm" x="470" y="104">tick</text>
+  <text class="t-c t-sm" x="470" y="48">slot 0</text><text class="t-c t-sm" x="536" y="104">slot 15</text><text class="t-c t-sm" x="470" y="168">slot 30</text><text class="t-c t-sm" x="404" y="104">slot 45</text>
+  <text class="t-sm" x="350" y="190">hand moves 1 slot / tick;</text><text class="t-sm" x="350" y="206">fires the list in that slot</text>
+
+  <text class="t-b" x="640" y="22">C. Delay queue</text>
+  <rect class="cache" x="640" y="34" width="300" height="130" rx="10"/>
+  <text class="t-sm" x="654" y="58">message + visible_at timestamp</text>
+  <text class="t-sm" x="654" y="82">msg X visible_at 12:00:00  (ready)</text>
+  <text class="t-sm" x="654" y="102">msg Y visible_at 12:03:00  (hidden)</text>
+  <text class="t-sm" x="654" y="122">msg Z visible_at 18:00:00  (hidden)</text>
+  <text class="t-sm" x="654" y="148">consumers only see ready messages</text>
+
+  <rect class="hit" x="20" y="250" width="920" height="64" rx="10"/>
+  <text class="t-b" x="34" y="274">Chosen: A for durable truth, with a small in-memory B in front of it</text>
+  <text class="t-sm" x="34" y="294">Poll the index in short windows, load the next few seconds of due rows into a memory wheel, fire from the wheel at sub-second accuracy.</text>
+</svg>
+<figcaption>Polling is simple and durable but coarse; a timer wheel is precise and cheap in memory but volatile; a delay queue pushes the whole problem onto a broker with limits on how far in the future it can hold messages.</figcaption>
+</figure>
+<h4>A. Polling an indexed table (time buckets)</h4>
+<p>Each shard has a B-tree index on <code>(shard, next_run_at)</code>. The scheduler asks "give me up to 500 rows with <code>next_run_at</code> at or before now plus a short look-ahead window, ordered by time". Because the index is sorted by time, this reads only the due rows, not 156,000. A <b>time bucket</b> is a coarse slice of time (say one second, or ten) used as the leading key, so rows due in the same bucket are physically close and the scan is a single contiguous range. The price is timing granularity: with a poll every 500 ms, the median lateness is about 250 ms, and the database sees 64 shards × 2 polls per second = 128 queries per second. That is trivial. It is also fully durable: a restart loses nothing, because the table is the truth.</p>
+<h4>B. Timer wheel</h4>
+<p>A <b>timer wheel</b> is a circular array of slots. With 1-second ticks and 3,600 slots, slot <code>i</code> holds the jobs due at second <code>i</code> of this hour. A hand advances one slot per tick, and the scheduler fires whatever is in that slot. Inserting and firing are O(1) (constant time), unlike a heap's O(log n). For longer horizons, a <b>hierarchical wheel</b> has a second wheel of minutes whose slots are "cascaded" into the seconds wheel as time approaches. Kernels and networking stacks use this. The weakness is that a wheel lives in memory: a crash loses it, so the database must still be the source it is rebuilt from.</p>
+<h4>C. Delay queue</h4>
+<p>Some brokers support messages that become visible only at a given time, or a per-message delay (some cap the delay to minutes or hours). A scheduler could put every future run into the broker. This removes the scheduler tier, but it ties the system to broker limits: very long delays are not supported, querying or cancelling a pending future message is hard or impossible, editing a cron job means finding and deleting old messages, and a broker with 10 million hidden messages is operationally heavy. A job store row can be edited or paused by simple update; a hidden message cannot.</p>
+<table>
+<tr><th>Option</th><th>Precision</th><th>Durability</th><th>Cancel / edit</th><th>Scale concern</th><th>Verdict</th></tr>
+<tr><td>Poll indexed table</td><td>Poll interval (about 0.5 s)</td><td>Excellent</td><td>Trivial (row update)</td><td>One range query per shard per poll</td><td>Foundation</td></tr>
+<tr><td>Timer wheel</td><td>Tick size (1 ms to 1 s)</td><td>None; rebuild from table</td><td>Remove from slot</td><td>Memory only for the near window</td><td>Accelerator for the next seconds</td></tr>
+<tr><td>Delay queue</td><td>Broker dependent</td><td>Broker dependent</td><td>Hard</td><td>Millions of hidden messages; max delay limits</td><td>Use only for short retry delays</td></tr>
+</table>
+<p>Our design: the table is the truth, the scheduler loads a rolling window (the next 5 seconds) of due rows into a small in-memory timer wheel, and fires at the exact tick. A restart just reloads the window. Delay queues are used for one narrow thing: short retry backoffs (seconds), where the retry is already a queue message.</p>
+
+<h3>7.2 Claiming rows without double scheduling</h3>
+<p>Two layers protect against two schedulers dispatching the same run.</p>
+<h4>Layer 1: partition ownership (the shard lease)</h4>
+<p>Instead of all schedulers competing for all rows, each of the 64 shards has exactly one owner at a time. The owner holds a <b>lease</b>, a time-limited claim stored in the coordination service (<a href="../chapters/29-consensus.html">Chapter 29</a>, <a href="../chapters/30-coordination-locks.html">Chapter 30</a>). The lease must be renewed every few seconds; if the owner stops renewing, the lease expires and another scheduler takes the shard. Each acquisition increments an <b>epoch</b> (also called a fencing token), a number that only goes up. With 20 scheduler instances and 64 shards, each instance owns about 3 shards; when an instance dies, its shards spread across the survivors. This is leader election per partition rather than one global leader, which avoids a single bottleneck.</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 330" role="img" aria-label="Shard ownership failover with epochs">
+  <rect class="box" x="20" y="30" width="160" height="50" rx="10"/><text class="t-c t-b" x="100" y="52">Scheduler S1</text><text class="t-c t-sm" x="100" y="68">owns shards 0..2</text>
+  <rect class="box" x="20" y="120" width="160" height="50" rx="10"/><text class="t-c t-b" x="100" y="142">Scheduler S2</text><text class="t-c t-sm" x="100" y="158">owns shards 3..5</text>
+  <rect class="cache" x="320" y="60" width="240" height="110" rx="10"/><text class="t-c t-b" x="440" y="86">Coordination store</text><text class="t-c t-sm" x="440" y="108">shard 1: owner S1, epoch 7</text><text class="t-c t-sm" x="440" y="126">lease until T+10 s</text><text class="t-c t-sm" x="440" y="148">compare-and-set on expiry</text>
+  <path class="arrow dash" d="M180 55 L316 90"/><text class="t-sm" x="190" y="62">renew</text>
+  <path class="arrow dash" d="M180 145 L316 140"/>
+  <rect class="db" x="680" y="60" width="260" height="110" rx="10"/><text class="t-c t-b" x="810" y="86">Job store shard 1</text><text class="t-c t-sm" x="810" y="108">rows carry last_epoch</text><text class="t-c t-sm" x="810" y="126">update only if epoch &gt;= row epoch</text><text class="t-c t-sm" x="810" y="148">(fencing)</text>
+  <path class="arrow" d="M180 50 L676 90"/><text class="t-sm" x="420" y="196">writes carry the epoch</text>
+
+  <rect class="miss" x="20" y="230" width="430" height="80" rx="10"/><text class="t-b" x="34" y="254">S1 pauses (long GC, network split) past its lease</text><text class="t-sm" x="34" y="274">S2 takes shard 1 with epoch 8 and starts dispatching.</text><text class="t-sm" x="34" y="292">S1 wakes and tries to write with epoch 7.</text>
+  <rect class="hit" x="490" y="230" width="450" height="80" rx="10"/><text class="t-b" x="504" y="254">Store rejects epoch 7 (8 is current)</text><text class="t-sm" x="504" y="274">S1's claim and enqueue fail the check, it sees the lost lease,</text><text class="t-sm" x="504" y="292">stops, and drops its in-memory wheel for that shard.</text>
+</svg>
+<figcaption>Leases give failover; fencing epochs make a paused or partitioned old owner harmless, because the database rejects its writes. A lease alone is not enough, since the old owner may not know it expired.</figcaption>
+</figure>
+<h4>Layer 2: an atomic claim in the database</h4>
+<p>Even with one owner per shard, bugs and ownership overlaps during failover must not cause duplicates. So the claim itself is a conditional update. Pseudocode in the owner's loop:</p>
+<pre><code>BEGIN;
+  rows = SELECT job_id, scheduled_for FROM schedule
+         WHERE shard = :s AND next_run_at &lt;= :now + 1s AND status = 'ACTIVE'
+         ORDER BY next_run_at LIMIT 500
+         FOR UPDATE SKIP LOCKED;           -- other claimers skip these rows
+  for each row:
+     INSERT INTO execution(job_id, run_id = job_id + ':' + scheduled_for, state='QUEUED')
+        ON CONFLICT DO NOTHING;            -- unique key makes the run id deterministic
+     UPDATE schedule SET next_run_at = next_cron(row), status='ACTIVE'
+        WHERE job_id = row.job_id AND next_run_at = row.next_run_at;  -- compare and set
+COMMIT;
+then enqueue run_ids.</code></pre>
+<p>The key is the <b>deterministic run id</b>: <code>job_id + scheduled_for</code>. Even if two owners both tried, the unique key on the execution table lets only one insert succeed. The compare-and-set on <code>next_run_at</code> advances the schedule exactly once. "Skip locked" is a database feature that lets many claimers take different rows instead of blocking each other.</p>
+<h4>The enqueue gap</h4>
+<p>A subtle failure: the transaction commits and the scheduler crashes before enqueueing. The run is recorded as <code>QUEUED</code> in the database but is not in the queue. The cure is the <b>outbox pattern</b> (<a href="../chapters/35-messaging-patterns.html">Chapter 35</a>): the reaper (and the scheduler on restart) scans for executions in state <code>QUEUED</code> older than a few seconds that have no lease and re-enqueues them. Because the run id is deterministic and workers take a lease before running, re-enqueueing is safe. The opposite order (enqueue first, then commit) can run a job whose database row says it is not due, so we always commit first.</p>
+
+<h2 id="workers">8. Deep dive 2: worker execution, leases, retries, dependencies</h2>
+<h3>8.1 Leases, heartbeats, and timeouts</h3>
+<p>A worker receives a run id from the queue and asks the store for a lease: a conditional update setting <code>state = RUNNING</code>, <code>lease_owner = me</code>, <code>lease_token = token + 1</code>, <code>lease_expires_at = now + 30 s</code>, but only where the state is <code>QUEUED</code> (or an expired <code>RUNNING</code>). If zero rows change, someone else has it, and the worker drops the message. While the job runs, the worker sends a heartbeat every 10 seconds, extending <code>lease_expires_at</code>. If the worker dies, heartbeats stop, the lease expires after at most 30 seconds, and the reaper marks the run <b>lost</b>, then requeues it as a new attempt under the retry policy. So the cost of a worker crash is bounded: about the lease length in extra latency.</p>
+<p>Two separate clocks matter. The <b>lease</b> answers "is the worker alive"; the <b>job timeout</b> (for example 900 seconds, from the definition) answers "has this run gone on too long even though the worker is alive". A hung job keeps its worker heartbeating forever, so without the timeout it never finishes. When the timeout is exceeded, the worker (or the reaper if the worker is unresponsive) terminates the run and records <code>TIMED_OUT</code>, which counts as a failed attempt.</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 300" role="img" aria-label="Execution state machine">
+  <rect class="box" x="20" y="40" width="130" height="50" rx="10"/><text class="t-c t-b" x="85" y="70">SCHEDULED</text>
+  <rect class="cache" x="200" y="40" width="130" height="50" rx="10"/><text class="t-c t-b" x="265" y="70">QUEUED</text>
+  <rect class="box" x="380" y="40" width="130" height="50" rx="10"/><text class="t-c t-b" x="445" y="70">RUNNING</text>
+  <rect class="hit" x="600" y="10" width="140" height="50" rx="10"/><text class="t-c t-b" x="670" y="40">SUCCEEDED</text>
+  <rect class="miss" x="600" y="100" width="140" height="50" rx="10"/><text class="t-c t-b" x="670" y="130">FAILED / LOST</text>
+  <rect class="miss" x="800" y="100" width="140" height="50" rx="10"/><text class="t-c t-b" x="870" y="130">DEAD</text>
+  <rect class="ext" x="380" y="200" width="130" height="50" rx="10"/><text class="t-c t-b" x="445" y="230">CANCELLED</text>
+  <rect class="cache" x="200" y="200" width="130" height="50" rx="10"/><text class="t-c t-b" x="265" y="222">RETRY</text><text class="t-c t-sm" x="265" y="240">wait backoff</text>
+  <path class="arrow" d="M150 65 L196 65"/><path class="arrow" d="M330 65 L376 65"/>
+  <path class="arrow-g" d="M510 55 L596 35"/><path class="arrow-r" d="M510 75 L596 120"/>
+  <path class="arrow-r" d="M740 125 L796 125"/><text class="t-sm" x="742" y="118">attempts out</text>
+  <path class="arrow dash" d="M640 150 L336 215"/><text class="t-sm" x="470" y="172">attempts left</text>
+  <path class="arrow dash" d="M265 200 L265 94"/><text class="t-sm" x="272" y="150">timer fires</text>
+  <path class="arrow dash" d="M445 90 L445 196"/><text class="t-sm" x="452" y="150">cancel</text>
+</svg>
+<figcaption>A run moves forward only. Failure with attempts left goes to a backoff wait and back to queued. After the last attempt the run is dead and visible for manual re-run.</figcaption>
+</figure>
+<h3>8.2 Retries and backoff</h3>
+<p>Retrying immediately after a failure usually makes things worse: if a downstream service is overloaded, a thousand instantly retried jobs deepen the overload. The standard policy is <b>exponential backoff with jitter</b> (<a href="../chapters/40-resilience.html">Chapter 40</a>). The wait before attempt <code>n</code> is a random value between 0 and <code>min(max, base × 2^n)</code>. With base 2 seconds and cap 10 minutes, waits are drawn from about 0-4 s, 0-8 s, 0-16 s and so on, up to 600 s. The random part ("full jitter") spreads retries so they do not arrive together. Not every failure is retried: a 4xx response such as "bad request" is permanent, so the policy distinguishes retryable (timeouts, 5xx, connection errors, lost lease) from non-retryable errors. After <code>max_attempts</code> the run becomes <code>DEAD</code> and an alert goes to the tenant. A dead-letter listing allows manual re-run.</p>
+<h3>8.3 Delivery semantics and exactly-once effects</h3>
+<p>Can the scheduler guarantee exactly-once execution? Not in general. Consider a worker that calls the target, the target performs its side effect, and then the worker crashes before reporting success. The scheduler cannot tell "never ran" from "ran, but report lost", so it must choose between possibly skipping (at-most-once) and possibly repeating (at-least-once). Losing a scheduled job silently is worse, so we choose <b>at-least-once</b>. Then we manufacture <b>exactly-once effects</b> (the business outcome occurs once even if the code runs twice) through idempotency (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>):</p>
+<ul>
+<li>Every call to the target carries an <b>idempotency key</b> equal to the deterministic <code>run_id</code> (the same for all retries of the same logical run; a separate <code>attempt</code> number is sent for logging). A well-built target stores processed keys and ignores repeats.</li>
+<li>For effects inside our own platform (for example publishing to a queue), the worker uses the lease token as a fence: the final state write is <code>UPDATE ... WHERE lease_token = :mine</code>. A worker whose lease was reclaimed cannot overwrite the result.</li>
+<li>Tenants are told plainly in the documentation: "your job may be delivered more than once; use the key."</li>
+</ul>
+<div class="callout watch"><b>Watch out</b>
+A lease and fencing token protect the scheduler's own records, but they cannot stop a "zombie" worker (one that stalled past its lease) from finishing its call to an external system after a second worker already did the same. Only idempotency at the target protects external effects.</div>
+<h3>8.4 Dependencies and DAGs</h3>
+<p>A job with <code>depends_on</code> does not run when its own timer fires. Instead the timer creates an execution in <code>WAITING</code>, and the scheduler records, for each upstream job, whether it has succeeded for the same logical period (the same <code>scheduled_for</code> day, for a daily DAG). When an upstream execution completes, the completing worker (or an event consumer) looks up its downstream edges and, for each downstream run, decrements a counter of unmet dependencies stored in the same row. When the counter reaches zero, the run moves to <code>QUEUED</code>. This is a topological execution: a node runs only after all its predecessors finished. Rules to state:</p>
+<ul>
+<li><b>Cycle check at registration:</b> the API runs a depth-first search to reject edges that create a cycle.</li>
+<li><b>Failure policy:</b> by default a failed upstream blocks downstream runs (marked <code>UPSTREAM_FAILED</code>); an option allows "run anyway".</li>
+<li><b>Timeouts for waiting:</b> a downstream run waits at most a configured time, so it does not wait forever on an upstream that was paused.</li>
+<li><b>Scale:</b> the dependency counters are updated by the same transactional claim pattern; a fan-in of 1,000 upstreams needs 1,000 conditional decrements, which is fine.</li>
+</ul>
+<p>When DAGs become richer (branching, loops, human steps, long waits, compensation), the right answer is a durable workflow engine such as the ones described in <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a> and the saga pattern in <a href="../chapters/48-sagas.html">Chapter 48</a>. A job scheduler with simple dependencies is a good fit for "run these 12 batch steps in order each night", not for a month-long business process.</p>
+
+<h2 id="fairness">9. Deep dive 3: priorities, fairness across tenants, and time semantics</h2>
+<h3>9.1 Priorities and fairness</h3>
+<p>If all runs go into one queue in due-time order, a tenant that creates 5 million jobs all due at midnight puts 5 million messages ahead of everyone else, and a small customer's 00:00:01 job waits behind them for minutes. This is the noisy neighbour problem (<a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>). Priority alone does not fix it, since the heavy tenant can also mark their jobs "high". We need two things.</p>
+<ol>
+<li><b>Priority classes</b> with separate queues: high, normal, low. Workers poll high first, but with a weighted share (for example 6:3:1) so low is never starved completely. Priorities are set by the platform from the tenant's plan; tenants may only choose within their allowed range.</li>
+<li><b>Per-tenant fairness inside a class.</b> Each tenant has its own virtual queue (a partition keyed by tenant id), and the dispatcher takes from tenants in <b>weighted round-robin</b> or with deficit round-robin: each turn a tenant may send up to its weight in runs, then yields. A tenant with 5 million backlog and weight 1 gets the same share as a tenant with 50 jobs, so the small tenant's runs wait for at most one round. Quotas also cap the number of concurrently running executions per tenant (for example 500), so a tenant cannot occupy the whole worker fleet.</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 960 330" role="img" aria-label="Fair dispatch across tenants and priorities">
+  <rect class="miss" x="20" y="30" width="200" height="50" rx="10"/><text class="t-c t-b" x="120" y="52">Tenant A backlog</text><text class="t-c t-sm" x="120" y="68">5,000,000 runs</text>
+  <rect class="hit" x="20" y="110" width="200" height="50" rx="10"/><text class="t-c t-b" x="120" y="132">Tenant B</text><text class="t-c t-sm" x="120" y="148">40 runs</text>
+  <rect class="hit" x="20" y="190" width="200" height="50" rx="10"/><text class="t-c t-b" x="120" y="212">Tenant C</text><text class="t-c t-sm" x="120" y="228">300 runs</text>
+  <rect class="cache" x="300" y="60" width="250" height="150" rx="10"/><text class="t-c t-b" x="425" y="86">Fair dispatcher</text><text class="t-c t-sm" x="425" y="108">weighted round robin over tenants</text><text class="t-c t-sm" x="425" y="128">per-tenant running cap (500)</text><text class="t-c t-sm" x="425" y="148">per-tenant rate limit (dispatch/s)</text><text class="t-c t-sm" x="425" y="168">starvation guard: age boosts</text>
+  <path class="arrow" d="M220 55 L296 100"/><path class="arrow" d="M220 135 L296 135"/><path class="arrow" d="M220 215 L296 170"/>
+  <rect class="box" x="640" y="30" width="140" height="50" rx="10"/><text class="t-c t-b" x="710" y="60">High queue</text>
+  <rect class="box" x="640" y="110" width="140" height="50" rx="10"/><text class="t-c t-b" x="710" y="140">Normal queue</text>
+  <rect class="box" x="640" y="190" width="140" height="50" rx="10"/><text class="t-c t-b" x="710" y="220">Low queue</text>
+  <path class="arrow" d="M550 110 L636 60"/><path class="arrow" d="M550 135 L636 135"/><path class="arrow" d="M550 160 L636 215"/>
+  <rect class="ext" x="840" y="90" width="100" height="90" rx="10"/><text class="t-c t-b" x="890" y="130">Workers</text><text class="t-c t-sm" x="890" y="148">6:3:1 share</text>
+  <path class="arrow" d="M780 55 L836 120"/><path class="arrow" d="M780 135 L836 135"/><path class="arrow" d="M780 215 L836 150"/>
+  <text class="t-sm" x="20" y="290">Result: B and C wait at most one round, even while A has millions queued; A is throttled, not rejected.</text>
+</svg>
+<figcaption>The dispatcher, not the queue order, decides who goes next. Heavy tenant A progresses at its fair share and its running cap; B and C are barely delayed.</figcaption>
+</figure>
+<h3>9.2 Time: zones, daylight saving, skew, and missed runs</h3>
+<p>Time is where schedulers go subtly wrong, so state the rules explicitly.</p>
+<ul>
+<li><b>Store UTC, compute in the tenant's zone.</b> A cron expression is evaluated in its IANA time zone (for example Europe/Berlin), and the resulting instant is stored in UTC. The next run time is computed from the previous <i>scheduled</i> time, not from "now", so a late run does not drift the schedule.</li>
+<li><b>Daylight saving time:</b> when clocks jump forward, "02:30 daily" does not exist on that day; the rule is to run at the next valid moment (03:00) once. When clocks fall back, "01:30" occurs twice; the rule is to run once, at the first occurrence. Document it.</li>
+<li><b>Clock skew:</b> scheduler machines' clocks differ from each other and from the database by milliseconds, occasionally seconds when NTP breaks. We never compare two machines' clocks with each other to decide ordering (<a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>). The due test uses the database's own <code>now()</code> in the claim query, so there is one reference clock per shard. Lease expiry is also judged by the store, not by the worker's clock. Workers measure their own elapsed time with a monotonic clock for timeouts.</li>
+<li><b>Missed runs and catch-up:</b> if the scheduler is down from 02:00 to 02:20, the 02:00 run is overdue by 20 minutes when the system returns. The tenant picks a policy: <code>skip</code> (ignore runs older than a grace period; right for "refresh a cache"), <code>run_latest</code> (run once now for the most recent missed slot; right for most reports) or <code>run_all</code> with a bound (run each missed slot, at most N, in order; right for hourly ingestion where each hour is distinct data). A recovered system also needs <b>backpressure</b>: ten minutes of backlog released all at once is another spike, so catch-up runs are throttled and low priority until they are within the on-time window.</li>
+<li><b>Overlap policy:</b> if the previous run is still running when the next is due, <code>forbid</code> skips or delays the new one, <code>allow</code> runs both, <code>replace</code> cancels the old.</li>
+<li><b>Jitter:</b> for jobs marked "any time within a window", the scheduler adds a deterministic random offset (hash of job id) so a thousand "hourly" jobs do not all fire at second 0.</li>
+</ul>
+
+<h2 id="scale">10. Scaling, hot spots, and sharding</h2>
+<h3>10.1 Sharding strategy</h3>
+<p>We shard the schedule by <code>hash(job_id) mod 64</code>, deciding the logical shard count up front and mapping logical shards onto physical nodes, which allows moving a shard to a new node without rehashing (<a href="../chapters/25-sharding.html">Chapter 25</a>). The alternative is sharding by tenant, which makes tenant queries local but puts a whale tenant on one shard. Hashing by job id spreads even a whale evenly; tenant-level views are served from a secondary index or a search view. Time-based sharding (one shard per hour) would put all current load on one shard, a classic hot spot, and is rejected.</p>
+<h3>10.2 Hot spots</h3>
+<ul>
+<li><b>The "now" bucket.</b> Everything due now is at the right edge of the index; heavy insert and delete at the edge can cause contention. Mitigation: per-shard parallelism (64 edges, not one), small batches (500 rows), and skip-locked claiming.</li>
+<li><b>The top of the hour.</b> Spreading by jitter (sections 9.2 and 10.2), the queue as a buffer, and autoscaling workers on queue depth, plus pre-warming workers a few minutes before known peaks (hour boundaries are predictable).</li>
+<li><b>A whale tenant</b> is limited by quotas and fair dispatch (section 9.1).</li>
+<li><b>History table growth:</b> time partitions, dropped by age; summary counts kept longer.</li>
+<li><b>Heartbeat load</b> is reduced by batching per worker (section 3.3).</li>
+</ul>
+<h3>10.3 Caching</h3>
+<p>Job definitions are read at dispatch time (target, retry policy). A per-scheduler cache keyed by <code>(job_id, version)</code> avoids a join on every claim; the <code>version</code> makes invalidation trivial, because an update creates a new version and a stale cache entry simply fails the version check (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>). No cache is used for the schedule rows themselves, because they change every run and are the authoritative state.</p>
+
+<h2 id="failures">11. Failure modes and mitigations</h2>
+<table>
+<tr><th>Component</th><th>Failure</th><th>Effect</th><th>Mitigation</th></tr>
+<tr><td>Scheduler instance</td><td>Crashes</td><td>Its shards stop dispatching</td><td>Lease expires in about 10 s; another instance takes the shard with a higher epoch and reloads its window from the table. Lateness bounded by the lease time.</td></tr>
+<tr><td>Scheduler</td><td>Long pause, then resumes (zombie)</td><td>Could dispatch alongside the new owner</td><td>Epoch fencing at the store and deterministic run ids reject its writes; unique key stops duplicate executions.</td></tr>
+<tr><td>Scheduler</td><td>Crash after commit, before enqueue</td><td>Run stuck QUEUED but not in the queue</td><td>Outbox sweep re-enqueues stale QUEUED runs.</td></tr>
+<tr><td>Job store shard</td><td>Primary fails</td><td>Shard cannot claim or update</td><td>Replica promotion (<a href="../chapters/24-replication.html">Chapter 24</a>); other 63 shards unaffected (blast radius 1/64). Missed runs caught up by the catch-up policy.</td></tr>
+<tr><td>Job store</td><td>Slow queries</td><td>Late dispatch</td><td>Index on time, small batches, query timeouts; alert on dispatch lag; shed low priority.</td></tr>
+<tr><td>Coordination store</td><td>Unavailable</td><td>Cannot renew leases</td><td>Owners keep working until lease expiry, then stop (they must not continue without a valid lease). Deploy it as a 5-node quorum across zones. Running jobs on workers are unaffected, since they use the job store, not the coordination store.</td></tr>
+<tr><td>Queue broker</td><td>Down or lost messages</td><td>Nothing reaches workers</td><td>Database holds the truth; the outbox sweep rebuilds the queue; scheduler backs off enqueue and keeps rows QUEUED.</td></tr>
+<tr><td>Worker</td><td>Crashes mid-job</td><td>Run in limbo</td><td>Lease expires, reaper marks LOST, retried as a new attempt; idempotency key makes the repeated call safe.</td></tr>
+<tr><td>Worker</td><td>Hangs</td><td>Heartbeats continue but no progress</td><td>Job timeout kills it; counted as a failed attempt.</td></tr>
+<tr><td>Target</td><td>Slow or failing</td><td>Retries pile up, workers blocked</td><td>Per-target circuit breaker and concurrency limit (<a href="../chapters/40-resilience.html">Chapter 40</a>), backoff with jitter.</td></tr>
+<tr><td>Clock</td><td>Skew on a scheduler host</td><td>Early or late fires</td><td>Due-ness decided by the database clock; alert on host NTP offset above 100 ms.</td></tr>
+<tr><td>Region</td><td>Primary region lost</td><td>All scheduling stops</td><td>Standby region with replicated stores; failover promotes it; catch-up policies handle the gap (<a href="../chapters/41-ha-dr.html">Chapter 41</a>). With asynchronous replication some of the last seconds of state may be lost, so dead-region failover can repeat runs, which idempotency absorbs.</td></tr>
+</table>
+<h3>11.1 Consistency decisions</h3>
+<p>Schedule claim and next-run update are in one local transaction, so we get strong consistency where it matters and need no distributed transaction (<a href="../chapters/31-distributed-transactions.html">Chapter 31</a>). The queue and the database are not atomic with each other, which is why the outbox and the deterministic run id exist. The result write is conditional on the lease token, so state transitions are monotonic: a late message cannot move a run backwards. Reads for dashboards may use replicas with a few hundred milliseconds of lag, and this is acceptable (<a href="../chapters/28-cap-consistency.html">Chapter 28</a>).</p>
+
+<h2 id="ops">12. Security, observability, and cost</h2>
+<h3>12.1 Security and abuse</h3>
+<ul>
+<li><b>Authentication and authorization:</b> every API call is scoped to a tenant; job ids are not guessable and are checked against the tenant.</li>
+<li><b>Target safety:</b> HTTP targets must not reach internal addresses (SSRF, server-side request forgery): resolve the address, block private ranges, use an egress proxy. Payloads and secrets are encrypted at rest; secrets are referenced, not stored in the payload.</li>
+<li><b>Abuse limits:</b> maximum jobs per tenant, a minimum cron interval (for example 1 minute on free plans), payload size cap, concurrent-run cap, and rate limits on the API (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>).</li>
+<li><b>Sandboxing:</b> container-based jobs run with resource limits and no access to other tenants' networks.</li>
+</ul>
+<h3>12.2 Monitoring and SLOs</h3>
+<p>The single most important metric is <b>scheduling lag</b>: actual start time minus scheduled time, per shard and per priority. The SLO: p99 under 1 second, p99.9 under 5 seconds, measured over 5-minute windows. Companions:</p>
+<ul>
+<li><b>Missed-run count</b> (runs whose lag exceeded the grace period) which should be zero in normal operation; alert on any.</li>
+<li>Queue depth and age of the oldest message per priority; worker utilization; lease-expiry rate (a rise means unstable workers or too-short leases); retry and dead rates per tenant and per target; heartbeat latency; shard-ownership churn (frequent changes signal a flapping scheduler).</li>
+<li>A synthetic canary job that runs every minute in every shard and alerts if it is late: it tests the whole path, even when metrics look healthy.</li>
+<li>Per-run trace id linking the API call, the claim, the queue message, the worker log and the target call, so a tenant asking "why did my 02:00 run not happen?" gets an answer.</li>
+</ul>
+<h3>12.3 Cost</h3>
+<p>The main costs are workers (about 1,400 instances, which autoscaling lowers off-peak) and the history store (11 TB per year if kept in full, which is why we tier to object storage and expire). The scheduler tier and coordination store are tiny: about 20 small instances and 5 nodes. Cost levers: batch small jobs into fewer runs, use spot instances for low-priority workers (the lease and retry logic already tolerates their loss), and compress or sample old history.</p>
+
+<h2 id="evolution">13. Evolution and phasing</h2>
+<h3>13.1 What to build first</h3>
+<ol>
+<li><b>Phase 1 (MVP):</b> one database, one scheduler with a leader lock, queue and a few workers. Cron, one-off and delay; retries; at-least-once; basic history. Good to about 1 million jobs and 10 million runs per day.</li>
+<li><b>Phase 2:</b> shard the schedule into 64 logical shards with per-shard leases and epochs; add leases and heartbeats; the outbox sweep; priorities; tenant quotas.</li>
+<li><b>Phase 3:</b> per-tenant fair dispatch, DAG dependencies, catch-up policies, canary jobs and full SLO dashboards.</li>
+<li><b>Phase 4:</b> standby region, cheaper history tiers, and a workflow-engine integration for complex flows.</li>
+</ol>
+<h3>13.2 At 10x scale (100 million jobs, a billion runs a day)</h3>
+<p>Per shard load would be 10x higher: about 180 dispatches per second on average and 2,000 at peak, which is still manageable for a good database node, but the history volume (300 GB per day) forces a column store or log-structured store and aggressive tiering. We would move to 256 or 512 logical shards, more physical nodes, a timer wheel as the primary dispatch source with the table as the recovery log, and cell-based isolation (<a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>): each cell is a full independent copy of the system serving a subset of tenants, which caps blast radius and simplifies capacity planning. The worker queue would be partitioned by cell.</p>
+<h3>13.3 Alternatives not chosen</h3>
+<ul>
+<li><b>Delay queue as the scheduler:</b> rejected for edit and cancel difficulty and horizon limits (section 7.1).</li>
+<li><b>A single global leader:</b> simpler, but a throughput bottleneck and a large failure domain. Per-shard owners are almost as simple with 64 times the parallelism.</li>
+<li><b>Distributed lock around each job</b> (every scheduler tries to lock each due job): works at small scale but creates heavy contention in the coordination store; partition ownership moves the coordination cost from per job to per shard.</li>
+<li><b>Database-only worker polling</b> (workers claim straight from the table, no queue): fewer parts, and it works at modest scale. At 12,500 dispatches per second with priorities and fair queues, a queue is a better buffer and lets workers scale independently.</li>
+<li><b>Full workflow engine for everything:</b> richer, but heavier and more costly per simple cron job.</li>
+</ul>
+
+<h2 id="qa">14. Interview Q&amp;A</h2>
+<details><summary>How do you make sure two scheduler instances do not run the same job?</summary>
+<p>There are two independent layers. First, each shard of the schedule has a single owner at a time, enforced by a lease in a consensus store with an increasing epoch; instances never scan shards they do not own. Second, the claim is an atomic database operation: a deterministic run id (job id plus scheduled time) with a unique key, and a compare-and-set on the next run time. If a paused old owner wakes up, its writes carry an old epoch and are rejected. Even if all of that failed, workers take a lease on the run id, so only one worker executes it, and the target sees the same idempotency key.</p></details>
+<details><summary>Why not just put every job in a delay queue and let the broker handle time?</summary>
+<p>It looks attractive because the broker already holds messages until a time. The problems are practical. Many brokers cap the delay to hours or days, a cron job has an unbounded future, and 10 million hidden messages are heavy to operate. Editing or cancelling a pending message is awkward or impossible, whereas with a table it is a single update. Visibility and querying ("what will run tomorrow?") are also weak. A delay queue is fine for short retry delays, where the message is created at failure time and is only seconds long.</p></details>
+<details><summary>What happens if the scheduler crashes right after it marks a job as dispatched?</summary>
+<p>That is the enqueue gap. The database says the run is queued, but the message may not exist. We commit before enqueueing on purpose, so that nothing runs that the database does not know about, and a recovery sweep re-enqueues executions that have stayed in QUEUED without a lease for more than a few seconds. Because the run id is deterministic and workers take a lease before running, a duplicate message is harmless: the second worker fails to get the lease and drops it. The cost is a small delay, not a lost or double run.</p></details>
+<details><summary>Can you give exactly-once execution?</summary>
+<p>Not as a pure guarantee on the scheduler side, because after a worker calls an external system and crashes before reporting, the scheduler cannot know whether the effect occurred. The choice is at-most-once, which may lose runs, or at-least-once, which may repeat them. We choose at-least-once and obtain exactly-once effects by making the work idempotent: the same idempotency key is sent on every attempt, and the target deduplicates on it. Inside our platform, a lease token fences the final state write so that a stale worker cannot overwrite a newer result.</p></details>
+<details><summary>How do you handle a tenant who schedules five million jobs at midnight?</summary>
+<p>Fairness is enforced in the dispatcher, not by queue order. Each tenant has a virtual queue, and the dispatcher takes from tenants by weighted round robin, so a small tenant waits at most one round. We also apply per-tenant caps on running executions and on dispatch rate, which throttles the heavy tenant without rejecting its jobs. Registration-time limits (a maximum number of jobs and a minimum interval) stop abuse at the source, and deterministic jitter spreads jobs marked flexible across a window.</p></details>
+<details><summary>How are missed runs handled after an outage?</summary>
+<p>The tenant chooses a catch-up policy per job. With skip, anything older than a grace period is ignored. With run_latest, only the most recent missed slot runs once. With run_all, each missed slot runs in order, bounded by a maximum count. In all cases the recovery is throttled and at lower priority than on-time runs, so the backlog does not become a second spike that delays fresh work. The schedule's next run time is computed from the previous scheduled time, so the cadence does not drift after catching up.</p></details>
+<details><summary>How do you deal with clock skew between machines?</summary>
+<p>We avoid trusting any machine's clock for cross-machine decisions. Whether a run is due is decided by the database's own clock inside the claim query, and lease expiry is judged by the store as well. Workers use a monotonic clock for local timeouts, which does not jump when NTP adjusts the wall clock. Ordering between machines comes from epochs, lease tokens and the deterministic run id, not timestamps. We still monitor NTP offset, because large skew affects lateness measurements and logs even if it does not corrupt correctness.</p></details>
+<details><summary>Why use a lease and heartbeat rather than a long timeout?</summary>
+<p>A long timeout detects a dead worker only after the whole expected runtime, which could be an hour, so a crash would delay the retry by that much. A short lease renewed by heartbeats detects death within about 30 seconds regardless of how long the job is meant to run. The separate job timeout still handles a worker that is alive but stuck, because heartbeats alone cannot tell productive work from a hang. Together they bound the cost of both crashes and hangs.</p></details>
+<details><summary>How would you implement job dependencies at scale?</summary>
+<p>Each downstream run is created in a waiting state with a counter of unmet upstream dependencies. When an upstream run succeeds, the worker finds the outgoing edges and performs conditional decrements; at zero the run moves to queued. Cycles are rejected at registration with a graph search, failed upstreams mark downstream runs as blocked by default, and waiting has a timeout. For richer control flow (branching, long waits, compensation) I would hand off to a workflow engine rather than growing the scheduler.</p></details>
+<details><summary>What would you change at ten times the scale?</summary>
+<p>I would raise the logical shard count to 256 or 512 so each shard stays small, and make the in-memory timer wheel the main dispatch path with the table acting as its recovery log. The history store would move to a column or log-structured store with strong tiering, since it would reach roughly 300 GB per day. Finally I would introduce cells: independent full copies of the system for groups of tenants, which limits blast radius and makes capacity planning simpler.</p></details>
+
+<h2 id="recap-sec">15. Connects to</h2>
+<p class="connects"><b>Connects to:</b> sizing and the interview approach from <a href="../chapters/01-interview-framework.html">Chapter 1</a> and <a href="../chapters/02-estimation.html">Chapter 2</a>; API conventions in <a href="../chapters/05-api-design.html">Chapter 5</a>; storage and sharding in <a href="../chapters/18-relational-internals.html">Chapter 18</a>, <a href="../chapters/24-replication.html">Chapter 24</a> and <a href="../chapters/25-sharding.html">Chapter 25</a>; time and ordering in <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a> and <a href="../chapters/28-cap-consistency.html">Chapter 28</a>; leader election and leases in <a href="../chapters/29-consensus.html">Chapter 29</a> and <a href="../chapters/30-coordination-locks.html">Chapter 30</a>; idempotency in <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>; queues and the outbox in <a href="../chapters/34-queues-kafka.html">Chapter 34</a> and <a href="../chapters/35-messaging-patterns.html">Chapter 35</a>; scheduling and workflow theory in <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>; retries and breakers in <a href="../chapters/40-resilience.html">Chapter 40</a>; multi-tenancy and cells in <a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>; worker autoscaling in <a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>; sagas in <a href="../chapters/48-sagas.html">Chapter 48</a>.</p>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">16. Recap</h2><ul>
+<li>A scheduler is a time-indexed store plus a dispatcher plus workers. Keep tenant code out of the scheduler, and keep the database as the truth with the queue as a pipe.</li>
+<li>Size it by arithmetic: 100 million runs per day is about 1,157 per second on average, designed for about 12,500 per second at the top of the hour, with 64 shards at about 18 runs per second each.</li>
+<li>Find due jobs by an indexed range scan on (shard, next_run_at), accelerated by an in-memory timer wheel for the next few seconds; use a delay queue only for short retry delays.</li>
+<li>Prevent double scheduling with per-shard leases and fencing epochs, plus an atomic claim keyed by a deterministic run id (job id plus scheduled time).</li>
+<li>Workers hold leases renewed by heartbeats; a separate job timeout catches hangs; the reaper turns lost runs into retries with exponential backoff and jitter.</li>
+<li>Delivery is at-least-once; exactly-once effects come from idempotency keys at the target and lease-token fencing for our own records.</li>
+<li>Fairness comes from priority queues plus weighted per-tenant dispatch and running caps; store UTC, evaluate cron in the tenant's zone, trust the database clock, and give tenants an explicit catch-up and overlap policy.</li>
+<li>Watch scheduling lag first, alert on any missed run, and run a canary job in every shard.</li>
+</ul></div>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

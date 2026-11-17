@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 30: Design a Social Graph (Friends and Followers) | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="c30-social-graph">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 30 · Worked solutions</div>
+<h1>Design a Social Graph (Friends and Followers)</h1>
+<p class="lead">A social graph answers one family of questions: who does this person follow, who follows them, who are their mutual friends, and who should they meet next. Every other social feature (feeds, notifications, search, privacy) calls it thousands of times per second. This page designs it for one billion accounts: how edges are stored, how follow and unfollow stay correct across two copies of the data, how mutual friends and suggestions are computed cheaply, how an account with 100 million followers is kept from melting a single shard, and how everything is sharded by user.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is short: "Design the friends and followers system of a social network." The word "graph" invites a graph database, and a weak answer goes straight there. A strong answer first decides what questions the system must answer and how fast, because the shape of those questions (almost all of them are one or two hops away from a single user) determines the whole design. Following the <a href="../chapters/01-interview-framework.html">interview framework in Chapter 1</a>, here are the questions to ask and the answers we assume for the rest of the page.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>How many users?</td><td>1 billion registered accounts, 500 million daily active users (DAU).</td></tr>
+<tr><td>What kind of relationship?</td><td>Both. A <b>follow</b> is a directed edge (A follows B, B need not follow back), as on Twitter or Instagram. A <b>friend</b> is derived: A and B are friends when each follows the other. One edge model must serve both products.</td></tr>
+<tr><td>How skewed is the graph?</td><td>Average account follows 200 others (so 200 billion edges). The follower distribution has a very long tail: the median account has about 100 followers, but a few thousand accounts have more than 10 million, and the largest have about 100 million.</td></tr>
+<tr><td>Limits?</td><td>A user can follow at most 7,500 accounts (an anti-spam cap). Friends are capped at 5,000. Followers are not capped.</td></tr>
+<tr><td>Which queries are required?</td><td>Is A following B? List followers of B and accounts followed by A (paged). Follower and following counts. Mutual friends of A and B. "People you may know" suggestions. Fan-out service asks "give me all followers of B, in pages".</td></tr>
+<tr><td>Latency targets?</td><td>Point checks under 10 ms p99, list pages under 50 ms p99, mutual friends under 100 ms p99. Suggestions may be hours old.</td></tr>
+<tr><td>Consistency?</td><td>A user who just followed someone must see the follow immediately (read-your-writes). Other users and counters may lag by seconds. Blocks must take effect fast and must not leak content.</td></tr>
+<tr><td>Private accounts?</td><td>Yes: following a private account creates a pending request that the owner approves. We model it as an edge state, not as a separate system.</td></tr>
+<tr><td>Global?</td><td>Yes, but we design one region deeply and discuss multi-region in section 13.</td></tr>
+</table>
+<div class="callout tip"><b>Interview tip</b> Say early that the graph here is "wide and shallow": billions of nodes, hundreds of billions of edges, but nearly every query touches a node and its immediate neighbours. That justifies a sharded key-value or wide-column store with adjacency lists instead of a general graph database that is built for deep traversals.</div>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li>Follow and unfollow an account. Both are idempotent: repeating a request changes nothing.</li>
+<li>Approve or reject a follow request for a private account; remove a follower; block and unblock an account (a block removes edges in both directions and prevents new ones).</li>
+<li>Check whether A follows B (and whether B follows A) in one call.</li>
+<li>List followers and followees of an account, in stable pages, newest first.</li>
+<li>Return follower and following counts for any account.</li>
+<li>List mutual friends between the viewer and another account, and the count of them.</li>
+<li>Return "people you may know" suggestions for the viewer.</li>
+<li>Publish graph-change events so that the feed fan-out service, notification service and search indexer can react.</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Read-dominated and latency-sensitive</b>: about 200 reads for every write.</li>
+<li><b>Highly available</b>: a slightly stale list is acceptable, an error page is not. This is the usual availability-over-consistency stance (<a href="../chapters/28-cap-consistency.html">Chapter 28</a>), with two exceptions: read-your-writes for the actor and prompt enforcement of blocks.</li>
+<li><b>Scales horizontally</b> by adding shards, with no query that needs to touch all shards.</li>
+<li><b>Skew tolerant</b>: one celebrity must not create a single overloaded partition for reads, writes or counters.</li>
+<li><b>Durable</b>: an acknowledged follow is never lost.</li>
+<li><b>Self-healing</b>: the several copies of the graph that we keep (out-edges, in-edges, friends, counters) must converge even after crashes.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Feed ranking and delivery (see <a href="c06-news-feed.html">Case study 6</a>), content storage, the machine-learning model that scores suggestions (we show where it plugs in and what features it needs), full search over users, and trust-and-safety classifiers. We assume user ids are 64-bit integers issued by an id service (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>).</p>
+
+<h2 id="estimation">3. Estimation with real arithmetic</h2>
+<p>The estimation (<a href="../chapters/02-estimation.html">Chapter 2</a>) tells us the read rate we must serve, how large the edge data is, and whether it fits in memory. Numbers are rounded and reused consistently later.</p>
+<h3>3.1 Traffic</h3>
+<ul>
+<li>Each DAU triggers about 20 graph reads per day: viewing a profile (relationship state and counts), opening follower lists, "mutual friends" badges on cards, filters inside feed and search, and so on. That is 500 M x 20 = <b>10 billion reads per day</b>.</li>
+<li>Average read rate = 10,000,000,000 / 86,400 s = about <b>116,000 per second</b>. Peak is about 3x average, so <b>about 350,000 reads per second</b>.</li>
+<li>Follow and unfollow actions: 0.1 per DAU per day, so 500 M x 0.1 = <b>50 million per day</b>, about 580 per second on average and <b>about 1,750 per second at peak</b>.</li>
+<li>Read:write ratio = 10 B : 50 M = <b>200:1</b>.</li>
+<li>Each follow writes two edge rows (out-edge and in-edge), so peak edge-row writes are about 3,500 per second, plus friend rows and counter updates. This is modest for a sharded store. The difficulty is skew, not volume.</li>
+<li>Fan-out reads: feed fan-out asks for the followers of each author in pages of 1,000. With 100 M posts per day and 200 followers on average that is about 20 M page reads per day, roughly 230 per second. Negligible next to user reads, but a celebrity post requires scanning 100,000 pages (100 M followers / 1,000), which matters for the hot-node discussion.</li>
+</ul>
+<h3>3.2 Storage</h3>
+<table>
+<tr><th>Data</th><th>Arithmetic</th><th>Result</th></tr>
+<tr><td>Edges</td><td>1 B users x 200 follows each</td><td>200 billion directed edges</td></tr>
+<tr><td>Out-edge table</td><td>200 B rows x 24 B (src 8, dst 8, timestamp and state 8)</td><td>4.8 TB</td></tr>
+<tr><td>In-edge table</td><td>same rows, other key order</td><td>4.8 TB</td></tr>
+<tr><td>Friend table</td><td>about 20% of edges are reciprocal, 40 B edges x 24 B x 2 directions stored</td><td>about 1.9 TB</td></tr>
+<tr><td>Logical total</td><td>4.8 + 4.8 + 1.9</td><td>about 11.5 TB</td></tr>
+<tr><td>With index and engine overhead (1.3x)</td><td>11.5 x 1.3</td><td>about 15 TB</td></tr>
+<tr><td>Replicated 3x</td><td>15 x 3</td><td>about 45 TB</td></tr>
+<tr><td>Counters</td><td>1 B users x 2 counters x 8 B</td><td>16 GB (tiny)</td></tr>
+<tr><td>Suggestions</td><td>500 M active users x 50 candidates x 12 B (id 8 + score 4)</td><td>about 300 GB</td></tr>
+</table>
+<p>Even with generous overhead, the whole graph is tens of terabytes. That is large for one machine but small for a fleet: with <b>64 primary nodes</b> each holds about 15 TB / 64 = 235 GB of primary data, and with two replicas each that is 192 nodes in total. Nothing about the data volume forces exotic technology.</p>
+<h3>3.3 Cache sizing</h3>
+<ul>
+<li>Cache the following list of the 100 M most recently active users: 100 M x 200 ids x 8 B = <b>160 GB</b>. Together with hot follower pages and counters (16 GB) that is about 200 GB. At about 50 GB of usable data per Redis node (<a href="../chapters/15-redis.html">Chapter 15</a>) we need 4 primaries, and in practice about 12 nodes with replicas and headroom.</li>
+<li>If the cache absorbs 90% of reads, the stores see 35,000 reads per second at peak. Spread over 64 primaries that is about 550 per second per node, well inside one node's capacity, and replicas can share it.</li>
+</ul>
+<h3>3.4 Edge cases worth stating</h3>
+<ul>
+<li>One 100-million-follower account: its follower list is 100 M x 8 B = 800 MB of ids. It must never be loaded as one object.</li>
+<li>A celebrity announcement can trigger a burst, for example 20,000 new followers per second for several minutes. On a naive layout every one of those writes hits one partition.</li>
+<li>Two-hop work: a user with 200 friends who each have 200 friends gives 40,000 candidates. Doing that online for 500 M users is too much; we will precompute.</li>
+</ul>
+<div class="callout key"><b>Key idea</b> The numbers say three things. Reads (350 K per second at peak) dominate writes (1.75 K per second), so cache and read replicas carry the design. The data (15 TB logical) is modest, so simple sharded storage is enough. And the only truly dangerous part is skew: the one account whose edges, counters and write bursts exceed what one shard can take.</div>
+
+<h2 id="api">4. API design</h2>
+<p>Internal RPC (for example gRPC) between services, plus REST for the public surface (<a href="../chapters/05-api-design.html">Chapter 5</a>). The actor id always comes from the authenticated token, never from the request body, so a user cannot forge a follow on behalf of someone else.</p>
+<pre><code>POST   /v1/users/{id}/follow            body: { "request_id": "uuid" }
+  200: { "state": "following" | "requested" }        (requested = private account)
+DELETE /v1/users/{id}/follow            idempotent unfollow
+DELETE /v1/users/{id}/follower          remove a follower (soft block)
+POST   /v1/users/{id}/block   DELETE /v1/users/{id}/block
+
+GET /v1/users/{id}/relationship?with=VIEWER
+  200: { "following": true, "followed_by": false, "friends": false,
+         "blocked": false, "pending": false }
+
+GET /v1/users/{id}/followers?limit=50&amp;cursor=OPAQUE
+GET /v1/users/{id}/following?limit=50&amp;cursor=OPAQUE
+  200: { "items": [ { "user_id", "since" } ], "next_cursor": "OPAQUE" }
+
+GET /v1/users/{id}/counts          200: { "followers": 100412331, "following": 312 }
+GET /v1/users/{id}/mutual?limit=20  200: { "count": 37, "sample": [ {user_id}, ... ] }
+GET /v1/suggestions?limit=20        200: { "items": [ { "user_id", "reason", "mutual_count" } ] }
+
+Internal (bulk, for other services):
+POST /internal/relationships:batchGet   body: { "viewer": 7, "targets": [..up to 500..] }
+GET  /internal/users/{id}/followers:scan?page_size=1000&amp;cursor=...</code></pre>
+<p>Four design points. First, <code>request_id</code> plus the natural primary key (src, dst) makes follow idempotent: a mobile client retrying after a timeout cannot create two edges or two counter increments (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>). Second, the <b>cursor is opaque</b> and encodes the last key seen (a keyset cursor, not an offset), because offset paging over a list that is being modified skips or repeats rows and gets slower as the offset grows. Third, the <b>batch relationship API</b> exists because other services (feed, search, profile cards) need the relationship to 20 or 500 accounts at once; one batched call per page, not 500 calls. Fourth, the <b>relationship</b> endpoint is the hottest read in the system, so it is a single-shard point lookup by design (section 8).</p>
+
+<h2 id="data">5. Data model and storage choices</h2>
+<h3>5.1 What we store</h3>
+<pre><code>edges_out:  PK (src_id, dst_id)         | created_at | state (active|pending|blocked) | version
+            partition key = src_id, clustering key = dst_id (or created_at desc)
+edges_in:   PK (dst_id, bucket, src_id) | created_at | state | version
+            partition key = (dst_id, bucket), bucket = hash(src_id) % B_dst
+friends:    PK (user_id, friend_id)     | since
+            partition key = user_id     -- derived from edges, capped at 5,000 per user
+counters:   user_id -> followers, following   (sharded counters for hot accounts)
+suggestions: user_id -> [ (candidate_id, score, reason) x 50 ], refreshed by batch job
+outbox:     per-shard log of unpublished graph-change events</code></pre>
+<p>The <code>version</code> column is a monotonically increasing number (a timestamp from a hybrid clock or a per-edge counter). It lets idempotent replays and out-of-order messages settle on the latest truth: a stale "add" arriving after a newer "remove" is discarded (<a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>).</p>
+<h3>5.2 Why every edge is stored twice (or three times)</h3>
+<p>The two basic access patterns are "whom does X follow" and "who follows X". Each is a scan over all edges that share one endpoint. A single table partitioned by source serves the first with one partition scan, but answering the second would need a scan of every partition. Hence we keep <b>edges_out</b>, partitioned by source, and <b>edges_in</b>, partitioned by destination. Writing an edge means writing two rows, usually on two different shards. That is a deliberate denormalisation (<a href="../chapters/17-data-modeling.html">Chapter 17</a>): we pay extra write cost and a consistency problem to turn every read into a single-partition lookup. The friend table is a third, derived copy that makes "mutual friends" cheap, because it stores only reciprocal edges, which are bounded by 5,000 per user.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="The same follow edges stored in two tables with different partition keys">
+<text class="t-b" x="20" y="22">Follow edges: 7 to 12, 7 to 40, 93 to 12</text>
+<rect class="db" x="20" y="40" width="270" height="170" rx="8"/>
+<text class="t-b" x="35" y="64">edges_out</text><text class="t-sm" x="35" y="82">partition key = src_id</text>
+<text class="t-sm" x="35" y="110">partition 7:   [12] [40]</text>
+<text class="t-sm" x="35" y="132">partition 93:  [12]</text>
+<text class="t-sm" x="35" y="160">Answers: whom does 7 follow?</text>
+<text class="t-sm" x="35" y="180">Answers: does 7 follow 12?</text>
+<rect class="db" x="320" y="40" width="270" height="170" rx="8"/>
+<text class="t-b" x="335" y="64">edges_in</text><text class="t-sm" x="335" y="82">partition key = (dst_id, bucket)</text>
+<text class="t-sm" x="335" y="110">partition 12:  [7] [93]</text>
+<text class="t-sm" x="335" y="132">partition 40:  [7]</text>
+<text class="t-sm" x="335" y="160">Answers: who follows 12?</text>
+<text class="t-sm" x="335" y="180">Used by fan-out and counts</text>
+<rect class="cache" x="620" y="40" width="260" height="170" rx="8"/>
+<text class="t-b" x="635" y="64">friends (derived)</text><text class="t-sm" x="635" y="82">partition key = user_id</text>
+<text class="t-sm" x="635" y="110">Only reciprocal edges</text>
+<text class="t-sm" x="635" y="132">Capped at 5,000 per user</text>
+<text class="t-sm" x="635" y="160">Answers: mutual friends</text>
+<text class="t-sm" x="635" y="180">by intersecting two short lists</text>
+<path class="arrow" d="M155 212 L155 250"/><path class="arrow" d="M455 212 L455 250"/><path class="arrow dash" d="M290 262 L322 262"/>
+<text class="t-sm" x="30" y="270">source of truth</text><text class="t-sm" x="340" y="270">async copy (events)</text><text class="t-sm" x="640" y="270">derived by worker</text>
+</svg>
+<figcaption>The same edge appears under the key that makes each query a single-partition scan. The out-edge table is the source of truth that accepts the user's write; the in-edge and friend tables are filled from events and can be rebuilt from it.</figcaption>
+</figure>
+<h3>5.3 Choosing the store</h3>
+<table>
+<tr><th>Option</th><th>How it works</th><th>Strengths</th><th>Weaknesses</th><th>Verdict</th></tr>
+<tr><td>Graph database (native traversal engine)</td><td>Nodes and relationships with pointer-following traversal</td><td>Expressive queries, deep traversals, quick to prototype</td><td>Hard to shard a billion-node graph without cutting many edges; hot nodes concentrate; operational maturity at this scale is limited</td><td>Fine for fraud or analytics on a subset, not for the serving path</td></tr>
+<tr><td>Sharded relational (MySQL or Postgres)</td><td>Edge tables, shard by user, covering indexes</td><td>Mature, transactions inside a shard, familiar, strong secondary indexes. Large social networks have run graph services on sharded MySQL</td><td>Resharding is operationally heavy; cross-shard writes still need application logic</td><td>Good choice, especially when the team already runs it</td></tr>
+<tr><td>Wide-column or KV store (Cassandra, HBase, DynamoDB-style)</td><td>Partition key = user, clustering key = neighbour, so a user's adjacency list is a contiguous range</td><td>Linear scale-out, automatic rebalancing, cheap range scans, high write throughput (<a href="../chapters/20-nosql.html">Chapter 20</a>)</td><td>Weak multi-row transactions, tombstone costs on deletes, hot partitions need explicit design</td><td><b>Chosen</b> for edges: the queries are all key-range scans</td></tr>
+<tr><td>Adjacency list as one blob per user</td><td>One value holds all neighbour ids</td><td>One read gets the whole list</td><td>Rewrite the whole blob on every follow; 800 MB blobs for celebrities; concurrent updates conflict</td><td>Rejected for the source of truth. Used only as a cache format for small lists</td></tr>
+</table>
+<p>We choose a wide-column store (or sharded MySQL, which has the same logical layout) for the edge tables, an in-memory cache (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>) in front for adjacency lists and counters, Kafka (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>) for graph-change events, and an offline batch engine (<a href="../chapters/37-batch-stream.html">Chapter 37</a>) for suggestions with a key-value store for the results. The storage engine under the edge store is typically an LSM tree (<a href="../chapters/19-storage-engines.html">Chapter 19</a>), which suits the append-heavy write pattern but makes mass deletes (tombstones) something to watch, as discussed in section 13.</p>
+
+<h2 id="first-design">6. A first simple design, then the scaled architecture</h2>
+<h3>6.1 The simple version</h3>
+<p>Start with one application server and one relational database holding a single table <code>follows(follower_id, followee_id, created_at)</code> with two indexes, one on each column. Follow is an insert. "Is A following B" is an index lookup. "Followers of B" is an index range scan on <code>followee_id</code>. Counts are <code>COUNT(*)</code>. Mutual friends is a self-join:</p>
+<pre><code>SELECT a.followee_id
+FROM follows a JOIN follows b ON a.followee_id = b.followee_id
+WHERE a.follower_id = :me AND b.follower_id = :other;</code></pre>
+<p>This is correct and perfectly fine for a few million users. It fails at our scale for four separate reasons. The table (200 B rows) does not fit one machine. <code>COUNT(*)</code> for a 100 M-follower account scans 100 M index entries. A single hot account concentrates all its reads and writes on one B-tree page range. And the two indexes mean every follow updates two B-trees, which already hints at the split into two tables. So we shard, split the table by access pattern, cache, and move the heavy computations offline.</p>
+<h3>6.2 The scaled architecture</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 420" role="img" aria-label="High level architecture of the social graph service">
+<rect class="ext" x="20" y="170" width="100" height="50" rx="8"/><text class="t-c t-b" x="70" y="200">Clients</text>
+<rect class="box" x="150" y="170" width="110" height="50" rx="8"/><text class="t-c t-b" x="205" y="190">API gateway</text><text class="t-c t-sm" x="205" y="207">auth, limits</text>
+<rect class="box" x="300" y="100" width="150" height="50" rx="8"/><text class="t-c t-b" x="375" y="122">Graph write svc</text><text class="t-c t-sm" x="375" y="139">follow, block</text>
+<rect class="box" x="300" y="240" width="150" height="50" rx="8"/><text class="t-c t-b" x="375" y="262">Graph read svc</text><text class="t-c t-sm" x="375" y="279">lists, mutual, counts</text>
+<rect class="cache" x="500" y="240" width="150" height="50" rx="8"/><text class="t-c t-b" x="575" y="262">Adjacency cache</text><text class="t-c t-sm" x="575" y="279">lists, counters</text>
+<rect class="db" x="500" y="100" width="150" height="50" rx="8"/><text class="t-c t-b" x="575" y="122">Edge store</text><text class="t-c t-sm" x="575" y="139">out, in, friends</text>
+<rect class="box" x="500" y="10" width="150" height="50" rx="8"/><text class="t-c t-b" x="575" y="32">Kafka</text><text class="t-c t-sm" x="575" y="49">EdgeChanged events</text>
+<rect class="box" x="700" y="10" width="180" height="50" rx="8"/><text class="t-c t-b" x="790" y="32">Edge workers</text><text class="t-c t-sm" x="790" y="49">in-edge, friends, counters</text>
+<rect class="box" x="700" y="100" width="180" height="50" rx="8"/><text class="t-c t-b" x="790" y="122">Consumers</text><text class="t-c t-sm" x="790" y="139">feed, notify, search</text>
+<rect class="box" x="700" y="240" width="180" height="50" rx="8"/><text class="t-c t-b" x="790" y="262">Suggestion API</text><text class="t-c t-sm" x="790" y="279">serve + filter</text>
+<rect class="db" x="700" y="340" width="180" height="50" rx="8"/><text class="t-c t-b" x="790" y="362">Suggestion store</text><text class="t-c t-sm" x="790" y="379">KV, top 50 per user</text>
+<rect class="box" x="450" y="340" width="190" height="50" rx="8"/><text class="t-c t-b" x="545" y="362">Batch graph jobs</text><text class="t-c t-sm" x="545" y="379">two-hop, scoring</text>
+<path class="arrow" d="M120 195 L148 195"/>
+<path class="arrow" d="M260 185 L298 130"/><path class="arrow" d="M260 205 L298 260"/>
+<path class="arrow" d="M450 125 L498 125"/><path class="arrow" d="M450 110 L498 45"/>
+<path class="arrow" d="M650 35 L698 35"/><path class="arrow" d="M790 62 L790 98"/><path class="arrow dash" d="M700 20 L652 20" style="display:none"/>
+<path class="arrow" d="M450 265 L498 265"/><path class="arrow dash" d="M575 242 L575 152"/>
+<path class="arrow dash" d="M700 60 L652 120"/>
+<path class="arrow" d="M650 265 L698 265"/><path class="arrow" d="M790 292 L790 338"/>
+<path class="arrow dash" d="M640 365 L698 365"/><path class="arrow dash" d="M500 340 L560 150" style="display:none"/>
+<path class="arrow dash" d="M545 338 L580 152" style="display:none"/>
+<text class="t-sm" x="20" y="330">Solid: main flow. Dashed: cache fill, writes by workers.</text>
+<text class="t-sm" x="20" y="350">Batch jobs read an edge snapshot, not the live store.</text>
+</svg>
+<figcaption>The write service commits the out-edge and an outbox event, then returns. Workers fan the event out to the in-edge, friend and counter tables. The read service answers from the adjacency cache and falls back to the edge store. Suggestions are produced by offline jobs and served from a key-value store, so the online path never computes a two-hop traversal.</figcaption>
+</figure>
+<p>Responsibilities. The <b>Graph write service</b> validates (not self-follow, not blocked, under the follow cap, rate limit), writes the out-edge row, and records the change in an outbox in the same transaction. The <b>edge workers</b> consume <code>EdgeChanged</code> events and maintain the derived tables. The <b>Graph read service</b> is stateless: it picks the right table, consults the cache, and hides cross-shard details from callers. The <b>Suggestion API</b> reads a precomputed list and filters it live (already following, blocked, deactivated) before returning. Other services such as feed fan-out subscribe to the same events (<a href="../chapters/36-event-driven.html">Chapter 36</a>) rather than polling the graph.</p>
+
+<h2 id="flows">7. Request flows</h2>
+<h3>7.1 Follow</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Sequence of a follow request">
+<text class="t-c t-b" x="70" y="22">Client</text><text class="t-c t-b" x="230" y="22">Graph write</text><text class="t-c t-b" x="390" y="22">Out-edge shard</text><text class="t-c t-b" x="550" y="22">Kafka</text><text class="t-c t-b" x="710" y="22">Edge worker</text><text class="t-c t-b" x="850" y="22">In-edge shard</text>
+<line class="life" x1="70" y1="32" x2="70" y2="330"/><line class="life" x1="230" y1="32" x2="230" y2="330"/><line class="life" x1="390" y1="32" x2="390" y2="330"/><line class="life" x1="550" y1="32" x2="550" y2="330"/><line class="life" x1="710" y1="32" x2="710" y2="330"/><line class="life" x1="850" y1="32" x2="850" y2="330"/>
+<path class="arrow" d="M70 60 L228 60"/><text class="t-sm" x="80" y="54">1 POST follow</text>
+<path class="arrow" d="M230 95 L388 95"/><text class="t-sm" x="240" y="89">2 upsert edge + outbox</text>
+<path class="arrow" d="M388 125 L232 125"/><text class="t-sm" x="290" y="141">3 ack (committed)</text>
+<path class="arrow" d="M230 175 L72 175"/><text class="t-sm" x="95" y="169">4 200 following</text>
+<path class="arrow" d="M390 205 L548 205"/><text class="t-sm" x="400" y="199">5 relay outbox event</text>
+<path class="arrow" d="M548 235 L708 235"/><text class="t-sm" x="570" y="229">6 consume</text>
+<path class="arrow" d="M710 265 L848 265"/><text class="t-sm" x="722" y="259">7 upsert in-edge (idempotent)</text>
+<path class="arrow dash" d="M710 305 L392 305"/><text class="t-sm" x="420" y="299">8 check reverse edge, write friends, bump counters</text>
+</svg>
+<figcaption>The user waits only for steps 1 to 4: one durable write on one shard. Steps 5 to 8 are asynchronous and idempotent, so a crash simply causes a redelivery. The worker in step 8 reads the reverse edge (B follows A?) to decide whether the two accounts have just become friends.</figcaption>
+</figure>
+<ol>
+<li>The gateway authenticates and applies a per-user rate limit (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>): follow spam is the most common abuse, so a user can only create a few hundred follows per day.</li>
+<li>The write service checks the block list (one point lookup in the target's out-edge partition for a block row) and the cap, then writes <code>edges_out(src=A, dst=B, state=active)</code> and an outbox row in a single transaction on A's shard. If B is private, the state is <code>pending</code> and no counters move yet.</li>
+<li>The call returns as soon as that transaction commits. The caller's own cache entry (A's following list, the relationship to B) is updated or invalidated synchronously so A's next page load shows the follow. This is read-your-writes for the actor only.</li>
+<li>A relay reads the outbox and publishes <code>EdgeAdded(A, B, version)</code> to Kafka, partitioned by <code>dst</code> so all events for one target are ordered (<a href="../chapters/35-messaging-patterns.html">Chapter 35</a>). This transactional outbox avoids the dual-write problem: the edge row and the event can never disagree because they commit together.</li>
+<li>The edge worker applies the in-edge row, the friend rows if reciprocal, and increments the two counters. Every operation is an upsert keyed by (src, dst) or a counter delta tagged with the event id, so redelivery is harmless.</li>
+<li>Downstream consumers (feed fan-out backfills A's feed with B's recent posts; the notification service tells B) receive the same event.</li>
+</ol>
+<p><b>Unfollow</b> is the same flow with a delete. In an LSM-based store a delete writes a tombstone. We write the out-edge tombstone first (the user-visible truth), then the event removes the in-edge, removes friend rows if they existed, and decrements counters. The version number protects against a quick follow-unfollow-follow sequence being applied out of order.</p>
+<h3>7.2 Read paths</h3>
+<ul>
+<li><b>Relationship check (A, B).</b> Two point reads on the out-edge table: (A, B) and (B, A). Both are single-partition lookups on A's and B's shards and are cache-friendly. We do not use the in-edge table, so a celebrity B never sees this read concentrated on its shard.</li>
+<li><b>Following list.</b> Range scan of A's partition in edges_out, newest first, 50 rows per page, served from the adjacency cache when A is active.</li>
+<li><b>Followers list.</b> Range scan over the buckets of B's partition in edges_in. For ordinary accounts there is one bucket; for celebrities there are several (section 11), and the reader merges them.</li>
+<li><b>Counts.</b> One cache read. Counts are maintained incrementally and reconciled by a nightly job (section 13); we never run <code>COUNT(*)</code> online.</li>
+</ul>
+
+<h2 id="deep-edges">8. Deep dive 1: edge storage and sharding by user</h2>
+<h3>8.1 Choosing the shard key</h3>
+<p>Sharding (<a href="../chapters/25-sharding.html">Chapter 25</a>) is a choice of key and of mapping. The candidates:</p>
+<table>
+<tr><th>Option</th><th>Single-hop query cost</th><th>Balance</th><th>Problems</th></tr>
+<tr><td>Shard edges by hash(src, dst)</td><td>List of A's follows hits every shard (scatter-gather)</td><td>Perfectly even</td><td>Every list query is a fan-out to all shards: poor tail latency at 350 K QPS. Rejected.</td></tr>
+<tr><td>Shard by hash(user_id), each table by its own owner (out by src, in by dst)</td><td>One shard for a list; a relationship check touches at most two shards</td><td>Even except for celebrity partitions</td><td>Writes touch two shards (the cost of denormalisation). Hot partition for celebrities (fixed by buckets).</td></tr>
+<tr><td>Shard by range of user_id</td><td>One shard</td><td>Poor: recent accounts are all on the newest shard</td><td>Needs constant splitting; skewed by signup waves. Rejected.</td></tr>
+<tr><td>Graph partitioning (community detection, keep friends together)</td><td>Often one shard</td><td>Hard to keep balanced</td><td>Communities shift; large re-partitioning jobs; no gain for celebrity edges. Tempting but rarely worth the complexity.</td></tr>
+</table>
+<p>We choose <b>hash of the owner's user id</b> for each table. Hashing removes the signup-order skew; owning each table by one endpoint makes "list for user X" one partition scan. Rather than mapping hash directly to machines, we use <b>1,024 logical shards</b> (hash(user_id) mod 1024) and a small shard map from logical shard to physical node, with 16 logical shards on each of 64 primary nodes. When we add capacity we move whole logical shards between nodes without rehashing any key. This is the standard virtual-shard trick (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a> covers consistent hashing as an alternative).</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Mapping a user id to a logical shard and a physical node">
+<rect class="ext" x="20" y="40" width="130" height="50" rx="8"/><text class="t-c t-b" x="85" y="62">user_id = 7</text><text class="t-c t-sm" x="85" y="79">edges_out owner</text>
+<rect class="box" x="190" y="40" width="150" height="50" rx="8"/><text class="t-c t-b" x="265" y="62">hash(7) mod 1024</text><text class="t-c t-sm" x="265" y="79">= logical shard 613</text>
+<rect class="cache" x="380" y="40" width="160" height="50" rx="8"/><text class="t-c t-b" x="460" y="62">Shard map</text><text class="t-c t-sm" x="460" y="79">613 to node n38 (cached)</text>
+<rect class="db" x="580" y="20" width="150" height="46" rx="8"/><text class="t-c t-b" x="655" y="48">n38 primary</text>
+<rect class="db" x="580" y="78" width="150" height="46" rx="8"/><text class="t-c t-b" x="655" y="106">n38 replica 1</text>
+<rect class="db" x="580" y="136" width="150" height="46" rx="8"/><text class="t-c t-b" x="655" y="164">n38 replica 2</text>
+<rect class="ext" x="20" y="200" width="130" height="50" rx="8"/><text class="t-c t-b" x="85" y="222">user_id = 12</text><text class="t-c t-sm" x="85" y="239">edges_in owner</text>
+<rect class="box" x="190" y="200" width="150" height="50" rx="8"/><text class="t-c t-b" x="265" y="222">hash(12) mod 1024</text><text class="t-c t-sm" x="265" y="239">= logical shard 87</text>
+<rect class="cache" x="380" y="200" width="160" height="50" rx="8"/><text class="t-c t-b" x="460" y="222">Shard map</text><text class="t-c t-sm" x="460" y="239">87 to node n05</text>
+<rect class="db" x="580" y="210" width="150" height="46" rx="8"/><text class="t-c t-b" x="655" y="238">n05 primary</text>
+<path class="arrow" d="M150 65 L188 65"/><path class="arrow" d="M340 65 L378 65"/><path class="arrow" d="M540 55 L578 45"/><path class="arrow dash" d="M650 68 L650 76"/>
+<path class="arrow" d="M150 225 L188 225"/><path class="arrow" d="M340 225 L378 225"/><path class="arrow" d="M540 230 L578 233"/>
+<text class="t-sm" x="20" y="285">A follow from 7 to 12 writes the out-edge on node n38 and, later, the in-edge on node n05.</text>
+<text class="t-sm" x="20" y="305">Adding nodes moves whole logical shards; keys never rehash. 1,024 shards / 64 nodes = 16 shards per node.</text>
+<text class="t-sm" x="760" y="48">writes</text><text class="t-sm" x="760" y="106">reads</text><text class="t-sm" x="760" y="164">reads</text>
+</svg>
+<figcaption>The two endpoints of one edge usually live on different nodes. The out-edge write happens on the actor's shard in the foreground; the in-edge write happens on the target's shard in the background. Replicas serve most reads.</figcaption>
+</figure>
+<h3>8.2 Cross-shard consistency without distributed transactions</h3>
+<p>Because the out-edge and the in-edge live on different shards, a follow is a two-shard update. Running a two-phase commit (<a href="../chapters/31-distributed-transactions.html">Chapter 31</a>) for 1,750 follows per second is possible but would add latency, make availability the product of two shards' availability, and block on slow participants. The alternative is the pattern from section 7: commit the source of truth locally, then propagate asynchronously, and design the propagation to be idempotent and repairable. The window of inconsistency is typically seconds. During it, "A follows B" is true in edges_out but B's followers page may not yet list A. This is acceptable because the actor sees the right state through read-your-writes and nobody else can tell.</p>
+<p>What if the worker dies for good, or an event is lost? A repair job (<b>anti-entropy</b>) periodically compares the two tables for a slice of the key space, either by sampling or by comparing per-partition checksums, and fixes differences (<a href="../chapters/33-gossip-merkle.html">Chapter 33</a> describes Merkle-tree style comparison). Because edges_out is the source of truth, repair always rebuilds edges_in and friends from it, never the other way around. This also gives disaster recovery: edges_in can be rebuilt from scratch from edges_out, which is a useful tool when we change the bucket count.</p>
+<h3>8.3 Row layout and paging</h3>
+<p>Within a partition, rows are sorted by <code>created_at</code> descending, then by neighbour id, so the first page is the newest follows and a keyset cursor <code>(created_at, id)</code> continues from where the last page ended. A "relationship check" needs lookup by neighbour id, not by time, so we keep a secondary clustering order (a second small table or a local index) keyed by (src, dst), which serves the point lookup. In a sharded MySQL implementation that is simply two indexes on the same table; in a wide-column store it is two column families or a materialised view.</p>
+
+<h2 id="deep-mutual">9. Deep dive 2: mutual friends</h2>
+<p>The query is: given viewer A and profile owner B, which accounts are friends of both? Because "friends" are bounded at 5,000 per user, this is the intersection of two bounded sets. Several designs exist.</p>
+<table>
+<tr><th>Approach</th><th>How</th><th>Cost</th><th>Verdict</th></tr>
+<tr><td>Self-join in the database</td><td>SQL join of the follow table with itself</td><td>Cross-shard, unpredictable, scans up to 10,000 index entries on a hot database</td><td>Rejected at scale</td></tr>
+<tr><td>Intersect two sorted lists in the service</td><td>Fetch friends(A) and friends(B) (two single-shard reads, usually cached), run a two-pointer merge or hash-set lookup</td><td>O(|A| + |B|), at most 10,000 comparisons, microseconds of CPU; network cost is two reads of at most 40 KB each</td><td><b>Chosen</b> for the default path</td></tr>
+<tr><td>Precompute every pair</td><td>Store mutual friends for all pairs</td><td>Quadratic in space; pairs change with every follow</td><td>Impossible</td></tr>
+<tr><td>Compressed bitmaps (for example Roaring)</td><td>Store each friend list as a compressed bitmap of ids and AND two bitmaps</td><td>Very fast for dense lists; extra encoding work and memory</td><td>Good optimisation if profiling shows CPU, not network, is the bottleneck</td></tr>
+<tr><td>Probabilistic count only</td><td>Show "about 37 mutual friends" using sketches</td><td>Tiny memory; no names</td><td>Useful when only the count is shown, for example on cards in a list</td></tr>
+</table>
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="Two sorted friend lists intersected by a two pointer merge">
+<text class="t-b" x="20" y="28">friends(A), sorted by id</text>
+<text class="t-b" x="20" y="148">friends(B), sorted by id</text>
+<rect class="box" x="60" y="40" width="70" height="40" rx="8"/><text class="t-c" x="95" y="65">3</text>
+<rect class="hit" x="150" y="40" width="70" height="40" rx="8"/><text class="t-c t-b" x="185" y="65">9</text>
+<rect class="box" x="240" y="40" width="70" height="40" rx="8"/><text class="t-c" x="275" y="65">14</text>
+<rect class="hit" x="330" y="40" width="70" height="40" rx="8"/><text class="t-c t-b" x="365" y="65">21</text>
+<rect class="hit" x="420" y="40" width="70" height="40" rx="8"/><text class="t-c t-b" x="455" y="65">40</text>
+<rect class="box" x="510" y="40" width="70" height="40" rx="8"/><text class="t-c" x="545" y="65">77</text>
+<rect class="box" x="60" y="160" width="70" height="40" rx="8"/><text class="t-c" x="95" y="185">5</text>
+<rect class="hit" x="150" y="160" width="70" height="40" rx="8"/><text class="t-c t-b" x="185" y="185">9</text>
+<rect class="hit" x="240" y="160" width="70" height="40" rx="8"/><text class="t-c t-b" x="275" y="185">21</text>
+<rect class="box" x="330" y="160" width="70" height="40" rx="8"/><text class="t-c" x="365" y="185">33</text>
+<rect class="hit" x="420" y="160" width="70" height="40" rx="8"/><text class="t-c t-b" x="455" y="185">40</text>
+<rect class="box" x="510" y="160" width="70" height="40" rx="8"/><text class="t-c" x="545" y="185">90</text>
+<path class="arrow-g" d="M185 82 L185 158"/><path class="arrow-g" d="M365 82 L278 158"/><path class="arrow-g" d="M455 82 L455 158"/>
+<rect class="hit" x="650" y="90" width="220" height="70" rx="8"/><text class="t-c t-b" x="760" y="118">Mutual friends</text><text class="t-c" x="760" y="142">9, 21, 40 (count 3)</text>
+<path class="arrow-g" d="M582 125 L648 125"/>
+<text class="t-sm" x="20" y="240">Advance the pointer with the smaller id; equal ids are emitted. Work is at most |A| + |B| steps.</text>
+<text class="t-sm" x="20" y="262">Fetch both lists from the cache (one shard each). A and B live on different nodes, so merge in the read service.</text>
+</svg>
+<figcaption>Green boxes are ids present in both lists. Two sorted lists are intersected in one pass without any database join. For lists up to 5,000 entries each this is about 10,000 steps, negligible CPU.</figcaption>
+</figure>
+<h3>9.1 Handling the follower model (non-reciprocal)</h3>
+<p>Not every product shows only friends. On a follower network the useful question is "people I follow who also follow B". The naive approach, intersecting following(A) (at most 7,500) with followers(B) (up to 100 M), is wrong for celebrities because it would load a giant list. The right approach is to iterate over the <b>smaller</b> side and do point lookups on the other: for each followee f of A (at most 7,500, typically 200), ask whether edge (f, B) exists. These are lookups in each f's out-edge partition, batched by shard (about 64 parallel batch calls at most). That is O(|following(A)|) regardless of B's popularity, and it uses the out-edge table, which is never hot for B. A bloom filter or the friend table can short-circuit some cases (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>).</p>
+<h3>9.2 Caching the answer</h3>
+<p>The result for a (viewer, owner) pair is cheap to compute and rarely repeated, so caching pairs is wasteful. Cache the <b>inputs</b> instead: friend lists of active users (at most 5,000 x 8 B = 40 KB each). A hot profile appears in thousands of viewers' requests per second, so its friend list stays in cache permanently. For list views that show only a count, compute from the cached lists and optionally cache the count per pair with a short TTL.</p>
+
+<h2 id="deep-suggest">10. Deep dive 3: friend suggestions ("people you may know")</h2>
+<p>The classic signal is the <b>friend of a friend</b> (FoF): accounts that are two hops away. The more mutual friends two people have, the more likely they know each other. Additional signals include shared groups, school or employer, address-book matches, profile views, and recency of contact. A machine-learning ranker combines them, but the candidate generation, the hard systems part, is a graph computation.</p>
+<h3>10.1 Why not compute online</h3>
+<p>Suppose a user has 200 friends who each have 200 friends. The FoF set is up to 40,000 candidates before deduplication. Counting how many paths reach each candidate means reading 200 friend lists (200 shard reads) and aggregating 40,000 ids. Doing that per request for 500 M DAU at several opens per day would add millions of heavy operations per second, and a user with a friend who has 5,000 friends makes it worse. Online computing is only reasonable for tiny graphs. Instead we compute offline.</p>
+<h3>10.2 Offline pipeline</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Offline pipeline for friend suggestions">
+<rect class="db" x="20" y="40" width="150" height="60" rx="8"/><text class="t-c t-b" x="95" y="65">Edge snapshot</text><text class="t-c t-sm" x="95" y="84">daily export</text>
+<rect class="box" x="210" y="40" width="170" height="60" rx="8"/><text class="t-c t-b" x="295" y="65">Two-hop join</text><text class="t-c t-sm" x="295" y="84">emit (A, C, via B)</text>
+<rect class="box" x="420" y="40" width="160" height="60" rx="8"/><text class="t-c t-b" x="500" y="65">Aggregate</text><text class="t-c t-sm" x="500" y="84">count paths per (A, C)</text>
+<rect class="box" x="620" y="40" width="130" height="60" rx="8"/><text class="t-c t-b" x="685" y="65">Score + filter</text><text class="t-c t-sm" x="685" y="84">ML ranker</text>
+<rect class="db" x="780" y="40" width="100" height="60" rx="8"/><text class="t-c t-b" x="830" y="65">KV store</text><text class="t-c t-sm" x="830" y="84">top 50</text>
+<rect class="ext" x="210" y="160" width="170" height="60" rx="8"/><text class="t-c t-b" x="295" y="185">Other signals</text><text class="t-c t-sm" x="295" y="204">contacts, groups, views</text>
+<rect class="cache" x="620" y="160" width="130" height="60" rx="8"/><text class="t-c t-b" x="685" y="185">Exclusions</text><text class="t-c t-sm" x="685" y="204">follows, blocks, hides</text>
+<path class="arrow" d="M170 70 L208 70"/><path class="arrow" d="M380 70 L418 70"/><path class="arrow" d="M580 70 L618 70"/><path class="arrow" d="M750 70 L778 70"/>
+<path class="arrow dash" d="M380 175 L618 85"/><path class="arrow dash" d="M685 160 L685 102"/>
+<text class="t-sm" x="20" y="255">Degree cap: a mid node with more than 1,000 friends contributes only a random sample of its neighbours (or a lower weight).</text>
+<text class="t-sm" x="20" y="277">At serve time the Suggestion API re-checks exclusions live, so a stale list never shows someone just followed or blocked.</text>
+</svg>
+<figcaption>Suggestions are produced by a batch pipeline on an edge snapshot. The join emits one record for every length-two path, the aggregation counts paths per candidate, and a ranker keeps the best 50. Real-time exclusions are applied at serve time.</figcaption>
+</figure>
+<p>The batch runs on a distributed dataflow engine (<a href="../chapters/37-batch-stream.html">Chapter 37</a>). The two-hop join is the expensive step: for each middle node B it pairs every friend of B with every other friend of B, so a node with degree d produces d(d-1) pairs. This quadratic blow-up is the key problem, and the standard remedies are:</p>
+<ul>
+<li><b>Degree capping and sampling.</b> For nodes with degree over about 1,000 emit pairs only for a random sample of neighbours, or skip them (their path carries little information: a celebrity connects millions of unrelated people). Weighting each path by 1/log(degree of the middle node), the Adamic-Adar weighting, further reduces the influence of high-degree middle nodes.</li>
+<li><b>Incremental recomputation.</b> Recompute only for users active in the last week whose neighbourhood changed. Assume 100 M such users per day and 20,000 sampled pairs each: 2 trillion pair emissions. A cluster of 1,000 cores each producing about 1 M pairs per second finishes in about 2,000 seconds, under an hour. This is an estimate, not a benchmark, but it shows the job fits in a nightly window.</li>
+<li><b>Keep only the top K.</b> Maintain a bounded heap of 50 candidates per user during aggregation instead of materialising every FoF.</li>
+</ul>
+<h3>10.3 Alternatives</h3>
+<table>
+<tr><th>Option</th><th>Strength</th><th>Weakness</th></tr>
+<tr><td>Offline FoF counting plus ranker (chosen)</td><td>Predictable cost, easy to debug, results can be hours old and cached</td><td>Stale; new users have no suggestions until the first job (use contacts and onboarding signals)</td></tr>
+<tr><td>Online FoF for small graphs</td><td>Fresh; no pipeline</td><td>Does not scale to heavy users; unpredictable tail latency</td></tr>
+<tr><td>Learned graph embeddings (nearest-neighbour search)</td><td>Captures more than shared friends; finds candidates beyond two hops</td><td>Needs ML infrastructure and an approximate nearest-neighbour index; harder to explain a suggestion</td></tr>
+<tr><td>Random-walk or personalised ranking on a subgraph</td><td>Good quality for sparse users</td><td>More compute per user</td></tr>
+</table>
+<p>We start with the first option and add embeddings later as another candidate source feeding the same ranker. Every suggestion carries a <b>reason</b> ("12 mutual friends") that the mutual-friend machinery from section 9 supplies cheaply. Privacy matters here: suggestions can reveal relationships, so private accounts and blocked pairs are excluded in the pipeline and again at serve time.</p>
+
+<h2 id="deep-hot">11. Deep dive 4: celebrity hot nodes</h2>
+<p>One account with 100 million followers breaks the assumption that load is spread evenly. Three different hot spots appear, and each needs its own remedy.</p>
+<h3>11.1 Hot partition on writes (the in-edge table)</h3>
+<p>In edges_in the partition key is the target, so all 100 M rows for the celebrity live in one partition on one node, and a burst of 20,000 follows per second all lands there. A single node typically handles on the order of several thousand writes per second, so it saturates, replication lags, and reads of that partition slow too. The remedy is to <b>bucket the partition key</b>: the in-edge key becomes <code>(dst_id, bucket)</code> with <code>bucket = hash(src_id) mod B</code>, where B is chosen per account. Ordinary accounts have B = 1. When an account crosses a follower threshold (say 1 million), a background job raises its B to 16, then 64 for the biggest. Each follower's row goes to a bucket determined by its own id, so writes spread evenly across B different shards: 20,000 per second over 16 buckets is 1,250 per second per shard.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 320" role="img" aria-label="Spreading a celebrity in-edge partition across buckets and shards">
+<rect class="ext" x="20" y="120" width="150" height="60" rx="8"/><text class="t-c t-b" x="95" y="145">Celebrity C</text><text class="t-c t-sm" x="95" y="164">100 M followers</text>
+<rect class="box" x="210" y="120" width="170" height="60" rx="8"/><text class="t-c t-b" x="295" y="143">bucket =</text><text class="t-c t-b" x="295" y="162">hash(src) mod 16</text>
+<rect class="db" x="450" y="20" width="200" height="44" rx="8"/><text class="t-c t-b" x="550" y="48">(C, bucket 0) on shard 17</text>
+<rect class="db" x="450" y="80" width="200" height="44" rx="8"/><text class="t-c t-b" x="550" y="108">(C, bucket 1) on shard 402</text>
+<rect class="db" x="450" y="140" width="200" height="44" rx="8"/><text class="t-c t-b" x="550" y="168">(C, bucket 2) on shard 951</text>
+<rect class="db" x="450" y="200" width="200" height="44" rx="8"/><text class="t-c t-b" x="550" y="228">(C, bucket 15) on shard 288</text>
+<text class="t-c t-sm" x="550" y="188" style="display:none">...</text>
+<rect class="cache" x="700" y="60" width="180" height="60" rx="8"/><text class="t-c t-b" x="790" y="85">16 sub-counters</text><text class="t-c t-sm" x="790" y="104">sum on read, cache 1 s</text>
+<rect class="box" x="700" y="150" width="180" height="60" rx="8"/><text class="t-c t-b" x="790" y="175">Follower scan</text><text class="t-c t-sm" x="790" y="194">read 16 buckets in parallel</text>
+<path class="arrow" d="M170 150 L208 150"/>
+<path class="arrow" d="M380 140 L448 42"/><path class="arrow" d="M380 145 L448 102"/><path class="arrow" d="M380 155 L448 162"/><path class="arrow" d="M380 165 L448 222"/>
+<path class="arrow dash" d="M652 60 L698 85"/><path class="arrow dash" d="M652 170 L698 175"/>
+<text class="t-sm" x="20" y="285">Writes: 20,000 per second / 16 buckets = 1,250 per second per shard. Relationship checks never touch these partitions:</text>
+<text class="t-sm" x="20" y="305">"does U follow C" is a lookup in U's own out-edge partition, which is spread across all users.</text>
+</svg>
+<figcaption>The celebrity's in-edge partition is split into buckets chosen by the follower's id, and each bucket maps to a different shard. Counters are split the same way. Readers that scan all followers read every bucket in parallel and merge the results.</figcaption>
+</figure>
+<h3>11.2 Hot key on counters</h3>
+<p>The follower counter for a celebrity is one key incremented 20,000 times per second. Atomic increments on one key serialise on one node. Use <b>sharded counters</b>: 16 sub-counters, each follower event increments <code>counter[C][hash(src) mod 16]</code>, and a read sums the 16 values (cached for about a second). Better still, workers <b>batch</b>: aggregate increments in memory for a short interval (say 500 ms) and apply one delta per counter per interval. Counts then lag slightly, which no one notices on a number like 100,412,331. A nightly reconciliation job recounts from the edge table to correct drift (section 13).</p>
+<h3>11.3 Hot reads and giant lists</h3>
+<ul>
+<li><b>Profile and counts reads</b> for a famous account arrive from millions of viewers. These are cacheable, and a few seconds of staleness is fine, so we cache them aggressively and add a tiny in-process cache in the read service with a 1 to 5 second TTL. For the very hottest keys, replicate the cache entry across several cache nodes and have clients pick one at random, to avoid one cache node taking the whole load (<a href="../chapters/14-caching-failures.html">Chapter 14</a>, the hot-key and stampede problems).</li>
+<li><b>Follower list scans</b> by fan-out. A post by a 100 M-follower account would need 100 M feed insertions, which is exactly why <a href="c06-news-feed.html">Case study 6</a> uses pull for celebrities. The graph service supports this by exposing "is_celebrity" and by paging the scan in 1,000-row pages read from replicas, never as one query.</li>
+<li><b>Never offer "list all followers" as one response.</b> The public follower list is paginated, and past a certain depth (for example 10,000 entries) the UI stops, as large networks do for abuse and cost reasons.</li>
+<li><b>Mutual friends with a celebrity</b> iterate over the viewer's smaller list (section 9.1), so the celebrity's size never matters.</li>
+</ul>
+<h3>11.4 Tradeoff</h3>
+<table>
+<tr><th>Choice</th><th>Upside</th><th>Downside</th></tr>
+<tr><td>Bucket in-edge partitions only for large accounts</td><td>Small accounts keep one-partition scans and simple paging</td><td>A migration is needed when an account crosses the threshold; readers must know B</td></tr>
+<tr><td>Bucket every account at a fixed B (for example 4)</td><td>No migration, simpler logic</td><td>Every follower list of a normal account becomes 4 reads and a merge, wasting 99% of the benefit</td></tr>
+<tr><td>Dedicated "celebrity" cluster</td><td>Isolation: one account cannot hurt others</td><td>More infrastructure; still needs buckets inside it</td></tr>
+</table>
+<p>We choose threshold-based buckets, with the bucket count stored in the user's metadata row and cached. Changing B requires re-writing the in-edge rows of that account, which is possible because edges_out is the source of truth: a background job streams that account's followers from their out-edge partitions (or from the old in-edge buckets) and writes them into the new layout, with dual reads during the cutover.</p>
+
+<h2 id="scaling">12. Scaling, bottlenecks and caching</h2>
+<h3>12.1 Read path</h3>
+<p>Reads are 99.5% of operations. Layers, from the closest to the store:</p>
+<ul>
+<li><b>Adjacency cache</b> (Redis or Memcached, <a href="../chapters/13-caching-patterns.html">Chapter 13</a>): per-user following list (as a sorted structure or compact blob), friend list, counters, relationship bits. Read-through with TTL (for example one hour for lists, seconds for celebrity counters). On a follow by A, the write path updates A's cached lists directly (write-through for the actor), and event consumers invalidate or patch B's follower-related entries.</li>
+<li><b>Read replicas</b> (<a href="../chapters/24-replication.html">Chapter 24</a>): reads that miss the cache go to replicas, with the primary used only for the actor's read-your-writes window (tracked by a short-lived "recently wrote" flag that routes that user's reads to the primary for a few seconds).</li>
+<li><b>Request coalescing</b>: when many concurrent requests need the same missing key, one fetches and the others wait for it, preventing a stampede on the store.</li>
+<li><b>Batching</b>: the batch relationship API groups lookups by shard so a page of 50 profile cards costs at most a handful of RPCs.</li>
+</ul>
+<h3>12.2 Write path</h3>
+<p>With 1,750 follows per second at peak, a single logical shard does not need to be fast, but the system must absorb bursts and replays. Kafka partitions events by target; workers scale with partition count. Backlog on the queue converts a burst into a short delay in derived tables, never into a failure for the user. If follow volume grows 10x, adding nodes and increasing logical-to-physical spreading is enough.</p>
+<h3>12.3 Where the bottlenecks are</h3>
+<table>
+<tr><th>Bottleneck</th><th>Symptom</th><th>Relief</th></tr>
+<tr><td>Celebrity partition (writes)</td><td>One shard CPU at 100%, replication lag</td><td>Bucketed in-edge keys, batching, sharded counters</td></tr>
+<tr><td>Cache miss storm after a cache node loss</td><td>Store read rate jumps from 35 K to hundreds of thousands per second</td><td>Consistent hashing with replicas of cache entries, coalescing, request shedding, warm-up from replicas</td></tr>
+<tr><td>Tombstone build-up in LSM stores</td><td>Slow range scans of lists with many deletes</td><td>Tuned compaction, shorter tombstone GC for edge tables, rewrite partitions with heavy churn</td></tr>
+<tr><td>Cross-shard fan-out of batch calls</td><td>Tail latency of a 500-target batch</td><td>Cap batch size; parallelise by shard; hedge slow calls; return partial results with flags</td></tr>
+<tr><td>Offline job size</td><td>FoF job misses its window</td><td>Degree caps, sampling, incremental recompute, more cores</td></tr>
+</table>
+<h3>12.4 Rebalancing and resharding</h3>
+<p>Because we use 1,024 logical shards, adding capacity means copying whole logical shards to new nodes, switching the shard map entry, and deleting the old copy. A shard is about 15 GB logical (15 TB / 1,024), so one move copies about 15 GB and takes minutes. If we ever need more than 1,024 logical shards (a possibility at 10x scale), we split each into two, doubling the count in a controlled, shard-by-shard migration (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a> covers migration strategies).</p>
+
+<h2 id="failures">13. Failure modes, consistency and multi-region</h2>
+<table>
+<tr><th>Component</th><th>If it fails, slows or returns wrong data</th><th>Mitigation</th></tr>
+<tr><td>Edge shard primary down</td><td>Follows and unfollows for its users fail; reads still work from replicas</td><td>Automatic failover to a replica (<a href="../chapters/41-ha-dr.html">Chapter 41</a>); clients retry idempotent writes with the same request id; queue user-visible follow as pending only if the product accepts it</td></tr>
+<tr><td>Replica lag</td><td>A user does not see a new follow, or sees an old unfollow</td><td>Route the actor to the primary briefly; show optimistic UI state client-side; alarm on lag over a few seconds</td></tr>
+<tr><td>Kafka down or backlogged</td><td>in-edges, friends and counters lag; downstream consumers lag</td><td>Outbox keeps events safe in the shard until Kafka returns; the user path is unaffected; page on backlog age (<a href="../chapters/40-resilience.html">Chapter 40</a>)</td></tr>
+<tr><td>Edge worker crash mid-event</td><td>Event replayed after restart; duplicates possible</td><td>Idempotent upserts keyed by (src, dst, version); counter deltas keyed by event id (deduplicated) or recomputed nightly</td></tr>
+<tr><td>Lost or skipped event</td><td>edges_in or counters permanently differ from edges_out</td><td>Anti-entropy repair per partition; nightly reconciliation of counters using counted rows; metric of mismatches found</td></tr>
+<tr><td>Cache node down</td><td>Miss storm on stores; tail latency spikes</td><td>Replicated cache entries, coalescing, circuit breaker with stale-while-error from local cache (<a href="../chapters/14-caching-failures.html">Chapter 14</a>)</td></tr>
+<tr><td>Cache holds stale data after unfollow or block</td><td>A blocked user still appears to follow or can see content</td><td>Blocks check the source of truth (primary read of the block row) for content access decisions; invalidate synchronously on block; keep cache TTLs short for block bits</td></tr>
+<tr><td>Wrong counters</td><td>A profile shows a follower count off by a few</td><td>Acceptable for small drift; reconcile; round large counts in the UI ("100.4M") so exactness is not promised</td></tr>
+<tr><td>Suggestion job fails or is late</td><td>Stale suggestions</td><td>Serve previous day's list; flag staleness; fall back to popular or contact-based candidates</td></tr>
+<tr><td>Hot account detection late</td><td>A newly viral account overloads a shard before being bucketed</td><td>Track follower velocity (follows per minute) and trigger early bucketing; rate-limit follow endpoint per target as a safety valve</td></tr>
+</table>
+<h3>13.1 Consistency and idempotency decisions</h3>
+<ul>
+<li><b>Source of truth</b>: edges_out, one shard per actor, committed with the outbox row in one local transaction.</li>
+<li><b>Derived data</b> (edges_in, friends, counters, suggestions) is eventually consistent and rebuildable. This is the core claim of the design and should be said explicitly in the interview.</li>
+<li><b>Idempotency</b>: follow and unfollow are set operations on a primary key, so repeating them is a no-op. Counters are the exception, because incrementing twice is wrong; we use the event id to dedupe or accept rare drift fixed by reconciliation.</li>
+<li><b>Ordering</b>: events for one target are ordered by partitioning, and the version in each row resolves races between a follow and an unfollow that arrive out of order.</li>
+<li><b>Race: mutual follow.</b> A follows B and B follows A at the same moment. Each worker checks the reverse edge, but both may check before the other's edge is visible and neither writes the friend rows. The fix is a re-check: after writing its own edge, each worker re-reads the reverse edge once more with a short delay, or the nightly reconciliation computes friends from edges. Friend rows are an idempotent derived fact, so duplicating the write is harmless.</li>
+<li><b>Block semantics</b>: a block is a strongly consistent write on the blocker's shard; the worker removes the opposite edge and the content services consult blocks at read time. Because of the delay, a block must never rely solely on derived tables.</li>
+</ul>
+<h3>13.2 Multi-region</h3>
+<p>Users are served from the region nearest them. The simplest correct approach is a <b>home region per user</b>: all writes for edges_out of user A go to A's home region, and other regions hold asynchronous replicas for reads (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>). A follow by A of B, where B is homed elsewhere, writes to A's home; the event is replicated cross-region to B's home to update edges_in and counters. Reads of "who follows B" are served from B's home region or from local replicas with seconds to minutes of lag, which is acceptable under our requirements. Active-active writes to the same edge row from two regions are avoided by the home-region rule, so there are no write conflicts to resolve for a single actor. Unfollow and block events use versions so the latest wins. For disaster recovery, replicas can be promoted, with a possible loss of a few seconds of recent edges; the outbox and Kafka mirror help replay them.</p>
+
+<h2 id="security">14. Security, abuse, monitoring and cost</h2>
+<h3>14.1 Security and abuse</h3>
+<ul>
+<li><b>Authorisation</b>: the actor comes from the token. Private-account lists (followers, following) are visible only to approved followers; the read service checks this per request (<a href="../chapters/55-security.html">Chapter 55</a>).</li>
+<li><b>Follow spam and follow-farming</b>: per-user and per-target rate limits (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>), daily caps, new-account throttling, and anomaly detection on follow velocity. Mass follow-unfollow patterns are a classic abuse signal.</li>
+<li><b>Scraping the graph</b>: deep pagination is capped, list endpoints are rate limited per token and per IP, and large bulk exports are not offered.</li>
+<li><b>Information leaks</b>: suggestions and mutual friends can reveal relationships of private or blocked users. Apply exclusion at both batch time and serve time, and do not show "mutual friend" names that the viewer is not allowed to see.</li>
+<li><b>Deletion and privacy law</b>: deleting an account must remove every edge in both tables and the derived rows (an offline delete job streamed from edges_out), and purge suggestion lists that include the user (<a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>).</li>
+</ul>
+<h3>14.2 Monitoring and SLOs</h3>
+<ul>
+<li><b>SLOs</b>: relationship check p99 under 10 ms with 99.99% availability; list page p99 under 50 ms; mutual friends p99 under 100 ms; follow write p99 under 100 ms; derived-table freshness: 99% of events applied within 10 seconds (<a href="../chapters/54-observability-slos.html">Chapter 54</a>).</li>
+<li><b>Health signals</b>: Kafka consumer lag and oldest unapplied event age; replica lag per shard; cache hit ratio (alert below 85%); store read QPS; per-shard write QPS and the top 10 hottest partitions; number of accounts per bucket count.</li>
+<li><b>Correctness signals</b>: edges_out versus edges_in mismatch rate found by repair; counter drift found by reconciliation; suggestion exclusion violations (a suggested user who was already followed), which should be zero.</li>
+</ul>
+<h3>14.3 Cost</h3>
+<p>The dominant costs are replicated storage (about 45 TB, modest), the cache fleet (a few hundred GB of RAM, modest), and the offline suggestion job, which is the largest compute item and runs for under an hour per day on a few thousand cores. Levers: smaller rows (varint-encoded ids, delta-encoded timestamps), tiered storage for long-inactive users' lists, sampling in the batch job, and fewer replicas in cold regions.</p>
+
+<h2 id="evolution">15. Evolution, phasing and alternatives not chosen</h2>
+<h3>15.1 What to build first</h3>
+<ol>
+<li><b>Phase 1</b>: one sharded relational cluster with two tables (out and in), synchronous writes of both within the same shard when possible, counters stored in the user row. This handles tens of millions of users.</li>
+<li><b>Phase 2</b>: add the adjacency cache, read replicas, and the asynchronous derived tables via an outbox and a queue. Add friend table and mutual-friend service.</li>
+<li><b>Phase 3</b>: add offline suggestions, repair and reconciliation jobs, and a counter service with batching.</li>
+<li><b>Phase 4</b>: bucketed celebrity partitions, sharded counters, multi-region home-based replication.</li>
+</ol>
+<h3>15.2 At 10x scale (about 3.5 million reads per second at peak and 2 trillion edges)</h3>
+<ul>
+<li>Raise logical shards to 4,096 or 8,192; hundreds of primary nodes; stronger isolation of celebrity traffic.</li>
+<li>Add a local per-host cache tier in the read service plus a regional cache tier, reducing store traffic further.</li>
+<li>Suggestions move from daily recompute to incremental streaming updates fed by edge events, plus embeddings for candidate generation.</li>
+<li>Consider graph partitioning for the batch jobs (not the serving path) so the two-hop join shuffles less data.</li>
+</ul>
+<h3>15.3 Alternatives we did not choose</h3>
+<ul>
+<li><b>A native graph database for serving</b>: expressive but hard to shard and operate at this volume, and our queries are shallow.</li>
+<li><b>Two-phase commit for both edge rows</b>: would give immediate consistency of both views but harms latency and availability for a gain nobody sees.</li>
+<li><b>One blob per user adjacency list</b>: simple but unsuitable for celebrities and high write rates.</li>
+<li><b>Fully precomputed mutual friends</b>: quadratic storage.</li>
+<li><b>Online suggestions</b>: fresh but too costly and unpredictable.</li>
+</ul>
+
+<h2 id="qa">16. Interview Q&amp;A</h2>
+<details><summary>Why not use a graph database such as Neo4j for this?</summary>
+<p>Graph databases shine at multi-hop traversals and ad-hoc pattern queries, such as fraud rings or recommendation research. Our serving queries are nearly all one hop from a known user id: list neighbours, check one edge, count. Those are key-range scans, which a sharded key-value or relational store does at lower cost and with simpler scaling. Partitioning a billion-node, 200-billion-edge graph across machines without a cheap natural cut is hard, and a hot celebrity node concentrates load. I would keep a graph engine for offline analytics or a trust-and-safety subgraph, and use sharded adjacency tables for the serving path.</p></details>
+<details><summary>How do you keep the out-edge and in-edge tables consistent?</summary>
+<p>I treat the out-edge table as the source of truth and write it, with an outbox row, in one local transaction on the actor's shard. A relay publishes the outbox event and a worker applies the in-edge row. Every step is idempotent, keyed by (src, dst) and a version, so redelivery is safe. Because events can still be lost or skipped, an anti-entropy job compares partitions and rebuilds the derived table from the source of truth. The user sees the right state through read-your-writes, and other users can only observe the delay of a few seconds. This avoids two-phase commit on the hot path.</p></details>
+<details><summary>How do you compute mutual friends quickly?</summary>
+<p>For a friend graph with a cap of 5,000, I keep a derived friend table so each user has a short, sorted list. The service fetches both lists, which are usually cached and each live on a single shard, and intersects them in one pass over at most about 10,000 entries. That is microseconds of CPU. For a follower graph, I iterate over the smaller side (accounts the viewer follows) and do batched point lookups to see whether each follows the target, so the cost depends on the viewer's list and not on a celebrity's follower count. If only the count is needed, a sketch or a bitmap intersection is enough.</p></details>
+<details><summary>An account with 100 million followers announces something and gets 20,000 follows per second. What breaks and how do you fix it?</summary>
+<p>Three things: the in-edge partition for that account is on one shard that cannot take 20,000 writes per second, the follower counter is a single key being incremented that often, and cached reads of its profile are hot. I bucket the in-edge partition key as (account, hash(follower) mod 16) so writes spread over 16 shards, about 1,250 per second each. I split the counter into sub-counters and batch increments over a short window, and I cache profile and count reads aggressively with a short TTL and replicated hot keys. Relationship checks are unaffected because they use the follower's own out-edge partition.</p></details>
+<details><summary>How would you shard the graph, and what are the downsides?</summary>
+<p>I hash the owner's user id into 1,024 logical shards and map them to physical nodes, with out-edges owned by the source and in-edges owned by the target. A list query is a single-shard range scan, and adding capacity moves whole logical shards without rehashing keys. The downsides are that each follow writes to two shards, so I need asynchronous propagation and repair, and that hash sharding ignores graph locality, so a two-hop query touches many shards. I mitigate this by batching lookups per shard and by moving two-hop work offline, where a dataflow engine handles the shuffle.</p></details>
+<details><summary>How do you generate friend suggestions at this scale?</summary>
+<p>Offline. A daily batch job reads an edge snapshot, joins it with itself to emit every friend-of-friend path, aggregates path counts per candidate, combines them with other signals in a ranker, and stores the top 50 per user in a key-value store. The risk is the quadratic blow-up from high-degree nodes, so I cap or sample neighbours of nodes above about 1,000 friends and weight paths by the inverse log of the middle node's degree. At serve time I re-filter the list so users already followed, blocked or deactivated never appear, and each suggestion shows a reason like the mutual friend count.</p></details>
+<details><summary>How do you maintain accurate follower counts?</summary>
+<p>I never run a count query online. Each event applies a delta to a counter, which is a sharded counter for hot accounts, and the worker deduplicates by event id. Because counters can still drift if an event is lost or applied twice, a nightly job recounts rows per partition from the edge table and corrects the stored value. For large numbers the UI rounds the display, so a small error is invisible. For exactness, such as enforcing the 7,500 follow cap, I count the actor's own out-edge partition, which is small and consistent.</p></details>
+<details><summary>What happens if a user follows, immediately unfollows, and follows again, and the events arrive out of order?</summary>
+<p>Each edge write carries a version, such as a hybrid timestamp assigned on the actor's shard, and the in-edge and friend upserts apply a change only if its version is higher than the stored one. A delayed "add" with an old version is ignored after a newer "remove" has been applied, and the final state matches the actor's last action. For deletes I keep a tombstone with its version until stale events cannot arrive any more, which is bounded by the queue retention. Partitioning events by target also keeps most of them in order.</p></details>
+<details><summary>How do blocks work, and why can't they be eventually consistent?</summary>
+<p>A block is a security and safety decision, so I treat it as a strongly consistent write on the blocker's shard, with the removal of edges in both directions done by events. Because propagation takes seconds, any service that decides whether one user may see another's content calls the graph service to check the block row at read time, reading from the primary or a replica verified fresh. The block bit has a very short cache TTL and is invalidated synchronously on write. Derived views such as suggestions exclude blocked pairs both at batch time and again at serve time.</p></details>
+<details><summary>How do you handle deleting an account with millions of edges?</summary>
+<p>I mark the account as deleted first, which makes it disappear from reads immediately because every read path filters on account status. Then an asynchronous job streams its edge rows from edges_out (the user's followees) and from the in-edge buckets (its followers), deletes the matching rows on the opposite sides, decrements counters in batches, and removes the user from friend and suggestion tables. For an account with 100 million followers the job runs in pages with throttling so it does not create a tombstone storm and slow other partitions. Completion is tracked so the process can resume after a crash.</p></details>
+<details><summary>How would the design change for a symmetric friendship network instead of follows?</summary>
+<p>A friendship needs a request-and-accept handshake and creates one logical relationship, but we can still store it as two directed rows (one per direction) in the friend table, written when the accepting user approves. There is a cap on friends per user, so lists are small and the celebrity problem mostly disappears, replaced by a separate "page" or "follower" concept for public figures. Mutual friends become the central query and are cheap because of the cap. The accept step needs a transaction across two shards or the same asynchronous pattern with a state machine (requested, accepted, declined), and the same repair job guarantees both rows exist.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">17. Recap</h2><ul>
+<li>The social graph is wide and shallow: 1 B nodes, 200 B edges, mostly one-hop queries. A sharded adjacency store plus caches beats a general graph database for serving.</li>
+<li>Estimation: 350 K reads per second at peak versus 1,750 writes per second, about 15 TB logical and 45 TB replicated data. Reads and skew, not volume, drive the design.</li>
+<li>Store every edge twice with different partition keys (out by source, in by target), plus a derived, capped friend table. The out-edge table is the source of truth; everything else is rebuildable.</li>
+<li>Follow commits one local transaction (edge plus outbox), returns, and propagates asynchronously and idempotently with versions. Anti-entropy and nightly reconciliation catch lost events.</li>
+<li>Shard by hash of the owner's user id into 1,024 logical shards mapped to nodes; list queries touch one shard, rebalancing moves whole logical shards.</li>
+<li>Mutual friends are the intersection of two short sorted lists, or point lookups from the smaller side; suggestions come from an offline two-hop job with degree caps and a ranker.</li>
+<li>Celebrities need bucketed in-edge partitions, sharded and batched counters, and aggressive hot-key caching. Relationship checks avoid their partitions entirely.</li>
+<li>Be explicit about consistency: strong where safety needs it (blocks, the actor's own view), eventual everywhere else.</li>
+</ul></div>
+<p class="connects"><b>Connects to:</b> builds on <a href="../chapters/01-interview-framework.html">Chapter 1</a> (framework), <a href="../chapters/02-estimation.html">Chapter 2</a> (estimation), <a href="../chapters/05-api-design.html">Chapter 5</a> (API design), <a href="../chapters/13-caching-patterns.html">Chapter 13</a> and <a href="../chapters/14-caching-failures.html">Chapter 14</a> (adjacency cache, hot keys), <a href="../chapters/15-redis.html">Chapter 15</a> (Redis), <a href="../chapters/17-data-modeling.html">Chapter 17</a> (denormalisation), <a href="../chapters/19-storage-engines.html">Chapter 19</a> (LSM, tombstones), <a href="../chapters/20-nosql.html">Chapter 20</a> (wide-column stores), <a href="../chapters/24-replication.html">Chapter 24</a> (replicas), <a href="../chapters/25-sharding.html">Chapter 25</a> (sharding), <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a> (multi-region), <a href="../chapters/28-cap-consistency.html">Chapter 28</a> (consistency), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotency), <a href="../chapters/33-gossip-merkle.html">Chapter 33</a> (anti-entropy), <a href="../chapters/34-queues-kafka.html">Chapter 34</a> and <a href="../chapters/36-event-driven.html">Chapter 36</a> (events, outbox), <a href="../chapters/37-batch-stream.html">Chapter 37</a> (batch jobs), <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a> (hashing, sketches). Related case study: <a href="c06-news-feed.html">Case study 6, News Feed</a>, which consumes this graph for fan-out.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

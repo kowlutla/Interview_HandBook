@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 28: Design a Distributed Unique ID Generator | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="c28-unique-id-generator">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 28 · Worked solutions</div>
+<h1>Design a Distributed Unique ID Generator</h1>
+<p class="lead">Every row, message, order and event in a large system needs a name that nothing else will ever share, and it must be handed out by hundreds of machines at once without them talking to each other. We walk from random UUIDs and database ticket servers to the Snowflake bit layout, and spend most of our time on the two things that actually break it: clocks that go backwards, and two machines that believe they own the same worker number.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is "Design a distributed unique ID generator." On a single database this is trivial: an auto-increment column hands out 1, 2, 3 and the database serializes the callers. The moment data is spread over many shards, many services and many regions, there is no single counter to ask. Yet we still want identifiers that are unique, compact, cheap to produce and, ideally, roughly ordered by creation time. The question is really about choosing which of those properties to keep and how to build them without a central bottleneck.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>What is an ID used for?</td><td>Primary key for orders, messages, posts and events across about 200 services. IDs are also exposed in URLs and APIs, so they should not be absurdly long.</td></tr>
+<tr><td>How big can it be?</td><td>64 bits. It fits a database <code>BIGINT</code> and a Java <code>long</code>, and it is half the width of a 128-bit key. Anything wider costs memory in every index and foreign key.</td></tr>
+<tr><td>Must IDs be sortable by time?</td><td>Roughly, yes ("k-sortable": sorted order is correct to within a small window such as a few milliseconds). Strict global order is not required and is not achievable without coordination.</td></tr>
+<tr><td>Must IDs be strictly sequential or gap free?</td><td>No. Gaps are fine. Business-visible numbers such as invoice numbers are a separate problem (section 18).</td></tr>
+<tr><td>Scale?</td><td>Average 300,000 IDs per second, peak 1,000,000 per second, across all services, in 3 regions.</td></tr>
+<tr><td>Latency?</td><td>Microseconds if generated in-process, under 2 ms p99 if it is a network call.</td></tr>
+<tr><td>Can IDs be guessed?</td><td>Internal keys may be guessable. Public capability tokens (password reset links) must not use this generator at all.</td></tr>
+<tr><td>Uniqueness guarantee?</td><td>Absolute for roughly 69 years. A duplicate silently corrupts data (two orders overwrite each other), so we make it impossible by construction, not merely improbable.</td></tr>
+<tr><td>What can we assume about clocks?</td><td>Machines run NTP or similar. Clocks are roughly right (within tens of milliseconds) but can jump, drift and occasionally step backwards. See <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>.</td></tr>
+</table>
+<div class="callout tip"><b>Interview tip</b> State the trade-off triangle immediately: uniqueness, compactness and order. Random UUIDs give uniqueness without coordination but are wide and unordered. Database counters give order and compactness but need coordination. Snowflake buys all three by splitting the coordination into a one-time worker-number assignment plus a clock. Then say that the interesting failure is the clock.</div>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li><b>Unique:</b> no two calls, anywhere, at any time in the next 69 years, return the same value.</li>
+<li><b>64-bit numeric:</b> positive, fits a signed 64-bit integer.</li>
+<li><b>Roughly time ordered:</b> an ID generated later is almost always numerically larger, so sorting by ID approximates sorting by creation time.</li>
+<li><b>Decodable:</b> the creation time and the generating worker can be extracted from the ID, which helps debugging and time-range queries without a separate timestamp column.</li>
+<li><b>Available:</b> generating an ID never blocks on a quorum or a remote database in the normal path.</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Throughput:</b> 1,000,000 IDs per second at peak across the fleet; each generator at least 100,000 per second.</li>
+<li><b>Latency:</b> under 1 microsecond in-process, under 2 ms p99 as a remote service.</li>
+<li><b>Fault tolerance:</b> losing any generator, any zone, or the coordination service must not stop generation on machines already running.</li>
+<li><b>Safety under time faults:</b> a backwards clock must never produce a duplicate (section 10).</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Gap-free business sequences (invoice numbers), unguessable security tokens, global strict ordering (that needs a consensus sequencer, <a href="../chapters/29-consensus.html">Chapter 29</a>), and content-addressed IDs (hashes of the data), which solve a different problem.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>ID generation is cheap in CPU terms, so the arithmetic is about the capacity of the bit layout and the storage cost of the IDs, not about compute. Technique is covered in <a href="../chapters/02-estimation.html">Chapter 2</a>.</p>
+<h3>3.1 Rate and volume</h3>
+<p>Peak 1,000,000 IDs/s; average 300,000 IDs/s. Per day at the average: 300,000 x 86,400 = <b>25.9 billion IDs/day</b>. Per year: 300,000 x 31,536,000 = about <b>9.5 trillion IDs/year</b>. Over 69 years that is roughly 650 trillion, about 6.5 x 10^14. A signed 64-bit space holds 2^63 = 9.2 x 10^18, so the raw count is not the constraint. What matters is how we <em>partition</em> the space among time, worker and sequence.</p>
+<h3>3.2 Storage and index cost of key width</h3>
+<p>An 8-byte ID for 25.9 billion rows per day is 207 GB/day of key bytes alone, about 76 TB/year. A 16-byte UUID doubles that to 414 GB/day, and every secondary index and foreign key that repeats the ID doubles too. If a table has three indexes and two child tables referencing it, the key is stored about six times, so halving the key saves several hundred GB per day. That is the quantitative argument for 64 bits.</p>
+<h3>3.3 Capacity of the Snowflake layout</h3>
+<table>
+<tr><th>Field</th><th>Bits</th><th>Capacity</th><th>Arithmetic</th></tr>
+<tr><td>Sign</td><td>1</td><td>always 0</td><td>keeps the value positive in signed types</td></tr>
+<tr><td>Timestamp (ms since a custom epoch)</td><td>41</td><td>about 69.7 years</td><td>2^41 = 2.199 x 10^12 ms, divided by 3.156 x 10^10 ms per year = 69.7</td></tr>
+<tr><td>Worker id (5 datacenter + 5 machine)</td><td>10</td><td>1,024 workers</td><td>2^10</td></tr>
+<tr><td>Sequence (per ms per worker)</td><td>12</td><td>4,096 IDs per ms per worker</td><td>2^12, which is 4.096 million IDs/s per worker</td></tr>
+</table>
+<p>One worker can emit up to 4,096,000 IDs per second. The entire fleet's 1,000,000/s peak could in principle come from <em>one</em> worker, so the number of workers is chosen for availability and locality, not throughput. Spread over 1,024 workers the peak is about 977 IDs/s each, using 0.024 percent of a worker's ceiling. In practice we plan 64 to 128 generator processes per region and keep the rest of the 1,024 as headroom for restarts (section 8).</p>
+<h3>3.4 Worker-id churn</h3>
+<p>If 200 services each run 20 instances, deploy weekly and autoscale so that the fleet doubles daily, we see on the order of 200 x 20 x 2 = 8,000 process starts per day. If each start consumed a worker id permanently, 1,024 would be gone in a few hours. Worker ids must therefore be <b>leased and recycled</b>, which is the central operational problem of section 8.</p>
+
+<h2 id="api">4. API design</h2>
+<p>We expose two shapes. An embedded library produces the ID in-process with no network hop. A thin service covers clients that cannot hold a worker id (browsers, short-lived functions, scripts). API style is in <a href="../chapters/05-api-design.html">Chapter 5</a>.</p>
+<pre><code>// Embedded library
+IdGenerator gen = IdGenerator.create(leaseClient, config);
+long id = gen.nextId();                       // thread safe, microseconds
+IdParts p = IdGenerator.decode(id);           // { timestampMs, workerId, sequence }
+
+// Service
+POST /v1/ids          { "count": 100 }        -> { "ids": ["123...", ...] }
+GET  /v1/ids/{id}/decode                      -> { "created_at": "...", "worker": 417, "sequence": 12 }
+
+// Lease protocol (internal, used by the library at startup)
+acquire(service, instance_hint)  -> { worker_id, lease_id, ttl_ms, last_ts_ms }
+renew(lease_id)                  -> { ttl_ms }
+release(lease_id)                -> {}</code></pre>
+<p>Notes. IDs are returned to JSON clients as <b>strings</b>: a JavaScript number is an IEEE double with only 53 bits of integer precision, so a 63-bit ID would be silently rounded. The batch form (<code>count</code>) amortizes network cost: one call can return up to 1,000 IDs. The lease returns <code>last_ts_ms</code>, the highest timestamp this worker id ever used, which a new owner must wait out (section 10.4). A failed <code>nextId</code> call is safe to retry because IDs are interchangeable: a retry may waste an ID, never duplicate one.</p>
+
+<h2 id="data-model">5. Data model and storage choice</h2>
+<p>The generator itself holds almost no state: a last timestamp and a sequence counter, in memory, per worker. The only durable state is the <b>lease registry</b> that hands out worker ids, a tiny, strongly consistent store of 1,024 rows.</p>
+<table>
+<tr><th>Record</th><th>Fields</th><th>Notes</th></tr>
+<tr><td>WorkerLease</td><td>worker_id (key), owner (host, pid, start nonce), lease_deadline, last_ts_ms, generation</td><td>Held in a consensus-backed store such as etcd or ZooKeeper (<a href="../chapters/30-coordination-locks.html">Chapter 30</a>), or in a relational table with a primary key on worker_id (<a href="../chapters/18-relational-internals.html">Chapter 18</a>). About 1,024 rows and a few writes per second.</td></tr>
+<tr><td>Config</td><td>custom epoch, bit widths, datacenter map, layout version</td><td>Immutable after launch. Changing a bit width changes the meaning of every existing ID, so layouts are versioned.</td></tr>
+<tr><td>Generator memory</td><td>last_ts, sequence, worker_id</td><td>A few bytes; never persisted per ID.</td></tr>
+</table>
+<p>We use a consensus store for leases because the safety property, "no two live processes hold the same worker id", is mutual exclusion, which the <a href="../chapters/30-coordination-locks.html">coordination chapter</a> treats, including the same caveat about leases and process pauses that we revisit in section 8. We deliberately do <b>not</b> store issued IDs anywhere. Recording every ID would make the generator as heavy as the databases it serves.</p>
+
+<h2 id="options">6. The candidate approaches, from simplest to real</h2>
+<p>Before drawing the final design, walk through the options in order of how an interviewer expects the conversation to go. Each one fails a requirement, and the failure motivates the next.</p>
+<h3>6.1 One database auto-increment</h3>
+<p>A single table with an auto-increment column is the baseline. IDs are small, perfectly ordered and gap-light. It fails for two reasons. Every ID generation is a write to one primary, so the ceiling is the write throughput of one database (typically a few thousand to tens of thousands of inserts per second), far below 1,000,000/s. And that primary is a single point of failure for every service that creates anything (<a href="../chapters/24-replication.html">Chapter 24</a>). Sharding the data (<a href="../chapters/25-sharding.html">Chapter 25</a>) makes it worse: each shard has its own counter, so shard 1 and shard 2 both hand out 1, 2, 3, and the same primary key now appears in two places.</p>
+<h3>6.2 Multi-master with step offsets, and ticket servers</h3>
+<p>The classic fix is to give each of N database servers a different offset and step. With two servers, server A starts at 1 and steps by 2 (1, 3, 5), and server B starts at 2 and steps by 2 (2, 4, 6). The sequences never collide. This is the "ticket server" pattern popularized by Flickr: a dedicated tiny table whose only purpose is to hand out IDs, using <code>REPLACE INTO Tickets64 (stub) VALUES ('a'); SELECT LAST_INSERT_ID();</code> and two MySQL servers configured with <code>auto_increment_increment = 2</code> and offsets 1 and 2. Application servers pick one ticket server round robin and fall back to the other if one is down.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Two ticket servers with interleaved odd and even sequences">
+  <rect class="ext" x="20" y="40" width="150" height="50" rx="8"/><text class="t-c t-b" x="95" y="70">App server 1</text>
+  <rect class="ext" x="20" y="120" width="150" height="50" rx="8"/><text class="t-c t-b" x="95" y="150">App server 2</text>
+  <rect class="ext" x="20" y="200" width="150" height="50" rx="8"/><text class="t-c t-b" x="95" y="230">App server N</text>
+  <rect class="db" x="400" y="40" width="210" height="80" rx="8"/><text class="t-c t-b" x="505" y="68">Ticket server A</text><text class="t-c t-sm" x="505" y="90">offset 1, step 2</text><text class="t-c t-sm" x="505" y="108">hands out 1, 3, 5, 7 ...</text>
+  <rect class="db" x="400" y="170" width="210" height="80" rx="8"/><text class="t-c t-b" x="505" y="198">Ticket server B</text><text class="t-c t-sm" x="505" y="220">offset 2, step 2</text><text class="t-c t-sm" x="505" y="238">hands out 2, 4, 6, 8 ...</text>
+  <path class="arrow" d="M170 65 L396 75"/><path class="arrow" d="M170 145 L396 100"/><path class="arrow" d="M170 145 L396 200"/><path class="arrow" d="M170 225 L396 225"/>
+  <rect class="miss" x="690" y="60" width="190" height="90" rx="8"/><text class="t-c t-b" x="785" y="88">Weaknesses</text><text class="t-c t-sm" x="785" y="108">still a network hop per ID</text><text class="t-c t-sm" x="785" y="124">IDs only roughly ordered</text><text class="t-c t-sm" x="785" y="140">adding a 3rd server is painful</text>
+  <text class="t-sm" x="640" y="215">round robin with failover</text>
+</svg>
+<figcaption>Ticket servers: two databases that interleave odd and even numbers. Applications alternate between them. Order across the two servers is only approximate, every ID costs a network round trip, and changing the step later requires a careful re-layout.</figcaption>
+</figure>
+<p>Ticket servers are a legitimate answer for modest scale, but they have real costs. Every ID is a network call (a typical 0.5 to 1 ms inside a datacenter), so a service that needs a thousand IDs per request is slow. Ordering is only per server, so IDs from A and B interleave unpredictably. Growing from two servers to three means changing the step on live databases without ever reusing a value, an operation that needs a planned gap in the sequence. A batch variant (a server hands out blocks of, say, 1,000 numbers that the application consumes locally) lifts throughput by 1,000x and is the idea behind many "segment" allocators. It makes IDs coarsely ordered and wastes the unused part of a block when an application restarts, which is acceptable.</p>
+<h3>6.3 UUIDs</h3>
+<p>A UUID is a 128-bit value, written as 36 characters with hyphens. Version 4 fills 122 of the bits with random data. Anyone can generate one with no coordination at all. The chance of a collision is governed by the birthday bound: with 122 random bits the probability that any two of n IDs collide is about n^2 / 2^123. For n = 10^12 (a trillion) that is 10^24 / 1.06 x 10^37, about 10^-13, so collisions are practically impossible, as long as the random source is good. Three problems remain. The ID is 128 bits, double our budget (section 3.2). It is random, so as a primary key in a B-tree index each insert lands on a random leaf page, which causes cache misses, page splits and write amplification (section 11). And it carries no time, so you cannot sort by it.</p>
+<p>Newer UUID versions fix the ordering. <b>UUIDv7</b> (standardized in RFC 9562) puts a 48-bit Unix millisecond timestamp in the most significant bits, then version bits, then random or counter bits (about 74 bits remain for randomness and sub-millisecond ordering). It is k-sortable and needs no worker id, which makes it a very good default when 128 bits are acceptable. ULID is similar: 48-bit timestamp plus 80 random bits in a 26-character text encoding. MongoDB's ObjectId is 12 bytes: 4 bytes of seconds, 5 bytes random per process, 3 bytes counter.</p>
+<h3>6.4 Snowflake: pack time, worker and sequence into 64 bits</h3>
+<p>Twitter's Snowflake (2010) observed that uniqueness can be built by construction instead of by luck. If every ID contains the millisecond it was made, the worker that made it, and a counter that distinguishes IDs made by that worker within the same millisecond, then no two IDs can be equal unless the same worker produced the same sequence number in the same millisecond, which the worker prevents locally. The only coordination needed is making sure no two live workers share a worker id. That is a tiny, rare operation, done once at process start, instead of one per ID.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="64 bit Snowflake layout: 1 sign, 41 timestamp, 10 worker, 12 sequence">
+  <rect class="hit" x="20" y="60" width="40" height="56" rx="4"/><text class="t-c t-b" x="40" y="94">0</text>
+  <rect class="box" x="60" y="60" width="500" height="56" rx="4"/><text class="t-c t-b" x="310" y="86">timestamp: ms since custom epoch</text><text class="t-c t-sm" x="310" y="104">41 bits, about 69.7 years</text>
+  <rect class="cache" x="560" y="60" width="150" height="56" rx="4"/><text class="t-c t-b" x="635" y="86">worker id</text><text class="t-c t-sm" x="635" y="104">10 bits, 1,024</text>
+  <rect class="db" x="710" y="60" width="170" height="56" rx="4"/><text class="t-c t-b" x="795" y="86">sequence</text><text class="t-c t-sm" x="795" y="104">12 bits, 4,096 / ms</text>
+  <text class="t-sm" x="22" y="48">bit 63</text><text class="t-sm" x="840" y="48">bit 0</text>
+  <text class="t-c t-sm" x="40" y="140">sign</text>
+  <text class="t-b" x="20" y="180">Example: timestamp delta 1,000,000 ms, worker 417, sequence 12</text>
+  <text class="t-sm" x="20" y="204">id = (1,000,000 shifted left 22) + (417 shifted left 12) + 12 = 4,194,304,000,000 + 1,708,032 + 12 = 4,194,305,708,044</text>
+  <text class="t-sm" x="20" y="226">decode: ts = id shifted right 22; worker = (id shifted right 12) AND 1023; sequence = id AND 4095</text>
+</svg>
+<figcaption>The Snowflake layout. The timestamp occupies the high bits so numeric order follows time. The worker id breaks ties between machines in the same millisecond. The sequence breaks ties inside one machine in the same millisecond. Shifts of 22 (10 + 12) and 12 position the fields.</figcaption>
+</figure>
+<p>The arithmetic in the example is worth checking in an interview. Shifting left by 22 bits multiplies by 2^22 = 4,194,304, so 1,000,000 becomes 4,194,304,000,000. The worker field is shifted by 12, so 417 x 4,096 = 1,708,032. Adding the sequence 12 gives 4,194,305,708,044. Because fields occupy disjoint bit ranges, the additions never carry between fields, and reading them back is just masks and shifts.</p>
+<h3>6.5 Comparison</h3>
+<table>
+<tr><th>Approach</th><th>Size</th><th>Ordered?</th><th>Coordination</th><th>Throughput</th><th>Main weakness</th></tr>
+<tr><td>Single DB auto-increment</td><td>8 B</td><td>strict</td><td>every ID</td><td>one DB's write rate</td><td>SPOF and bottleneck</td></tr>
+<tr><td>Ticket servers (2 to 3)</td><td>8 B</td><td>approximate</td><td>every ID (network)</td><td>tens of thousands per second per server</td><td>extra hop, hard to resize</td></tr>
+<tr><td>Segment / block allocation</td><td>8 B</td><td>coarse</td><td>every block</td><td>very high</td><td>gaps on restart, blocks interleave</td></tr>
+<tr><td>UUIDv4</td><td>16 B</td><td>none</td><td>none</td><td>unbounded</td><td>wide, random index inserts</td></tr>
+<tr><td>UUIDv7 / ULID</td><td>16 B</td><td>k-sortable</td><td>none</td><td>unbounded</td><td>wide, depends on clock monotonicity</td></tr>
+<tr><td>Snowflake</td><td>8 B</td><td>k-sortable</td><td>worker id at startup</td><td>4.096M per worker per second</td><td>clock rollback, worker-id uniqueness</td></tr>
+</table>
+<div class="callout key"><b>Key idea</b> Snowflake does not remove coordination. It moves it from "once per ID" to "once per process start", and replaces the rest with a local clock. Every hard problem in this design is a place where that replacement can be wrong: the clock lies, or two processes believe they hold the same worker id.</div>
+<p><b>Decision.</b> We choose Snowflake-style IDs as the primary generator because they meet the 64-bit, ordered, coordination-free-per-ID requirements. We keep UUIDv7 as the documented alternative for teams that prefer zero coordination and accept 128 bits (section 18).</p>
+
+<h2 id="architecture">7. High-level architecture and request flows</h2>
+<p>There are three layers. The <b>generator</b> is a small in-process library (or a sidecar) that holds a worker id and produces IDs. The <b>lease registry</b> hands out and recycles worker ids. The <b>ID service</b> is a thin stateless tier, itself composed of generator processes with leased worker ids, for clients that do not embed the library. Clock discipline (NTP or a cloud time service) is an external dependency that we monitor but do not own.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="Architecture: embedded generators, ID service, lease registry, time source">
+  <rect class="ext" x="20" y="30" width="190" height="56" rx="8"/><text class="t-c t-b" x="115" y="55">Order service pod</text><text class="t-c t-sm" x="115" y="73">embedded generator, worker 17</text>
+  <rect class="ext" x="20" y="110" width="190" height="56" rx="8"/><text class="t-c t-b" x="115" y="135">Chat service pod</text><text class="t-c t-sm" x="115" y="153">embedded generator, worker 18</text>
+  <rect class="ext" x="20" y="190" width="190" height="56" rx="8"/><text class="t-c t-b" x="115" y="215">Browser / script</text><text class="t-c t-sm" x="115" y="233">no worker id of its own</text>
+  <rect class="box" x="300" y="170" width="170" height="76" rx="8"/><text class="t-c t-b" x="385" y="198">Load balancer</text><text class="t-c t-sm" x="385" y="218">L4, round robin</text>
+  <rect class="box" x="560" y="150" width="150" height="46" rx="8"/><text class="t-c t-b" x="635" y="178">ID service pod</text>
+  <rect class="box" x="560" y="210" width="150" height="46" rx="8"/><text class="t-c t-b" x="635" y="238">ID service pod</text>
+  <rect class="db" x="300" y="40" width="250" height="90" rx="8"/><text class="t-c t-b" x="425" y="68">Lease registry</text><text class="t-c t-sm" x="425" y="88">etcd or ZooKeeper, 5 nodes</text><text class="t-c t-sm" x="425" y="106">1,024 worker leases + last_ts</text>
+  <rect class="cache" x="700" y="40" width="180" height="70" rx="8"/><text class="t-c t-b" x="790" y="68">Time source</text><text class="t-c t-sm" x="790" y="88">NTP / chrony / cloud time</text>
+  <rect class="miss" x="300" y="300" width="250" height="56" rx="8"/><text class="t-c t-b" x="425" y="326">Monitoring</text><text class="t-c t-sm" x="425" y="344">clock offset, lease age, waits</text>
+  <path class="arrow dash" d="M210 50 L298 70"/><path class="arrow dash" d="M210 135 L298 100"/>
+  <path class="arrow" d="M210 218 L296 212"/><path class="arrow" d="M470 200 L556 175"/><path class="arrow" d="M470 215 L556 232"/>
+  <path class="arrow dash" d="M580 150 L500 128"/>
+  <path class="arrow dash" d="M720 80 L698 148"/><path class="arrow-r dash" d="M425 300 L425 134"/>
+  <text class="t-sm" x="236" y="48">lease at startup only</text>
+</svg>
+<figcaption>Dashed arrows are rare control traffic (lease at startup and renewal, clock sync). Solid arrows are the data path. Most IDs never leave their process: embedded generators call the registry only at start and at renewal.</figcaption>
+</figure>
+<h3>7.1 Flow A: process startup</h3>
+<ol>
+<li>The process boots and asks the lease registry for a worker id, passing its host, pid and a random start nonce.</li>
+<li>The registry picks a free or expired worker id, writes a lease row with a deadline (for example now + 60 s), and returns <code>worker_id</code>, a <code>generation</code> number and the <code>last_ts_ms</code> that previous owners reached.</li>
+<li>The process reads its own clock. If the clock is earlier than <code>last_ts_ms</code>, it waits (or refuses to start) until the clock passes it. This makes reuse of a worker id safe (section 10.4).</li>
+<li>The process starts a renewal loop at a third of the TTL, and begins serving <code>nextId</code>.</li>
+</ol>
+<h3>7.2 Flow B: nextId on the hot path</h3>
+<ol>
+<li>Read the clock in milliseconds and subtract the custom epoch.</li>
+<li>If the time equals the last timestamp, increment the sequence. If the sequence overflows 4,095, spin until the next millisecond.</li>
+<li>If the time is greater than the last timestamp, reset the sequence to 0 (or a small random start, section 9.3).</li>
+<li>If the time is less than the last timestamp, the clock went backwards: apply the rollback policy of section 10.</li>
+<li>Store the new last timestamp, compose the 64 bits, return. No network, no lock beyond a short mutex or atomic.</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Sequence diagram of startup lease then local ID generation">
+  <rect class="ext" x="40" y="14" width="140" height="34" rx="8"/><text class="t-c t-b" x="110" y="36">Generator</text>
+  <rect class="db" x="260" y="14" width="160" height="34" rx="8"/><text class="t-c t-b" x="340" y="36">Lease registry</text>
+  <rect class="cache" x="500" y="14" width="140" height="34" rx="8"/><text class="t-c t-b" x="570" y="36">Local clock</text>
+  <rect class="box" x="720" y="14" width="140" height="34" rx="8"/><text class="t-c t-b" x="790" y="36">Caller</text>
+  <line class="life" x1="110" y1="48" x2="110" y2="345"/><line class="life" x1="340" y1="48" x2="340" y2="345"/><line class="life" x1="570" y1="48" x2="570" y2="345"/><line class="life" x1="790" y1="48" x2="790" y2="345"/>
+  <path class="arrow" d="M110 78 L338 78"/><text class="t-sm" x="130" y="72">1 acquire(host, nonce)</text>
+  <path class="arrow-g" d="M338 108 L112 108"/><text class="t-sm" x="130" y="102">2 worker 417, gen 9, last_ts T0</text>
+  <path class="arrow" d="M110 138 L568 138"/><text class="t-sm" x="250" y="132">3 read now</text>
+  <path class="arrow-g" d="M568 164 L112 164"/><text class="t-sm" x="250" y="158">now &gt; T0, safe to start</text>
+  <path class="arrow dash" d="M110 194 L338 194"/><text class="t-sm" x="130" y="188">4 renew every TTL/3</text>
+  <path class="arrow" d="M788 224 L112 224"/><text class="t-sm" x="400" y="218">5 nextId()</text>
+  <path class="arrow" d="M110 250 L568 250"/><text class="t-sm" x="250" y="244">6 now_ms</text>
+  <path class="arrow-g" d="M568 276 L112 276"/><text class="t-sm" x="250" y="270">7 ms value</text>
+  <path class="arrow-g" d="M112 312 L788 312"/><text class="t-sm" x="360" y="306">8 id = ts, worker 417, seq (no network)</text>
+</svg>
+<figcaption>Steps 1 to 4 happen once per process. Steps 5 to 8 happen per ID and touch only the local clock, which is why latency is measured in nanoseconds to microseconds.</figcaption>
+</figure>
+<h3>7.3 Generator algorithm</h3>
+<pre><code>synchronized long nextId() {
+    long now = currentMillis() - EPOCH;
+    if (now &lt; lastTs) {                       // clock went backwards
+        return handleRollback(now);           // section 10
+    }
+    if (now == lastTs) {
+        seq = (seq + 1) &amp; 4095;
+        if (seq == 0) {                       // 4096 IDs already issued this ms
+            now = waitNextMillis(lastTs);     // spin or sleep ~1 ms
+        }
+    } else {
+        seq = 0;
+    }
+    lastTs = now;
+    return (now &lt;&lt; 22) | (workerId &lt;&lt; 12) | seq;
+}</code></pre>
+<p>The method is serialized with a lock or implemented with a compare-and-set on one packed 64-bit state word. At 1,000 IDs per second per worker, contention is irrelevant. Even at the 4 million per second ceiling, a single uncontended lock costs tens of nanoseconds per call.</p>
+
+<h2 id="worker-id">8. Deep dive 1: worker-id assignment</h2>
+<p>Everything in Snowflake depends on one invariant: <b>at any moment at most one live process emits IDs with a given worker id</b>, and a later owner of that id never emits an ID that an earlier owner already emitted. The second half is the clock part (section 10.4). The first half is a mutual exclusion problem with the usual wrinkle that a "live" process may be paused.</p>
+<h3>8.1 Options for assigning worker ids</h3>
+<table>
+<tr><th>Option</th><th>How it works</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Static configuration</td><td>Operator edits a file: host A is worker 1, host B is worker 2.</td><td>No dependency at all; simple.</td><td>Breaks under autoscaling and containers; human error causes duplicates; no reuse tracking.</td></tr>
+<tr><td>Derive from IP or hostname</td><td>Lower 10 bits of the IPv4 address, or a hash.</td><td>No registry.</td><td>Hash collisions are likely (birthday bound: about 38 hosts give a 50 percent chance of two sharing a 10-bit value); IPs are reused by containers.</td></tr>
+<tr><td>Kubernetes StatefulSet ordinal</td><td>Pod <code>idsvc-17</code> uses worker 17.</td><td>Stable, no registry, deterministic.</td><td>Only for the ID service pods themselves; two clusters or regions need disjoint ranges; scaling beyond 1,024 is impossible.</td></tr>
+<tr><td>Lease from a coordination service</td><td>Take an ephemeral lease on <code>/workers/N</code> in etcd or ZooKeeper; hold it by heartbeat.</td><td>Handles churn, crashes and reuse; enforces uniqueness in one place.</td><td>Needs a highly available registry at startup; subject to pause/lease caveat.</td></tr>
+<tr><td>Database row with unique key</td><td><code>UPDATE workers SET owner=?, deadline=? WHERE id=? AND deadline &lt; now()</code> in a transaction.</td><td>Simple, familiar, easy to audit.</td><td>Relies on database clock and a reachable primary; same caveats.</td></tr>
+</table>
+<p>We choose <b>leases from the registry</b>, with static ranges per region as a fallback (section 14). A lease is a lock with an expiry, the same primitive explained in <a href="../chapters/30-coordination-locks.html">Chapter 30</a>: the owner must keep renewing, and if the owner stops (crash, partition) the registry may give the same worker id to someone else after the deadline.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Timeline of a worker lease expiring while the old process is paused">
+  <line class="arrow" x1="40" y1="90" x2="870" y2="90"/>
+  <text class="t-b" x="40" y="30">Old process P1 (worker 417)</text>
+  <rect class="hit" x="40" y="45" width="230" height="30" rx="4"/><text class="t-c t-sm" x="155" y="65">issues IDs, renews lease</text>
+  <rect class="miss" x="270" y="45" width="330" height="30" rx="4"/><text class="t-c t-sm" x="435" y="65">stop-the-world pause or partition</text>
+  <rect class="hit" x="600" y="45" width="140" height="30" rx="4"/><text class="t-c t-sm" x="670" y="65">wakes up</text>
+  <line class="arrow" x1="40" y1="240" x2="870" y2="240"/>
+  <text class="t-b" x="40" y="160">New process P2 (assigned worker 417 after expiry)</text>
+  <rect class="cache" x="370" y="175" width="120" height="30" rx="4"/><text class="t-c t-sm" x="430" y="195">acquire + wait</text>
+  <rect class="hit" x="490" y="175" width="380" height="30" rx="4"/><text class="t-c t-sm" x="680" y="195">issues IDs with worker 417</text>
+  <path class="arrow-r dash" d="M670 90 L670 170"/>
+  <text class="t-sm" x="40" y="280">lease deadline passes here (x = 330)</text>
+  <text class="t-sm" x="40" y="300">After wake-up, P1 must notice its lease expired (self-fence) before issuing another ID.</text>
+  <line class="life" x1="330" y1="40" x2="330" y2="260"/>
+</svg>
+<figcaption>If P1 pauses longer than its lease TTL, the registry reassigns worker 417 to P2. When P1 wakes it still believes it owns the worker id. Without a self-check on every ID, both processes emit IDs with the same worker field, and the sequence field alone may not prevent duplicates.</figcaption>
+</figure>
+<h3>8.2 Why leases alone are not safe, and how we make them safe</h3>
+<p>This is the same hazard as any lock with a timeout (a paused holder resumes after expiry and still believes it has the lock). We cannot make the registry perfectly protect the data, because the "resource" here, the ID space, has no server that can check a fencing token. We therefore combine four defenses. Each is cheap.</p>
+<ol>
+<li><b>Self-expiry check on the hot path.</b> The generator remembers the local monotonic-clock time at which its lease will expire, minus a safety margin. Before every ID it checks that the monotonic clock is still before that time. If not, it refuses to issue IDs and re-acquires. A process pause that happens <em>between</em> the check and the use is the remaining gap, but it is only a few instructions wide, and the next defense covers it.</li>
+<li><b>Generous TTL versus renewal.</b> TTL 60 s, renew every 20 s. A process has to miss two renewals before the lease is at risk, and the registry does not hand a worker id to a new owner until a <b>quarantine period</b> (for example 2 x TTL, 120 s) has passed since the last renewal. Garbage collection pauses and brief partitions are far shorter than that.</li>
+<li><b>Wait out the old timestamps.</b> The new owner of a worker id waits until its own clock exceeds the highest timestamp the previous owner could have used (<code>last_ts_ms</code> persisted at each renewal, plus the lease TTL). Then even an old owner that wakes up cannot collide, because the new owner's timestamps are strictly greater than anything the old one issued before its lease was lost, and the old owner (if it wakes) is blocked by defense 1.</li>
+<li><b>Allocate in the least recently used order.</b> The registry hands out the worker id that has been free for the longest. Recently released ids are not reused for as long as possible, so a stale process is much more likely to find its id unclaimed than reassigned.</li>
+</ol>
+<div class="callout watch"><b>Watch out</b> A nonce in the ID is not a fix for a worker-id collision, because it would need bits we have spent. The honest statement is: worker-id uniqueness is a probabilistic-free guarantee only to the extent that the lease, quarantine and self-expiry assumptions hold. State that assumption out loud (bounded clock rate drift and pauses shorter than the margin) rather than claiming it is impossible to violate.</div>
+<h3>8.3 Sizing the worker-id space</h3>
+<p>From section 3.4, we can see 8,000 process starts per day. With a 120-second quarantine per release, the number of ids tied up in quarantine at any instant is starts per second times quarantine: (8,000 / 86,400) x 120, which is about 11 ids. Add the steady-state fleet of about 400 processes and the registry needs roughly 411 of 1,024 worker ids at the busiest, a comfortable 40 percent utilization. If the fleet grows toward 800, we reallocate bits (section 17) rather than shrinking the quarantine.</p>
+<h3>8.4 Datacenter and region bits</h3>
+<p>The 10-bit worker field is often split as 5 bits of datacenter and 5 bits of machine (32 datacenters x 32 machines). Splitting statically wastes capacity when regions are unequal. We instead treat the 10 bits as one opaque number and let each region own a range (for example region 1 owns 0 to 340, region 2 owns 341 to 681, region 3 owns 682 to 1,023), which keeps uniqueness across regions even if a regional registry is isolated (section 14).</p>
+
+<h2 id="layout">9. Deep dive 2: choosing the bit layout and the sequence</h2>
+<h3>9.1 Choosing the custom epoch</h3>
+<p>The 41-bit timestamp counts milliseconds since a custom epoch, not since 1970. If we used the Unix epoch, 2^41 ms from 1970 expires in about 2039, which is far too soon. Choosing the epoch as the project start date (say 2024-01-01) gives about 69.7 years, until roughly 2093. The epoch is fixed forever and stored in config. If we ever need to extend lifetime, we have to shift bits (section 17), because changing the epoch would reorder old and new IDs.</p>
+<h3>9.2 Trading bits among the three fields</h3>
+<p>The 63 usable bits are a budget. Different companies allocate them differently, and the trade-off is itself a good interview discussion.</p>
+<table>
+<tr><th>Layout</th><th>Time</th><th>Worker</th><th>Sequence</th><th>Lifetime</th><th>Peak per worker</th></tr>
+<tr><td>Original Snowflake</td><td>41 bits, 1 ms</td><td>10 bits</td><td>12 bits</td><td>about 69.7 years</td><td>4,096 per ms</td></tr>
+<tr><td>Instagram (documented in their engineering blog)</td><td>41 bits, 1 ms</td><td>13 bits (logical shard id)</td><td>10 bits</td><td>about 69.7 years</td><td>1,024 per ms per shard</td></tr>
+<tr><td>Our fleet today</td><td>41 bits, 1 ms</td><td>10 bits</td><td>12 bits</td><td>about 69.7 years</td><td>4,096 per ms</td></tr>
+<tr><td>Many workers, low rate (Sonyflake style, about 10 ms ticks)</td><td>39 bits, 10 ms</td><td>16 bits</td><td>8 bits</td><td>about 174 years</td><td>256 per 10 ms</td></tr>
+</table>
+<p>Our workers peak at about 977 IDs/s, but a single process can see a microburst of 4,000 IDs in one millisecond (a batch insert). 12 sequence bits absorb that. If a burst exceeds 4,096 in a millisecond the generator waits for the next millisecond, which delays the caller by under 1 ms. That is a throttle, not a failure.</p>
+<p>The more workers you need, the fewer sequence or time bits remain. If the fleet needed 16,384 workers the choices are fewer sequence bits (limiting burst size), a coarser tick (10 ms), or a 128-bit ID. This is why Instagram uses 13 bits for a logical shard: their generation happens inside the database shard, so the worker id <em>is</em> the shard id, which also lets them route a read by looking at the ID's shard bits.</p>
+<h3>9.3 Sequence reset: zero or random start?</h3>
+<p>Resetting the sequence to 0 every millisecond is correct but skews distribution. If most workers issue one ID per millisecond, nearly all IDs end in sequence 0, so the low bits are almost constant. That is harmless for uniqueness, but it matters when the ID is used for hash-based sharding (<code>id mod N</code>): with N a power of two, all those IDs land on shard 0 plus a worker-derived offset. Two fixes. Shard on a hash of the ID rather than the raw low bits (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>), or start each new millisecond with a small random sequence (for example 0 to 9). The second has a cost: a random start reduces the headroom to 4,087 at worst, and it must still never wrap back to equal an already issued number in the same millisecond, which the overflow check handles.</p>
+<h3>9.4 Monotonic within a worker, k-sortable across workers</h3>
+<p>Within one worker, IDs are strictly increasing: the timestamp never goes down (section 10) and the sequence rises inside a millisecond. Across workers, two IDs generated in the same millisecond differ in the worker field, so which is larger is arbitrary. If worker clocks disagree by 5 ms, an ID created later by a worker with the slower clock can sort before an ID created earlier by the faster one. That is exactly what <b>k-sortable</b> means: the order is correct to within k, where k is the clock skew plus one millisecond. For sorting a feed, k of a few milliseconds is invisible. For deciding "which write happened first" it is not usable, so never use these IDs as a causal order (<a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>).</p>
+
+<h2 id="clock">10. Deep dive 3: clock skew and clock rollback</h2>
+<p>The generator trusts that the timestamp it reads never decreases. Real clocks violate this. Understanding why, and what to do, is the most heavily probed part of this question.</p>
+<h3>10.1 How clocks go backwards</h3>
+<ul>
+<li><b>NTP step corrections.</b> If a clock has drifted by more than the slew threshold (typically 128 ms for the classic ntpd, configurable in chrony), the daemon may <em>step</em> the clock directly to the right time, which can jump backwards by seconds.</li>
+<li><b>Leap seconds.</b> A positive leap second repeats the second 23:59:59 (or shows 23:59:60). Naive systems see time go back by one second. Large providers avoid this by "smearing" the leap second across many hours so time is always monotonic but slightly slow.</li>
+<li><b>VM migration, pause and restore, host suspend.</b> A virtual machine restored from a snapshot or migrated to a host with a different clock source can see time jump either way.</li>
+<li><b>Operator error.</b> Someone sets the date by hand, or a bad time server is configured.</li>
+</ul>
+<p>The consequence is not just an out-of-order ID. If the clock goes back by 3 ms, the worker will again reach millisecond values it already used. With the same worker id and the sequence restarting at 0, it emits IDs it emitted before: <b>exact duplicates</b>. That is the data-corrupting outcome we must prevent.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Clock rollback timeline and the three policies">
+  <line class="arrow" x1="40" y1="110" x2="860" y2="110"/>
+  <text class="t-b" x="40" y="30">Wall clock reading (ms) as seen by one worker</text>
+  <circle cx="120" cy="110" r="5" fill="var(--fg)"/><text class="t-c t-sm" x="120" y="132">1000</text>
+  <circle cx="240" cy="110" r="5" fill="var(--fg)"/><text class="t-c t-sm" x="240" y="132">1004</text>
+  <circle cx="360" cy="110" r="5" fill="var(--bad)"/><text class="t-c t-sm" x="360" y="132">1001 (stepped back)</text>
+  <circle cx="480" cy="110" r="5" fill="var(--fg)"/><text class="t-c t-sm" x="480" y="132">1002</text>
+  <circle cx="600" cy="110" r="5" fill="var(--fg)"/><text class="t-c t-sm" x="600" y="132">1004</text>
+  <circle cx="720" cy="110" r="5" fill="var(--good)"/><text class="t-c t-sm" x="720" y="132">1005 (safe again)</text>
+  <path class="arrow-r" d="M240 100 C300 60 330 60 360 100"/><text class="t-sm" x="262" y="62">offset = 3 ms</text>
+  <rect class="hit" x="40" y="170" width="260" height="96" rx="8"/><text class="t-b" x="52" y="194">Small rollback (up to 5 ms)</text><text class="t-sm" x="52" y="214">wait until now &gt; last timestamp</text><text class="t-sm" x="52" y="232">caller waits a few ms, nothing wasted</text>
+  <rect class="cache" x="320" y="170" width="260" height="96" rx="8"/><text class="t-b" x="332" y="194">Medium rollback (to about 1 s)</text><text class="t-sm" x="332" y="214">stop serving, fail health check,</text><text class="t-sm" x="332" y="232">LB drains this worker, retry elsewhere</text>
+  <rect class="miss" x="600" y="170" width="260" height="96" rx="8"/><text class="t-b" x="612" y="194">Large rollback (seconds+)</text><text class="t-sm" x="612" y="214">refuse IDs, alert, release lease,</text><text class="t-sm" x="612" y="232">restart with a fresh worker id</text>
+</svg>
+<figcaption>After the clock reads 1004 and then steps back to 1001, any ID built from 1001 to 1004 with the same worker id could repeat a number already issued. The correct reaction depends on the size of the offset: wait, drain, or replace the worker.</figcaption>
+</figure>
+<h3>10.2 Prevention: a clock that cannot go back</h3>
+<p>The first line of defense is not to read a clock that steps. Configure the time daemon to <b>slew only</b>: chrony and ntpd can adjust frequency gradually (up to a small percentage) so time stays monotonic, and refuse to step except at boot. Use smeared leap seconds from the cloud provider's time service. Inside the process, measure elapsed time with the <b>monotonic clock</b> (the language's nanosecond timer, which never goes back) and compute the timestamp as <code>wall_at_start + monotonic_elapsed</code>. This protects against steps while running, at the price of slowly diverging from wall time if the process is very long-lived, so we re-anchor at each lease renewal only if the new wall time is not behind (we never anchor backwards).</p>
+<h3>10.3 Detection and policy on the hot path</h3>
+<p>Even with prevention, the generator must check <code>now &lt; lastTs</code> on every call, because the check costs nothing and a duplicate costs a data-corruption incident. We define the offset <code>d = lastTs - now</code> and apply a tiered policy:</p>
+<table>
+<tr><th>Offset d</th><th>Action</th><th>Why</th></tr>
+<tr><td>0 &lt; d at most 5 ms</td><td>Block the caller until the clock passes lastTs (sleep for d, then recheck).</td><td>Cheap, invisible to callers, and preserves uniqueness and monotonicity.</td></tr>
+<tr><td>5 ms &lt; d at most 1 s</td><td>Reject the call with a retryable error and mark the generator unhealthy. The load balancer routes to other workers; embedded callers fall back to a local backup generator or retry.</td><td>Blocking for hundreds of ms stalls request threads. Healthy peers can serve.</td></tr>
+<tr><td>d above 1 s</td><td>Stop issuing, raise an alert, release the lease, and restart the process so it acquires a (possibly different) worker id after waiting out the old timestamps.</td><td>Something is badly wrong with the host clock; the safest thing is a fresh start on a verified clock.</td></tr>
+</table>
+<p>Another policy, sometimes seen, is the <b>logical clock</b> approach: keep using <code>max(now, lastTs)</code> and just keep incrementing the sequence, borrowing from the future. It never blocks, but it silently lets the embedded timestamp run ahead of real time, and it overflows the sequence quickly if the rollback is long. If the timestamp runs ahead, IDs are still unique, but "created at" decoding is wrong and, if the process restarts, the new instance has no memory of how far ahead it ran. We therefore reserve it for tiny offsets and rely on the tiered policy above.</p>
+<h3>10.4 Persisting the high-water mark across restarts</h3>
+<p>A restart loses the in-memory <code>lastTs</code>. If the restarted process reuses its old worker id on a host whose clock is behind the old timestamps, it will reissue numbers. The defense is a persisted high-water mark. At each lease renewal (every 20 s) the generator writes <code>last_ts_ms + TTL</code> to the registry, meaning "I promise never to have used a timestamp above this". A new owner of that worker id then must observe its own clock above that value before issuing, waiting if necessary. Because the mark is written ahead of use (a limit rather than the exact last value), it costs one write per renewal, not per ID.</p>
+<pre><code>// on renewal, every TTL/3 (about 20 s)
+promised = now_ms + TTL_ms + SAFETY_MS        // upper bound of timestamps used until the next renewal
+registry.renew(lease_id, last_ts_ms = promised)
+
+// on startup with an inherited worker id
+if (clock.now_ms() &lt;= lease.last_ts_ms) sleep(lease.last_ts_ms - clock.now_ms() + 1)</code></pre>
+<p>Typically the wait is zero, because a new process starts at least a quarantine period after the old one died, and the quarantine already exceeds the TTL. The wait only bites when the new host's clock is genuinely behind, which is the situation we want to catch.</p>
+<h3>10.5 Clock skew across workers</h3>
+<p>Skew between workers (not rollback within one) never produces a duplicate, because the worker field differs. It only widens the k in "k-sortable". We monitor skew against a reference and alert if it exceeds, for example, 50 ms, because beyond that sorting by ID starts to misorder visibly (a chat message shown above an earlier one). Skew detection compares each worker's clock to the NTP reference reported by the time daemon (offset and estimated error).</p>
+<h3>10.6 Comparing the clock options</h3>
+<table>
+<tr><th>Option</th><th>Guarantee</th><th>Cost</th><th>When to choose</th></tr>
+<tr><td>NTP, slew-only, monotonic anchoring</td><td>Skew typically within tens of ms; no rollbacks if configured well</td><td>Free, standard</td><td>Default for our fleet</td></tr>
+<tr><td>Cloud time service (for example Amazon Time Sync, Google's NTP with smear)</td><td>Offsets typically well under a few ms inside one provider; smeared leap seconds</td><td>Low</td><td>Preferred where available</td></tr>
+<tr><td>PTP or hardware time (GPS, atomic clock)</td><td>Microsecond-level offsets</td><td>Special hardware</td><td>Only if sub-ms ordering across machines matters</td></tr>
+<tr><td>Logical clock only (no wall time)</td><td>No rollback ever</td><td>IDs lose real-time meaning</td><td>When sortability by wall time is not needed; then use a plain counter allocator</td></tr>
+</table>
+
+<h2 id="sortable">11. K-sortable IDs, B-trees and why order matters for databases</h2>
+<p>Time ordering is not a cosmetic feature. It changes how the database behaves. Most relational and many NoSQL engines store the primary key in a B+tree or an LSM tree (<a href="../chapters/19-storage-engines.html">Chapter 19</a>). Consider what happens when a million rows arrive with random keys versus roughly increasing keys.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="Random keys touch many B-tree pages, time-ordered keys touch one hot right edge page">
+  <text class="t-b" x="40" y="26">Random UUIDv4 keys</text>
+  <rect class="db" x="40" y="44" width="60" height="50" rx="4"/><rect class="db" x="110" y="44" width="60" height="50" rx="4"/><rect class="db" x="180" y="44" width="60" height="50" rx="4"/><rect class="db" x="250" y="44" width="60" height="50" rx="4"/><rect class="db" x="320" y="44" width="60" height="50" rx="4"/>
+  <text class="t-c t-sm" x="70" y="74">leaf</text><text class="t-c t-sm" x="140" y="74">leaf</text><text class="t-c t-sm" x="210" y="74">leaf</text><text class="t-c t-sm" x="280" y="74">leaf</text><text class="t-c t-sm" x="350" y="74">leaf</text>
+  <path class="arrow-r" d="M60 130 L70 98"/><path class="arrow-r" d="M130 130 L140 98"/><path class="arrow-r" d="M250 130 L280 98"/><path class="arrow-r" d="M330 130 L350 98"/><path class="arrow-r" d="M200 130 L210 98"/>
+  <text class="t-sm" x="40" y="156">each insert hits a different leaf page</text>
+  <text class="t-sm" x="40" y="174">working set = the entire index</text>
+  <text class="t-sm" x="40" y="192">page splits everywhere, about 50% fill</text>
+  <text class="t-b" x="500" y="26">Snowflake / UUIDv7 keys</text>
+  <rect class="db" x="500" y="44" width="60" height="50" rx="4"/><rect class="db" x="570" y="44" width="60" height="50" rx="4"/><rect class="db" x="640" y="44" width="60" height="50" rx="4"/><rect class="db" x="710" y="44" width="60" height="50" rx="4"/><rect class="cache" x="780" y="44" width="80" height="50" rx="4"/>
+  <text class="t-c t-sm" x="530" y="74">full</text><text class="t-c t-sm" x="600" y="74">full</text><text class="t-c t-sm" x="670" y="74">full</text><text class="t-c t-sm" x="740" y="74">full</text><text class="t-c t-sm" x="820" y="74">hot leaf</text>
+  <path class="arrow-g" d="M800 130 L820 98"/><path class="arrow-g" d="M830 130 L830 98"/><path class="arrow-g" d="M850 130 L840 98"/>
+  <text class="t-sm" x="500" y="156">inserts append to the right edge</text>
+  <text class="t-sm" x="500" y="174">working set = a handful of pages in cache</text>
+  <text class="t-sm" x="500" y="192">pages fill to about 90% or more, fewer splits</text>
+  <text class="t-sm" x="52" y="242">Caveat: a single hot right-edge page can itself become a write hotspot on very heavy insert workloads. Sharded tables spread it.</text>
+  <text class="t-sm" x="52" y="260">Range scans by time also become index range scans, and recent data stays contiguous on disk.</text>
+</svg>
+<figcaption>Left: random keys scatter inserts across all leaf pages, so the buffer pool must hold the whole index to avoid disk reads. Right: time-ordered keys always insert near the right edge, so the active part of the index is tiny and pages fill densely.</figcaption>
+</figure>
+<p>The practical difference can be large: random UUID keys are widely reported to cause substantially slower inserts and larger indexes than sequential keys once the index exceeds memory, because each insert may need a random disk read and pages end up only partly full after splits. The exact factor depends on the engine, so state it qualitatively in an interview. There is a second benefit: <b>pagination and range queries by time</b>. "Give me the 50 newest orders" becomes <code>ORDER BY id DESC LIMIT 50</code> using the primary key index, with no separate timestamp index (see <a href="../chapters/17-data-modeling.html">Chapter 17</a>). Decoding the ID also gives the creation time for free in logs and debugging.</p>
+<p>Two cautions. First, time-ordered IDs leak information: anyone who sees two IDs can compute how many were created between them and when. For order numbers, that reveals business volume, which competitors might want. Second, on a sharded system that distributes by the raw ID, time-ordered keys make all new writes hit the newest range, a classic hotspot (<a href="../chapters/25-sharding.html">Chapter 25</a>). Hash the ID (or the tenant) for shard placement, and keep the ordered ID as the within-shard primary key.</p>
+
+<h2 id="scaling">12. Scaling, bottlenecks and hot spots</h2>
+<p>This system scales almost embarrassingly. There is no shared mutable state on the hot path, so adding generators adds capacity linearly. The places that can still bite are worth naming.</p>
+<ul>
+<li><b>Per-worker ceiling.</b> 4,096 IDs per millisecond, 4.096 million per second, versus our worst-case 977 per second per worker (section 3.3). A worker would need to run at 4,000x its current load to saturate. If a caller needs bulk IDs (a data import of a billion rows), it should use several workers or the batch API, not a single generator.</li>
+<li><b>ID service tier.</b> For clients that call the service, each pod is a generator with its own worker id. With 1,000,000 IDs/s peak and batch size 100, that is 10,000 requests per second, easily handled by about 10 pods (at roughly 1,000 requests per second per pod, leaving large headroom). Scale pods with load (<a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>); each new pod consumes a worker id for its life.</li>
+<li><b>Lease registry.</b> A consensus store is sized for its writes. Our lease writes are renewals: 400 processes renewing every 20 s is 20 writes per second, plus about 0.1 per second of acquire and release. That is trivial for etcd or ZooKeeper, which handle thousands of writes per second. The registry is not on the data path, so even a total outage only blocks <em>new</em> processes from starting.</li>
+<li><b>Hot clock calls.</b> Reading the clock on every ID is cheap on modern Linux (about 20 to 50 ns using the vDSO, a mapped kernel fast path). If a virtualization layer forces a real system call for the clock (a rare configuration), the cost is about a microsecond, still fine; we cache the millisecond and refresh it from a background thread only if profiling shows it matters.</li>
+<li><b>Skewed use of the time bits.</b> Fleets that all start batch jobs at midnight issue bursts in the same millisecond across many workers. Uniqueness is safe because workers differ. Downstream tables may see a hot key range; handled by sharding on a hash (section 11).</li>
+<li><b>Caching:</b> nothing to cache. IDs are produced, not looked up. Decoding is pure arithmetic.</li>
+</ul>
+<p>We do not shard anything because there is nothing to shard. The "partitioning" is done by construction: the worker field partitions the ID space so generators never need to agree on which number comes next.</p>
+
+<h2 id="failures">13. Failure modes and mitigations</h2>
+<table>
+<tr><th>What fails</th><th>What happens</th><th>Mitigation</th></tr>
+<tr><td>Generator process crashes</td><td>In-memory state (<code>lastTs</code>, <code>seq</code>) lost. IDs it issued are already out. Nothing to recover.</td><td>Restart takes a worker id; the high-water mark wait (section 10.4) makes reuse safe. Callers retry on another instance.</td></tr>
+<tr><td>Lease registry is down</td><td>Running generators continue until their lease deadline; they cannot renew. New processes cannot start.</td><td>Set TTL far larger than a typical registry outage (60 s or more). If the lease nears expiry and the registry is still unreachable, a process may <em>fail closed</em> (stop issuing) or fall back to a pre-reserved emergency range with a documented risk (section 14). Run the registry across three zones.</td></tr>
+<tr><td>Clock steps backwards</td><td>Section 10: wait, drain, or replace.</td><td>Tiered policy; slew-only NTP; alert on any rollback event.</td></tr>
+<tr><td>Clock jumps forward (for example a bad NTP source sets the year 2090)</td><td>Worse than backwards: the worker now issues IDs with huge timestamps, which are unique but violate ordering, and after the clock is corrected the worker is stuck behind its own high-water mark.</td><td>Sanity bound: compare to the lease's <code>last_ts_ms</code> and reject a reading more than, say, 60 s ahead of the registry's time. Treat the forward jump as an outage of that worker and replace it.</td></tr>
+<tr><td>Two processes share a worker id</td><td>Possible duplicates. The most dangerous failure, because it is silent.</td><td>Registry-enforced uniqueness, quarantine, self-expiry, last-timestamp wait. A duplicate-detection canary: a periodic job that samples the id stream and looks for repeated values per worker field; unique constraints in the databases are the final backstop and will raise an error rather than silently overwrite.</td></tr>
+<tr><td>Sequence overflow in one millisecond</td><td>Generator would exhaust 4,096 numbers.</td><td>Wait for the next millisecond (sub-ms delay). Count how often it happens as a capacity signal.</td></tr>
+<tr><td>Wrong or mixed bit layout config</td><td>One service uses 10 worker bits, another 13; IDs are decoded incorrectly, collisions possible between services sharing a table.</td><td>Immutable, versioned layout; a startup check that the layout version in config matches the registry; decoders reject unknown versions.</td></tr>
+<tr><td>Service returns IDs but the response is lost</td><td>Caller does not get the ID; the ID is effectively skipped.</td><td>Harmless: IDs are not required to be gap free. Retrying gets a different ID. Do not use IDs as idempotency keys across retries unless the <em>caller</em> generated them once and keeps them (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>).</td></tr>
+</table>
+<h3>13.1 Consistency and idempotency decisions</h3>
+<p>The generator is deliberately available over consistent when the registry is partitioned: running generators keep issuing IDs because their uniqueness depends on local state and a lease they already hold, not on a live quorum. That is safe because the quarantine period guarantees nobody else gets their worker id until well after the lease deadline. The registry itself is a CP system (<a href="../chapters/28-cap-consistency.html">Chapter 28</a>): when it cannot reach a quorum it refuses to hand out worker ids, since a duplicated assignment is far worse than a delayed one. A common idempotency pattern is for the <b>client</b> to generate the ID once (for an order) and send it with the create request, so that a retried create is recognized by its primary key and does not make a second row. This is only correct because the ID is unique and stable across the retry.</p>
+
+<h2 id="multi-region">14. Multi-region</h2>
+<p>Each region runs its own lease registry and its own generators, so IDs can be created with no cross-region latency and survive a region isolation. Uniqueness across regions comes from <b>disjoint worker-id ranges</b> (section 8.4): region 1 owns 0 to 340, region 2 owns 341 to 681, region 3 owns 682 to 1,023. A region can never hand out an id from another's range, even while partitioned, so there is nothing to reconcile later. The three ranges are decided statically at launch and recorded in the immutable layout config.</p>
+<ul>
+<li><b>Clock sources.</b> Each region has its own time source. Cross-region skew is the sum of both regions' offsets from true time, typically a few milliseconds, which is the k in k-sortable. Do not promise cross-region ordering.</li>
+<li><b>Range exhaustion.</b> If one region grows far larger than the others, ranges must be rebalanced. Because ids are leased and quarantined, move a range only while its ids are unallocated, and update the immutable config in a controlled migration (section 17). Having 1,024 ids spread over three regions leaves about 340 per region against a need of about 130 at the busiest, so we have more than 2x headroom.</li>
+<li><b>Region failover.</b> When a region's workloads fail over to another, they request worker ids from the surviving region's registry, which draws from its own range. IDs created in the failed region before failover stay valid because they embed the old region's worker ids.</li>
+<li><b>Emergency range.</b> Reserve a small slice (for example worker ids 1,000 to 1,023) that only a manual runbook can hand out, for the case where a region's registry is unavailable for hours. Processes started this way are tracked by hand and cannot be auto-recycled.</li>
+</ul>
+<p>The general topic of replication and failover across regions is in <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a> and disaster recovery in <a href="../chapters/41-ha-dr.html">Chapter 41</a>.</p>
+
+<h2 id="security">15. Security and abuse</h2>
+<ul>
+<li><b>Predictability.</b> A Snowflake ID is guessable: given one ID, the neighbors in time and sequence are easy to enumerate. Never use it as a bearer secret (session id, password reset token, signed URL). Use 128 or more random bits from a cryptographic generator for those. If you must expose IDs publicly and want to prevent enumeration (<code>/orders/12345</code>), authorize every access on the server (<a href="../chapters/55-security.html">Chapter 55</a>) rather than relying on obscurity, and optionally encrypt the numeric ID with a format-preserving cipher at the API boundary.</li>
+<li><b>Information leak.</b> The timestamp and the worker id reveal creation time, rate and approximate topology. Decide whether that is acceptable for public IDs.</li>
+<li><b>Service abuse.</b> The ID service can be asked for huge batches. Cap <code>count</code> (for example 1,000), authenticate callers, and rate limit per client (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>), since a malicious or buggy loop could burn the ID space of one worker at 4 million per second.</li>
+<li><b>Registry access.</b> Only the lease client identity may write lease rows. A compromised or misconfigured client that could write arbitrary worker leases could cause duplicates deliberately.</li>
+</ul>
+
+<h2 id="ops">16. Monitoring, SLOs and cost</h2>
+<p>Observability principles are in <a href="../chapters/54-observability-slos.html">Chapter 54</a>. For this system the specific signals are:</p>
+<table>
+<tr><th>Signal</th><th>Why</th><th>Alert</th></tr>
+<tr><td>Clock offset to reference, per host</td><td>Predicts skew and rollback.</td><td>Warn at 20 ms, page at 100 ms.</td></tr>
+<tr><td>Clock rollback events, per worker (count and size)</td><td>Direct measure of the dangerous event.</td><td>Any rollback above 5 ms pages; any above 1 s pages immediately.</td></tr>
+<tr><td>Sequence-overflow waits per second</td><td>Capacity of a single worker.</td><td>Sustained above 1 percent of calls.</td></tr>
+<tr><td>Lease age and renewal failures</td><td>Predicts expiry and pauses.</td><td>Renewal failure for more than half a TTL.</td></tr>
+<tr><td>Worker ids in use, in quarantine, free</td><td>Exhaustion of the 1,024 space.</td><td>Free below 20 percent.</td></tr>
+<tr><td>Duplicate-key errors on tables using these IDs</td><td>The user-visible symptom of a worker collision.</td><td>Any occurrence on a generated-ID column.</td></tr>
+<tr><td>nextId p99 latency (service)</td><td>User-facing SLI.</td><td>Above 2 ms.</td></tr>
+</table>
+<p><b>SLOs.</b> Availability of the ID service 99.99 percent (about 4.3 minutes of downtime per 30 days); correctness SLO of zero duplicates, which is an invariant not a rate. Embedded generators have effectively the availability of the host process.</p>
+<h3>16.1 Cost</h3>
+<p>The cost is negligible compared with the systems it serves. The registry is 5 small nodes. The ID service is about 10 small pods plus headroom. The embedded library costs nothing. The dominant cost is indirect: the key width. At 25.9 billion IDs per day, choosing 8-byte over 16-byte keys saves about 207 GB per day of key bytes before indexes and replicas (section 3.2); at a typical block-storage price of a few cents per GB-month and 3x replication, that is the line that matters, not the generator's compute.</p>
+
+<h2 id="evolution">17. Evolution, phasing and what changes at 10x</h2>
+<h3>17.1 What to build first</h3>
+<ol>
+<li><b>Phase 1.</b> UUIDv7 or a single ticket-server pair if the team is small. It works today, needs almost no infrastructure, and the bit-layout debate can wait.</li>
+<li><b>Phase 2.</b> Embedded Snowflake library with static worker ids from StatefulSet ordinals, slew-only NTP, rollback handling and decode helpers.</li>
+<li><b>Phase 3.</b> Lease registry, quarantine, high-water marks and the canary duplicate detector. This is when autoscaling and multi-region become safe.</li>
+<li><b>Phase 4.</b> ID service for non-embedding clients, batch API, quotas, dashboards.</li>
+</ol>
+<h3>17.2 At 10x scale</h3>
+<p>10,000,000 IDs per second at peak is still only 2.4 times one worker's ceiling, so the layout still works. What strains is the worker count (more processes) and the burst per millisecond (10,000 per ms spread across workers is fine). If the fleet outgrows 1,024 workers, the options are: borrow bits from the sequence (10 worker bits become 13, sequence 12 becomes 9, giving 512 IDs per ms per worker, enough for our 977 per second average); move to a 10 ms tick (Sonyflake style) which frees 3 bits; or change the layout version. Because the layout is versioned, a new layout must be distinguishable from the old one. Reserve the sign bit's neighbor, or use disjoint timestamp ranges: all new-layout IDs sort above old ones if the new epoch's start is later and the migration happens at a fixed instant.</p>
+<h3>17.3 Alternatives not chosen</h3>
+<p>The main alternatives are summarized in the next section. We did not choose a centralized sequencer (a consensus-backed counter, <a href="../chapters/29-consensus.html">Chapter 29</a>), because it puts a consensus round or at least a network hop on every ID, which costs milliseconds and makes the sequencer a global dependency. A block-allocation hybrid (the registry hands out blocks of 10,000 numbers) is a viable simpler design if strict k-sortability is not needed.</p>
+
+<h2 id="alternatives">18. Alternatives and related problems</h2>
+<h3>18.1 When UUIDv7 is the better answer</h3>
+<p>If 128 bits is acceptable, UUIDv7 removes the whole lease registry and the worker-id problem: its 74 random-ish bits make collision negligible without any assignment. It still depends on a clock for ordering (a rollback only misorders IDs rather than duplicating them, since the random bits differ with overwhelming probability). The price is the doubled key width and a weaker decode story (no worker id). For many companies that is the right call; for ones with billions of rows per day and several indexes, the 64-bit width wins.</p>
+<h3>18.2 Gap-free business sequences</h3>
+<p>Invoice numbers, cheque numbers and some tax identifiers must be gapless and in order. This is a different problem: a single serialized allocator in a database transaction (<code>UPDATE counters SET n = n + 1 RETURNING n</code> inside the same transaction that writes the invoice), so a rolled-back transaction does not consume a number. It scales only to the throughput of that row, typically hundreds per second, which is fine for invoices. Keep this separate from the primary-key generator, which may skip values freely.</p>
+<h3>18.3 Other designs worth naming</h3>
+<ul>
+<li><b>Hash of content</b> (content-addressed IDs): the ID is a digest of the data, giving deduplication and integrity but no ordering and 256 bits.</li>
+<li><b>Database sequences per shard plus a shard prefix</b> (Instagram style): ID = time bits + shard id + per-shard sequence generated inside Postgres with a PL/pgSQL function; no external service, and the shard id is embedded so routing is trivial.</li>
+<li><b>Hierarchical ids</b> (parent id plus child counter): useful for orders and order lines; the child number only needs to be unique under its parent.</li>
+</ul>
+
+<h2 id="qa">19. Interview Q&amp;A</h2>
+<details><summary>Why not just use UUIDs everywhere and skip all this?</summary>
+<p>UUIDv4 is a perfectly safe default when you do not care about order or size, and for small systems it is the right answer because it needs no infrastructure. At our scale it costs twice the key width, which multiplies through every index and foreign key (hundreds of gigabytes per day here), and its randomness causes scattered B-tree inserts and poor cache behavior. UUIDv7 repairs the ordering but not the size. So the honest answer is: UUIDv7 if 128 bits are fine, Snowflake if you need 64 bits and decodable fields. I would say that trade-off out loud and let the constraints choose.</p></details>
+<details><summary>Two workers get the same worker id. What happens and how do you prevent it?</summary>
+<p>If both are alive and both issue IDs in the same millisecond with the same sequence, they emit identical IDs, and the database either rejects one with a duplicate key error or, worse, an upsert overwrites a row. Prevention is layered: a lease registry that is the only source of worker ids, a quarantine so a recently released id is not reissued quickly, a self-expiry check on every call so a paused process stops itself, and a high-water mark so a new owner waits out the old timestamps. Detection is a duplicate-key alert and a canary that samples IDs. I would also be clear that the guarantee rests on bounded pause and clock drift assumptions, not on magic.</p></details>
+<details><summary>What do you do when the system clock moves backwards?</summary>
+<p>First, do not let it happen: slew-only NTP, smeared leap seconds, and a monotonic clock anchored at startup. Second, detect it on every call by comparing now to the last timestamp. For a small offset (a few milliseconds) the generator waits until the clock catches up; for a medium offset it fails health checks and the load balancer drains it; for a large offset it releases its lease and restarts with a fresh worker id after waiting out the stored high-water mark. The invariant is simple: never issue an ID whose timestamp is not greater than or equal to the last one with the same worker id and a larger sequence.</p></details>
+<details><summary>Why is the timestamp in the most significant bits?</summary>
+<p>Because numeric comparison of integers looks at the high bits first. Putting time first means that IDs created later compare larger, so sorting by ID approximates sorting by time and database indexes see mostly increasing keys. If the worker id were first, IDs from worker 1 would all sort before those of worker 2 regardless of time. The order inside the same millisecond is arbitrary across workers, which is why we call it k-sortable rather than strictly ordered.</p></details>
+<details><summary>How does a new service instance get its worker id, and what if the registry is down?</summary>
+<p>At startup it acquires a lease on one of 1,024 worker ids from a consensus-backed registry, gets back the last timestamp used by prior owners, waits if its clock is behind, and renews every third of the TTL. If the registry is down at startup, the process cannot get a safe id and should fail to start (fail closed) or, in a documented emergency, take an id from a reserved manual range. Processes already running are unaffected until their lease deadline, which we set to be much longer than typical outages.</p></details>
+<details><summary>How many IDs per second can one worker produce, and how do you scale beyond it?</summary>
+<p>With 12 sequence bits it can produce 4,096 IDs per millisecond, which is 4,096,000 per second. Beyond that the generator waits for the next millisecond, which is a built-in throttle. To scale, add workers: each has its own worker id, and IDs never collide. With 1,024 workers the theoretical ceiling is about 4.2 billion IDs per second. If more is needed, shorten the tick, take bits from the worker field, or use a wider ID.</p></details>
+<details><summary>Can you use these IDs to determine which event happened first?</summary>
+<p>Only approximately. Within one worker, yes, as timestamps never go down. Across workers the order is correct only to within the clock skew, typically a few milliseconds, because two IDs in nearby milliseconds from different machines may sort the wrong way. For causality you need logical clocks, version vectors or a consensus sequence (<a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>), not wall-clock IDs. I would use the ID for pagination and storage locality, and a separate mechanism for correctness-critical ordering.</p></details>
+<details><summary>Why not use a central ID server or a database sequence for everything?</summary>
+<p>It would give exact order and no clock risk, but it puts every ID creation behind one network call and one machine or one consensus group. At a million IDs per second a single database cannot sustain the writes, a consensus group adds a round trip of milliseconds per ID, and the service becomes a global point of failure. Batching blocks of numbers reduces the load but gives up fine-grained time order. Snowflake removes the hot-path coordination at the cost of operational care around clocks and worker ids, which is a better trade at this scale.</p></details>
+<details><summary>How would you migrate an existing system from auto-increment IDs to Snowflake IDs?</summary>
+<p>Widen the column to 64-bit unsigned (or confirm it is a BIGINT) and make clients treat IDs as opaque strings so JavaScript clients do not lose precision. Start generating new rows with Snowflake IDs while old rows keep their small integers; because the timestamp is in the high bits and the old values are tiny, old IDs sort before new ones, which preserves rough order. Dual-read for a while, and move foreign keys step by step. There is no need to rewrite old rows unless you want uniform decoding, and rewriting would require a coordinated migration of every reference (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>).</p></details>
+<details><summary>Is it a problem that IDs reveal time and worker information?</summary>
+<p>It can be. Anyone who sees two IDs can estimate how many records were created between them, which can reveal business volume, and the worker bits leak topology. For internal keys this is usually fine. For public identifiers, either accept the leak, encrypt the ID at the API boundary, or expose a separate random public id and keep the Snowflake ID internal. In every case, authorization must be checked on each access, because a guessable ID with no access check is a vulnerability regardless of the generator.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">20. Recap</h2><ul>
+<li>The choice is a triangle of uniqueness, compactness and order. UUIDv4 gives uniqueness only. Ticket servers give order but need a network hop per ID. Snowflake gives all three by packing time, worker and sequence into 64 bits.</li>
+<li>Layout: 1 sign, 41 timestamp (about 69.7 years from a custom epoch), 10 worker (1,024), 12 sequence (4,096 per ms per worker, 4.096 million per second). Capacity is not the constraint; correctness around the clock and the worker id is.</li>
+<li>Worker ids are leased from a consensus-backed registry with quarantine, self-expiry and a persisted high-water timestamp, so reuse is safe and a paused old owner cannot collide.</li>
+<li>Clock rollback is the dangerous event: prevent with slew-only NTP and monotonic anchoring, detect on every call, and respond by size (wait, drain, replace).</li>
+<li>Time-ordered IDs make B-tree inserts append to a hot edge and keep indexes dense; hash the ID for shard placement to avoid a hot shard.</li>
+<li>IDs are k-sortable, not causally ordered, and are guessable, so never use them as secrets or as proof of order.</li>
+<li>UUIDv7 is the best alternative when 128 bits are acceptable; gap-free business numbers are a separate transactional allocator.</li>
+</ul></div>
+<p class="connects"><b>Connects to:</b> <a href="../chapters/02-estimation.html">Chapter 2</a> (estimation), <a href="../chapters/17-data-modeling.html">Chapter 17</a> (keys and modeling), <a href="../chapters/19-storage-engines.html">Chapter 19</a> (B-tree and LSM behavior), <a href="../chapters/25-sharding.html">Chapter 25</a> (shard keys and hot spots), <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a> (clocks and ordering), <a href="../chapters/28-cap-consistency.html">Chapter 28</a> (availability versus consistency), <a href="../chapters/29-consensus.html">Chapter 29</a> (consensus), <a href="../chapters/30-coordination-locks.html">Chapter 30</a> (leases and locks), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotency and IDs), <a href="../chapters/54-observability-slos.html">Chapter 54</a> (monitoring). Related case studies: <a href="c21-lock-service.html">Case study 21</a> (the lease and fencing problem in depth), <a href="c01-url-shortener.html">Case study 1</a> (short IDs), <a href="c04-key-value-store.html">Case study 4</a>.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

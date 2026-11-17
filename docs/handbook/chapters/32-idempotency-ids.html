@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 32: Idempotency, Delivery Semantics and ID Generation | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="32-idempotency-ids">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+
+<main>
+<div class="kicker">Chapter 32 · Module 4 · Distributed Systems Theory</div>
+<h1>Idempotency, Delivery Semantics and ID Generation</h1>
+<p class="lead">In a distributed system a request can be sent twice even though the user only meant it once, and every record needs an identifier that no two machines ever hand out twice. This chapter explains why duplicates are unavoidable, how idempotency keys and consumer-side deduplication make them harmless, and how production systems generate unique IDs (auto-increment, UUIDs, ULID, Snowflake, ticket servers, short URL codes) without a central bottleneck.</p>
+
+<!-- ======================= 1 ======================= -->
+<h2 id="duplicates">1. Why retries create duplicates</h2>
+
+<p>Start with the simplest scenario. A mobile app sends <code>POST /payments</code> to charge a customer 50 dollars. The server receives the request, charges the card, writes the payment row, and sends back <code>201 Created</code>. Somewhere on the way back, the response is lost: the phone went through a tunnel, a load balancer dropped the connection, or the client's timeout (say 5 seconds) expired a moment before the reply arrived. The client now holds a single piece of information: <b>"I did not get an answer."</b></p>
+
+<p>That sentence hides three completely different realities, and the client cannot tell them apart:</p>
+<ol>
+  <li>The request never reached the server. Nothing happened. Retrying is correct.</li>
+  <li>The server received it, started working, and crashed before finishing. Maybe nothing was committed, maybe half of it was. Retrying is probably correct.</li>
+  <li>The server completed everything, and only the <b>acknowledgement</b> (the "ack") was lost. Retrying will do the work a second time. The customer is charged twice.</li>
+</ol>
+
+<p>The client has to choose between two bad options. If it <b>retries</b>, it risks a duplicate in case 3. If it <b>gives up</b>, it risks a lost operation in cases 1 and 2. There is no third option available from inside the client, because the network gives no way to distinguish a slow reply from a missing one. This is a restatement of a classic result: you cannot tell a crashed or unreachable peer from a slow one (see <a href="27-failure-time-ordering.html">Chapter 27</a> on failure detection).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Sequence diagram showing a lost acknowledgement causing a duplicate charge">
+  <rect class="ext" x="60" y="14" width="140" height="36" rx="8"/><text class="t-c t-b" x="130" y="37">Client</text>
+  <rect class="box" x="380" y="14" width="140" height="36" rx="8"/><text class="t-c t-b" x="450" y="37">Payment service</text>
+  <rect class="db" x="700" y="14" width="140" height="36" rx="8"/><text class="t-c t-b" x="770" y="37">Database</text>
+  <line class="life" x1="130" y1="50" x2="130" y2="330"/><line class="life" x1="450" y1="50" x2="450" y2="330"/><line class="life" x1="770" y1="50" x2="770" y2="330"/>
+  <path class="arrow" d="M130 80 L446 80"/><text class="t-sm" x="150" y="73">1. POST /payments (50 USD)</text>
+  <path class="arrow" d="M450 105 L766 105"/><text class="t-sm" x="470" y="98">2. INSERT payment, charge card</text>
+  <path class="arrow dash" d="M766 130 L454 130"/><text class="t-sm" x="560" y="123">3. committed</text>
+  <path class="arrow-r dash" d="M450 160 L250 160"/><text class="t-sm" x="262" y="153" style="fill:var(--bad)">4. 201 Created ... lost on the network</text>
+  <rect class="miss" x="40" y="180" width="200" height="34" rx="8"/><text class="t-sm" x="52" y="202">5. client timeout fires, no answer</text>
+  <path class="arrow" d="M130 245 L446 245"/><text class="t-sm" x="150" y="238">6. retry: POST /payments (50 USD)</text>
+  <path class="arrow" d="M450 270 L766 270"/><text class="t-sm" x="470" y="263">7. INSERT second payment</text>
+  <rect class="miss" x="560" y="288" width="300" height="34" rx="8"/><text class="t-sm" x="572" y="310">Result: the customer is charged twice</text>
+</svg>
+<figcaption>Read top to bottom. Steps 1 to 3 succeed, but the acknowledgement in step 4 never reaches the client. The client's timeout in step 5 makes it retry in step 6, and because the server has no memory that it already did this work, step 7 creates a duplicate.</figcaption>
+</figure>
+
+<h3>1.1 Where duplicates come from in real systems</h3>
+<p>Duplicates are not an exotic bug. They are the normal output of reliable design. Every layer that tries to be reliable adds retries, and every retry is a potential duplicate:</p>
+<ul>
+  <li><b>Client retries:</b> mobile SDKs, browsers with a "resubmit" prompt, a user double-clicking a Pay button, or an impatient user pressing it again.</li>
+  <li><b>Proxy and gateway retries:</b> load balancers and service meshes often retry automatically on connection resets or 503 responses (see <a href="09-load-balancing.html">Chapter 9</a> and <a href="40-resilience.html">Chapter 40</a>).</li>
+  <li><b>Message broker redelivery:</b> a queue hands a message to a consumer; if the consumer crashes before acknowledging, or the ack is lost, the broker delivers it again, possibly to a different consumer.</li>
+  <li><b>Producer retries:</b> a service publishes an event, the broker's ack is lost, the producer publishes again, and the log now contains the event twice.</li>
+  <li><b>Workflow and job engines:</b> a worker's lease expires while it is slow (a long garbage collection pause, say), the scheduler assigns the same task to another worker, and now two workers run it.</li>
+  <li><b>Replays and backfills:</b> an operator replays a day of events after a bug fix, deliberately re-sending messages that were already processed.</li>
+  <li><b>Webhooks:</b> a third party such as a payment provider will resend a webhook until it receives a 2xx, so your endpoint will see the same event several times by design.</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b>
+You cannot prevent duplicate delivery in an unreliable network while also guaranteeing delivery. Since you want delivery to be reliable, the realistic goal is to make duplicates <b>harmless</b>. That property has a name: idempotency.
+</div>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="semantics">2. Delivery semantics: at-most-once, at-least-once, exactly-once</h2>
+
+<p>When one component sends a message or command to another over an unreliable link, the sender can choose how to behave when it does not hear back. The three possible policies are called <b>delivery semantics</b>.</p>
+
+<h3>2.1 At-most-once</h3>
+<p>The sender transmits once and never retries. If the message is lost, it stays lost. Each message is processed zero or one times, never more. This is "fire and forget". It is the right choice when losing a message is cheap and duplicates are costly or meaningless: a metrics sample, a heartbeat, a UDP-based game position update, a log line you can afford to drop. It has the best latency and the simplest implementation, but it cannot be used for anything where loss matters, such as payments.</p>
+
+<h3>2.2 At-least-once</h3>
+<p>The sender keeps retrying until it receives an acknowledgement. Nothing is lost (assuming the sender itself survives or the message is durably stored), but a message may be delivered and processed <b>more than once</b>, exactly the scenario in section 1. Most real messaging systems default to this: SQS standard queues, RabbitMQ with manual acks, Kafka consumers that commit offsets after processing, HTTP clients with retry. It is the practical baseline for reliable systems. The cost is moved to the receiver, which must tolerate duplicates.</p>
+
+<h3>2.3 Exactly-once: what it really means</h3>
+<p>"Exactly-once delivery" means every message has its effect applied exactly one time, never lost and never duplicated. As a property of the <b>network</b> this is impossible to achieve in the general case, because of the lost-ack problem: the sender can never know whether the last attempt landed. (This is a close cousin of the Two Generals problem.) A broker advertising "exactly-once" is therefore never promising that a message crosses the wire once. What it can legitimately promise is <b>exactly-once processing effect</b>: although the message may be delivered several times, the visible outcome is as if it were processed once.</p>
+
+<p>The formula that engineers use is:</p>
+<pre><code>at-least-once delivery  +  idempotent (or deduplicating) processing  =  effectively-once</code></pre>
+
+<p>That is the only recipe that works across arbitrary systems. Everything marketed as exactly-once is an implementation of this formula inside some boundary.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Comparison of at-most-once, at-least-once and effectively-once flows">
+  <text class="t-b" x="20" y="22">At-most-once</text>
+  <rect class="ext" x="20" y="34" width="110" height="40" rx="8"/><text class="t-c t-b" x="75" y="59">Sender</text>
+  <rect class="box" x="360" y="34" width="110" height="40" rx="8"/><text class="t-c t-b" x="415" y="59">Receiver</text>
+  <path class="arrow" d="M130 54 L356 54"/><text class="t-sm" x="490" y="59">send once, never retry. Lost message = lost forever.</text>
+
+  <text class="t-b" x="20" y="116">At-least-once</text>
+  <rect class="ext" x="20" y="128" width="110" height="40" rx="8"/><text class="t-c t-b" x="75" y="153">Sender</text>
+  <rect class="box" x="360" y="128" width="110" height="40" rx="8"/><text class="t-c t-b" x="415" y="153">Receiver</text>
+  <path class="arrow" d="M130 142 L356 142"/><path class="arrow-r dash" d="M356 158 L134 158"/>
+  <text class="t-sm" x="490" y="147">retry until acked. Nothing lost, but</text><text class="t-sm" x="490" y="164">the receiver may see the same message twice.</text>
+
+  <text class="t-b" x="20" y="210">Effectively-once (at-least-once + dedup)</text>
+  <rect class="ext" x="20" y="222" width="110" height="40" rx="8"/><text class="t-c t-b" x="75" y="247">Sender</text>
+  <rect class="box" x="300" y="222" width="130" height="40" rx="8"/><text class="t-c t-b" x="365" y="247">Dedup check</text>
+  <rect class="db" x="560" y="222" width="110" height="40" rx="8"/><text class="t-c t-b" x="615" y="247">State</text>
+  <path class="arrow" d="M130 236 L296 236"/><path class="arrow-r dash" d="M296 252 L134 252"/>
+  <path class="arrow-g" d="M430 242 L556 242"/>
+  <text class="t-sm" x="690" y="240">effect applied once</text><text class="t-sm" x="690" y="257">duplicates are recognised</text>
+  <text class="t-sm" x="20" y="300">Delivery is still at-least-once on the wire. The receiver makes the second copy a no-op, so the outcome looks like exactly-once.</text>
+</svg>
+<figcaption>The three policies side by side. Effectively-once keeps retries on the sender side (for reliability) and adds a deduplication step on the receiver side (for safety).</figcaption>
+</figure>
+
+<h3>2.4 Kafka: idempotent producer and transactions, in concept</h3>
+<p>Apache Kafka is the best-known system that offers "exactly-once semantics", and it is worth understanding what it actually does (the broker itself is covered in <a href="34-queues-kafka.html">Chapter 34</a>). There are two building blocks.</p>
+
+<p><b>The idempotent producer.</b> When enabled (and it is the default in recent Kafka versions), the broker assigns each producer a <b>producer ID</b>. The producer stamps every record batch sent to a given partition with an increasing <b>sequence number</b>. The broker remembers the last sequence numbers it accepted for each producer and partition. If a retry arrives with a sequence number the broker has already written, the broker discards it and returns success. If a sequence number skips ahead, the broker rejects it, because that signals a gap. The effect: producer retries after lost acks cannot create duplicate records in a partition's log. The guarantee is scoped to one producer session writing to one partition; if the producer process restarts and gets a new producer ID, the broker cannot connect the old and new sessions.</p>
+
+<p><b>Transactions.</b> A producer configured with a stable <code>transactional.id</code> can write to several partitions and topics atomically: either all records become visible or none. Crucially, it can include the <b>consumer offsets</b> in the same transaction. This enables the "consume, process, produce" loop: read a record from input topic A, compute a result, write it to output topic B, and commit the offset of A, all as one atomic unit. If the application crashes in the middle, the transaction aborts, the output is never seen by consumers that read with <code>isolation.level=read_committed</code>, and the input is re-read and re-processed after restart. Observed from outside, each input record affected the output exactly once. Transactional producers also fence out "zombie" instances with the same transactional id by using an epoch number.</p>
+
+<div class="callout watch"><b>Watch out</b>
+Kafka's exactly-once covers data that stays inside Kafka (topic to topic, with offsets stored in Kafka). The moment your consumer calls an external system, such as sending an email, charging a card, or writing to a database, Kafka's transaction cannot undo or deduplicate that side effect. For external effects you still need idempotency keys or a dedup table on the receiving side. An interviewer who hears "I will use Kafka exactly-once" for a payment flow will immediately ask what happens at the database write.
+</div>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="idempotency">3. Idempotency: definition and examples</h2>
+
+<p>An operation is <b>idempotent</b> if performing it many times has the same effect on system state as performing it once. In math: f(f(x)) = f(x). The important word is <i>effect on state</i>. The response may differ between the first and later calls (the second call might say "already done"), but the state of the world after N calls equals the state after one.</p>
+
+<h3>3.1 Naturally idempotent versus not</h3>
+<table>
+<tr><th>Operation</th><th>Idempotent?</th><th>Why</th></tr>
+<tr><td><code>SET balance = 100</code>, <code>PUT /users/42</code> with a full body</td><td>Yes</td><td>The result is the same regardless of how often it runs. It writes an absolute value.</td></tr>
+<tr><td><code>DELETE /users/42</code></td><td>Yes (state-wise)</td><td>After the first call the user is gone; later calls leave it gone. The response may change from 200 to 404, but the state is identical.</td></tr>
+<tr><td>Reading data, <code>GET</code></td><td>Yes (and safe)</td><td>No state change at all.</td></tr>
+<tr><td><code>INSERT ... ON CONFLICT DO NOTHING</code> with a deterministic key</td><td>Yes</td><td>The second insert hits the unique key and is ignored.</td></tr>
+<tr><td><code>balance = balance + 50</code>, "increment counter"</td><td>No</td><td>Each execution changes the result. Two runs add 100.</td></tr>
+<tr><td><code>POST /payments</code>, "create new order", "send email"</td><td>No</td><td>Each call creates a new thing with a new identity.</td></tr>
+<tr><td><code>append item to list</code></td><td>No</td><td>The list grows with each repeat.</td></tr>
+</table>
+
+<p>Notice the pattern: operations that describe a <b>target state</b> ("make it be 100") are idempotent, while operations that describe a <b>change</b> ("add 50") or <b>create something new</b> are not. HTTP encodes this convention: <code>GET</code>, <code>PUT</code>, <code>DELETE</code>, <code>HEAD</code> and <code>OPTIONS</code> are defined as idempotent, <code>POST</code> and (in general) <code>PATCH</code> are not (see <a href="05-api-design.html">Chapter 5</a>). The definition is a promise by the API designer, not enforced by the protocol, so your <code>PUT</code> implementation must really be idempotent.</p>
+
+<h3>3.2 Making a non-idempotent operation idempotent</h3>
+<p>Three techniques cover most cases:</p>
+<ol>
+  <li><b>Convert the change into a target state.</b> Instead of "add 50 to balance", record "payment P-123 of 50 was applied" and compute the balance as the sum of payments. Applying P-123 twice does nothing the second time, because the row already exists. Ledger-style designs work this way.</li>
+  <li><b>Attach an identity to the operation</b> and remember it. Every attempt carries the same operation ID, and the receiver records which IDs it has already processed. This is the idempotency key, the main subject of the next section.</li>
+  <li><b>Make the operation conditional</b> on the current state: "set status to SHIPPED only if status is PAID" or "update only if version is 7". A repeat finds the precondition false and does nothing (section 5).</li>
+</ol>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="keys">4. Idempotency keys: design in depth</h2>
+
+<p>An <b>idempotency key</b> is a unique token that the client attaches to a request to say "all attempts that carry this token are the same logical operation". The server uses it to detect that a request is a retry and, instead of redoing the work, returns the result of the first attempt. Stripe popularised the pattern in its public API with an <code>Idempotency-Key</code> header, and it has since become the standard approach for payment, order and booking APIs.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 420" role="img" aria-label="Idempotency key request flow with states: new, in progress, completed">
+  <rect class="ext" x="20" y="150" width="130" height="50" rx="10"/><text class="t-c t-b" x="85" y="173">Client</text><text class="t-c t-sm" x="85" y="190">Key: K-9f3a</text>
+  <rect class="box" x="210" y="150" width="150" height="50" rx="10"/><text class="t-c t-b" x="285" y="173">Look up key K</text><text class="t-c t-sm" x="285" y="190">in key store</text>
+  <path class="arrow" d="M150 175 L206 175"/>
+
+  <rect class="cache" x="460" y="30" width="200" height="56" rx="10"/><text class="t-c t-b" x="560" y="53">Not found</text><text class="t-c t-sm" x="560" y="72">insert row: IN_PROGRESS</text>
+  <rect class="miss" x="460" y="150" width="200" height="56" rx="10"/><text class="t-c t-b" x="560" y="173">Found: IN_PROGRESS</text><text class="t-c t-sm" x="560" y="192">another attempt is running</text>
+  <rect class="hit" x="460" y="270" width="200" height="56" rx="10"/><text class="t-c t-b" x="560" y="293">Found: COMPLETED</text><text class="t-c t-sm" x="560" y="312">same fingerprint?</text>
+  <path class="arrow" d="M360 165 L456 66"/><path class="arrow" d="M360 175 L456 178"/><path class="arrow" d="M360 190 L456 292"/>
+
+  <rect class="box" x="720" y="30" width="160" height="56" rx="10"/><text class="t-c t-b" x="800" y="53">Do the work once</text><text class="t-c t-sm" x="800" y="72">then store response</text>
+  <rect class="miss" x="720" y="150" width="160" height="56" rx="10"/><text class="t-c t-b" x="800" y="173">409 Conflict</text><text class="t-c t-sm" x="800" y="192">or wait, then replay</text>
+  <rect class="hit" x="720" y="240" width="160" height="40" rx="8"/><text class="t-c t-b" x="800" y="265">Replay stored response</text>
+  <rect class="miss" x="720" y="300" width="160" height="56" rx="10"/><text class="t-c t-b" x="800" y="323">422 / 400</text><text class="t-c t-sm" x="800" y="342">same key, different body</text>
+  <path class="arrow" d="M660 58 L716 58"/><path class="arrow" d="M660 178 L716 178"/>
+  <path class="arrow-g" d="M660 290 L716 262"/><path class="arrow-r" d="M660 308 L716 322"/>
+  <text class="t-sm" x="20" y="395">The key store must support an atomic "insert if absent" so two simultaneous attempts cannot both see "not found".</text>
+</svg>
+<figcaption>The server maps each key to a record with a state. A new key starts work. A key whose first attempt is still running is rejected or made to wait. A completed key replays the saved response, but only if the new request body matches the original; a mismatch is a client bug and is refused.</figcaption>
+</figure>
+
+<h3>4.1 Who generates the key, and what it looks like</h3>
+<p>The key is generated by the <b>client</b>, not the server. This is essential: if the server generated it, the client would have to call the server first to get a key, and that first call could itself be duplicated. The client creates the key before the first attempt, stores it with the pending operation, and reuses the same key on every retry. A random UUID (version 4) is a typical choice; for UI forms, a key generated when the form is rendered works well, because a double-click or a page resubmit then carries the same key. The key must have enough entropy that two different logical operations never collide, which is why one uses 122 random bits (a UUID) rather than a timestamp.</p>
+<p>Important: a <i>new</i> logical action must get a <i>new</i> key. If a client mistakenly reuses a key for a different payment, the server will think it is a retry and return the first payment's response. This is the single most common integration mistake and is why servers check the request fingerprint (4.3).</p>
+
+<h3>4.2 Scope</h3>
+<p>Keys must be namespaced. The same string from two different customers must not collide, so the store key is usually <code>(tenant or account id, endpoint or operation name, idempotency key)</code>. Scoping per account also prevents one customer from probing for another's keys, and prevents a malicious client from "poisoning" a key that a victim might later use. Some APIs scope per user and per route, so the same key used on <code>/payments</code> and <code>/refunds</code> does not conflict.</p>
+
+<h3>4.3 The request fingerprint</h3>
+<p>Along with the key, the server stores a <b>fingerprint</b>: a hash of the request's essential content (method, path, body, relevant parameters). When a request arrives with a known key, the server compares fingerprints. If equal, it is a genuine retry. If different, the client has reused a key for a different request, and the server must refuse with an error (Stripe returns an error describing that the key was used with different parameters) instead of silently replaying the old answer. Without this check, a bug in the client can cause one customer's order to be answered with another's response.</p>
+
+<h3>4.4 Storage</h3>
+<p>The key store maps <code>key to {fingerprint, state, response status, response body, created_at}</code>. Where does it live?</p>
+<ul>
+  <li><b>In the same database as the business data.</b> This is the strongest option. The key row and the business rows are written in the <b>same transaction</b>, so either both exist or neither does. A crash can never leave the work done but the key unrecorded (which would allow a duplicate) or the key recorded but the work not done (which would make retries return a false success). Use this whenever the operation is a local database change.</li>
+  <li><b>In a fast external store such as Redis.</b> Cheaper and faster, using <code>SET key value NX EX ttl</code> for the atomic claim (see <a href="15-redis.html">Chapter 15</a>). The weakness is that the key store and the business database are two systems, so there is a window between "did the work" and "recorded the result" in which a crash causes a duplicate on retry. This is acceptable for low-stakes operations, and unacceptable for money unless the downstream operation is itself idempotent.</li>
+</ul>
+
+<h3>4.5 TTL: how long to remember</h3>
+<p>Keys cannot be stored forever, because the store would grow without bound. A <b>time to live</b> is chosen to cover the longest plausible retry window: how long the client might keep retrying plus a safety margin. Stripe, for example, documents that keys can be removed after at least 24 hours. A mobile client that queues operations while offline for a day needs a longer TTL than a server-to-server call that gives up after 30 seconds. Once the key expires, a retry would be treated as brand-new, so the TTL is a contract: "retries are safe for N hours". Document it in the API.</p>
+
+<h3>4.6 Concurrent duplicates and in-flight requests</h3>
+<p>The hard case is not the sequential retry (first request finished, then the second arrives). It is the <b>concurrent duplicate</b>: the client times out at 5 seconds while the server is still working on the first request (it takes 8 seconds), the client retries, and now two copies are in flight at the same time. If both check "is key present?" before either writes it, both proceed. The fix is an <b>atomic claim</b>: insert the key row with state <code>IN_PROGRESS</code> using a unique constraint or <code>SET NX</code>. Exactly one request wins the insert. For the loser, there are two designs:</p>
+<ul>
+  <li><b>Reject fast:</b> return <code>409 Conflict</code> (or 425/429 depending on the API) with a message "a request with this key is in progress; retry shortly". The client's retry logic backs off and tries again, by which time the first request has likely finished and the retry gets the stored response. Simple and stateless.</li>
+  <li><b>Wait and replay:</b> the second request blocks (polling the key row or waiting on a lock) until the first completes, then returns the same stored response. A friendlier client experience, but it holds a connection and thread, and it needs a timeout.</li>
+</ul>
+<p>Also handle <b>crashed first attempts</b>. If the first server dies after claiming the key and before completing, the row would stay <code>IN_PROGRESS</code> forever and block every retry. The remedy is a lock expiry (a "lease"): the <code>IN_PROGRESS</code> row carries a timestamp, and after, say, 60 seconds a retry may take over. The work itself must then be safe to resume or redo, which is why the local transaction approach (all or nothing) is easier than multi-step external workflows.</p>
+
+<h3>4.7 Storing the response</h3>
+<p>For a true replay, the server stores the status code and body of the first completed response and returns exactly those on later attempts, even if the underlying data has since changed. That way the client cannot tell the difference between the original and the retry, which is the whole point. Should <b>errors</b> be stored too? Stripe saves the result of the first request regardless of success or failure, including 500 errors, so that behaviour is deterministic. A reasonable middle path: store definitive outcomes (success, or validation errors that will not change) and do not store transient failures (a 503 from a dependency, timeouts), so the client can retry with the same key and get a real attempt. Be explicit in your design about which class each failure belongs to.</p>
+
+<div class="callout tip"><b>Interview tip</b>
+When you add a payments or order-creation API on the whiteboard, volunteer the idempotency key before being asked. Say it in this order: client generates the key, server atomically claims it with a unique constraint in the same transaction as the business write, stores the fingerprint and response, returns the saved response on retries, and expires keys after about a day. That sequence shows you know the failure mode and the details.
+</div>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="patterns">5. Implementation patterns for deduplication</h2>
+
+<p>An idempotency key tells you <i>what</i> to deduplicate on. The patterns below are <i>how</i> the storage layer enforces it. They apply equally to API requests and to message consumers.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Dedup table with unique constraint in one transaction, and compare-and-set versioning">
+  <text class="t-b" x="20" y="22">A. Dedup table with a unique constraint (one transaction)</text>
+  <rect class="ext" x="20" y="40" width="130" height="50" rx="10"/><text class="t-c t-b" x="85" y="63">Request</text><text class="t-c t-sm" x="85" y="80">key = K-9f3a</text>
+  <rect class="box" x="210" y="40" width="130" height="50" rx="10"/><text class="t-c t-b" x="275" y="63">BEGIN</text><text class="t-c t-sm" x="275" y="80">transaction</text>
+  <rect class="db" x="400" y="30" width="230" height="30" rx="8"/><text class="t-c t-sm" x="515" y="50">1. INSERT processed_keys (K-9f3a)</text>
+  <rect class="db" x="400" y="68" width="230" height="30" rx="8"/><text class="t-c t-sm" x="515" y="88">2. INSERT/UPDATE business rows</text>
+  <rect class="hit" x="690" y="30" width="190" height="30" rx="8"/><text class="t-c t-sm" x="785" y="50">success: COMMIT both</text>
+  <rect class="miss" x="690" y="68" width="190" height="30" rx="8"/><text class="t-c t-sm" x="785" y="88">duplicate key: ROLLBACK, skip</text>
+  <path class="arrow" d="M150 65 L206 65"/><path class="arrow" d="M340 55 L396 48"/><path class="arrow" d="M340 75 L396 83"/>
+  <path class="arrow-g" d="M630 45 L686 45"/><path class="arrow-r" d="M630 83 L686 83"/>
+
+  <text class="t-b" x="20" y="150">B. Compare-and-set with a version (optimistic concurrency)</text>
+  <rect class="db" x="20" y="166" width="250" height="60" rx="8"/><text class="t-b" x="34" y="188">orders row: id=7</text><text class="t-sm" x="34" y="208">status=PAID, version=4</text>
+  <rect class="box" x="340" y="166" width="540" height="60" rx="8"/>
+  <text class="t-sm" x="354" y="188">UPDATE orders SET status='SHIPPED', version=5</text>
+  <text class="t-sm" x="354" y="208">WHERE id=7 AND version=4     (rows affected: 1 = we won, 0 = already applied or lost race)</text>
+  <path class="arrow" d="M270 196 L336 196"/>
+
+  <text class="t-b" x="20" y="270">C. Sequence numbers per producer</text>
+  <rect class="ext" x="20" y="286" width="150" height="50" rx="10"/><text class="t-c t-b" x="95" y="309">Producer P1</text><text class="t-c t-sm" x="95" y="326">seq 1, 2, 3, 3, 4</text>
+  <rect class="box" x="260" y="286" width="250" height="50" rx="10"/><text class="t-c t-b" x="385" y="309">Receiver keeps last_seq[P1]=3</text><text class="t-c t-sm" x="385" y="326">seq &lt;= 3 : drop,  seq = 4 : accept</text>
+  <path class="arrow" d="M170 311 L256 311"/>
+  <rect class="hit" x="580" y="286" width="300" height="50" rx="8"/><text class="t-sm" x="592" y="308">Needs ordered delivery per producer. One counter</text><text class="t-sm" x="592" y="326">per producer, not one entry per message.</text>
+  <text class="t-sm" x="20" y="376">All three make the second attempt a no-op by relying on an atomic check performed by the database or receiver.</text>
+</svg>
+<figcaption>Three ways to enforce "apply once". A uses a unique key written in the same transaction as the work. B uses a conditional update that only succeeds from an expected state. C stores one counter per producer instead of remembering every message id.</figcaption>
+</figure>
+
+<h3>5.1 Dedup table with a unique constraint</h3>
+<p>Create a table <code>processed_keys(key PRIMARY KEY, created_at)</code>. In one database transaction, first insert the key, then perform the business change. If the key already exists, the database raises a unique-violation error, you roll back (or treat it as "already done") and return the saved result. Because the constraint is enforced by the database engine under its own locking, even two simultaneous transactions with the same key cannot both succeed: one blocks on the other's uncommitted insert and then fails. This is the workhorse pattern. It works with any relational store and is the simplest to reason about. The cost is one extra indexed write per operation and a table that must be pruned.</p>
+
+<h3>5.2 Conditional writes</h3>
+<p>Many stores support "write only if". DynamoDB has condition expressions (<code>attribute_not_exists(pk)</code>), Cassandra has lightweight transactions (<code>IF NOT EXISTS</code>), S3 supports conditional puts, and SQL has <code>INSERT ... ON CONFLICT DO NOTHING</code>. The idea is the same: you let the storage engine perform the existence check and the write as one atomic step, avoiding the race of "read then write". Whenever you see yourself writing "if not exists(key): insert(key)" as two statements in application code, you have a race; collapse it into one conditional statement.</p>
+
+<h3>5.3 Versioning and compare-and-set</h3>
+<p>Give each mutable row a version number (or use its last-modified timestamp or a hash of its contents). An update says "set X, but only if the version is still 4", and bumps the version to 5. If a duplicate or stale update arrives, the version no longer matches, zero rows are affected, and the writer knows the change was already applied or that someone else changed the row. This pattern, known as <b>optimistic concurrency control</b> or <b>compare-and-set (CAS)</b>, also protects against lost updates between different users, not just duplicates. State machines use the same idea: "move from PAID to SHIPPED" is a conditional update on the current state, so repeating it is harmless (see <a href="31-distributed-transactions.html">Chapter 31</a> for how such steps are chained across services).</p>
+
+<h3>5.4 The inbox pattern (idempotent receiver)</h3>
+<p>The <b>inbox pattern</b> is the consumer-side partner of the transactional outbox described in <a href="31-distributed-transactions.html">Chapter 31</a>. The consumer has an <code>inbox</code> table containing the message ids it has handled. When a message arrives, the consumer opens a local transaction, inserts the message id into the inbox, applies the business effect, and commits. Only then does it acknowledge the message to the broker. Three crash points illustrate why it works:</p>
+<ul>
+  <li>Crash before the transaction commits: nothing was recorded or applied. The broker redelivers, and the retry processes it normally.</li>
+  <li>Crash after commit but before the ack: both the inbox row and the business effect exist. The broker redelivers, the insert hits the unique constraint, and the consumer simply acknowledges without redoing the work.</li>
+  <li>Two consumers receive the same message simultaneously: the unique constraint lets exactly one commit.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 310" role="img" aria-label="Inbox pattern with a broker, a consumer, an inbox table and business tables in one transaction">
+  <rect class="cache" x="20" y="110" width="150" height="70" rx="10"/><text class="t-c t-b" x="95" y="140">Broker</text><text class="t-c t-sm" x="95" y="160">at-least-once</text>
+  <rect class="box" x="250" y="110" width="160" height="70" rx="10"/><text class="t-c t-b" x="330" y="140">Consumer</text><text class="t-c t-sm" x="330" y="160">handler code</text>
+  <rect class="db" x="520" y="40" width="360" height="190" rx="12"/><text class="t-b" x="536" y="62">Consumer's database (one local transaction)</text>
+  <rect class="db" x="540" y="80" width="320" height="50" rx="8"/><text class="t-c t-b" x="700" y="103">inbox(message_id PRIMARY KEY)</text><text class="t-c t-sm" x="700" y="121">1. insert id; duplicate = skip</text>
+  <rect class="db" x="540" y="150" width="320" height="56" rx="8"/><text class="t-c t-b" x="700" y="173">business tables</text><text class="t-c t-sm" x="700" y="191">2. apply the effect, then COMMIT</text>
+  <path class="arrow" d="M170 135 L246 135"/><text class="t-sm" x="178" y="128">deliver</text>
+  <path class="arrow" d="M410 120 L516 108"/><path class="arrow" d="M410 165 L516 175"/>
+  <path class="arrow-g dash" d="M246 160 L174 160"/><text class="t-sm" x="182" y="176">3. ack after commit</text>
+  <text class="t-sm" x="20" y="270">If the ack is lost, the broker redelivers; step 1 fails on the unique key and the handler just acks again.</text>
+  <text class="t-sm" x="20" y="290">The inbox row and the business effect commit together, so they can never disagree.</text>
+</svg>
+<figcaption>The consumer records the message id and applies the effect in the same local transaction, and acknowledges only afterwards. A redelivered message is detected by the primary key on the inbox.</figcaption>
+</figure>
+
+<h3>5.5 Sequence numbers per producer</h3>
+<p>Instead of remembering every message id, each producer numbers its messages 1, 2, 3, and so on. The receiver keeps only the <b>highest sequence number processed per producer</b>. A message with a number at or below it is a duplicate and is dropped; the next expected number is accepted; a number that skips ahead signals a gap and triggers a wait or a resend. TCP uses this idea for byte streams and Kafka's idempotent producer uses it for batches. The storage cost is one counter per producer rather than one row per message, which is why it scales to very high rates. The limits: it needs ordered delivery per producer, a stable producer identity, and a way to handle producer restarts (Kafka solves the restart case with transactional ids and epochs).</p>
+
+<h3>5.6 Dedup windows and their cost</h3>
+<p>Remembering every message id forever is impossible at scale, so almost all systems use a <b>dedup window</b>: they remember ids for a bounded time and assume that a duplicate can only arrive within that window. SQS FIFO queues, for example, deduplicate messages with the same deduplication id within a five minute interval. Choosing the window is a tradeoff:</p>
+<ul>
+  <li><b>Too short:</b> a late retry or a replay after an outage falls outside the window and is processed twice.</li>
+  <li><b>Too long:</b> storage and index size grow in proportion to rate times window.</li>
+</ul>
+<p>Worked estimate: a consumer handling 5,000 messages per second with a 24 hour window must remember 5,000 x 86,400 = 432 million ids. At 16 bytes for a UUID plus roughly 30 bytes of index and row overhead, that is around 46 bytes each, about 20 GB. That is comfortable for a database table with partitioning and a daily drop of old partitions, but heavy for an in-memory set. A Bloom filter (see <a href="57-hashing-probabilistic.html">Chapter 57</a>) can shrink memory a lot, but it has false positives, which would wrongly drop genuinely new messages, so it is used only as a first-level filter in front of an exact check, never alone for money. Sequence numbers (5.5) avoid the problem entirely when they are applicable.</p>
+
+<h3>5.7 Idempotent consumers, end to end</h3>
+<p>Put the pieces together for a consumer that reads events from a queue and updates a database. The safest recipe is: (1) make the handler's effect idempotent on its own where possible (upserts rather than inserts, absolute values rather than increments); (2) where it is not, use the inbox pattern so the dedup record and the effect commit atomically; (3) acknowledge only after the transaction commits, so a crash leads to redelivery rather than loss; (4) for effects on external systems (an email, a card charge), pass a deterministic idempotency key derived from the message id, such as <code>"payment-" + messageId</code>, so that even if your handler runs twice the downstream system sees the same key and deduplicates it. That last point is the general rule for chains: <b>every hop in the chain must either be idempotent or be handed a stable key</b>.</p>
+
+<h3>5.8 Safe retries</h3>
+<p>Idempotency is what makes retrying legal. A retry policy without it is a duplicate generator. Retries themselves must be designed carefully, and that topic is covered in <a href="40-resilience.html">Chapter 40</a> (and again for microservices in <a href="51-microservice-resilience.html">Chapter 51</a>); the short version is:</p>
+<ul>
+  <li>Retry only operations that are idempotent or carry an idempotency key. Retrying a bare <code>POST</code> is unsafe.</li>
+  <li>Retry only errors that are likely transient (timeouts, connection resets, 503, 429), never validation errors (400, 422) or authorisation failures.</li>
+  <li>Use <b>exponential backoff with jitter</b>, so a thousand clients that failed together do not all retry on the same millisecond and keep the server down.</li>
+  <li>Cap the number of attempts and set a total deadline, and avoid retrying at every layer of a deep call chain, since three layers each retrying three times produce 27 attempts at the bottom (a retry storm).</li>
+  <li>Use a retry budget or circuit breaker so retries cannot exceed a small fraction of normal traffic.</li>
+</ul>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="id-reqs">6. ID generation: why it is a design problem</h2>
+
+<p>Every row, event, order, file and message needs an identifier. On a single database server this is trivial: let the database count. In a distributed system, many machines create records at the same time, often in different data centers, and the identifiers must still never collide. Worse, the choice of ID format quietly affects index performance, storage cost, security and how you can shard the data (<a href="25-sharding.html">Chapter 25</a>). This second half of the chapter walks through the requirements and the main designs.</p>
+
+<h3>6.1 Requirements</h3>
+<ul>
+  <li><b>Uniqueness.</b> The non-negotiable one. Two different records must never receive the same ID, even if created on different machines at the same instant.</li>
+  <li><b>Rough sortability (k-sortable).</b> Many systems want IDs that increase roughly with creation time. Then "newest first" is an index scan, range queries by time are cheap, and B-tree inserts land at the right edge of the index instead of at random places. "K-sortable" means sorted to within some small tolerance (for example, to the millisecond), not strictly ordered.</li>
+  <li><b>Size.</b> A 64-bit integer takes 8 bytes. A UUID takes 16 bytes as binary and 36 characters as text. The ID is copied into every secondary index, every foreign key and every cache entry, so size multiplies (section 12).</li>
+  <li><b>No coordination (or very little).</b> Generating an ID should not need a network round trip to a central server for every record, because that becomes a latency cost and a single point of failure. Ideally each node generates IDs locally.</li>
+  <li><b>High throughput and availability.</b> Large systems create hundreds of thousands to millions of IDs per second and must keep generating them during partial failures.</li>
+  <li><b>Privacy and unguessability.</b> Sometimes IDs are exposed in URLs. Sequential integers leak business volume and allow enumeration (section 11). Sometimes you want opaque IDs; sometimes you want IDs that reveal nothing about creation time.</li>
+  <li><b>Human or URL friendliness.</b> Short, case-safe, easy to read or type, no special characters.</li>
+</ul>
+<p>These goals conflict. Random IDs are unguessable and need no coordination but are unsorted and large; sequential IDs are small and sorted but need coordination. Most of the designs below are different compromises.</p>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="autoinc">7. Auto-increment and why it breaks at scale</h2>
+
+<p>The default in every relational database is an auto-incrementing integer (<code>AUTO_INCREMENT</code> in MySQL, <code>SERIAL</code> or identity columns in PostgreSQL). The database keeps a counter and hands out 1, 2, 3, and so on. It is small (4 or 8 bytes), perfectly ordered, and fast on a single node. For a monolith with one primary database, it is often the correct answer, and you should not over-engineer past it.</p>
+
+<p>It breaks when the system grows beyond one writer:</p>
+<ul>
+  <li><b>Single point of contention and failure.</b> Every insert must take the next value from one counter on one primary. That limits write throughput to what one node's counter can do, and if that node is down, no one can create records.</li>
+  <li><b>Sharding.</b> With ten database shards, each shard has its own counter, so shard 1 and shard 2 both produce ID 1. IDs are no longer globally unique, so you cannot move rows between shards, and foreign references become ambiguous.</li>
+  <li><b>Multi-region and multi-primary replication.</b> Two primaries accepting writes both count upward from the same value and collide. The standard workaround is to give each primary a different offset and step, for example with two nodes, node A produces odd numbers and node B even numbers (<code>auto_increment_increment = 2</code>, offsets 1 and 2). That works but is fragile: adding a third node means reconfiguring the step, IDs from different nodes are no longer in time order, and gaps appear.</li>
+  <li><b>Enumeration and leakage.</b> Sequential IDs let an outsider guess neighbours (<code>/orders/1001</code>, <code>/orders/1002</code>) and estimate your total volume.</li>
+  <li><b>Client-side generation is impossible.</b> The ID exists only after the insert round trip, which complicates idempotent creation (the client cannot choose the ID in advance) and offline-first applications.</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b>
+Auto-increment couples "creating an ID" to "talking to one particular database". Every scalable scheme below breaks that coupling by letting each node generate IDs independently, or by handing out ranges of IDs in bulk so the central counter is touched rarely.
+</div>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="uuids">8. UUIDs, ULID and KSUID: coordination-free IDs</h2>
+
+<h3>8.1 UUID version 4 (random)</h3>
+<p>A <b>UUID</b> (universally unique identifier) is a 128-bit value, usually written as 32 hexadecimal digits in five groups, such as <code>3f2b8c1e-9a47-4d3e-8b61-7c0d5e2fa913</code>. Version 4 fills 122 of the 128 bits with random data (the remaining 6 bits mark the version and variant). Any machine can generate one with no coordination at all. The collision probability is negligible for practical purposes: to have even a one-in-a-billion chance of any collision you would need on the order of 100 trillion UUIDs (the birthday bound is roughly the square root of 2^122, about 2.3 x 10^18 IDs for a 50 percent chance). That makes UUIDv4 attractive: trivial to implement, safe to generate on clients, and unguessable.</p>
+
+<p>The cost is <b>index locality</b>. Databases that organise a table or index as a B-tree (InnoDB's clustered primary key in MySQL, and every ordinary secondary index) keep entries sorted by key. With a sequential key, every new row goes to the rightmost leaf page, which stays hot in memory and fills up neatly. With a random key, each new row lands on a random leaf page somewhere in the whole index. Consequences:</p>
+<ul>
+  <li><b>Cache misses.</b> The "hot" part of the index is the entire index, not its right edge. Once the index is larger than memory, a large share of inserts need a disk read to fetch the target page.</li>
+  <li><b>Page splits and fragmentation.</b> Inserting into the middle of a full page forces a split, leaving two half-empty pages. Over time the index becomes larger (often 20 to 40 percent) and less dense than a sequential one.</li>
+  <li><b>Write amplification.</b> Random page writes dirty many different pages, inflating the amount written to the write-ahead log and to disk (see <a href="18-relational-internals.html">Chapter 18</a> and <a href="19-storage-engines.html">Chapter 19</a>).</li>
+  <li><b>Size.</b> 16 bytes instead of 8, copied into every secondary index of an InnoDB table, since secondary indexes store the primary key.</li>
+</ul>
+<p>This is invisible with a million rows and very visible with a billion.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Comparison of insert locality for random UUIDv4 and time-ordered IDs in a B-tree index">
+  <text class="t-b" x="20" y="22">Random key (UUIDv4): inserts hit leaves everywhere</text>
+  <rect class="db" x="20" y="40" width="80" height="50" rx="6"/><text class="t-c t-sm" x="60" y="70">leaf 1</text>
+  <rect class="db" x="110" y="40" width="80" height="50" rx="6"/><text class="t-c t-sm" x="150" y="70">leaf 2</text>
+  <rect class="db" x="200" y="40" width="80" height="50" rx="6"/><text class="t-c t-sm" x="240" y="70">leaf 3</text>
+  <rect class="db" x="290" y="40" width="80" height="50" rx="6"/><text class="t-c t-sm" x="330" y="70">leaf 4</text>
+  <rect class="db" x="380" y="40" width="80" height="50" rx="6"/><text class="t-c t-sm" x="420" y="70">leaf 5</text>
+  <rect class="db" x="470" y="40" width="80" height="50" rx="6"/><text class="t-c t-sm" x="510" y="70">leaf 6</text>
+  <path class="arrow-r" d="M600 70 L194 94"/><path class="arrow-r" d="M600 70 L420 94"/><path class="arrow-r" d="M600 70 L64 94"/><path class="arrow-r" d="M600 70 L330 94"/>
+  <rect class="miss" x="610" y="40" width="270" height="60" rx="8"/><text class="t-sm" x="622" y="62">New rows land on random pages.</text><text class="t-sm" x="622" y="82">Whole index must stay in memory.</text>
+
+  <text class="t-b" x="20" y="180">Time-ordered key (UUIDv7, ULID, Snowflake): inserts append at the right edge</text>
+  <rect class="db" x="20" y="198" width="80" height="50" rx="6"/><text class="t-c t-sm" x="60" y="228">leaf 1</text>
+  <rect class="db" x="110" y="198" width="80" height="50" rx="6"/><text class="t-c t-sm" x="150" y="228">leaf 2</text>
+  <rect class="db" x="200" y="198" width="80" height="50" rx="6"/><text class="t-c t-sm" x="240" y="228">leaf 3</text>
+  <rect class="db" x="290" y="198" width="80" height="50" rx="6"/><text class="t-c t-sm" x="330" y="228">leaf 4</text>
+  <rect class="db" x="380" y="198" width="80" height="50" rx="6"/><text class="t-c t-sm" x="420" y="228">leaf 5</text>
+  <rect class="hit" x="470" y="198" width="80" height="50" rx="6"/><text class="t-c t-sm" x="510" y="228">leaf 6</text>
+  <path class="arrow-g" d="M600 223 L554 223"/>
+  <rect class="hit" x="610" y="198" width="270" height="60" rx="8"/><text class="t-sm" x="622" y="220">New rows go to the newest page.</text><text class="t-sm" x="622" y="240">Only the right edge needs to be hot.</text>
+  <text class="t-sm" x="20" y="300">Older pages are written once and then mostly read, so they can sit on disk without hurting insert speed.</text>
+</svg>
+<figcaption>Top: random IDs scatter inserts across the whole B-tree, causing cache misses and page splits. Bottom: time-ordered IDs append to the rightmost leaf, which stays in memory and fills completely.</figcaption>
+</figure>
+
+<h3>8.2 UUIDv7</h3>
+<p>The newer <b>UUID version 7</b> (standardised in RFC 9562) keeps the 128-bit UUID format but puts a <b>48-bit Unix timestamp in milliseconds</b> in the most significant bits, followed by the version bits and about 74 bits of randomness (some implementations use part of the random field as a counter to keep IDs within one millisecond ordered). Because the timestamp comes first, UUIDv7 values sort by creation time as plain bytes, giving the B-tree behaviour in the lower half of the figure, while still needing no coordination and fitting any column that already stores UUIDs. It is today the sensible default when you want UUID compatibility plus index friendliness. The tradeoff is that the creation time is readable from the ID, which can be a privacy leak (section 11).</p>
+
+<h3>8.3 ULID</h3>
+<p><b>ULID</b> (Universally Unique Lexicographically Sortable Identifier) predates UUIDv7 with the same idea: 48 bits of millisecond timestamp followed by 80 bits of randomness, 128 bits total. It is written as a 26-character string in Crockford base32 (digits and uppercase letters without confusing ones like I, L, O, U), which is shorter than the 36-character UUID text and sorts correctly as a string. Within the same millisecond, a monotonic ULID generator increments the random part so IDs from one process stay strictly ordered. Compared with UUIDv7, ULID's main advantages are the compact text form and no dependency on a standard; UUIDv7's are native database types and library support.</p>
+
+<h3>8.4 KSUID</h3>
+<p><b>KSUID</b> (K-Sortable Unique ID, from Segment) uses 160 bits: a 32-bit timestamp counted in seconds from a custom epoch in 2014, followed by 128 bits of randomness, rendered as a 27-character base62 string. Second granularity is coarser, so IDs created within the same second are not ordered relative to each other, but the very large random part makes collisions practically impossible without any counter. Its longer 20-byte size is the price.</p>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="snowflake">9. Snowflake: 64-bit time-ordered IDs</h2>
+
+<p>Twitter created <b>Snowflake</b> in 2010 when it moved away from a single MySQL auto-increment and needed IDs that were small enough for a 64-bit column, roughly time-ordered, and generated by many machines without a call to a central server. The idea has been copied across the industry (Discord, Instagram's variant, Sonyflake, Baidu's UidGenerator, and many in-house versions).</p>
+
+<h3>9.1 The bit layout</h3>
+<p>A Snowflake ID is a 64-bit integer built by packing several fields into fixed bit ranges. In Twitter's original layout:</p>
+<table>
+<tr><th>Field</th><th>Bits</th><th>Meaning</th></tr>
+<tr><td>Sign bit</td><td>1</td><td>Always 0, so the value fits a signed 64-bit integer and stays positive.</td></tr>
+<tr><td>Timestamp</td><td>41</td><td>Milliseconds since a custom epoch chosen by the system (not 1970). 2^41 ms is about 2.2 x 10^12 ms, roughly 69.7 years of range.</td></tr>
+<tr><td>Datacenter id</td><td>5</td><td>32 possible data centers.</td></tr>
+<tr><td>Machine (worker) id</td><td>5</td><td>32 workers per data center. Together with the data center, 1,024 distinct generators.</td></tr>
+<tr><td>Sequence</td><td>12</td><td>A counter that restarts at 0 every millisecond. 4,096 IDs per millisecond per worker.</td></tr>
+</table>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Snowflake 64-bit layout: 1 sign bit, 41 timestamp bits, 5 datacenter bits, 5 machine bits, 12 sequence bits">
+  <rect class="ext" x="20" y="60" width="40" height="60" rx="4"/><text class="t-c t-b" x="40" y="86">0</text><text class="t-c t-sm" x="40" y="104">1 bit</text>
+  <rect class="box" x="60" y="60" width="440" height="60" rx="4"/><text class="t-c t-b" x="280" y="86">Timestamp</text><text class="t-c t-sm" x="280" y="104">41 bits, ms since custom epoch</text>
+  <rect class="cache" x="500" y="60" width="100" height="60" rx="4"/><text class="t-c t-b" x="550" y="86">Datacenter</text><text class="t-c t-sm" x="550" y="104">5 bits</text>
+  <rect class="cache" x="600" y="60" width="100" height="60" rx="4"/><text class="t-c t-b" x="650" y="86">Machine</text><text class="t-c t-sm" x="650" y="104">5 bits</text>
+  <rect class="db" x="700" y="60" width="180" height="60" rx="4"/><text class="t-c t-b" x="790" y="86">Sequence</text><text class="t-c t-sm" x="790" y="104">12 bits, 0..4095 per ms</text>
+  <text class="t-sm" x="20" y="48">bit 63 (most significant)</text><text class="t-sm" x="780" y="48">bit 0</text>
+  <path class="arrow" d="M280 135 L280 170"/><text class="t-c t-sm" x="280" y="190">Because time is in the high bits, larger ID means later (to the ms)</text>
+  <path class="arrow" d="M650 135 L650 170"/><text class="t-c t-sm" x="690" y="190">Makes IDs unique across 1,024 workers</text>
+  <text class="t-sm" x="20" y="230">Example capacity: 4,096 IDs per ms per worker = 4.096 million per second per worker, about 4.2 billion per second for 1,024 workers.</text>
+</svg>
+<figcaption>Read left to right from the most significant bit. The timestamp occupies the high bits so numeric order follows time. The worker fields make each generator's output disjoint from every other's, and the sequence disambiguates IDs created in the same millisecond on the same worker.</figcaption>
+</figure>
+
+<h3>9.2 How a worker generates an ID</h3>
+<p>Each worker keeps two pieces of state in memory: the timestamp of the last ID it issued and the current sequence number. To make an ID it reads the current time in milliseconds and then:</p>
+<ol>
+  <li>If the current time equals the last timestamp, increment the sequence. If the sequence overflows past 4,095, <b>spin-wait until the next millisecond</b> so the counter can restart.</li>
+  <li>If the current time is greater, reset the sequence to 0.</li>
+  <li>Compute <code>((now - epoch) &lt;&lt; 22) | (datacenter &lt;&lt; 17) | (machine &lt;&lt; 12) | sequence</code>, store the timestamp as the new last one, and return the value.</li>
+</ol>
+<p>This runs entirely in local memory, takes a few hundred nanoseconds, and requires no network call, which is why it scales to millions of IDs per second per node. The only synchronisation is a lock or atomic around the two state variables within one process.</p>
+
+<h3>9.3 The clock problem</h3>
+<p>Snowflake trusts the machine's clock. Clocks can move backwards: an NTP correction steps the clock back a few milliseconds, a virtual machine resumes after pause, or a leap second is smeared. If the clock goes back to a timestamp the worker has already used, it might regenerate an ID it issued before (same timestamp, same worker, same sequence), a <b>collision</b>. Real implementations handle it explicitly:</p>
+<ul>
+  <li><b>Refuse and wait.</b> If <code>now &lt; lastTimestamp</code>, the generator throws or blocks until the clock catches up. For small rollbacks (a few milliseconds) waiting is fine. Twitter's original code throws an error when the clock moves backwards.</li>
+  <li><b>Keep using the last timestamp.</b> Continue issuing IDs from the stored last timestamp and an incrementing sequence, ignoring the real clock until it catches up. This preserves uniqueness and availability at the cost of IDs briefly "living in the future", and it is bounded by the sequence capacity.</li>
+  <li><b>Persist the last timestamp.</b> Write the last issued timestamp periodically to disk or a coordination service, so that after a crash and restart the worker refuses to issue anything earlier. Without this, a restarted worker on a machine with a slightly earlier clock could duplicate.</li>
+  <li><b>Alert and take the node out of rotation</b> when the rollback is large (seconds), since something is wrong with time on that host.</li>
+  <li><b>Use a monotonic clock for the delta</b> (elapsed time since start) combined with a wall-clock reading at start, which avoids most step adjustments from NTP.</li>
+</ul>
+<p>Also note that Snowflake order is only approximate across workers: two workers with clocks 5 ms apart produce IDs that are 5 ms out of true order. That is normally fine ("k-sortable"), but it means you cannot use the ID as a strict causal ordering. For causality you need the tools of <a href="27-failure-time-ordering.html">Chapter 27</a>, such as logical or hybrid clocks.</p>
+
+<h3>9.4 Assigning worker ids</h3>
+<p>The scheme depends on <b>no two live workers sharing the same (datacenter, machine) pair</b>. How the pair is assigned is the one place coordination appears, but only once per worker startup, not per ID:</p>
+<ul>
+  <li><b>Static configuration.</b> A config file or environment variable per host. Simple, but error-prone: copying a config duplicates the id, and autoscaled or containerised fleets make static assignment awkward.</li>
+  <li><b>Coordination service.</b> On startup each worker registers in ZooKeeper or etcd (<a href="30-coordination-locks.html">Chapter 30</a>), for example by creating an ephemeral sequential node, and uses the assigned sequence number as its worker id. When the worker dies, the ephemeral node disappears and the id can be reused. Often combined with a lease so a worker that is partitioned from the coordinator stops issuing IDs before its id is handed to a newcomer.</li>
+  <li><b>Database table.</b> A worker inserts a row to claim the smallest free id and heartbeats to renew it. Cheap if you already have a database.</li>
+  <li><b>Derived from the environment.</b> Use the low bits of the pod IP, the Kubernetes StatefulSet ordinal, or a cloud instance number. Sonyflake, for instance, uses the lower 16 bits of the private IP address by default, which is quick but risks collisions across subnets.</li>
+</ul>
+<p>Take care that the bit budget fits the fleet. If you autoscale to thousands of short-lived containers, 10 bits (1,024 ids) can be exhausted, so you may need to give up some sequence or timestamp bits for more worker bits, a tradeoff the calculator below lets you explore.</p>
+
+<h3>9.5 Variants in the wild</h3>
+<ul>
+  <li><b>Twitter Snowflake:</b> 41 + 10 + 12 as above. Open sourced, now mostly a reference.</li>
+  <li><b>Instagram:</b> 41 bits of milliseconds since a custom epoch, <b>13 bits for the logical shard id</b>, and 10 bits for a sequence. Instead of a separate service, the ID is computed inside PostgreSQL by a stored function in each logical shard, using that shard's own sequence modulo 1,024. The shard id is embedded in the ID, so given any ID you know which shard holds the row, which fits naturally with sharding (<a href="25-sharding.html">Chapter 25</a>).</li>
+  <li><b>Sonyflake:</b> 39 bits of time in units of 10 ms (so about 174 years instead of 69), 8 bits of sequence (256 IDs per 10 ms per machine, much lower throughput) and 16 bits of machine id (65,536 machines). It trades per-node speed for lifetime and fleet size.</li>
+  <li><b>Discord:</b> uses a Snowflake layout with a 2015 epoch, worker and process ids, and a 12-bit increment.</li>
+</ul>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="central">10. Ticket servers and range allocation</h2>
+
+<p>Another family keeps a central counter but avoids calling it for every ID by using it only to hand out blocks.</p>
+
+<h3>10.1 Flickr's ticket server</h3>
+<p>Flickr's well-known design uses a dedicated MySQL table whose only job is to produce numbers. The table has an auto-increment <code>id</code> column and a single-row-per-stub trick: application code runs <code>REPLACE INTO Tickets64 (stub) VALUES ('a'); SELECT LAST_INSERT_ID();</code>. REPLACE deletes the old row and inserts a new one with the next auto-increment value, so the table stays one row big while the counter keeps climbing. To avoid a single point of failure, Flickr runs <b>two ticket servers</b>, one configured to produce odd numbers and the other even (<code>auto_increment_increment = 2</code> with offsets 1 and 2), and clients alternate between them (round robin). If one dies, the other keeps issuing. The IDs are small, 64-bit integers, nearly sequential, and ordered per server. The costs: a network call per ID (usually mitigated with batching), and the two servers can drift so that IDs are only roughly ordered.</p>
+
+<h3>10.2 DB range allocation (segment mode, hi-lo)</h3>
+<p>Rather than asking the central server for each ID, a node asks for a <b>block</b>. The central table stores <code>(name, next_value)</code>. A node runs <code>UPDATE counters SET next = next + 1000 WHERE name = 'order'</code> in a transaction and receives the range [next, next + 999]. It then hands out those 1,000 IDs from memory with no network call, and goes back for another block when exhausted. This is the <b>segment</b> approach used by systems such as Meituan's Leaf, and it is essentially the same as the <b>hi-lo algorithm</b> in ORMs like Hibernate (the "hi" part comes from the central source, the "lo" part counts locally from 0 to block size minus 1).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Range allocation: nodes fetch blocks of IDs from a central counter and hand them out locally">
+  <rect class="db" x="360" y="20" width="200" height="70" rx="10"/><text class="t-c t-b" x="460" y="46">Central counter</text><text class="t-c t-sm" x="460" y="66">next_value = 3000</text><text class="t-c t-sm" x="460" y="82">(replicated DB)</text>
+  <rect class="box" x="40" y="190" width="220" height="80" rx="10"/><text class="t-c t-b" x="150" y="216">App node A</text><text class="t-c t-sm" x="150" y="236">holds block 1000..1999</text><text class="t-c t-sm" x="150" y="254">now at 1412</text>
+  <rect class="box" x="340" y="190" width="220" height="80" rx="10"/><text class="t-c t-b" x="450" y="216">App node B</text><text class="t-c t-sm" x="450" y="236">holds block 2000..2999</text><text class="t-c t-sm" x="450" y="254">now at 2005</text>
+  <rect class="box" x="640" y="190" width="220" height="80" rx="10"/><text class="t-c t-b" x="750" y="216">App node C</text><text class="t-c t-sm" x="750" y="236">just asked for a block</text><text class="t-c t-sm" x="750" y="254">will get 3000..3999</text>
+  <path class="arrow dash" d="M150 190 L380 92"/><path class="arrow dash" d="M450 190 L450 94"/><path class="arrow" d="M750 190 L540 92"/>
+  <text class="t-sm" x="600" y="150">1 round trip per 1,000 IDs</text>
+  <text class="t-sm" x="20" y="295">A node that crashes loses the unused rest of its block. That is acceptable: gaps are harmless, uniqueness is kept.</text>
+</svg>
+<figcaption>Each node reserves a block from the central counter in a single atomic update and then issues IDs from memory. The central database sees one write per block instead of one per ID, so it is no longer a throughput bottleneck.</figcaption>
+</figure>
+
+<p>Properties: IDs are compact and ordered within a node but only roughly ordered across nodes (a node holding an older block issues smaller numbers later), gaps appear when nodes crash or restart, and a node that cannot reach the central database can keep issuing until its block runs out. Some implementations pre-fetch the next block when the current one is about 10 percent consumed, so there is no pause at the boundary. The central counter is still a dependency, but replicating it and widening the block size makes it tolerable.</p>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="short">11. Short IDs for URLs and exposure concerns</h2>
+
+<h3>11.1 Short codes (base62)</h3>
+<p>A URL shortener (<a href="../case-studies/c01-url-shortener.html">the URL shortener case study</a>) needs very short IDs such as <code>aZ3k9Q</code>, which rules out 128-bit UUIDs. The standard approach is to produce a number and encode it in <b>base62</b>, using the 62 characters <code>0-9</code>, <code>a-z</code> and <code>A-Z</code>, which are safe in URLs. The capacity is 62^n:</p>
+<table>
+<tr><th>Length</th><th>Combinations</th></tr>
+<tr><td>6 characters</td><td>62^6, about 56.8 billion</td></tr>
+<tr><td>7 characters</td><td>62^7, about 3.5 trillion</td></tr>
+<tr><td>8 characters</td><td>62^8, about 218 trillion</td></tr>
+</table>
+<p>Three ways to get the underlying number:</p>
+<ul>
+  <li><b>Counter.</b> A global counter (or range-allocated counters as in section 10) is incremented per new URL, then base62-encoded. No collisions by construction, compact codes. The downside is that codes are sequential and so guessable, which matters when links are private. One mitigation is to scramble the counter with a reversible bijection (multiply by a large odd number modulo 2^k, or a small Feistel network) before encoding, which keeps uniqueness but hides the order.</li>
+  <li><b>Hash of the long URL.</b> Hash the URL (MD5 or SHA-256) and take the first 6 to 8 characters of the base62 or base64 encoding. The same URL maps to the same code, which gives free deduplication, but <b>collisions</b> are possible because you truncate the hash. By the birthday bound, with N possible codes, a collision becomes likely after about 1.2 times the square root of N entries: for 7 characters (N around 3.5 x 10^12) that is roughly 2 million links, a tiny number. So the system must check the database and, on collision, re-hash with a salt or append a counter and retry.</li>
+  <li><b>Random code.</b> Pick random characters and insert with a unique constraint, retrying on conflict. Unguessable, no coordination, but collision chance rises as the keyspace fills, so use 7 or more characters and keep the fill ratio low.</li>
+</ul>
+
+<h3>11.2 ID exposure and enumeration</h3>
+<p>Whatever you choose, remember what the ID reveals when it appears in a URL or API response:</p>
+<ul>
+  <li><b>Enumeration (IDOR).</b> If <code>/invoices/1001</code> is valid, an attacker tries 1002, 1003 and so on. The root defence is <b>authorisation checks on every object access</b>, never obscurity. Unguessable IDs are defence in depth only, not a substitute (see <a href="55-security.html">Chapter 55</a>).</li>
+  <li><b>Business intelligence leakage.</b> Sequential IDs tell competitors how many orders you handle: they place two orders a week apart and subtract (the "German tank problem").</li>
+  <li><b>Time leakage.</b> UUIDv7, ULID, KSUID and Snowflake all embed a creation timestamp. That is usually harmless, but for sensitive objects (user accounts, password-reset tokens) it can leak signup time, or make tokens easier to predict.</li>
+  <li><b>Machine leakage.</b> Snowflake IDs reveal datacenter and worker bits, hinting at your topology.</li>
+</ul>
+<p>A common pattern separates the two roles: an internal, compact, time-ordered ID (bigint or Snowflake) used for storage and joins, plus a separate random public identifier (a UUIDv4 or a random short string) exposed in URLs and APIs. You pay one extra indexed column to get fast storage and unguessable external names. For security tokens such as password resets, never use any of these ID schemes; use a cryptographically secure random generator with at least 128 bits.</p>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="compare">12. Comparison and capacity math</h2>
+
+<table>
+<tr><th>Scheme</th><th>Size</th><th>Sortable</th><th>Coordination</th><th>Main weakness</th></tr>
+<tr><td>Auto-increment</td><td>4-8 bytes</td><td>Strict, one node</td><td>Central counter on every insert</td><td>Single writer, breaks with sharding and multi-primary, guessable</td></tr>
+<tr><td>UUIDv4</td><td>16 bytes (36 chars)</td><td>No</td><td>None</td><td>Poor index locality, large, no time information</td></tr>
+<tr><td>UUIDv7</td><td>16 bytes</td><td>By ms</td><td>None</td><td>Leaks creation time, 128 bits</td></tr>
+<tr><td>ULID</td><td>16 bytes (26 chars)</td><td>By ms</td><td>None</td><td>Leaks time, not a native DB type</td></tr>
+<tr><td>KSUID</td><td>20 bytes (27 chars)</td><td>By second</td><td>None</td><td>Larger, coarse ordering</td></tr>
+<tr><td>Snowflake</td><td>8 bytes</td><td>By ms (roughly)</td><td>Worker id assignment once; trusts the clock</td><td>Clock rollback, worker id management, 69-year limit</td></tr>
+<tr><td>Ticket server</td><td>8 bytes</td><td>Roughly</td><td>Network call per ID or batch</td><td>Central dependency, extra service to run</td></tr>
+<tr><td>Range allocation</td><td>8 bytes</td><td>Per node</td><td>One call per block</td><td>Gaps, only roughly ordered across nodes</td></tr>
+<tr><td>Base62 short code</td><td>6-8 chars</td><td>Depends</td><td>Counter or uniqueness check</td><td>Guessable if sequential, collisions if hashed</td></tr>
+</table>
+
+<h3>12.1 Capacity math: what an ID really costs</h3>
+<p>Take a table of 10 billion rows with three secondary indexes. With an 8-byte key, the primary key column is 80 GB. With a 16-byte UUID it is 160 GB. In InnoDB every secondary index entry also contains the primary key, so three secondary indexes add the key three more times: 8 bytes gives about 240 GB extra and 16 bytes gives about 480 GB extra. Total key-related storage: roughly 320 GB for bigint compared with 640 GB for UUID, before per-entry overhead. That difference is real money and also real memory pressure, because the buffer pool holds fewer index pages. Combine this with the random-insert behaviour from section 8.1 and the case for compact, time-ordered keys on very large tables is clear.</p>
+
+<h3>12.2 Capacity math: Snowflake limits</h3>
+<ul>
+  <li><b>Lifetime:</b> 41 bits of milliseconds is 2,199,023,255,552 ms. Dividing by 31,557,600,000 ms per year gives about 69.7 years from the chosen epoch. Choose an epoch near the launch date, not 1970, or you waste 55 years of range.</li>
+  <li><b>Per-worker rate:</b> 12 sequence bits give 4,096 IDs per ms, so 4.096 million per second. Real workloads rarely approach this; when they do, the generator waits for the next millisecond, which slows callers slightly.</li>
+  <li><b>Fleet rate:</b> 1,024 workers times 4.096 million is about 4.2 billion IDs per second, orders of magnitude more than almost any system needs.</li>
+  <li><b>Bit trade:</b> if you need 8,192 workers you take 3 bits from the sequence (down to 512 IDs per ms per worker, 512,000 per second), which is still ample.</li>
+</ul>
+
+<h3>12.3 Capacity math: collision probability</h3>
+<p>For random IDs with b random bits, the chance of any collision among n IDs is approximately n^2 / 2^(b+1). For UUIDv4 (122 bits) and n = 10^12 (a trillion IDs) this is 10^24 / 2^123, about 10^24 / 10^37, which is 10^-13, effectively zero. For a 7-character base62 code (about 41.7 bits) and n = 10^6 it is 10^12 / 2^42.7, about 10^12 / 7 x 10^12, around 14 percent. This is why short random codes always need a uniqueness check, and 128-bit IDs never do.</p>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="widget">13. Try it: Snowflake bit-layout calculator</h2>
+
+<p>Choose how many of the 63 usable bits (after the sign bit) go to the timestamp, the worker id and the sequence, and the time unit. The calculator reports how long the timestamp range lasts, how many workers you can run, and how many IDs each worker and the whole fleet can issue per second. Try Twitter's 41/10/12, Sonyflake's 39/16/8 with a 10 ms unit, and your own ideas. The three fields must add up to 63.</p>
+
+<div class="widget" id="sfCalc">
+  <h4>Try it: Snowflake layout</h4>
+  <div class="row">
+    <label>Timestamp bits <input id="sf-t" type="number" value="41" min="1" max="61" step="1" style="width:70px"></label>
+    <label>Worker bits <input id="sf-w" type="number" value="10" min="0" max="30" step="1" style="width:70px"></label>
+    <label>Sequence bits <input id="sf-s" type="number" value="12" min="0" max="30" step="1" style="width:70px"></label>
+    <label>Time unit ms <input id="sf-u" type="number" value="1" min="1" step="1" style="width:70px"></label>
+  </div>
+  <div class="row">
+    <button id="sf-twitter">Twitter 41/10/12</button>
+    <button id="sf-sony" class="alt">Sonyflake 39/16/8 (10 ms)</button>
+  </div>
+  <div id="sf-out" class="log"></div>
+</div>
+
+<!-- ======================= 14 ======================= -->
+<h2 id="worked">14. Worked example: payments API and order IDs</h2>
+
+<p>Put both halves of the chapter together. You are designing the order and payment service for a shop with 2,000 orders per second at peak, in three regions, with an order table that will grow to about 20 billion rows.</p>
+<ol>
+  <li><b>Order IDs.</b> Auto-increment is out: three regions write locally and the table will be sharded by user (<a href="25-sharding.html">Chapter 25</a>). Choose Snowflake-style 64-bit IDs with the shard or region encoded in the worker bits. At 2,000 per second the sequence is barely touched, so a layout of 41 timestamp, 12 worker (4,096 pods) and 10 sequence (1,024 per ms per worker, over a million per second) is generous. The worker id is claimed from etcd with a lease at pod start. Clock rollbacks over 5 ms take the pod out of rotation. A separate random public order token (a UUIDv4) is exposed in URLs, so competitors cannot count orders and users cannot enumerate neighbours.</li>
+  <li><b>Payment API.</b> <code>POST /payments</code> requires an <code>Idempotency-Key</code> header. The server inserts <code>(account_id, key, fingerprint, state=IN_PROGRESS)</code> into the same database as the payment row, protected by a unique constraint, inside one transaction. The card network call has its own stable key derived from the payment id so a retry cannot double-charge. The completed response is stored, and keys expire after 24 hours.</li>
+  <li><b>Events.</b> After commit, the service publishes <code>PaymentCaptured</code> to Kafka via a transactional outbox (<a href="31-distributed-transactions.html">Chapter 31</a>). Consumers (shipping, email, ledger) are at-least-once. Each uses an inbox table keyed by event id in the same transaction as its own effect, with a 7-day retention.</li>
+  <li><b>Numbers.</b> 2,000 payments per second times 86,400 seconds is 172.8 million keys per day. At about 100 bytes per key row including the stored response, that is roughly 17 GB per day, kept for one day, with a partition dropped each night. The inbox for a consumer with the same rate over 7 days is 1.2 billion ids, about 55 GB at 46 bytes each, which is why partitioning by day matters.</li>
+  <li><b>Failure walk-through.</b> The client times out after a successful charge and retries with the same key: the server finds state COMPLETED with a matching fingerprint and replays the original 201. The client retries while the first attempt is still running: the claim insert conflicts, and the client receives 409 and backs off with jitter. A consumer crashes after committing but before acking: redelivery hits the inbox's primary key and is acknowledged without a second effect.</li>
+</ol>
+
+<!-- ======================= 15 ======================= -->
+<h2 id="qa">15. Interview Q&amp;A</h2>
+
+<details><summary>Why is "exactly-once delivery" considered impossible, and what do systems that claim it actually provide?</summary>
+<p>Between two nodes on an unreliable network, a sender that gets no acknowledgement cannot know whether the message was lost on the way there or the ack was lost on the way back. To guarantee delivery it must retry, which can produce a second copy; to avoid duplicates it must not retry, which can lose the message. So delivery on the wire is either at-most-once or at-least-once. What systems like Kafka provide is exactly-once <i>processing effect</i> inside a boundary: the idempotent producer discards retried batches using producer id and sequence numbers, and transactions make consume, process and produce atomic together with offset commits. Outside that boundary, for example when calling a payment provider, you still need idempotency keys to get an effectively-once outcome.</p></details>
+
+<details><summary>Design an idempotency-key mechanism for a payment API. What can go wrong?</summary>
+<p>The client generates a unique key per logical payment and sends it in a header with every retry. The server stores a row keyed by (account, key) with a request fingerprint, a state, and eventually the response. It claims the key atomically with a unique constraint in the same database transaction as the payment itself, so a crash cannot leave one without the other. Retries with a completed key and the same fingerprint get the stored response replayed, a different fingerprint is rejected, and a key whose first attempt is in progress yields a conflict or waits. Things that go wrong are concurrent duplicates if the claim is not atomic, stuck IN_PROGRESS rows after a crash (fixed with a lease timeout), a TTL shorter than the client's retry window, a key reused for different requests, and storing the key in a different system than the business data so a crash between the two causes duplicate or phantom success.</p></details>
+
+<details><summary>What is the difference between idempotent and safe operations, and how does HTTP treat them?</summary>
+<p>A safe operation does not change server state at all, like GET and HEAD. An idempotent operation may change state, but repeating it leaves the state the same as doing it once, like PUT (replace with this exact representation) and DELETE. All safe methods are idempotent, but not the other way round. POST is neither, because each call may create a new resource, and PATCH depends on how it is defined: "set field to X" is idempotent while "increment field" is not. These classifications are conventions that clients, proxies and browsers rely on to decide when automatic retries are acceptable, so the server must actually honour them. A POST that must be retried safely needs an explicit idempotency key.</p></details>
+
+<details><summary>How would you make a message consumer idempotent?</summary>
+<p>First prefer naturally idempotent effects such as upserts and absolute values over inserts and increments. When that is not possible, use the inbox pattern: in one local transaction insert the message id into a table with a unique constraint and apply the business effect, then commit and only afterwards acknowledge the message. A redelivered message fails the unique insert and is acknowledged without being reprocessed. Where the consumer calls an external service, pass a deterministic idempotency key derived from the message id. Keep ids for a dedup window that exceeds the maximum redelivery delay, partition the table by time so old ids can be dropped cheaply, and use per-producer sequence numbers if ordering is guaranteed, which needs only one counter per producer.</p></details>
+
+<details><summary>Why are random UUIDs bad as primary keys in large B-tree databases, and what would you use instead?</summary>
+<p>A B-tree keeps keys sorted, so a random key sends each insert to an unpredictable leaf page. Once the index outgrows memory, many inserts cause disk reads, pages split in the middle and leave half-empty pages, and write amplification rises. In InnoDB the primary key is also copied into every secondary index, so the 16-byte size multiplies. A time-ordered ID turns inserts into appends at the right edge, where the hot pages are cached and pages fill completely. I would use a 64-bit Snowflake-style ID when I control the infrastructure and want 8 bytes, or UUIDv7 when I need the UUID format and no coordination. If the ID must be unguessable externally, I keep a separate random public identifier.</p></details>
+
+<details><summary>Explain the Snowflake layout and how you would handle clock rollback and worker id assignment.</summary>
+<p>A Snowflake ID is 1 unused sign bit, 41 bits of milliseconds since a custom epoch, 10 bits split into datacenter and machine, and a 12-bit sequence that resets each millisecond. Time in the high bits makes IDs roughly sorted, the worker bits make generators disjoint, and the sequence allows 4,096 IDs per millisecond per worker. For clock rollback the generator remembers the last timestamp; if the clock reads earlier, it waits for small rollbacks, keeps using the last timestamp and increments the sequence, or refuses and alerts for large jumps, and it persists the last timestamp so a restart cannot issue earlier values. Worker ids are claimed once at startup, for instance as an ephemeral sequential node in ZooKeeper or etcd or a leased row in a database, so that two live workers never share an id and a dead worker's id is eventually reclaimed.</p></details>
+
+<details><summary>Compare a ticket server, range allocation and Snowflake. When would you pick each?</summary>
+<p>A ticket server such as Flickr's centralises a counter and calls it for each ID or batch, giving compact sequential integers, with a pair of servers using odd and even steps for availability. Range allocation (segment or hi-lo) has each node reserve a block of numbers from a central counter in one update and issue them from memory, so the database sees one write per thousand IDs; gaps appear on crashes and order is only per node. Snowflake avoids per-ID or per-block calls entirely by encoding time, worker and sequence, needing coordination only for worker ids and trusting clocks. I would choose range allocation when I want dense, mostly sequential numbers and already have a reliable database; Snowflake when throughput, multi-region and no runtime dependency matter and roughly time-ordered IDs are useful; a ticket server only when simplicity matters more than removing the central dependency.</p></details>
+
+<details><summary>Design the ID scheme for a URL shortener with 7-character codes. How do you avoid collisions and guessing?</summary>
+<p>Seven base62 characters give about 3.5 trillion codes, enough for tens of billions of URLs with a low fill ratio. The most predictable approach is a counter, ideally allocated in blocks per application node so there is no hotspot, base62 encoded, which makes collisions impossible by construction. To avoid sequential, guessable links I would pass the counter through a reversible scrambling step before encoding. Hashing the long URL and truncating gives deduplication but needs collision handling, since the birthday bound makes a collision likely after only about two million entries at that length, so each insert must be checked against a unique index and retried with a salt on conflict. Random codes work with a unique constraint and a retry. The case study in the URL shortener chapter explores the tradeoffs further.</p></details>
+
+<details><summary>How long should you retain idempotency keys and dedup records, and what happens if the window is too short?</summary>
+<p>The retention must exceed the longest period over which a duplicate of the same operation can still arrive, which is the client's maximum retry horizon plus the broker's maximum redelivery delay plus any replay you plan to run, with a safety margin. Public payment APIs commonly keep keys for around a day; queue systems with built-in dedup can use as little as minutes, which is only valid if redelivery is guaranteed to happen quickly. If the window is too short, a late retry looks like a brand-new request and is executed again, creating exactly the duplicate you built the mechanism to prevent. If it is too long you pay in storage and index size, so I would estimate rate times window times row size, partition by time, and drop old partitions. The window is part of the API contract and should be documented.</p></details>
+
+<details><summary>Can you give an operation that looks idempotent but is not, and how do you fix it?</summary>
+<p>"Send a welcome email when a user signs up" looks fine until the signup event is delivered twice and the user gets two emails; sending an email is a side effect that cannot be rolled back. Similarly an <code>UPDATE accounts SET balance = balance + 50</code> triggered by a retried message adds money twice. A subtler case is a PUT whose handler also appends an audit row or fires a webhook, so the resource state is idempotent but the side effects are not. The fixes are to record the fact that the effect happened under a stable id (an emails_sent table with a unique key on user and email type, checked in the same transaction as the signup), to turn increments into insertions of uniquely identified ledger entries and compute the balance by summing, and to pass idempotency keys to every external call. The principle is to make every side effect either naturally idempotent or guarded by a recorded identity.</p></details>
+
+<!-- ======================= 16 ======================= -->
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">16. Recap</h2><ul>
+  <li>Retries are needed for reliability, and lost acks and timeouts make duplicates unavoidable. The client cannot tell "not delivered" from "delivered, reply lost".</li>
+  <li>At-most-once can lose messages, at-least-once can duplicate them, and true exactly-once delivery on a network is impossible. Practical exactly-once means at-least-once plus idempotent or deduplicating processing, which is what Kafka's idempotent producer and transactions do inside Kafka.</li>
+  <li>Naturally idempotent operations set absolute state (PUT, DELETE, upserts). Increments and creates are not, and need a key or a conditional write.</li>
+  <li>Idempotency keys are client-generated, scoped per account and operation, stored with a request fingerprint and the response, claimed atomically in the same transaction as the business write, and expire after a documented TTL. Concurrent duplicates are handled by a state machine with conflict responses or waiting, and stuck in-progress records by leases.</li>
+  <li>Enforcement patterns: unique-constraint dedup table, conditional writes, version-based compare-and-set, the inbox pattern, and per-producer sequence numbers. Dedup windows trade storage for safety.</li>
+  <li>Retry only idempotent operations, only on transient errors, with backoff and jitter and a budget (<a href="40-resilience.html">Chapter 40</a>).</li>
+  <li>IDs must be unique and ideally compact, time-ordered and coordination-free. Auto-increment breaks with sharding and multi-primary writes. UUIDv4 is simple but wrecks B-tree locality; UUIDv7, ULID and Snowflake are time-ordered.</li>
+  <li>Snowflake packs 41 bits time, worker bits and a 12-bit sequence into 64 bits; it needs clock rollback handling and one-time worker id assignment via a coordination service. Ticket servers and range allocation reduce central calls by handing out blocks.</li>
+  <li>Short URL codes use base62 of a counter, a hash or random bytes, and need collision handling. Separate internal ordered IDs from public random ones, and never rely on unguessable IDs instead of authorisation.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="27-failure-time-ordering.html">Chapter 27</a> (why failures and slow nodes cannot be told apart, and clocks), <a href="05-api-design.html">Chapter 5</a> (HTTP method semantics and API contracts) and <a href="25-sharding.html">Chapter 25</a> (shard keys and why local counters break). Pairs with <a href="31-distributed-transactions.html">Chapter 31</a> (outbox, sagas and why distributed commits are hard), and leads to <a href="34-queues-kafka.html">Chapter 34</a> (Kafka internals), <a href="40-resilience.html">Chapter 40</a> (retries, backoff and circuit breakers) and the <a href="../case-studies/c01-url-shortener.html">URL shortener case study</a>.</p>
+
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+<script>
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+function setParts(node, parts) { node.textContent = ''; parts.forEach(function (p) { if (typeof p === 'string') node.appendChild(document.createTextNode(p)); else node.appendChild(el('b', null, p.b)); }); }
+
+(function () {
+  const t = document.getElementById('sf-t'), w = document.getElementById('sf-w');
+  const s = document.getElementById('sf-s'), u = document.getElementById('sf-u');
+  const out = document.getElementById('sf-out');
+  function fmt(n) {
+    if (n >= 1e12) return (n / 1e12).toFixed(2) + ' trillion';
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + ' billion';
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + ' million';
+    return Math.round(n).toLocaleString();
+  }
+  function calc() {
+    const tb = parseInt(t.value, 10) || 0, wb = parseInt(w.value, 10) || 0;
+    const sb = parseInt(s.value, 10) || 0, unit = Math.max(parseFloat(u.value) || 1, 1);
+    const total = tb + wb + sb;
+    const ms = Math.pow(2, tb) * unit;
+    const years = ms / 31557600000;
+    const workers = Math.pow(2, wb);
+    const perUnit = Math.pow(2, sb);
+    const perWorkerSec = perUnit * (1000 / unit);
+    const fleetSec = perWorkerSec * workers;
+    const parts = [];
+    if (total !== 63) {
+      parts.push('Bits used: ', { b: String(total) + ' of 63' }, '. Adjust so the three fields add up to 63 (plus 1 sign bit = 64).');
+      parts.push('\n');
+    } else {
+      parts.push('Layout is valid: ', { b: '63 + 1 sign bit = 64 bits' }, '.\n');
+    }
+    parts.push('Timestamp range: ', { b: years.toFixed(1) + ' years' }, ' from your epoch.\n');
+    parts.push('Workers: ', { b: workers.toLocaleString() }, '.   IDs per time unit per worker: ', { b: perUnit.toLocaleString() }, '.\n');
+    parts.push('Per worker: ', { b: fmt(perWorkerSec) + ' IDs/s' }, '.   Whole fleet: ', { b: fmt(fleetSec) + ' IDs/s' }, '.');
+    setParts(out, parts);
+    out.style.whiteSpace = 'pre-wrap';
+  }
+  [t, w, s, u].forEach(function (i) { i.addEventListener('input', calc); });
+  document.getElementById('sf-twitter').addEventListener('click', function () { t.value = 41; w.value = 10; s.value = 12; u.value = 1; calc(); });
+  document.getElementById('sf-sony').addEventListener('click', function () { t.value = 39; w.value = 16; s.value = 8; u.value = 10; calc(); });
+  calc();
+})();
+</script>
+</body>
+</html>

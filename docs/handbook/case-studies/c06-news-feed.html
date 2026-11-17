@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 6: Design a News Feed | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c06-news-feed">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 06 · Worked solutions</div>
+<h1>Design a News Feed</h1>
+<p class="lead">A news feed shows each user a personalised, mostly recent list of posts from the people they follow. The hard part is that one write (a post) must become visible in millions of different lists, while one read (opening the app) must feel instant. This page designs it for 500 million users and works through fan-out, feed caches, pagination, ranking, deletes and failure modes.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is usually one line: "Design the home feed of a social network." A strong candidate does not start drawing. Following the <a href="../chapters/01-interview-framework.html">interview framework in Chapter 1</a>, we first pin down what is being asked. Below are the questions to ask and the answers we will assume for the rest of the page.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>How many users?</td><td>500 million registered, 300 million daily active users (DAU).</td></tr>
+<tr><td>What is a follow?</td><td>Directed and asymmetric (like Twitter or Instagram), not a mutual friendship. The average user follows about 200 accounts; the follower-count distribution is very skewed, and a few accounts have tens of millions of followers.</td></tr>
+<tr><td>What goes in a post?</td><td>Text up to a few thousand characters, optionally photos or short video. Posts can be edited briefly and deleted.</td></tr>
+<tr><td>Chronological or ranked feed?</td><td>Ranked by default (relevance model), with a "Following, latest first" toggle that is purely chronological. Both must work.</td></tr>
+<tr><td>How fresh must a new post be?</td><td>A normal user's post should appear in followers' feeds within a few seconds (target p99 under 10 s). A celebrity post within about 30 s is acceptable.</td></tr>
+<tr><td>Latency of opening the feed?</td><td>p99 under 300 ms server-side for the first page of 20 posts.</td></tr>
+<tr><td>Do we need ads, search, comments, likes?</td><td>No. We only expose hooks for them. Counters such as likes are shown but owned by another service.</td></tr>
+<tr><td>Global?</td><td>Yes, users on every continent; we design one region deeply and discuss multi-region in section 10.</td></tr>
+</table>
+<div class="callout tip"><b>Interview tip</b> Say out loud that "feed" hides two different problems: a <b>write path</b> (distributing a post) and a <b>read path</b> (assembling a page). Most of the design is a decision about how much work to do on each path.</div>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li>A user can publish a post (text plus optional media).</li>
+<li>A user can follow and unfollow another account, and block or mute accounts.</li>
+<li>A user can open their home feed and scroll through it indefinitely, page by page.</li>
+<li>A user can edit or delete their own post, and the change must propagate to every feed that shows it.</li>
+<li>The system emits events that a notification service can consume (for example "an account you enabled alerts for just posted").</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Read-heavy and latency-sensitive:</b> the first page must be fast; reads vastly outnumber writes.</li>
+<li><b>Highly available:</b> a stale or slightly incomplete feed is better than an error page. We choose availability over strict consistency (<a href="../chapters/28-cap-consistency.html">Chapter 28</a>).</li>
+<li><b>Eventually consistent propagation</b> with one strong guarantee: a user always sees their own post right after posting (read-your-writes).</li>
+<li><b>Scalable</b> to skewed graphs: an account with 50 million followers must not melt the system.</li>
+<li><b>Durable:</b> an accepted post is never lost.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Comment and like storage, ad insertion, full-text search, direct messages, content moderation models (we only show where they plug in), and the internals of the media transcoder.</p>
+
+<h2 id="estimation">3. Estimation with real arithmetic</h2>
+<p>Estimation (<a href="../chapters/02-estimation.html">Chapter 2</a>) tells us which side of the system is the expensive one. We round aggressively and keep every number consistent for the rest of the page.</p>
+<h3>3.1 Traffic</h3>
+<ul>
+<li>DAU = 300 M. Each opens the feed about 10 times a day (many short sessions), giving 3 B feed loads per day.</li>
+<li>Average feed QPS = 3,000,000,000 / 86,400 s = about <b>35,000 per second</b>. Peak is about 3x average, so <b>about 100,000 per second</b>.</li>
+<li>Posts: 1 post per 3 DAU per day gives <b>100 M posts per day</b>, about 1,160 per second on average and about <b>3,500 per second at peak</b>.</li>
+<li>At the request level the read:write ratio is 3 B loads to 100 M posts = <b>30:1</b>. Counting items shown (20 per load = 60 B post views per day) against posts created it is 600:1.</li>
+</ul>
+<h3>3.2 Fan-out volume</h3>
+<ul>
+<li>Average followers per account = 200 (500 M users x 200 follows each = 100 B edges, divided by 500 M accounts).</li>
+<li>If every post were pushed to every follower: 100 M x 200 = <b>20 B feed insertions per day</b>, which is 231,000 per second average and about 700,000 per second at peak.</li>
+<li>We only push to <b>active</b> followers (opened the app in the last 7 days, about 60%). That is 12 B per day, or <b>140,000 per second average and about 420,000 per second at peak</b>. Celebrity posts (section 7) are pulled instead of pushed, which lowers this a little further; we keep 420 K per second as the design number.</li>
+</ul>
+<h3>3.3 Storage</h3>
+<table>
+<tr><th>Data</th><th>Arithmetic</th><th>Result</th></tr>
+<tr><td>Follow graph</td><td>100 B edges, stored twice (followers-of and following-of) at about 20 B each</td><td>about 4 TB</td></tr>
+<tr><td>Post text and metadata</td><td>100 M per day x 1 KB</td><td>100 GB per day, about 36 TB per year</td></tr>
+<tr><td>Media</td><td>40% of posts have media, about 1.5 MB total across renditions: 40 M x 1.5 MB</td><td>60 TB per day, about 22 PB per year</td></tr>
+<tr><td>Feed cache</td><td>300 M active users x 500 entries x about 32 B per sorted-set entry (8 B post id, 8 B score, structure overhead)</td><td>about 5 TB of RAM</td></tr>
+<tr><td>Hot post cache</td><td>Last 3 days of posts = 300 M x 1 KB</td><td>about 300 GB</td></tr>
+</table>
+<p>The feed cache is the largest memory item. At about 50 GB of usable data per Redis node, 5 TB needs about 100 primaries; with one replica each, <b>about 200 nodes</b>.</p>
+<h3>3.4 Bandwidth</h3>
+<p>Each feed load shows about 10 images of 150 KB, so 1.5 MB. Average: 35,000 x 1.5 MB = 52 GB/s, about 420 Gbps; peak about 1.2 Tbps. With a 95% CDN hit ratio (<a href="../chapters/12-cdn.html">Chapter 12</a>), the origin sees only 5%, about 60 Gbps at peak. The API payload (JSON for 20 posts, about 20 KB) at 100 K QPS is 2 GB/s, about 16 Gbps, which is a small part.</p>
+<h3>3.5 Read amplification</h3>
+<p>One feed load needs 20 post bodies. At 100 K peak QPS that is <b>2 M post lookups per second</b>, which is why the post cache must hit above 95% and why we always fetch in batches.</p>
+<div class="callout key"><b>Key idea</b> The numbers say: 420 K feed insertions per second (write amplification of about 120x over the 3.5 K posts per second) buys a 100 K QPS read path that is a single cache read. That trade, doing work at write time to make reads cheap, is the core of the design, and the celebrity problem is where it breaks.</div>
+
+<h2 id="api">4. API design</h2>
+<p>REST-style endpoints (<a href="../chapters/05-api-design.html">Chapter 5</a>). All calls are authenticated; the user id comes from the token, never from the body.</p>
+<pre><code>POST /v1/posts
+  body: { "text": "...", "media_ids": ["m_91"], "client_request_id": "uuid" }
+  201:  { "post_id": "1871234567890123456", "created_at": "..." }
+
+GET /v1/feed?mode=ranked|latest&amp;limit=20&amp;cursor=OPAQUE
+  200: { "items": [ { "post_id", "author", "text", "media", "counts" } ],
+         "next_cursor": "OPAQUE", "has_more": true }
+
+PUT    /v1/posts/{id}      edit (within 30 min)
+DELETE /v1/posts/{id}      delete
+POST   /v1/users/{id}/follow     DELETE /v1/users/{id}/follow
+POST   /v1/users/{id}/block      DELETE /v1/users/{id}/block
+GET    /v1/users/{id}/posts?cursor=...    (profile timeline, not the home feed)</code></pre>
+<p>Three details matter. First, <code>client_request_id</code> makes post creation idempotent: a mobile client that retries after a timeout does not create duplicates (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>). Second, the <b>cursor is opaque</b> to the client so we can change its contents later. Third, media is uploaded separately (section 8) and only referenced by id, so the post API stays small and fast.</p>
+
+<h2 id="data">5. Data model and storage choices</h2>
+<table>
+<tr><th>Data</th><th>Store</th><th>Why</th></tr>
+<tr><td>Follow graph</td><td>Sharded key-value or wide-column store (<a href="../chapters/20-nosql.html">Chapter 20</a>), two tables</td><td>Access is by user id: "who follows X" and "whom does X follow". No joins. Needs huge capacity and cheap range scans per user.</td></tr>
+<tr><td>Posts (durable)</td><td>Sharded wide-column store or sharded MySQL, keyed by post id</td><td>Point lookups by id and scans by author. Write-heavy and append-mostly. Sharding by <code>post_id</code> spreads load; an author index supports profiles.</td></tr>
+<tr><td>Post cache</td><td>Redis or Memcached cluster (<a href="../chapters/15-redis.html">Chapter 15</a>)</td><td>2 M lookups per second at peak; read-through with a TTL of a few days.</td></tr>
+<tr><td>Feed cache (precomputed timelines)</td><td>Redis sorted sets, sharded by user id</td><td>Ordered by score, cheap range reads, cheap trimming, in-memory speed.</td></tr>
+<tr><td>Media</td><td>Object store plus CDN (<a href="../chapters/21-object-storage.html">Chapter 21</a>, <a href="../chapters/12-cdn.html">Chapter 12</a>)</td><td>Large immutable blobs; cheap per GB; the CDN cuts latency and origin cost.</td></tr>
+<tr><td>Fan-out work</td><td>Kafka topic (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>)</td><td>Durable, replayable, absorbs bursts, lets workers scale independently.</td></tr>
+</table>
+<h3>5.1 Schemas</h3>
+<pre><code>posts:      post_id (PK, 64-bit time-ordered id) | author_id | text | media[] | created_at | edited_at | deleted(bool) | visibility
+following:  (user_id, followee_id) PK, created_at     -- "whom do I follow", partition key user_id
+followers:  (followee_id, follower_id) PK, created_at -- "who follows me", partition key followee_id
+feed:       Redis ZSET  feed:{user_id}   member = post_id, score = rank_time or ranking score
+user_flags: user_id | last_active_at | is_celebrity | follower_count</code></pre>
+<p>The post id is a <b>time-ordered 64-bit id</b> (Snowflake style: 41 bits of milliseconds, 10 bits of machine id, 12 bits of sequence; see <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>). Time ordering means sorting by id is almost the same as sorting by creation time, so ids can double as scores and as pagination keys.</p>
+<h3>5.2 Why the graph is stored twice</h3>
+<p>Fan-out needs "all followers of the author", a scan over one partition of <code>followers</code>. Feed rebuild and celebrity pull need "everyone this user follows", a scan over one partition of <code>following</code>. One table cannot serve both access patterns with a single-partition scan, so on each follow we write both rows. The second write can lag, and a repair job reconciles the two tables (section 9).</p>
+
+<h2 id="first-design">6. A first simple design, then the scaled architecture</h2>
+<h3>6.1 The simple version</h3>
+<p>Start with one application server and one database. Posting inserts a row. Opening the feed runs a query: find everyone I follow, fetch their latest posts, sort by time, return 20. This is <b>fan-out on read</b> in its purest form.</p>
+<pre><code>SELECT p.* FROM posts p JOIN following f ON f.followee_id = p.author_id
+WHERE f.user_id = :me ORDER BY p.post_id DESC LIMIT 20;</code></pre>
+<p>It is correct and tiny to build, and it works for thousands of users. At our scale it fails: each feed load touches 200 authors' recent posts (200 index probes plus a merge), and at 100 K QPS that is 20 M probes per second on data spread across many shards, with the slowest shard deciding the latency. The tail latency of a scatter-gather over 200 partitions is poor. So we precompute.</p>
+<h3>6.2 The scaled architecture</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="High level news feed architecture">
+<rect class="ext" x="20" y="170" width="100" height="50" rx="8"/><text class="t-c t-b" x="70" y="200">Clients</text>
+<rect class="box" x="160" y="170" width="110" height="50" rx="8"/><text class="t-c t-b" x="215" y="190">API gateway</text><text class="t-c t-sm" x="215" y="207">auth, limits</text>
+<rect class="box" x="320" y="60" width="130" height="50" rx="8"/><text class="t-c t-b" x="385" y="82">Post service</text><text class="t-c t-sm" x="385" y="99">write path</text>
+<rect class="box" x="320" y="170" width="130" height="50" rx="8"/><text class="t-c t-b" x="385" y="192">Feed service</text><text class="t-c t-sm" x="385" y="209">read path</text>
+<rect class="box" x="320" y="290" width="130" height="50" rx="8"/><text class="t-c t-b" x="385" y="312">Graph service</text><text class="t-c t-sm" x="385" y="329">follow, block</text>
+<rect class="db" x="500" y="10" width="130" height="46" rx="8"/><text class="t-c t-b" x="565" y="38">Post store</text>
+<rect class="cache" x="500" y="75" width="130" height="46" rx="8"/><text class="t-c t-b" x="565" y="103">Post cache</text>
+<rect class="box" x="500" y="140" width="130" height="46" rx="8"/><text class="t-c t-b" x="565" y="162">Kafka</text><text class="t-c t-sm" x="565" y="178">post events</text>
+<rect class="box" x="500" y="205" width="130" height="46" rx="8"/><text class="t-c t-b" x="565" y="233">Fan-out workers</text>
+<rect class="cache" x="690" y="140" width="190" height="46" rx="8"/><text class="t-c t-b" x="785" y="160">Feed cache</text><text class="t-c t-sm" x="785" y="177">Redis ZSET per user</text>
+<rect class="box" x="690" y="205" width="190" height="46" rx="8"/><text class="t-c t-b" x="785" y="225">Ranking service</text><text class="t-c t-sm" x="785" y="242">candidates, score</text>
+<rect class="db" x="500" y="300" width="130" height="46" rx="8"/><text class="t-c t-b" x="565" y="328">Graph store</text>
+<rect class="db" x="690" y="300" width="190" height="46" rx="8"/><text class="t-c t-b" x="785" y="320">Object store + CDN</text><text class="t-c t-sm" x="785" y="337">media</text>
+<rect class="box" x="690" y="75" width="190" height="46" rx="8"/><text class="t-c t-b" x="785" y="95">Notification hook</text><text class="t-c t-sm" x="785" y="112">consumes events</text>
+<path class="arrow" d="M120 195 L158 195"/>
+<path class="arrow" d="M270 185 L318 90"/><path class="arrow" d="M270 195 L318 195"/><path class="arrow" d="M270 205 L318 310"/>
+<path class="arrow" d="M450 75 L498 40"/><path class="arrow" d="M450 85 L498 98"/><path class="arrow" d="M450 90 L498 160"/>
+<path class="arrow" d="M630 170 L688 165" style="display:none"/><path class="arrow" d="M565 186 L565 203"/>
+<path class="arrow" d="M630 228 L688 175"/>
+<path class="arrow dash" d="M450 195 L688 168"/>
+<path class="arrow dash" d="M500 322 L452 322"/><path class="arrow dash" d="M500 240 L452 305"/>
+<path class="arrow dash" d="M630 150 L688 108"/>
+<path class="arrow dash" d="M450 212 L688 222"/>
+<text class="t-sm" x="20" y="260">Solid: main flow. Dashed: reads, lookups, side hooks.</text>
+<text class="t-sm" x="20" y="285">Clients fetch media directly from the CDN, not through these services.</text>
+</svg>
+<figcaption>The write path (Post service, Kafka, fan-out workers, feed cache) does the heavy lifting so the read path (Feed service reading one sorted set, then hydrating posts) is cheap. The Graph service answers who-follows-whom for fan-out workers and block checks.</figcaption>
+</figure>
+<p>Responsibilities: the <b>Post service</b> validates, assigns the id, writes to the post store and publishes a <code>PostCreated</code> event. <b>Fan-out workers</b> consume the event, look up followers, and insert the post id into each follower's feed sorted set. The <b>Feed service</b> reads the sorted set, merges in celebrity posts, asks the <b>Ranking service</b> to order candidates, hydrates post bodies from the cache, and returns a page.</p>
+
+<h3>6.3 Write flow: publishing a post</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Sequence of publishing a post">
+<text class="t-c t-b" x="70" y="22">Client</text><text class="t-c t-b" x="230" y="22">Post svc</text><text class="t-c t-b" x="390" y="22">Post store</text><text class="t-c t-b" x="550" y="22">Kafka</text><text class="t-c t-b" x="710" y="22">Fan-out worker</text><text class="t-c t-b" x="850" y="22">Feed cache</text>
+<line class="life" x1="70" y1="32" x2="70" y2="320"/><line class="life" x1="230" y1="32" x2="230" y2="320"/><line class="life" x1="390" y1="32" x2="390" y2="320"/><line class="life" x1="550" y1="32" x2="550" y2="320"/><line class="life" x1="710" y1="32" x2="710" y2="320"/><line class="life" x1="850" y1="32" x2="850" y2="320"/>
+<path class="arrow" d="M70 60 L228 60"/><text class="t-sm" x="80" y="54">1 POST /posts</text>
+<path class="arrow" d="M230 90 L388 90"/><text class="t-sm" x="240" y="84">2 insert (quorum)</text>
+<path class="arrow" d="M388 115 L232 115"/><text class="t-sm" x="290" y="130">3 ack</text>
+<path class="arrow" d="M230 150 L548 150"/><text class="t-sm" x="300" y="144">4 publish PostCreated</text>
+<path class="arrow" d="M230 185 L72 185"/><text class="t-sm" x="95" y="179">5 201 (author sees post)</text>
+<path class="arrow" d="M548 220 L712 220"/><text class="t-sm" x="570" y="214">6 consume</text>
+<path class="arrow dash" d="M710 255 L552 255"/><text class="t-sm" x="560" y="271">7 get followers (graph)</text>
+<path class="arrow" d="M710 300 L848 300"/><text class="t-sm" x="722" y="294">8 ZADD each follower</text>
+</svg>
+<figcaption>The client gets its answer after step 5, once the post is durable and the event is in Kafka. Steps 6 to 8 are asynchronous, which is why a post reaches followers seconds later but the author is never blocked by fan-out.</figcaption>
+</figure>
+<ol>
+<li>The client sends the post with a <code>client_request_id</code>. The API gateway authenticates and rate-limits (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>).</li>
+<li>The Post service generates the post id, writes the row with quorum durability, and publishes <code>PostCreated(post_id, author_id, created_at)</code>. To avoid the dual-write problem (row saved but event lost) use a transactional outbox (<a href="../chapters/36-event-driven.html">Chapter 36</a>): the event row is written in the same transaction and relayed to Kafka.</li>
+<li>The author's own feed is written synchronously so the author sees the post at once: read-your-writes.</li>
+<li>Workers consume the event, page through the author's followers 1,000 at a time, filter out inactive and blocked followers, and issue pipelined <code>ZADD</code> calls grouped by Redis shard.</li>
+</ol>
+
+<h3>6.4 Read flow: opening the feed</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 310" role="img" aria-label="Sequence of reading a feed page">
+<text class="t-c t-b" x="70" y="22">Client</text><text class="t-c t-b" x="230" y="22">Feed svc</text><text class="t-c t-b" x="390" y="22">Feed cache</text><text class="t-c t-b" x="550" y="22">Celeb store</text><text class="t-c t-b" x="710" y="22">Ranker</text><text class="t-c t-b" x="850" y="22">Post cache</text>
+<line class="life" x1="70" y1="32" x2="70" y2="300"/><line class="life" x1="230" y1="32" x2="230" y2="300"/><line class="life" x1="390" y1="32" x2="390" y2="300"/><line class="life" x1="550" y1="32" x2="550" y2="300"/><line class="life" x1="710" y1="32" x2="710" y2="300"/><line class="life" x1="850" y1="32" x2="850" y2="300"/>
+<path class="arrow" d="M70 55 L228 55"/><text class="t-sm" x="80" y="49">1 GET /feed</text>
+<path class="arrow" d="M230 90 L388 90"/><text class="t-sm" x="240" y="84">2 range read ZSET</text>
+<path class="arrow" d="M230 125 L548 125"/><text class="t-sm" x="300" y="119">3 recent posts of followed celebrities</text>
+<path class="arrow" d="M230 160 L708 160"/><text class="t-sm" x="400" y="154">4 rank about 300 candidates</text>
+<path class="arrow" d="M230 200 L848 200"/><text class="t-sm" x="400" y="194">5 batch get 20 post bodies</text>
+<path class="arrow dash" d="M230 235 L390 235"/><text class="t-sm" x="240" y="251">6 filter deleted, blocked</text>
+<path class="arrow" d="M230 285 L72 285"/><text class="t-sm" x="95" y="279">7 page plus next_cursor</text>
+</svg>
+<figcaption>Steps 2 and 3 run in parallel. The only heavy work is ranking, and it operates on a few hundred ids, not on the whole graph.</figcaption>
+</figure>
+
+<h2 id="fanout">7. Deep dive 1: fan-out on write, fan-out on read, and the hybrid</h2>
+<p>This is the question the interviewer is waiting for. There are two pure strategies and one practical compromise.</p>
+<h3>7.1 Fan-out on write (push)</h3>
+<p>When a post is created, copy its id into the feed list of every follower immediately. Reading a feed is then a single sorted-set range read. The cost moves to write time: a post by an account with F followers costs F insertions. For an average account (200 followers) that is nothing. For an account with 30 million followers it is 30 million insertions for one post, which at 100,000 insertions per second per worker pool of 100 workers takes 3 seconds of the whole pool, and repeats for every post that account makes. Worse, most of that work is wasted on followers who will not open the app today.</p>
+<h3>7.2 Fan-out on read (pull)</h3>
+<p>Store posts only once, under the author. At read time, fetch the follow list, get recent posts of each followee, merge. Writes are trivial and celebrity posts cost nothing extra. The price is the read path described in 6.1: many lookups per page, and heavy tail latency, for the 600:1 dominant operation.</p>
+<h3>7.3 The hybrid</h3>
+<p>The insight is that cost is driven by the <b>skew</b>. Most accounts are cheap to push. A tiny fraction of accounts (say above 100,000 followers, perhaps 0.01% of accounts) make push expensive. So:</p>
+<ul>
+<li><b>Normal authors:</b> push to active followers' feed caches (fan-out on write).</li>
+<li><b>Celebrity authors</b> (flag <code>is_celebrity</code>, set when follower count crosses a threshold, with hysteresis, for example on at 100 K and off at 50 K so accounts do not flap): do <b>not</b> fan out. Their posts live in a small, hot, separately cached "celebrity timeline" per author.</li>
+<li><b>At read time</b>, the Feed service reads the user's precomputed feed (pushed posts) and also pulls the recent posts from the celebrities this user follows, then merges them. A typical user follows only a handful of celebrities (say 5 to 20), so this adds a few hot-cache reads, not 200 probes.</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Hybrid fan-out decision flow">
+<rect class="ext" x="20" y="120" width="150" height="50" rx="8"/><text class="t-c t-b" x="95" y="150">PostCreated event</text>
+<rect class="box" x="230" y="120" width="170" height="50" rx="8"/><text class="t-c t-b" x="315" y="141">Author a celebrity?</text><text class="t-c t-sm" x="315" y="158">followers over threshold</text>
+<rect class="box" x="480" y="30" width="190" height="56" rx="8"/><text class="t-c t-b" x="575" y="54">Push path</text><text class="t-c t-sm" x="575" y="72">ZADD to active followers</text>
+<rect class="box" x="480" y="210" width="190" height="56" rx="8"/><text class="t-c t-b" x="575" y="234">Celebrity path</text><text class="t-c t-sm" x="575" y="252">append to author timeline</text>
+<rect class="cache" x="730" y="30" width="150" height="56" rx="8"/><text class="t-c t-b" x="805" y="54">Follower feed</text><text class="t-c t-sm" x="805" y="72">ZSET per user</text>
+<rect class="cache" x="730" y="210" width="150" height="56" rx="8"/><text class="t-c t-b" x="805" y="234">Celeb timeline</text><text class="t-c t-sm" x="805" y="252">hot cache, replicated</text>
+<path class="arrow" d="M170 145 L228 145"/>
+<path class="arrow-g" d="M400 135 L478 70"/><text class="t-sm" x="400" y="95">no</text>
+<path class="arrow-r" d="M400 160 L478 225"/><text class="t-sm" x="400" y="215">yes</text>
+<path class="arrow" d="M670 58 L728 58"/><path class="arrow" d="M670 238 L728 238"/>
+<text class="t-sm" x="20" y="310">Read time: Feed service = own ZSET + celebrity timelines of followed celebrities, merged.</text>
+</svg>
+<figcaption>The decision is made per post using a cached flag on the author. Pushed posts are already in the follower's list; celebrity posts are merged at read time.</figcaption>
+</figure>
+<h3>7.4 Comparison</h3>
+<table>
+<tr><th>Property</th><th>Push (write)</th><th>Pull (read)</th><th>Hybrid</th></tr>
+<tr><td>Feed read cost</td><td>One range read</td><td>About 200 lookups plus merge</td><td>One range read plus about 5 to 20 hot reads</td></tr>
+<tr><td>Post write cost</td><td>O(followers)</td><td>O(1)</td><td>O(followers) for normal, O(1) for celebrity</td></tr>
+<tr><td>Wasted work on inactive users</td><td>High unless filtered</td><td>None</td><td>Low (active filter)</td></tr>
+<tr><td>Freshness of celebrity posts</td><td>Delayed by queue depth</td><td>Immediate</td><td>Immediate for celebrity</td></tr>
+<tr><td>Storage</td><td>Large (copies)</td><td>Small</td><td>Medium (5 TB)</td></tr>
+<tr><td>Complexity</td><td>Low</td><td>Low</td><td>Higher (two paths, flag management)</td></tr>
+</table>
+<p>We choose the hybrid. It keeps the 100 K QPS read path cheap, caps the write amplification, and treats the celebrity as the special case it is. The extra complexity is real: ranking must treat both candidate sources uniformly, and a user who just became a celebrity has old posts already pushed (harmless: the merge deduplicates by post id).</p>
+<h3>7.5 Making push efficient</h3>
+<ul>
+<li><b>Active-only push.</b> Keep <code>last_active_at</code>; skip followers inactive for 7 days. When they return, the Feed service sees an empty or stale list and runs the <b>rebuild</b> path (pull from followees, section 9.3) and re-warms the cache. This turns 20 B into 12 B insertions per day.</li>
+<li><b>Batching and pipelining.</b> A worker reads 1,000 followers, groups them by Redis shard (hash of user id), and sends one pipelined batch per shard. Throughput of a single Redis shard is roughly 100,000 simple commands per second; our 420 K per second spread over 100 primaries is about 4,200 per second each, comfortable.</li>
+<li><b>Partitioning the work.</b> A single author with 90 K followers is split into chunk tasks (follower offset ranges) so one worker is not stuck; chunk tasks are idempotent because <code>ZADD</code> of the same member and score is a no-op.</li>
+<li><b>Priority lanes.</b> Separate topics for normal and large-author fan-out, so a burst from large accounts cannot delay everyone (<a href="../chapters/35-messaging-patterns.html">Chapter 35</a>).</li>
+</ul>
+
+<h2 id="feedcache">8. Deep dives 2 to 4: feed cache and cursors, ranking, media</h2>
+<h3>8.1 Feed cache structure: Redis list or sorted set?</h3>
+<p>The per-user feed is a bounded ordered list of post ids, not full posts. Storing ids keeps entries small (8 bytes) and means an edit or delete changes one record, the post, instead of 200 copies.</p>
+<table>
+<tr><th>Option</th><th>Strengths</th><th>Weaknesses</th></tr>
+<tr><td>Redis <b>list</b> (<code>LPUSH</code> then <code>LTRIM</code> to 500)</td><td>Very cheap append at head, trivial trim, small memory.</td><td>Position-based pagination only (<code>LRANGE</code> offset) which drifts when new items are pushed; cannot remove or re-rank a specific member cheaply (<code>LREM</code> is O(N)); no score so ranked mode needs a separate structure; late-arriving or backfilled items cannot be placed in order.</td></tr>
+<tr><td>Redis <b>sorted set</b> (<code>ZADD</code>, <code>ZREMRANGEBYRANK</code>)</td><td>Ordered by score; range by score gives stable cursors; <code>ZREM</code> of one post is O(log N); idempotent re-insert; backfill and repair insert in correct order; supports both modes.</td><td>More memory per entry (skip list plus hash, about 2 to 3x a list); each insert is O(log N), fine for N = 500.</td></tr>
+</table>
+<p>We choose the sorted set (<a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a> and <a href="../chapters/15-redis.html">Chapter 15</a> explain the structure). Each key is <code>feed:{user_id}</code>, member is the post id, score is the post id's timestamp (for latest mode) or a precomputed coarse score. After each insert we trim to the newest 500 entries. Keys have a TTL of about 14 days so abandoned accounts vanish, and a Lua script or pipeline does <code>ZADD</code> plus trim atomically enough in one round trip.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 290" role="img" aria-label="Feed sorted set and cursor pagination">
+<text class="t-b" x="20" y="24">feed:{u42} (sorted set, newest first by score)</text>
+<rect class="cache" x="20" y="40" width="130" height="44" rx="6"/><text class="t-c" x="85" y="59">post 9081</text><text class="t-c t-sm" x="85" y="75">score 9081</text>
+<rect class="cache" x="160" y="40" width="130" height="44" rx="6"/><text class="t-c" x="225" y="59">post 9070</text><text class="t-c t-sm" x="225" y="75">score 9070</text>
+<rect class="cache" x="300" y="40" width="130" height="44" rx="6"/><text class="t-c" x="365" y="59">post 9066</text><text class="t-c t-sm" x="365" y="75">score 9066</text>
+<rect class="hit" x="440" y="40" width="130" height="44" rx="6"/><text class="t-c" x="505" y="59">post 9040</text><text class="t-c t-sm" x="505" y="75">last of page 1</text>
+<rect class="cache" x="580" y="40" width="130" height="44" rx="6"/><text class="t-c" x="645" y="59">post 9031</text><text class="t-c t-sm" x="645" y="75">score 9031</text>
+<rect class="cache" x="720" y="40" width="160" height="44" rx="6"/><text class="t-c" x="800" y="59">... 500 entries</text><text class="t-c t-sm" x="800" y="75">trimmed at the tail</text>
+<path class="arrow-g" d="M505 120 L505 88"/><text class="t-c t-sm" x="505" y="136">cursor = (score 9040, id 9040)</text>
+<text class="t-b" x="20" y="180">Page 2 request</text>
+<rect class="box" x="20" y="194" width="430" height="44" rx="6"/><text x="34" y="221">ZREVRANGEBYSCORE feed:u42 (9040 -inf LIMIT 0 20</text>
+<text class="t-sm" x="470" y="212">"(" = exclusive bound: strictly older than the cursor.</text>
+<text class="t-sm" x="470" y="230">New posts land at the head and never shift page 2.</text>
+<text class="t-sm" x="20" y="268">If the cursor is older than the tail (trimmed), fall through to the durable timeline in the post store.</text>
+</svg>
+<figcaption>A cursor remembers a position by value (the last score seen), not by offset. New posts inserted at the head do not move older pages.</figcaption>
+</figure>
+<h3>8.2 Pagination with cursors</h3>
+<p>Offset pagination (<code>LIMIT 20 OFFSET 40</code>) is wrong for feeds: when three new posts arrive between page 1 and page 2, every item shifts down by three and the user sees repeats. A <b>cursor</b> is a bookmark by value. For the latest mode the cursor is <code>(last_score, last_post_id)</code>, base64-encoded and signed, and the next page is "20 items strictly older than this". Since post ids are unique and time-ordered, ties on the score are broken by id, so no item is skipped or repeated.</p>
+<p>For the <b>ranked mode</b> the order is not a timestamp. We solve this by making the ranked list a short-lived snapshot: on the first request the ranker produces an ordered list of about 100 post ids and stores it under a <code>session_id</code> (Redis list with a 30 minute TTL); the cursor is then <code>(session_id, position)</code>. This keeps order stable while scrolling, and when the snapshot runs out the next request builds a new one, excluding ids already shown (kept in a small "seen" set). The client also sends back the ids it has displayed so the server can drop duplicates even if the snapshot expired.</p>
+<h3>8.3 Timeline ordering and consistency</h3>
+<ul>
+<li><b>Ordering:</b> the sorted set orders by score, and with time-ordered ids the order is creation order modulo small clock skew between id generators (a few milliseconds). Nobody notices.</li>
+<li><b>Out-of-order arrival:</b> if fan-out for post A is delayed behind post B (created later), <code>ZADD</code> still puts A in the right place, because position comes from the score, not arrival. A user mid-scroll may never see A if they already passed its slot; they will see it on next refresh. This is acceptable eventual consistency.</li>
+<li><b>Read-your-writes:</b> the author's own feed is written synchronously, and the client also optimistically inserts the new post locally.</li>
+<li><b>Monotonic reads:</b> a user hitting a lagging replica could see a post disappear. We read feed lists from the primary or use sticky routing to one replica per session (<a href="../chapters/24-replication.html">Chapter 24</a>).</li>
+</ul>
+<h3>8.4 Ranking pipeline</h3>
+<p>Ranking is a separate service so the ranking team can iterate without touching storage. At a high level it has four stages.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Ranking pipeline stages">
+<rect class="box" x="20" y="50" width="190" height="90" rx="8"/><text class="t-c t-b" x="115" y="76">1. Candidates</text><text class="t-c t-sm" x="115" y="98">pushed ids from ZSET</text><text class="t-c t-sm" x="115" y="114">+ celebrity posts</text><text class="t-c t-sm" x="115" y="130">about 300 ids</text>
+<rect class="box" x="250" y="50" width="190" height="90" rx="8"/><text class="t-c t-b" x="345" y="76">2. Features</text><text class="t-c t-sm" x="345" y="98">post age, author affinity</text><text class="t-c t-sm" x="345" y="114">engagement counts, media</text><text class="t-c t-sm" x="345" y="130">from feature store</text>
+<rect class="box" x="480" y="50" width="190" height="90" rx="8"/><text class="t-c t-b" x="575" y="76">3. Scoring</text><text class="t-c t-sm" x="575" y="98">model predicts like,</text><text class="t-c t-sm" x="575" y="114">reply, dwell probability</text><text class="t-c t-sm" x="575" y="130">weighted into one score</text>
+<rect class="box" x="710" y="50" width="170" height="90" rx="8"/><text class="t-c t-b" x="795" y="76">4. Re-ranking</text><text class="t-c t-sm" x="795" y="98">diversity, dedupe,</text><text class="t-c t-sm" x="795" y="114">policy, ads slots</text><text class="t-c t-sm" x="795" y="130">top 100 to snapshot</text>
+<path class="arrow" d="M210 95 L248 95"/><path class="arrow" d="M440 95 L478 95"/><path class="arrow" d="M670 95 L708 95"/>
+<text class="t-sm" x="20" y="190">Budget: about 100 ms total. Features come from a low-latency feature store; the model is a light gradient-boosted</text>
+<text class="t-sm" x="20" y="210">tree or small neural net. Fallback if the ranker times out: sort the candidates by recency.</text>
+</svg>
+<figcaption>Candidate generation is cheap and recall-oriented; scoring is expensive and precision-oriented, so it only sees a few hundred items.</figcaption>
+</figure>
+<ol>
+<li><b>Candidate generation.</b> Union of the user's feed ZSET (newest 300) and recent celebrity posts. Optionally add "recommended" posts from accounts not followed, from a separate recommender.</li>
+<li><b>Feature fetch.</b> For each candidate: post features (age, media type, text length, engagement so far), author-user affinity (how often this user interacts with that author), and user context (time of day, device). Features come from a feature store in batch calls.</li>
+<li><b>Scoring.</b> A model predicts probabilities of actions such as like, comment, share and long dwell; a weighted sum gives one score. Models are trained offline on logged impressions and outcomes.</li>
+<li><b>Re-ranking.</b> Rule-based adjustments: do not show five posts from one author in a row, remove near-duplicates, apply safety demotions, drop already-seen posts and insert sponsored slots.</li>
+</ol>
+<p>The write path is unaffected: the sorted set only needs recency. Ranking happens at read time on a few hundred ids, which is affordable. Heavy users can have scores cached for a minute or two.</p>
+<h3>8.5 Media: upload, storage and CDN</h3>
+<p>Media never travels through the post service. The client asks for an upload URL, uploads the bytes straight to object storage using a pre-signed URL (<a href="../chapters/21-object-storage.html">Chapter 21</a>), and gets a <code>media_id</code>. An asynchronous pipeline then virus-scans, generates resized renditions (thumbnail, 480, 1080 pixels; video transcodes into multiple bitrates), and marks the media ready. The post may only be published after the media is ready, or it is published with a placeholder and the client re-fetches. The feed JSON carries CDN URLs; the CDN pulls from object storage on first miss and keeps popular images at the edge (<a href="../chapters/12-cdn.html">Chapter 12</a>). URLs contain a content hash so they are immutable and cacheable for a year, and deletion works through the post record, not by purging every edge.</p>
+
+<h2 id="repair">9. Deletes, edits, blocks and feed repair</h2>
+<p>The precomputed feed is a cache of references, so the design question is how to keep it truthful when the world changes.</p>
+<h3>9.1 Edits</h3>
+<p>Feeds hold only post ids, and the Feed service hydrates bodies from the post cache. An edit updates the post row and invalidates its cache entry; every feed reflects the edit on its next read with no fan-out. This is the main reason for storing ids rather than copies.</p>
+<h3>9.2 Deletes and blocks</h3>
+<table>
+<tr><th>Event</th><th>Mechanism</th><th>Why</th></tr>
+<tr><td>Post deleted</td><td>Mark <code>deleted=true</code> in the post store and evict the cache (soft delete). At read time, hydration finds the tombstone and skips the id. A background job later fans out <code>ZREM</code> to cleanup, lazily.</td><td>Read-time filtering gives immediate effect; background cleanup is only for memory. Eager fan-out removal of 200 copies is too slow to be the source of truth.</td></tr>
+<tr><td>User blocks X</td><td>Write to a per-user block set (cached). The Feed service filters X's posts at read time and the fan-out worker checks the set before pushing. A cleanup job removes X's entries from the ZSET.</td><td>Blocks are privacy-critical, so read-time filtering is mandatory, not an optimisation.</td></tr>
+<tr><td>Unfollow</td><td>Remove graph edges; filter at read time by checking the followed set (cached) for non-celebrity entries; cleanup job removes entries.</td><td>Unfollowed content must stop immediately, but the exact entries can linger.</td></tr>
+<tr><td>Follow</td><td>Backfill: pull the new followee's last 20 posts into the follower's ZSET with their scores.</td><td>Otherwise the feed shows nothing from the new account until it next posts.</td></tr>
+<tr><td>Account deleted or suspended</td><td>Visibility flag on the author; filtered on hydration.</td><td>Same pattern as delete.</td></tr>
+</table>
+<div class="callout watch"><b>Watch out</b> Read-time filtering means a page can contain fewer than 20 valid items after filtering. The Feed service over-fetches (for example 30 ids for a page of 20) and loops until the page is full, otherwise heavy blockers see short pages and a misleading "no more posts".</div>
+<h3>9.3 Feed repair and rebuild</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Feed rebuild flow">
+<rect class="miss" x="20" y="50" width="200" height="70" rx="8"/><text class="t-c t-b" x="120" y="76">Trigger</text><text class="t-c t-sm" x="120" y="96">cache miss, node loss,</text><text class="t-c t-sm" x="120" y="110">inactive user returns</text>
+<rect class="box" x="270" y="50" width="200" height="70" rx="8"/><text class="t-c t-b" x="370" y="76">Get followees</text><text class="t-c t-sm" x="370" y="96">graph store, following</text><text class="t-c t-sm" x="370" y="110">table by user id</text>
+<rect class="box" x="520" y="50" width="170" height="70" rx="8"/><text class="t-c t-b" x="605" y="76">Fetch recent posts</text><text class="t-c t-sm" x="605" y="96">last 20 per author</text><text class="t-c t-sm" x="605" y="110">author timelines</text>
+<rect class="cache" x="740" y="50" width="140" height="70" rx="8"/><text class="t-c t-b" x="810" y="76">Bulk ZADD</text><text class="t-c t-sm" x="810" y="96">top 500 by score</text>
+<path class="arrow" d="M220 85 L268 85"/><path class="arrow" d="M470 85 L518 85"/><path class="arrow" d="M690 85 L738 85"/>
+<text class="t-sm" x="20" y="170">Cost per rebuild: 200 followees x 20 posts = 4,000 candidate ids, a few hundred ms in parallel batches.</text>
+<text class="t-sm" x="20" y="195">Guards: single-flight per user (lock key), rate-limit rebuilds per second, serve a partial feed immediately</text>
+<text class="t-sm" x="20" y="220">from the newest authors while the rest fills in.</text>
+</svg>
+<figcaption>Rebuild is the same code as the pull strategy, run on demand for one user, which is why pure pull must remain implemented even in a push-heavy design.</figcaption>
+</figure>
+<p>Repair covers three situations. <b>Lost cache:</b> if a Redis shard dies, its users hit a rebuild on next read; rebuilds are single-flight per user and rate-limited so a node loss does not become a stampede on the graph and post stores (<a href="../chapters/14-caching-failures.html">Chapter 14</a>). <b>Drift:</b> a nightly sampled job compares a few thousand feeds against what a rebuild would produce and alerts if the difference is above a threshold. <b>Lost fan-out events:</b> the worker acknowledges the Kafka offset only after the pipeline succeeds, so a crash replays; because <code>ZADD</code> is idempotent, replays are safe (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>).</p>
+
+<h2 id="scaling">10. Scaling, hot users, sharding and failure modes</h2>
+<h3>10.1 Sharding</h3>
+<table>
+<tr><th>Data</th><th>Shard key</th><th>Reason and caveat</th></tr>
+<tr><td>Feed cache</td><td>Hash of <code>user_id</code> (consistent hashing or Redis Cluster slots, <a href="../chapters/25-sharding.html">Chapter 25</a>)</td><td>All of one user's feed on one shard, so a read is one call. Uniform because users are uniform in feed size (bounded 500).</td></tr>
+<tr><td>Posts</td><td>Hash of <code>post_id</code></td><td>Even load; a single celebrity's posts spread out. Author index is a secondary table partitioned by author.</td></tr>
+<tr><td>Graph</td><td><code>following</code> by <code>user_id</code>, <code>followers</code> by <code>followee_id</code></td><td>The followers partition for a celebrity is huge (50 M rows); we split it into sub-partitions by <code>hash(follower_id) mod 256</code> so fan-out and scans are parallel.</td></tr>
+<tr><td>Kafka</td><td>Partition by author id (ordering per author)</td><td>A hot author cannot be split across partitions without losing ordering, but ordering per author is not needed for correctness thanks to scores, so chunk tasks use a random key.</td></tr>
+</table>
+<h3>10.2 Hot users and hot keys</h3>
+<ul>
+<li><b>Celebrity timeline reads:</b> one account's recent posts are read by millions of feed loads. Keep it in an in-process cache on every Feed service instance with a TTL of a few seconds, plus replicated copies in Redis. A celebrity post then reaches users within the TTL.</li>
+<li><b>Viral post:</b> the post body is read by many; the post cache uses local near caches and request coalescing, and counters are served from a separate counter service with sampled updates.</li>
+<li><b>Hot Redis shard:</b> a shard whose users are all very active. Detect with per-shard QPS dashboards; mitigate by adding read replicas for feed reads and resharding slots.</li>
+<li><b>Thundering fan-out:</b> a big event (a final, an election) makes many accounts post at once. Kafka absorbs the burst; workers autoscale on consumer lag (<a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>); backpressure drops the push for the least active followers first.</li>
+</ul>
+<h3>10.3 New-post latency budget</h3>
+<p>Target for a normal user's post: visible to active followers within 5 seconds p99. Budget: API and database write 100 ms, outbox relay 100 ms, Kafka 50 ms, queueing in fan-out 1 to 3 seconds in normal load, worker work (200 followers) 50 ms, so about 2 to 4 seconds. The metric to watch is <code>end-to-end fan-out lag</code>, measured as feed insertion time minus post creation time, which should alarm when p99 passes 10 seconds.</p>
+<h3>10.4 Failure modes</h3>
+<table>
+<tr><th>Component</th><th>Failure</th><th>User-visible effect</th><th>Mitigation</th></tr>
+<tr><td>Redis feed shard (primary)</td><td>Crash</td><td>Feeds of 1% of users empty or stale</td><td>Replica promotion in seconds; if lost, rebuild on demand, single-flight and rate limited; show partial feed</td></tr>
+<tr><td>Redis feed shard</td><td>Slow</td><td>Latency spikes</td><td>Tight timeouts (50 ms), hedged read to replica, circuit breaker returns recency-sorted post-store fallback (<a href="../chapters/40-resilience.html">Chapter 40</a>)</td></tr>
+<tr><td>Kafka or workers</td><td>Backlog</td><td>New posts delayed</td><td>Autoscale on lag, priority lanes, reads still work; the author sees own post immediately</td></tr>
+<tr><td>Fan-out worker</td><td>Crash mid-post</td><td>Some followers miss it</td><td>Offset committed after completion; replay is idempotent</td></tr>
+<tr><td>Post store</td><td>Shard unavailable</td><td>Posts from that shard cannot hydrate</td><td>Replicas; cache keeps recent posts; skip unhydratable ids rather than failing the page</td></tr>
+<tr><td>Ranker</td><td>Timeout or bad model</td><td>Worse ordering</td><td>Deadline of 100 ms then fall back to recency; model rollout behind a canary and an automatic metric guard</td></tr>
+<tr><td>Graph store</td><td>Slow or down</td><td>Fan-out and follow fail</td><td>Cache follower lists for large authors; follow writes queued; feed reads do not need the graph on the hot path except celebrity set (cached per user)</td></tr>
+<tr><td>Celebrity flag wrong</td><td>Large account pushed</td><td>Fan-out storm</td><td>Hard cap on fan-out per post (for example 100 K) with the remainder routed to the pull path</td></tr>
+<tr><td>Stale cache returning wrong data</td><td>Deleted post shown</td><td>Privacy bug</td><td>Tombstone check at hydration is authoritative; cache TTL for tombstones is longer than for bodies</td></tr>
+</table>
+<h3>10.5 Multi-region</h3>
+<p>Run full stacks in several regions; each user has a home region (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>). Posts and graph writes go to the author's home region and replicate asynchronously to others. Each region maintains feed caches for its users, filled by consuming the replicated event stream. A follower in another region sees the post after replication lag (typically under a second, bounded by seconds). During a region failure, users are routed to a neighbour and rebuild their feeds from replicated posts and graph; the feed is stale for some minutes, which we accept (<a href="../chapters/41-ha-dr.html">Chapter 41</a>).</p>
+
+<h2 id="ops">11. Security, notification hooks, monitoring and cost</h2>
+<h3>11.1 Security and abuse</h3>
+<ul>
+<li><b>Authorization on read:</b> private accounts and blocks are enforced at hydration time, not only at fan-out, because the feed cache can be stale (<a href="../chapters/55-security.html">Chapter 55</a>).</li>
+<li><b>Spam and bots:</b> post rate limits per account and per IP, follow rate limits and new-account quarantines at the gateway (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>). A spammer that follows 100 K accounts is also a fan-in abuse vector.</li>
+<li><b>Cursor tampering:</b> cursors are signed so clients cannot craft arbitrary positions or session ids.</li>
+<li><b>Moderation:</b> an asynchronous classifier consumes <code>PostCreated</code> events; flagged posts get a visibility flag, which read-time filtering enforces within seconds.</li>
+</ul>
+<h3>11.2 Notification hooks</h3>
+<p>The system does not send notifications itself. The same <code>PostCreated</code> topic is consumed by the notification service (<a href="../case-studies/c08-notification-system.html">Case study 8</a>), which reads a per-follower "alert me when X posts" setting, applies rate limits and quiet hours, and sends push messages. Notifications for accounts with huge followings go through the same celebrity logic (batched, throttled, and only for opted-in followers). Other consumers, such as search indexing and analytics, subscribe to the same stream, so the feed does not need to know about them.</p>
+<h3>11.3 Monitoring and SLOs</h3>
+<table>
+<tr><th>SLI</th><th>Target (SLO)</th></tr>
+<tr><td>Feed read success rate</td><td>99.95% over 30 days</td></tr>
+<tr><td>Feed first page latency (server side)</td><td>p50 under 80 ms, p99 under 300 ms</td></tr>
+<tr><td>Fan-out lag (post created to inserted)</td><td>p99 under 10 s</td></tr>
+<tr><td>Feed cache hit rate</td><td>above 99% of reads (a miss triggers rebuild)</td></tr>
+<tr><td>Short page rate (fewer than 20 items after filtering)</td><td>below 1%</td></tr>
+</table>
+<p>Also graph Kafka consumer lag, per-shard Redis QPS and memory, rebuild rate, ranker timeout rate, and the drift job's mismatch percentage (<a href="../chapters/54-observability-slos.html">Chapter 54</a>).</p>
+<h3>11.4 Cost</h3>
+<ul>
+<li><b>Feed cache RAM</b> is the biggest compute cost: 200 nodes of 64 to 128 GB memory. Levers: shrink entries (store only 8 B ids with compact encodings), keep only 300 entries for casual users, shorten the TTL for inactive users, and push only to active followers (saves 40% of both writes and memory).</li>
+<li><b>Media storage</b> is the biggest storage cost: 60 TB per day, 22 PB per year. Levers: lifecycle rules moving media older than 90 days to colder tiers, efficient codecs (WebP or AVIF, newer video codecs), and not keeping all renditions of old content.</li>
+<li><b>CDN egress</b> is the biggest bandwidth cost: 52 GB/s average. A hit ratio of 95% versus 90% halves origin egress. Negotiated CDN rates and own edge caches are the long-term lever.</li>
+<li><b>Ranking compute</b> scales with feed loads: 100 K QPS x 300 candidates = 30 M scored items per second at peak; use lightweight models, cache scores, and skip ranking for latest mode.</li>
+</ul>
+
+<h2 id="evolution">12. Evolution, phasing and alternatives not chosen</h2>
+<h3>12.1 What to build first</h3>
+<ol>
+<li><b>Phase 1 (up to about 1 M users):</b> one relational database, fan-out on read with an index on <code>(author_id, post_id)</code>. Ship the product.</li>
+<li><b>Phase 2 (up to about 50 M):</b> add Redis feed ZSETs and push fan-out via a queue; rebuild on miss. Add a CDN for media. Cursor pagination from day one, since changing it later breaks clients.</li>
+<li><b>Phase 3 (500 M, this design):</b> shard everything, introduce the celebrity path, the ranking service, active-only push and multi-region.</li>
+</ol>
+<h3>12.2 At 10x (5 B users, 3 M feed QPS)</h3>
+<p>The graph store and the feed cache shard counts grow 10x; fan-out lag becomes the dominant risk, so we move to cell-based deployment (<a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>), each cell owning a slice of users with its own Redis, Kafka and workers. The celebrity threshold gets lowered (as the total fan-out is proportional to followers, the cost-benefit moves). More of the ranking runs on precomputed per-user candidate pools, and feeds shrink to ids plus a few features to reduce memory.</p>
+<h3>12.3 Alternatives not chosen</h3>
+<ul>
+<li><b>Pure pull:</b> simple but fails the tail latency at 600:1 read ratio.</li>
+<li><b>Pure push:</b> a 50 M follower account makes one post cost 50 M writes; also wastes work on inactive users.</li>
+<li><b>Storing full post bodies in the feed:</b> faster hydration, but an edit or delete has to rewrite hundreds of millions of copies and memory grows by 30 to 100x.</li>
+<li><b>A graph database for the follow graph:</b> useful for multi-hop queries (friends of friends), which the feed does not need; a sharded key-value store is cheaper and scales more simply.</li>
+<li><b>Offset pagination:</b> rejected for duplicate and skip problems under concurrent inserts.</li>
+</ul>
+
+<h2 id="qa">13. Interview Q&amp;A</h2>
+<details><summary>Why not just compute the feed on read with a join, like a normal database application?</summary><p>A join works when a user follows a few accounts. Here a user follows about 200, and each feed load would need the newest posts from 200 different authors, spread over many shards. At 100 K feed loads per second that is 20 million partition probes per second, and the response time of each page equals the slowest of 200 parallel calls, so tail latency is dominated by the worst shard. Precomputing the list at write time converts that into one sorted-set range read. The price is write amplification, which we then bound with the hybrid design. I would still keep the pull code, since it is the rebuild path.</p></details>
+<details><summary>How do you decide who counts as a celebrity, and what happens at the boundary?</summary><p>I use follower count, because it directly measures fan-out cost, with a threshold around 100,000 where a single post costs about 100,000 insertions. To avoid flapping, I use hysteresis, turning the flag on above 100 K and off below 50 K. Accounts near the line are fine either way, since both strategies work for them, only at different costs. Posts made before the flag flipped remain in followers' sorted sets and are deduplicated by post id when merged with celebrity posts. As a safety net, the fan-out worker enforces a hard cap on insertions per post and sends the rest of the followers to the pull path.</p></details>
+<details><summary>A user follows 3,000 accounts, 20 of whom are celebrities. How does the feed read change?</summary><p>The pushed part is unchanged: one range read from their sorted set. For celebrities, the Feed service reads 20 celebrity timelines. Each is a small, very hot list that is cached in process and in Redis, so these are mostly memory hits and are issued in parallel, adding a few milliseconds. We take only the last few posts from each, merge by score, and dedupe against the pushed list. If a user follows hundreds of celebrities, we limit the pull to the most engaged 50 celebrities, plus a precomputed per-user "celebrity candidates" list refreshed every minute.</p></details>
+<details><summary>How does pagination stay correct when new posts keep arriving?</summary><p>I use cursors that encode a position by value, not offset. In latest mode the cursor is the last score and post id seen, and the next page asks for items strictly older. New posts are added at the head so they do not shift older pages and nothing repeats. In ranked mode the order depends on a model, so I snapshot the top 100 ranked ids at first request under a session id and page through the snapshot by position, and build a new snapshot (excluding seen ids) when it runs out. The cursor is opaque and signed, so I can change the internal format later.</p></details>
+<details><summary>A user deletes a post, or blocks someone. How quickly does it vanish from feeds, and how do you guarantee it?</summary><p>Feeds only store ids, and every page is hydrated against the post store or cache, where deletes are tombstones and block sets are checked. So the post disappears on the next read, regardless of how many feed copies exist, without a fan-out of removals. A background job then removes the stale ids from sorted sets to save memory. The important design decision is that correctness for privacy-sensitive changes lives in read-time filtering, and the physical cleanup is an optimisation. The page over-fetches to remain full after filtering.</p></details>
+<details><summary>What happens if a Redis feed shard fails?</summary><p>A replica is promoted, typically in seconds, and replication is asynchronous so a few of the latest insertions might be lost. If both die, users on that shard have empty feeds, and the Feed service treats an empty or missing list as a miss and rebuilds it from the graph and author timelines. I guard that with single-flight per user and a global rate limit, so a node loss of about 3 million users does not turn into a stampede on the graph and post stores, and serve partial feeds first. The cache is therefore a derived, recoverable structure, not a source of truth, which is why we can run it without strong durability.</p></details>
+<details><summary>How do you keep fan-out from delaying the author's own experience or creating duplicates?</summary><p>The post request returns after the durable write and the event is stored (using the outbox pattern), and fan-out is asynchronous, so the author never waits on it. The author's own feed gets the post synchronously for read-your-writes. Duplicates cannot occur in the feed because a sorted set member is unique, and a replayed fan-out simply re-adds the same member with the same score. Client retries are covered by a client request id that makes post creation idempotent.</p></details>
+<details><summary>How would you add a "recommended posts from accounts you do not follow" section?</summary><p>That is another candidate source, not a change to the storage design. A separate recommender produces candidate post ids per user (from engagement signals, graph neighbours or topics) and writes them to a per-user candidate list or serves them on demand. The ranking service merges them with followed content, marks their source for the client, and the re-ranking stage enforces a mix ratio, for example no more than one in four. Because the feed stores ids and ranking operates at read time, this plugs in without touching the fan-out pipeline.</p></details>
+<details><summary>How would you handle the cold start of a new user, or a user returning after a month?</summary><p>A new user has no follows, so we show an onboarding flow and a recommended or trending feed built from popular posts, and as they follow accounts we backfill each one's recent posts into the sorted set. A returning user was dropped from active-only push, so their sorted set is expired or stale. On first open the Feed service detects a missing or old list and runs the rebuild path, returning a quick partial result from the most recent authors and finishing the rest in the background. The cost is limited by the rebuild rate limit, and warming can be spread in advance by detecting an opened push notification or email.</p></details>
+<details><summary>If an interviewer asks you to make the feed strictly consistent, what do you say?</summary><p>I would first ask what guarantee actually matters. For a social feed, the guarantees that matter are read-your-writes for the author, monotonic reads for a session, and that deletes and blocks apply promptly. We provide those with synchronous author writes, sticky replica routing and read-time filtering. A total order seen identically by all followers at the same instant would need cross-shard coordination on each post, which would cost latency and availability for no user-visible benefit, so I would explain the choice using the availability side of the trade-off in <a href="../chapters/28-cap-consistency.html">Chapter 28</a>.</p></details>
+
+<h2 id="connects-section">14. Connects to and recap</h2>
+<p class="connects"><b>Connects to:</b> <a href="../chapters/01-interview-framework.html">Chapter 1</a> (framework followed here), <a href="../chapters/02-estimation.html">Chapter 2</a> (estimation), <a href="../chapters/05-api-design.html">Chapter 5</a> (API and pagination), <a href="../chapters/12-cdn.html">Chapter 12</a> (media delivery), <a href="../chapters/13-caching-patterns.html">Chapter 13</a> and <a href="../chapters/14-caching-failures.html">Chapter 14</a> (cache patterns and stampedes), <a href="../chapters/15-redis.html">Chapter 15</a> and <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a> (sorted sets), <a href="../chapters/20-nosql.html">Chapter 20</a> (graph and post stores), <a href="../chapters/21-object-storage.html">Chapter 21</a> (media), <a href="../chapters/25-sharding.html">Chapter 25</a> (sharding), <a href="../chapters/28-cap-consistency.html">Chapter 28</a> (consistency), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotency and ids), <a href="../chapters/34-queues-kafka.html">Chapter 34</a> (fan-out queue), <a href="../chapters/40-resilience.html">Chapter 40</a> (fallbacks), and <a href="../chapters/60-pattern-playbook.html">Chapter 60</a> (pattern playbook). Related: <a href="c07-chat.html">Case study 7</a> (real-time delivery) and <a href="c08-notification-system.html">Case study 8</a> (notifications).</p>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>The feed is a write-versus-read trade: at 100 K peak read QPS and 3.5 K posts per second, precomputing with fan-out on write (about 420 K insertions per second at peak) makes reads one sorted-set range read.</li>
+<li>Pure push fails on celebrities and pure pull fails on tail latency; the <b>hybrid</b> pushes for normal authors to active followers only, and pulls celebrity posts at read time.</li>
+<li>Feeds hold <b>ids</b> in Redis sorted sets (about 5 TB, about 200 nodes with replicas), so edits are free and deletes and blocks are enforced by read-time filtering plus lazy cleanup.</li>
+<li>Pagination uses <b>cursors by value</b>, with a session snapshot in ranked mode; offsets are rejected.</li>
+<li>Ranking is a separate four-stage pipeline (candidates, features, scoring, re-ranking) with a recency fallback.</li>
+<li>Failures are handled by treating the feed cache as rebuildable: single-flight rebuild, idempotent replayable fan-out, and graceful degradation to partial or recency-sorted feeds.</li>
+<li>Media goes straight to object storage and is served by the CDN; the largest costs are feed RAM, media storage and egress.</li>
+</ul></div>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

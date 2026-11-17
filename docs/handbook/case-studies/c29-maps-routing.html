@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 29: Design Maps and Routing | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="c29-maps-routing">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 29 · Worked solutions</div>
+<h1>Design Maps and Routing</h1>
+<p class="lead">A maps product answers four questions at planet scale: what does the map look like here, where is this address, what is the fastest way from A to B, and how long will it take right now. This worked solution designs each answer in turn: tiles served from a CDN, a geocoder built on a search index, a partitioned road graph searched with Dijkstra, A* and contraction hierarchies, a live traffic pipeline that reweights the graph every minute, and an ETA service that turns routes into trustworthy minutes.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+
+<p>The prompt "Design Google Maps" is enormous, so the first job is to carve out a problem that fits in 45 minutes, following the framework in <a href="../chapters/01-interview-framework.html">Chapter 1</a>. The honest observation is that maps is really <b>four loosely coupled systems</b> that share one geographic base layer: a <i>rendering</i> system (draw the map), a <i>search</i> system (turn text into coordinates and back), a <i>routing</i> system (find paths on a graph), and a <i>traffic</i> system (measure how fast roads are right now). Each has different data, different traffic and a different bottleneck, so I would say that out loud and ask the questions below.</p>
+
+<table>
+<tr><th>Question I ask</th><th>Assumed answer</th></tr>
+<tr><td>Which features are in scope?</td><td>Map display with pan and zoom, place and address search (geocoding and autocomplete), driving directions with alternatives, live traffic, and a time-of-arrival estimate. Reverse geocoding (coordinates to address) is included because it is cheap once forward geocoding exists.</td></tr>
+<tr><td>Which travel modes?</td><td>Driving is designed in full. Walking and cycling use the same machinery on different graphs and speed models; transit (timetables, transfers) is out of scope.</td></tr>
+<tr><td>Scale?</td><td>1 billion monthly users, 500 million daily active users, worldwide, mobile first.</td></tr>
+<tr><td>Where does map data come from?</td><td>We license and ingest base data (road networks, buildings, places, addresses) from vendors, open data and our own survey and user edits. Building the cartographic data pipeline from raw imagery is out of scope; we design how fresh data is ingested and published.</td></tr>
+<tr><td>How fast must routes be?</td><td>A cross-country route in well under 1 second end to end (p99 around 500 ms including network); tiles feel instant (p95 under 100 ms from the nearest edge).</td></tr>
+<tr><td>How real is "live" traffic?</td><td>Segment speeds refreshed about every minute, derived mostly from anonymous phone probes plus incident feeds. A route being navigated is re-evaluated when conditions change materially.</td></tr>
+<tr><td>Offline maps?</td><td>Mentioned as an extension: download a region's tiles and a compact routing graph. Not designed in detail.</td></tr>
+<tr><td>Accuracy expectation for ETA?</td><td>Typically within about 10 percent for trips under an hour. We state that as a target, not a promise.</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li>Render a map at any zoom level for any viewport, with smooth pan and zoom, in light and dark styles and in the user's language.</li>
+<li>Search: free-text query to ranked places and addresses, with autocomplete while typing; reverse geocode a coordinate.</li>
+<li>Route: given origin, destination, optional waypoints and mode, return the best route plus a few alternatives, with turn-by-turn steps and a polyline.</li>
+<li>Traffic: color roads by current speed; apply current and predicted conditions to route choice and ETA.</li>
+<li>ETA: estimate the travel time of a route now or for a future departure; keep it updated during navigation and offer rerouting.</li>
+</ul>
+
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Read-heavy and cacheable:</b> map tiles are identical for everyone at a given zoom, location and style version, so they should be served almost entirely from CDN edge caches (<a href="../chapters/12-cdn.html">Chapter 12</a>).</li>
+<li><b>Low-latency routing:</b> a continental route must not need a graph search that touches tens of millions of nodes per query. This forces precomputation.</li>
+<li><b>Freshness differs by layer:</b> tiles may be minutes to days old; traffic must be about a minute old; road closures must propagate within minutes; base map edits within hours.</li>
+<li><b>Availability over consistency:</b> a slightly stale map or traffic value is far better than an error (<a href="../chapters/28-cap-consistency.html">Chapter 28</a>). The only strong consistency need is that a single route computation sees one consistent graph version.</li>
+<li><b>Graceful degradation:</b> if live traffic breaks, routing falls back to historical typical speeds; if routing is slow, show a straight-line estimate.</li>
+<li><b>Privacy:</b> location probes are anonymized and aggregated (<a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>).</li>
+</ul>
+
+<h3>2.3 Out of scope</h3>
+<p>Transit timetables, street-level imagery, indoor maps, ads and business listings, reviews, fleet optimization (many stops, vehicle routing problem), turn-by-turn voice, and the cartographic compilation pipeline. Where they would attach I will say so.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+
+<p>The method is from <a href="../chapters/02-estimation.html">Chapter 2</a>. The numbers are round on purpose; what matters is which resource each subsystem is bound by.</p>
+
+<h3>3.1 Tile traffic</h3>
+<ul>
+<li>500 million daily users, each with about 2 map sessions per day and about 40 tiles fetched per session (an initial viewport shows roughly 12 to 20 tiles, then panning and zooming adds more; phones cache some). That is 500,000,000 x 2 x 40 = 40 billion tiles per day.</li>
+<li>40,000,000,000 / 86,400 is about 460,000 tiles per second on average. Using a peak of 3 times gives about <b>1.4 million tile requests per second</b> worldwide.</li>
+<li>At a 98 percent CDN hit rate, origin sees 2 percent of that, about 28,000 requests per second at peak. Each percentage point of hit rate is worth about 14,000 origin requests per second, which is why tile caching is the first-class design problem.</li>
+<li>Average vector tile: about 20 KB on the wire after compression. Edge egress at peak: 1,400,000 x 20 KB = 28 GB/s, about 224 Gbit/s, spread over hundreds of edge locations. Large but ordinary for a CDN.</li>
+</ul>
+
+<h3>3.2 Tile storage</h3>
+<ul>
+<li>A tile pyramid has 4^z tiles at zoom z (each zoom doubles both axes). At zoom 14 that is 4^14 = 268,435,456 tiles. Much of the world is ocean, desert or ice with nearly empty tiles; assume 30 percent are non-empty: about 80 million tiles.</li>
+<li>At about 15 KB average stored size, zoom 14 is about 1.2 TB. Lower zooms add a geometric series (1/4 + 1/16 + ...), so all zooms up to 14 total about 4/3 of that, about <b>1.6 TB</b>. Trivial storage, so we precompute everything up to a middle zoom and generate the deepest zooms on demand.</li>
+<li>The full tile set must be rebuilt whenever style or base data changes, which is a large batch job, not a storage problem.</li>
+</ul>
+
+<h3>3.3 Search and geocoding</h3>
+<ul>
+<li>Assume 50 million searches per day that end in a selection, and autocomplete sends one request per keystroke after the second character, about 5 requests per search: 250 million autocomplete requests per day, about 2,900 per second average and <b>9,000 per second at peak</b>.</li>
+<li>Index size: roughly 200 million addresses, places and administrative areas at about 200 bytes each (names in several languages, centroid, type, popularity) is about 40 GB, plus the inverted index overhead, so low hundreds of GB. A search cluster of a few dozen nodes handles it.</li>
+</ul>
+
+<h3>3.4 Routing</h3>
+<ul>
+<li>Say 10 percent of daily users request a route: 50 million routes per day, about 580 per second on average, about <b>1,700 per second at peak</b>. Add ETA calls from other products (ride sharing, delivery, place details showing "12 min away"), which are far more frequent, perhaps 10 times: a combined budget of about <b>20,000 route or ETA queries per second at peak</b>.</li>
+<li>Road graph: assume about 200 million directed road segments (edges) and about 150 million intersections (nodes) worldwide after dropping paths irrelevant to cars. This is an assumption; real graphs depend on how fine the data is (a country such as the US alone has on the order of tens of millions of nodes).</li>
+<li>Graph memory: in compact adjacency-array form an edge costs roughly 16 bytes (target node, travel time, flags), so 200 million edges is about 3.2 GB; contraction shortcuts (section 8) typically add about as many edges again, so the routing graph is about 8 to 10 GB with metadata. <b>The whole world's road graph fits in the RAM of one ordinary server.</b> That fact shapes the partitioning discussion: we partition mostly for preprocessing speed, regional isolation and cache locality, not because the graph cannot fit.</li>
+<li>CPU: a contraction-hierarchy query takes on the order of a millisecond or less on a continental graph; with live traffic weights it is a few milliseconds. 20,000 queries per second times 5 ms is 100 core-seconds per second, so about 100 busy cores, or perhaps 300 cores with headroom. Compare plain Dijkstra at roughly seconds per cross-country query: it would need tens of thousands of cores.</li>
+</ul>
+
+<h3>3.5 Traffic probes</h3>
+<ul>
+<li>Peak concurrent devices sending location probes (navigation users, plus opted-in background users): 10 million. One fix every 5 seconds is 2 million probes per second at peak. Average maybe 1 million per second.</li>
+<li>Probe size about 60 bytes (anonymous id rotated per trip, lat, lon, speed, heading, timestamp, accuracy). Peak ingest: 2,000,000 x 60 B = 120 MB/s. Per day at 1 million per second average: 86 billion points, about 5 TB per day raw.</li>
+<li>Speed table: 200 million segments x 8 bytes (current speed, confidence, version) is 1.6 GB per snapshot, small enough to broadcast to every routing node every minute.</li>
+<li>Historical profiles: per segment, a typical speed for every 15-minute slot of the week (672 slots) at 1 byte each is 200,000,000 x 672 = about 134 GB. Large but regional, readable, and sharded with the graph.</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b> Four subsystems, four bottlenecks. Tiles are bounded by <b>egress and cache hit rate</b>, so the CDN does the work. Geocoding is bounded by <b>index search latency</b>, so a search engine does it. Routing is bounded by <b>CPU per query</b>, so we spend hours of preprocessing to save milliseconds per query. Traffic is bounded by <b>ingest and aggregation</b>, so it is a streaming pipeline. The road graph itself is small enough for one machine's memory.</div>
+
+<h2 id="api">4. API design</h2>
+
+<p>All requests are HTTPS (<a href="../chapters/05-api-design.html">Chapter 5</a>); tiles and route responses use compact binary or protobuf encoding where it pays (<a href="../chapters/07-serialization.html">Chapter 7</a>). Tiles must be plain cacheable GETs so the CDN can do its job.</p>
+
+<pre>GET /tiles/v{style_ver}/{z}/{x}/{y}.pbf          (vector tile, cacheable)
+    Cache-Control: public, max-age=86400, stale-while-revalidate=604800
+    ETag: "h3f9a..."                              (content hash)
+
+GET /v1/geocode?q=1600+amphitheatre+pkwy&amp;bias=37.4,-122.1&amp;lang=en&amp;limit=5
+    -> { results: [ { place_id, name, address, lat, lon, bbox, type, score } ] }
+
+GET /v1/autocomplete?q=amph&amp;session=ab12&amp;bias=37.4,-122.1
+GET /v1/reverse?lat=37.42&amp;lon=-122.08
+
+POST /v1/route
+    { origin: {lat,lon,heading?}, destination: {...}, waypoints: [...],
+      mode: "drive", depart_at: "now" | ISO-time,
+      avoid: ["tolls"], alternatives: 2 }
+    -> { routes: [ { id, distance_m, duration_s, duration_in_traffic_s,
+                     polyline (encoded), steps: [ ... ], graph_version } ] }
+
+POST /v1/eta-matrix     { origins: [...], destinations: [...], mode, depart_at }
+    -> n x m table of { duration_s, distance_m }
+
+POST /v1/navigation/{route_id}/reroute   { current_position, heading }
+POST /v1/probes         [ { ts, lat, lon, speed, heading, acc } ... ]   (batched uploads)
+</pre>
+
+<p>Design notes. Tile URLs contain the style version, so changing a style never needs invalidation, it needs a new URL (the cache-busting-by-name idea from <a href="../chapters/12-cdn.html">Chapter 12</a>). The <code>session</code> token on autocomplete groups keystrokes of one search for billing, caching and relevance feedback. The route response includes <code>graph_version</code> so that a support engineer can reproduce what the router saw. The probe endpoint accepts <b>batches</b>: phones buffer points and upload every 10 to 30 seconds to save radio power, so the server does not see strictly one point per request.</p>
+
+<h2 id="data-model">5. Data model and storage choices</h2>
+
+<h3>5.1 Base map: features and tiles</h3>
+<p>Source of truth is a versioned collection of <b>features</b>: roads, buildings, water, land use, places, boundaries, each with geometry, attributes and a stable id. It lives in a spatially indexed database (PostGIS-like, or a custom store) for editing and in immutable snapshot files for batch pipelines. Published output is the <b>tile set</b>: for each style version and tile coordinate, one binary blob, stored in object storage (<a href="../chapters/21-object-storage.html">Chapter 21</a>) keyed by <code>style_ver/z/x/y</code>. Object storage fits perfectly: 1.6 TB, write once, read by key, enormous parallel read throughput, and the CDN pulls from it as the origin shield.</p>
+
+<h3>5.2 Place and address index</h3>
+<p>Geocoding documents live in a search engine (<a href="../chapters/22-search-engines.html">Chapter 22</a>): one document per place or address range with names, normalized tokens, hierarchy (street, city, region, country), centroid, bounding box, category and a popularity prior. The search engine is a derived index, rebuilt from the feature store, so it can be sharded freely by geography and reindexed without risk.</p>
+
+<h3>5.3 Road graph and routing data</h3>
+<p>The routing graph is a compiled, read-only artifact, not a table. Nodes and edges are stored in flat arrays in compressed sparse row (CSR) form: a node array holds the offset of its first outgoing edge; an edge array holds target node, base length, speed class, and flags (one-way, toll, ferry). Turn restrictions and turn costs are stored separately. The artifact is versioned (<code>graph_v2026_11_17_03</code>), built offline, copied to routing servers and memory-mapped. Treating the graph as an immutable snapshot makes consistency trivial: a query pins one version for its whole lifetime.</p>
+
+<h3>5.4 Traffic data</h3>
+<ul>
+<li><b>Live speed table:</b> segment id to current speed, held in memory on every routing node, refreshed about every minute from a message stream. Also kept in a key-value store for the tile service that draws traffic colors.</li>
+<li><b>Historical profile store:</b> per-segment typical speed by time-of-week slot, in a wide-column or columnar store (<a href="../chapters/20-nosql.html">Chapter 20</a>), sharded by geographic region (<a href="../chapters/25-sharding.html">Chapter 25</a>).</li>
+<li><b>Raw probe archive:</b> append-only files in object storage, partitioned by day and region, used for model training and replay.</li>
+</ul>
+
+<table>
+<tr><th>Data</th><th>Store</th><th>Why</th></tr>
+<tr><td>Features (editable truth)</td><td>Spatial database plus versioned snapshots</td><td>Editors need spatial queries and transactions; batch jobs need immutable snapshots</td></tr>
+<tr><td>Tiles</td><td>Object storage behind CDN</td><td>Write once, read by key, huge read fanout</td></tr>
+<tr><td>Place index</td><td>Search engine cluster</td><td>Inverted index, prefix and fuzzy matching, geo biasing</td></tr>
+<tr><td>Road graph</td><td>Compiled in-memory snapshot</td><td>Pointer-chasing search needs arrays in RAM, not a database</td></tr>
+<tr><td>Live speeds</td><td>In-memory table fed by a stream</td><td>Small, rewritten each minute, read on every query</td></tr>
+<tr><td>Typical speeds</td><td>Wide-column store by region</td><td>Large, read by segment and time slot</td></tr>
+<tr><td>Probe archive</td><td>Object storage, columnar files</td><td>Cheap and huge, batch consumers</td></tr>
+</table>
+
+<h2 id="first-design">6. A first simple design, then the scaled architecture</h2>
+
+<h3>6.1 The single-box version</h3>
+<p>One server holds a city's data. A request for a tile runs a spatial query against a database, renders an image, and returns it. A route request loads the city graph into memory and runs Dijkstra from origin to destination. Geocoding is a text search over a table of addresses. Traffic does not exist; every road has its speed limit as its speed. This works for a small city and a few users, and it is exactly where each problem begins: rendering on demand is too slow and CPU heavy for millions of viewers, whole-planet Dijkstra takes seconds, text search over a table cannot do fuzzy prefix matching, and free-flow speeds make ETAs wrong at rush hour.</p>
+
+<h3>6.2 The scaled architecture</h3>
+<p>Each pain point yields one component: <b>pre-rendering plus CDN</b> for tiles, a <b>search cluster</b> for geocoding, a <b>preprocessed, partitioned graph with a routing service</b> for directions, a <b>streaming pipeline</b> that turns phone probes into segment speeds, and an <b>ETA service</b> that combines routes with traffic and learned corrections.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 920 520" role="img" aria-label="High-level architecture of the maps and routing system">
+  <rect class="ext" x="20" y="200" width="110" height="60" rx="8"/><text class="t-c t-b" x="75" y="228">Phones</text><text class="t-c t-sm" x="75" y="246">maps app, SDK</text>
+  <rect class="box" x="170" y="200" width="120" height="60" rx="8"/><text class="t-c t-b" x="230" y="228">CDN edge</text><text class="t-c t-sm" x="230" y="246">tiles, static</text>
+  <rect class="box" x="170" y="300" width="120" height="60" rx="8"/><text class="t-c t-b" x="230" y="328">API gateway</text><text class="t-c t-sm" x="230" y="346">auth, limits</text>
+  <rect class="db" x="340" y="60" width="140" height="56" rx="8"/><text class="t-c t-b" x="410" y="86">Tile store</text><text class="t-c t-sm" x="410" y="104">object storage</text>
+  <rect class="box" x="340" y="150" width="140" height="56" rx="8"/><text class="t-c t-b" x="410" y="176">Tile service</text><text class="t-c t-sm" x="410" y="194">origin shield</text>
+  <rect class="box" x="340" y="250" width="140" height="56" rx="8"/><text class="t-c t-b" x="410" y="276">Search service</text><text class="t-c t-sm" x="410" y="294">geocode, autocomplete</text>
+  <rect class="box" x="340" y="340" width="140" height="56" rx="8"/><text class="t-c t-b" x="410" y="366">Routing service</text><text class="t-c t-sm" x="410" y="384">CH + live weights</text>
+  <rect class="box" x="340" y="430" width="140" height="56" rx="8"/><text class="t-c t-b" x="410" y="456">ETA service</text><text class="t-c t-sm" x="410" y="474">route + model</text>
+  <rect class="db" x="540" y="250" width="130" height="56" rx="8"/><text class="t-c t-b" x="605" y="276">Place index</text><text class="t-c t-sm" x="605" y="294">search cluster</text>
+  <rect class="cache" x="540" y="340" width="130" height="56" rx="8"/><text class="t-c t-b" x="605" y="366">Graph + speeds</text><text class="t-c t-sm" x="605" y="384">in memory</text>
+  <rect class="db" x="540" y="430" width="130" height="56" rx="8"/><text class="t-c t-b" x="605" y="456">Typical speeds</text><text class="t-c t-sm" x="605" y="474">by time of week</text>
+  <rect class="box" x="720" y="340" width="170" height="56" rx="8"/><text class="t-c t-b" x="805" y="366">Traffic pipeline</text><text class="t-c t-sm" x="805" y="384">stream, aggregate</text>
+  <rect class="box" x="720" y="250" width="170" height="56" rx="8"/><text class="t-c t-b" x="805" y="276">Probe ingest</text><text class="t-c t-sm" x="805" y="294">batched uploads</text>
+  <rect class="box" x="720" y="150" width="170" height="56" rx="8"/><text class="t-c t-b" x="805" y="176">Map build pipeline</text><text class="t-c t-sm" x="805" y="194">tiles, index, graph</text>
+  <rect class="db" x="720" y="60" width="170" height="56" rx="8"/><text class="t-c t-b" x="805" y="86">Feature store</text><text class="t-c t-sm" x="805" y="104">versioned map data</text>
+  <line class="arrow" x1="130" y1="220" x2="168" y2="220"/>
+  <line class="arrow" x1="130" y1="245" x2="168" y2="320"/>
+  <line class="arrow" x1="290" y1="215" x2="338" y2="180"/>
+  <line class="arrow" x1="410" y1="150" x2="410" y2="118"/>
+  <line class="arrow" x1="290" y1="320" x2="338" y2="280"/>
+  <line class="arrow" x1="290" y1="335" x2="338" y2="368"/>
+  <line class="arrow" x1="290" y1="350" x2="338" y2="450"/>
+  <line class="arrow" x1="480" y1="278" x2="538" y2="278"/>
+  <line class="arrow" x1="480" y1="368" x2="538" y2="368"/>
+  <line class="arrow" x1="480" y1="458" x2="538" y2="458"/>
+  <line class="arrow" x1="410" y1="430" x2="410" y2="398"/>
+  <line class="arrow-g" x1="805" y1="250" x2="805" y2="398" marker-end="url(#ahg)"/>
+  <line class="arrow-g" x1="720" y1="368" x2="672" y2="368" marker-end="url(#ahg)"/>
+  <line class="arrow dash" x1="805" y1="150" x2="805" y2="118"/>
+  <line class="arrow dash" x1="720" y1="190" x2="480" y2="100"/>
+  <line class="arrow dash" x1="720" y1="190" x2="672" y2="270"/>
+  <text class="t-sm" x="20" y="500">Solid = request path. Green = traffic data path. Dashed = offline build and publish path.</text>
+</svg>
+<figcaption>Read paths on the left, build and data paths on the right. Phones reach tiles through the CDN and everything else through the gateway. The map build pipeline (dashed) publishes new tiles, a new place index and a new routing graph from the feature store; probes flow up into the traffic pipeline, which refreshes the live speed table that routing reads.</figcaption>
+</figure>
+
+<h2 id="tiles">7. Deep dive 1: map tiles and the CDN</h2>
+
+<h3>7.1 Why tiles</h3>
+<p>The world map is far too large to send, and most of it is irrelevant to any viewer. The standard answer is the <b>tile pyramid</b>. The world in the common Web Mercator projection is cut into a square. At zoom 0 the whole world is one tile. At zoom 1 it is 2 x 2 tiles, at zoom 2 it is 4 x 4, and at zoom z it is 2^z by 2^z tiles. A tile is addressed by three integers <code>(z, x, y)</code>. The client computes which tiles cover its viewport (a phone screen typically needs a handful to about 20) and fetches each by URL. Because the URL fully determines the content, every user looking at the same place at the same zoom requests the same bytes, which is what makes the CDN effective.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Tile pyramid at zoom 0, 1 and 2 and the tile addressing scheme">
+  <text class="t-b" x="20" y="22">Each zoom level splits every tile into 4 children</text>
+  <rect class="box" x="30" y="50" width="80" height="80" rx="4"/><text class="t-c" x="70" y="95">0/0/0</text>
+  <text class="t-c t-sm" x="70" y="150">zoom 0: 1 tile</text>
+  <rect class="box" x="170" y="50" width="40" height="40" rx="2"/><rect class="box" x="210" y="50" width="40" height="40" rx="2"/>
+  <rect class="box" x="170" y="90" width="40" height="40" rx="2"/><rect class="hit" x="210" y="90" width="40" height="40" rx="2"/>
+  <text class="t-c" x="190" y="75">0,0</text><text class="t-c" x="230" y="75">1,0</text><text class="t-c" x="190" y="115">0,1</text><text class="t-c" x="230" y="115">1,1</text>
+  <text class="t-c t-sm" x="210" y="150">zoom 1: 4 tiles</text>
+  <g>
+    <rect class="box" x="310" y="50" width="20" height="20"/><rect class="box" x="330" y="50" width="20" height="20"/><rect class="box" x="350" y="50" width="20" height="20"/><rect class="box" x="370" y="50" width="20" height="20"/>
+    <rect class="box" x="310" y="70" width="20" height="20"/><rect class="box" x="330" y="70" width="20" height="20"/><rect class="box" x="350" y="70" width="20" height="20"/><rect class="box" x="370" y="70" width="20" height="20"/>
+    <rect class="box" x="310" y="90" width="20" height="20"/><rect class="box" x="330" y="90" width="20" height="20"/><rect class="hit" x="350" y="90" width="20" height="20"/><rect class="hit" x="370" y="90" width="20" height="20"/>
+    <rect class="box" x="310" y="110" width="20" height="20"/><rect class="box" x="330" y="110" width="20" height="20"/><rect class="hit" x="350" y="110" width="20" height="20"/><rect class="hit" x="370" y="110" width="20" height="20"/>
+  </g>
+  <text class="t-c t-sm" x="350" y="150">zoom 2: 16 tiles</text>
+  <text class="t-b" x="450" y="60">Addressing and sizes</text>
+  <text x="450" y="86">URL: /tiles/v42/{z}/{x}/{y}.pbf</text>
+  <text x="450" y="110">Tiles at zoom z: 4^z   (z=14 gives 268 million)</text>
+  <text x="450" y="134">Children of (z,x,y): (z+1, 2x, 2y) ... (z+1, 2x+1, 2y+1)</text>
+  <text x="450" y="158">Parent of (z,x,y): (z-1, x/2, y/2) using integer division</text>
+  <text class="t-b" x="30" y="205">Cache behaviour</text>
+  <text x="30" y="230">Low zoom tiles: few, requested by everyone, effectively always cached at every edge.</text>
+  <text x="30" y="254">City-centre tiles at zoom 13 to 16: hot, mostly cached, refreshed when data changes.</text>
+  <text x="30" y="278">Deep zoom rural tiles: a long tail, often a miss at the edge, served from origin shield.</text>
+  <text class="t-sm" x="30" y="308">The popularity of tiles follows a power law, so a small fraction of tiles carries most requests.</text>
+</svg>
+<figcaption>The pyramid trades a little storage (geometric series, about one third extra) for the ability to answer any viewport with a small number of fixed-name objects. The highlighted tile at zoom 1 has four children at zoom 2, drawn highlighted.</figcaption>
+</figure>
+
+<h3>7.2 Raster versus vector tiles</h3>
+<p>A <b>raster tile</b> is a finished image (PNG or JPEG, typically 256 or 512 pixels square). It is simple for any client but large, cannot be restyled, looks blurry between zoom levels and must be rebuilt for each style and each language. A <b>vector tile</b> contains geometry and attributes (road lines with class and name, building polygons, place points) encoded compactly, for example in the Mapbox Vector Tile protobuf format with coordinates quantized to a local grid. The client draws it with a GPU renderer using a style sheet. Vector tiles are typically several times smaller, scale smoothly between zoom levels (the app interpolates), rotate and tilt for 3D views, and let one tile serve many styles and languages because labels are drawn on the device. The cost is client complexity and on-device rendering work. Most modern mobile mapping uses vector tiles for the base map and keeps raster for satellite imagery (photographs are inherently raster).</p>
+
+<table>
+<tr><th>Aspect</th><th>Raster tiles</th><th>Vector tiles</th></tr>
+<tr><td>Size per tile</td><td>Typically 20 to 100 KB image</td><td>Typically 5 to 40 KB</td></tr>
+<tr><td>Restyle (dark mode, language)</td><td>Rebuild and re-cache the whole set per style</td><td>Client style sheet; same tiles reused</td></tr>
+<tr><td>Zoom, rotate, tilt</td><td>Fixed scale steps, blur or pop between levels</td><td>Smooth interpolation, rotation, 3D</td></tr>
+<tr><td>Client work</td><td>Almost none</td><td>GPU renderer, font and icon handling</td></tr>
+<tr><td>Cache variety</td><td>Tiles x styles x languages x scale factors</td><td>Tiles x data version</td></tr>
+<tr><td>Best for</td><td>Satellite photos, simple clients</td><td>Base map in apps</td></tr>
+</table>
+
+<h3>7.3 Producing tiles: pre-generate versus on demand</h3>
+<p>There are two options. <b>Pre-generate everything</b> in a batch job (a map-reduce style pipeline from the feature snapshot, see <a href="../chapters/37-batch-stream.html">Chapter 37</a>) and store the results in object storage. Serving is then a pure read, latency is minimal, and the origin has no CPU-heavy work. The price is time and storage for rarely used tiles: zoom 17 and above is 4^17 = 17 billion tiles, mostly empty or unvisited. <b>Generate on demand</b> renders a tile when first requested and caches it. This saves storage and makes updates cheap, but the first viewer of each tile waits on rendering and a surge of cold requests can overload the renderers.</p>
+<p>The chosen hybrid: pre-generate zoom 0 through about 14 (1.6 TB, as estimated), where every tile is likely to be requested and where one tile covers a lot of map; generate zoom 15 and beyond on demand from the feature store behind the origin shield, cache them in the CDN, and let the client over-zoom a parent tile (draw the zoom-14 data larger) while the deeper tile loads. <b>Request coalescing</b> at the origin shield (many simultaneous requests for one missing tile cause exactly one render, the others wait) is essential; it is the same protection against stampedes covered in <a href="../chapters/14-caching-failures.html">Chapter 14</a>.</p>
+
+<h3>7.4 Caching layers and freshness</h3>
+<p>A tile request meets several caches. The phone caches on disk (days). The CDN edge caches next (hours to days). A regional shield cache behind it collapses misses from hundreds of edge sites into few origin requests. Only then does the tile service fetch the object from storage or render it. Freshness uses the versioned-URL idea: base data changes with a monthly or weekly <code>data_ver</code>, styles with <code>style_ver</code>, and both appear in the URL or are bound into an ETag, so a new version is simply a new set of cache keys that fill over time. For urgent corrections (a wrongly mapped bridge closure) we need a targeted purge by tile coordinate, which the CDN supports; the build pipeline computes which tiles a feature touches (every zoom, the tile containing its bounding box) and purges just those.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Sequence of a tile request through phone cache, CDN edge, shield and origin">
+  <g>
+    <rect class="ext" x="30" y="20" width="110" height="34" rx="6"/><text class="t-c t-b" x="85" y="42">Phone</text>
+    <rect class="box" x="250" y="20" width="110" height="34" rx="6"/><text class="t-c t-b" x="305" y="42">CDN edge</text>
+    <rect class="box" x="470" y="20" width="110" height="34" rx="6"/><text class="t-c t-b" x="525" y="42">Shield</text>
+    <rect class="db" x="690" y="20" width="170" height="34" rx="6"/><text class="t-c t-b" x="775" y="42">Tile service + store</text>
+  </g>
+  <line class="life" x1="85" y1="54" x2="85" y2="310"/><line class="life" x1="305" y1="54" x2="305" y2="310"/><line class="life" x1="525" y1="54" x2="525" y2="310"/><line class="life" x1="775" y1="54" x2="775" y2="310"/>
+  <line class="arrow" x1="85" y1="85" x2="303" y2="85"/><text class="t-sm" x="95" y="78">1 GET /tiles/v42/14/2620/6330.pbf</text>
+  <rect class="hit" x="225" y="95" width="160" height="26" rx="4"/><text class="t-c t-sm" x="305" y="113">2 edge hit? return (98%)</text>
+  <line class="arrow-g" x1="303" y1="140" x2="87" y2="140" marker-end="url(#ahg)"/><text class="t-sm" x="110" y="133">3 200 + tile, Cache-Control</text>
+  <line class="arrow-r" x1="307" y1="175" x2="523" y2="175" marker-end="url(#ahr)"/><text class="t-sm" x="318" y="168">4 edge miss: ask shield</text>
+  <rect class="hit" x="445" y="183" width="160" height="26" rx="4"/><text class="t-c t-sm" x="525" y="201">5 shield hit? return</text>
+  <line class="arrow-r" x1="527" y1="235" x2="773" y2="235" marker-end="url(#ahr)"/><text class="t-sm" x="560" y="228">6 shield miss: coalesce, fetch</text>
+  <rect class="miss" x="670" y="245" width="210" height="26" rx="4"/><text class="t-c t-sm" x="775" y="263">7 read blob (or render deep zoom)</text>
+  <line class="arrow-g" x1="773" y1="292" x2="527" y2="292" marker-end="url(#ahg)"/><text class="t-sm" x="570" y="286">8 tile fills shield, then edge, then phone</text>
+</svg>
+<figcaption>Most requests stop at step 2. Misses travel inward one cache layer at a time and the answer fills every layer on the way back, so the next viewer in that region hits at the edge. The shield coalesces duplicate misses so the store sees at most one read per tile per shield.</figcaption>
+</figure>
+
+<div class="callout tip"><b>Interview tip</b> Say the hit-rate arithmetic: at 1.4 million tiles per second peak, 98 percent hit means 28,000 origin requests per second, while 90 percent would mean 140,000. The justification for the shield layer and for long cache lifetimes is that every percentage point matters.</div>
+
+<h2 id="geocoding">8. Deep dive 2: geocoding and search</h2>
+
+<h3>8.1 What geocoding really is</h3>
+<p><b>Forward geocoding</b> turns text such as "221b baker st london" into coordinates. <b>Reverse geocoding</b> turns coordinates into a nearby address or place. Autocomplete is forward geocoding on a prefix, under a 100 ms budget, with the user still typing. This is a text search problem with a geographic twist, so it belongs on a search engine (<a href="../chapters/22-search-engines.html">Chapter 22</a>) with an inverted index, not on a relational table.</p>
+
+<h3>8.2 The pipeline</h3>
+<ol>
+<li><b>Normalize.</b> Lowercase, strip accents where appropriate, expand abbreviations ("st" to "street" or "saint", ambiguous, so keep both), transliterate scripts, and detect language.</li>
+<li><b>Parse.</b> Tag tokens as house number, street, locality, region, postcode, country, or business name. A statistical or rule-based parser handles "pizza near me", "10 downing", or "94043".</li>
+<li><b>Retrieve candidates.</b> Query the index: prefix and edge n-gram matching for the last token being typed, fuzzy matching for misspellings, exact matching for earlier tokens, and a filter or boost for the user's location and map viewport.</li>
+<li><b>Rank.</b> Combine text match quality, place importance (a city outranks a street of the same name), distance to the user or viewport, and popularity learned from past selections.</li>
+<li><b>Resolve address ranges.</b> Many street numbers are not individual records; the data stores a street segment with a number range, and the answer is interpolated along the segment geometry. Rooftop-precise points are used where available.</li>
+</ol>
+
+<h3>8.3 Hierarchy and sharding</h3>
+<p>Addresses form a hierarchy: country, region, city, street, number. A common technique indexes each place with its full ancestry so that "springfield" can be disambiguated by a second token ("springfield il"), and so that results can be grouped. For sharding (<a href="../chapters/25-sharding.html">Chapter 25</a>), partition the index by <b>country or large region</b> for locality: most queries concern the user's own region, so the primary shard is queried with a high boost and others only if too few good results exist. The alternative, hashing documents randomly across all shards, forces every query to touch every shard, so tail latency grows with shard count. Geographic sharding does create hot shards (a big country gets more traffic), which is fixed by splitting dense countries into multiple shards and adding replicas.</p>
+
+<h3>8.4 Reverse geocoding</h3>
+<p>Given a point, find the containing administrative polygons and the nearest address points or street. This is a spatial index query, using a grid or an R-tree, or the cell-based indexes in <a href="../chapters/58-geospatial-text.html">Chapter 58</a> (geohash, S2, H3-style cells). Precompute: store, per cell at a fixed level, the list of candidate features, then confirm with exact geometry tests. Results cache well because popular coordinates are rounded to a grid of about 10 meters for the cache key.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Geocoding query pipeline from raw text to ranked results">
+  <rect class="ext" x="20" y="110" width="120" height="60" rx="8"/><text class="t-c t-b" x="80" y="136">Query</text><text class="t-c t-sm" x="80" y="154">"10 dow lon"</text>
+  <rect class="box" x="175" y="110" width="120" height="60" rx="8"/><text class="t-c t-b" x="235" y="136">Normalize</text><text class="t-c t-sm" x="235" y="154">case, script, abbr</text>
+  <rect class="box" x="330" y="110" width="120" height="60" rx="8"/><text class="t-c t-b" x="390" y="136">Parse</text><text class="t-c t-sm" x="390" y="154">number, street, city</text>
+  <rect class="db" x="485" y="60" width="150" height="60" rx="8"/><text class="t-c t-b" x="560" y="86">Index shard A</text><text class="t-c t-sm" x="560" y="104">user's region (boosted)</text>
+  <rect class="db" x="485" y="160" width="150" height="60" rx="8"/><text class="t-c t-b" x="560" y="186">Index shard B</text><text class="t-c t-sm" x="560" y="204">fallback region</text>
+  <rect class="box" x="670" y="110" width="100" height="60" rx="8"/><text class="t-c t-b" x="720" y="136">Rank</text><text class="t-c t-sm" x="720" y="154">text, dist, pop.</text>
+  <rect class="ext" x="795" y="110" width="90" height="60" rx="8"/><text class="t-c t-b" x="840" y="136">Results</text><text class="t-c t-sm" x="840" y="154">top 5</text>
+  <line class="arrow" x1="140" y1="140" x2="173" y2="140"/><line class="arrow" x1="295" y1="140" x2="328" y2="140"/>
+  <line class="arrow" x1="450" y1="130" x2="483" y2="95"/><line class="arrow dash" x1="450" y1="150" x2="483" y2="190"/>
+  <line class="arrow" x1="635" y1="95" x2="668" y2="130"/><line class="arrow dash" x1="635" y1="190" x2="668" y2="150"/>
+  <line class="arrow" x1="770" y1="140" x2="793" y2="140"/>
+  <text class="t-sm" x="20" y="260">Dashed paths run only when the primary region returns too few confident matches. A small autocomplete cache</text>
+  <text class="t-sm" x="20" y="278">keyed by (prefix, coarse location cell) absorbs the repeated early keystrokes of popular queries.</text>
+</svg>
+<figcaption>The viewport or device location biases the query toward the local shard. Only weak local results trigger the wider query, which keeps median latency low and tail latency bounded.</figcaption>
+</figure>
+
+<h2 id="routing">9. Deep dive 3: the road graph and shortest paths</h2>
+
+<h3>9.1 Modelling roads as a graph</h3>
+<p>Intersections are <b>nodes</b>; road segments between them are directed <b>edges</b> (a two-way street is two edges). Each edge has a length and a free-flow speed, so a base travel time in seconds, and the routing objective is the path with minimum total <b>travel time</b> (not distance, which is a common wrong answer; the shortest distance is rarely the fastest). Real routing also needs <b>turn restrictions</b> (no left turn here) and <b>turn costs</b> (a left across traffic takes longer). They are handled either by expanding each node into per-turn pseudo-nodes (an "edge-based" graph) or by storing penalty tables looked up at each relaxation step. Road class, tolls, ferries, and vehicle restrictions are edge flags that the query can filter.</p>
+
+<h3>9.2 Option 1: Dijkstra</h3>
+<p>Dijkstra's algorithm keeps a priority queue of nodes ordered by tentative distance from the origin. It repeatedly removes the closest unsettled node, then <i>relaxes</i> each outgoing edge: if going through this node gives a shorter path to a neighbour, update it. With non-negative weights, the first time a node is removed it has its final distance, so when the destination is removed the search can stop. The search expands in all directions equally, like a ripple, so the number of nodes settled grows with the area of the circle whose radius is the trip length. For a cross-country trip that means tens of millions of nodes; with a binary heap and arrays that is on the order of seconds, far too slow for 1,700 queries per second and an interactive latency budget.</p>
+
+<h3>9.3 Option 2: Bidirectional search and A*</h3>
+<p><b>Bidirectional Dijkstra</b> runs one search forward from the origin and one backward from the destination (on the reversed graph) and stops when they meet. Two circles of half the radius cover about half the area of one big circle, a speedup of roughly 2 times. <b>A*</b> adds a heuristic: order the queue by <code>distance_so_far + estimated_remaining</code>, where the estimate never overestimates the true remaining cost (it is "admissible"). The straight-line distance divided by the maximum road speed is a safe estimate for travel time. The search then leans toward the destination rather than rippling in all directions. The weakness for road networks is that the estimate is weak: it assumes you can travel in a straight line at highway speed, so A* with this heuristic still explores a large fraction of the area. A better heuristic, <b>ALT</b> (A*, landmarks, triangle inequality), precomputes exact distances to and from a few dozen landmark nodes and uses the triangle inequality to get much tighter lower bounds, giving a speedup of an order of magnitude. This is useful but still far from the millisecond range.</p>
+
+<h3>9.4 Option 3: Contraction hierarchies</h3>
+<p>The key insight: long trips use highways, and highways are few. Humans route this way too (get on the motorway, travel far, get off). <b>Contraction hierarchies (CH)</b>, introduced by Geisberger and colleagues in 2008, turn that into an algorithm. Preprocessing assigns every node an <b>importance rank</b> (roughly: how much of the shortest-path structure depends on it, with local streets low and major interchanges high). Nodes are then <b>contracted</b> in order of increasing importance. To contract node v means removing it from the graph, but for each pair of its neighbours (u, w), if the path u to v to w is the <i>only</i> shortest path between u and w (a "witness search" checks for an alternative), add a <b>shortcut</b> edge u to w with weight w(u,v) + w(v,w). After contracting all nodes, the original edges plus all shortcuts form the hierarchy graph.</p>
+<p>A query runs a bidirectional Dijkstra in which the forward search from the origin may only follow edges going <b>up</b> in rank, and the backward search from the destination may only follow edges going up in the reversed graph. Both searches climb towards the important nodes, meet at the top of the hierarchy, and the shortest path is the best meeting node. Each search settles only a few hundred to a few thousand nodes, even on continental graphs, so queries take about a millisecond or less. The resulting path contains shortcuts, which are <b>unpacked</b> recursively into the original edges for display and turn instructions.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Contraction hierarchies: contracting a node adds a shortcut, and queries climb up in rank from both ends">
+  <text class="t-b" x="20" y="22">Contraction: remove v, add shortcut u to w if v was on their only shortest path</text>
+  <circle cx="60" cy="90" r="16" fill="none" stroke="var(--fg)"/><text class="t-c" x="60" y="95">u</text>
+  <circle cx="170" cy="90" r="16" fill="none" stroke="var(--bad)" stroke-width="2"/><text class="t-c" x="170" y="95">v</text>
+  <circle cx="280" cy="90" r="16" fill="none" stroke="var(--fg)"/><text class="t-c" x="280" y="95">w</text>
+  <line class="arrow" x1="77" y1="90" x2="152" y2="90"/><text class="t-c t-sm" x="115" y="80">3</text>
+  <line class="arrow" x1="187" y1="90" x2="262" y2="90"/><text class="t-c t-sm" x="225" y="80">4</text>
+  <text class="t-c t-sm" x="170" y="130">before: v has low rank</text>
+  <circle cx="60" cy="210" r="16" fill="none" stroke="var(--fg)"/><text class="t-c" x="60" y="215">u</text>
+  <circle cx="280" cy="210" r="16" fill="none" stroke="var(--fg)"/><text class="t-c" x="280" y="215">w</text>
+  <line class="arrow-g" x1="77" y1="210" x2="262" y2="210" marker-end="url(#ahg)"/><text class="t-c t-sm" x="170" y="200">shortcut 7 (via v)</text>
+  <text class="t-c t-sm" x="170" y="250">after: v removed, shortcut u to w</text>
+  <text class="t-b" x="400" y="52">Query: both searches only go upward in rank</text>
+  <rect class="ext" x="420" y="290" width="70" height="34" rx="6"/><text class="t-c" x="455" y="312">origin</text>
+  <rect class="ext" x="800" y="290" width="70" height="34" rx="6"/><text class="t-c" x="835" y="312">dest</text>
+  <circle cx="500" cy="240" r="13" fill="none" stroke="var(--fg)"/><circle cx="560" cy="190" r="13" fill="none" stroke="var(--fg)"/><circle cx="620" cy="130" r="13" fill="none" stroke="var(--fg)"/>
+  <circle cx="660" cy="80" r="16" class="hit"/><text class="t-c t-sm" x="660" y="58">meeting node</text>
+  <circle cx="700" cy="130" r="13" fill="none" stroke="var(--fg)"/><circle cx="760" cy="190" r="13" fill="none" stroke="var(--fg)"/><circle cx="800" cy="240" r="13" fill="none" stroke="var(--fg)"/>
+  <line class="arrow" x1="455" y1="290" x2="498" y2="252"/><line class="arrow" x1="508" y1="230" x2="552" y2="200"/><line class="arrow" x1="568" y1="180" x2="613" y2="140"/><line class="arrow" x1="627" y1="119" x2="650" y2="94"/>
+  <line class="arrow" x1="835" y1="290" x2="805" y2="252"/><line class="arrow" x1="793" y1="230" x2="765" y2="200"/><line class="arrow" x1="753" y1="180" x2="706" y2="140"/><line class="arrow" x1="694" y1="119" x2="670" y2="94"/>
+  <text class="t-sm" x="400" y="345">Rank rises toward the top: local streets at the bottom, highway interchanges near the meeting point.</text>
+</svg>
+<figcaption>Left: contraction replaces a low-rank node by a shortcut that preserves the shortest distance. Right: a query climbs from both ends toward high-rank nodes and meets at the top, touching a few hundred nodes instead of millions.</figcaption>
+</figure>
+
+<h3>9.5 Comparing the options</h3>
+<table>
+<tr><th>Algorithm</th><th>Preprocessing</th><th>Query work (continental)</th><th>Handles live traffic</th><th>Verdict</th></tr>
+<tr><td>Dijkstra</td><td>None</td><td>Tens of millions of nodes, seconds</td><td>Trivially (read current weight)</td><td>Correct baseline; fine for short local routes and as a fallback</td></tr>
+<tr><td>Bidirectional Dijkstra</td><td>None</td><td>About half of Dijkstra</td><td>Trivially</td><td>Small win; building block for the rest</td></tr>
+<tr><td>A* with straight-line bound</td><td>None</td><td>Still a large share of the area</td><td>Trivially (bound uses max speed)</td><td>Weak on road networks</td></tr>
+<tr><td>ALT (landmarks)</td><td>Minutes to hours; a few dozen distance arrays</td><td>Roughly 10x fewer than Dijkstra</td><td>Landmark bounds stay valid only if speeds never drop below the preprocessed ones, so keep lower bounds optimistic</td><td>Good middle ground</td></tr>
+<tr><td>Contraction hierarchies</td><td>Minutes to hours per region; extra shortcut edges about equal to original count</td><td>Hundreds to a few thousand nodes, around a millisecond</td><td>Needs a re-weighting step (customization) because shortcut weights depend on edge weights</td><td>Chosen for the main path</td></tr>
+</table>
+
+<h3>9.6 Making CH work with live traffic</h3>
+<p>Plain CH bakes the edge weights into shortcut weights, so a changed speed on one road invalidates every shortcut that passes through it, and full re-preprocessing takes far too long to repeat every minute. Three practical approaches exist.</p>
+<ul>
+<li><b>Customizable contraction hierarchies (CCH).</b> Split preprocessing in two phases: a slow <i>metric-independent</i> phase computes the node ordering and the shortcut <i>structure</i> once (stable until the road network itself changes), and a fast <i>customization</i> phase recomputes shortcut weights from current edge weights bottom-up, in seconds on a multicore server for a large region. Queries then use the customized weights. This is the approach that matches "reweight every minute".</li>
+<li><b>Time-bucketed hierarchies.</b> Preprocess several CH graphs with typical weights for different periods (weekday morning peak, midday, evening, night). Queries pick the bucket for their departure time. Cheap at query time but ignores today's incident.</li>
+<li><b>Hybrid: CH for the static part, local search for live deviations.</b> Run the CH on typical weights to get candidate routes, then re-time the candidates with live speeds, and run a local Dijkstra only near segments with large deviations (an accident). It is simple and robust, and fits the alternatives requirement because each candidate gets re-evaluated.</li>
+</ul>
+<p>The design here: a <b>CCH-style customized hierarchy</b> in the routing servers, refreshed from the speed table every minute (or when a closure arrives), with the hybrid trick as the fallback for fast-changing local incidents and for departure-time-dependent routes, plus a straight Dijkstra fallback if the hierarchy is unavailable.</p>
+
+<h3>9.7 Partitioning the graph</h3>
+<p>Even though the planet graph fits in memory (section 3.4), partitioning is worth doing for four reasons: customization and preprocessing parallelize across regions; routing servers can be placed near their users and keep only the regions they serve in RAM (better CPU cache behaviour and fast restarts); an outage or bad data in one region does not affect others; and the memory for time-dependent profiles (about 134 GB, section 3.5) does not fit a single server. The question is how to cut.</p>
+<ul>
+<li><b>Geographic grid or administrative cut.</b> Simple, but cuts roads at arbitrary places, producing many border edges, and unbalanced pieces (a city is dense, a desert is empty).</li>
+<li><b>Graph partitioning that minimises cut edges.</b> Algorithms such as multilevel schemes (METIS-like), or inertial flow and natural-cut approaches designed for road networks, produce balanced cells with few border nodes. Fewer border nodes means a smaller overlay graph and less cross-partition work.</li>
+</ul>
+<p>A query whose origin and destination lie in the same cell is answered within that cell. A query that crosses cells uses a <b>multi-level overlay</b> (the idea behind customizable route planning, CRP): inside the origin and destination cells, search the detailed graph out to the cell's border nodes; between cells, search an <b>overlay graph</b> whose nodes are only border nodes and whose edges are precomputed cell-crossing shortcut distances. Updating a traffic speed only requires recomputing the overlay shortcuts of the one cell it belongs to, which is cheap. CRP and CCH are the two well-known ways to get "fast preprocessing with fast metric updates"; I would name both and pick one rather than pretend they are the same.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Graph partitioned into cells with border nodes and an overlay graph of cell-crossing shortcuts">
+  <rect class="box" x="40" y="50" width="230" height="230" rx="10" fill-opacity="0.35"/>
+  <rect class="cache" x="290" y="50" width="230" height="230" rx="10" fill-opacity="0.35"/>
+  <rect class="db" x="540" y="50" width="230" height="230" rx="10" fill-opacity="0.35"/>
+  <text class="t-b" x="50" y="40">Cell A</text><text class="t-b" x="300" y="40">Cell B</text><text class="t-b" x="550" y="40">Cell C</text>
+  <rect class="ext" x="60" y="200" width="60" height="30" rx="6"/><text class="t-c" x="90" y="220">origin</text>
+  <rect class="ext" x="690" y="110" width="60" height="30" rx="6"/><text class="t-c" x="720" y="130">dest</text>
+  <circle cx="270" cy="110" r="8" fill="var(--fg)"/><circle cx="270" cy="200" r="8" fill="var(--fg)"/>
+  <circle cx="290" cy="110" r="8" fill="var(--fg)"/><circle cx="290" cy="200" r="8" fill="var(--fg)"/>
+  <circle cx="520" cy="130" r="8" fill="var(--fg)"/><circle cx="520" cy="220" r="8" fill="var(--fg)"/>
+  <circle cx="540" cy="130" r="8" fill="var(--fg)"/><circle cx="540" cy="220" r="8" fill="var(--fg)"/>
+  <line class="arrow dash" x1="120" y1="215" x2="262" y2="205"/>
+  <line class="arrow-g" x1="296" y1="112" x2="514" y2="130" marker-end="url(#ahg)"/>
+  <line class="arrow-g" x1="296" y1="200" x2="514" y2="220" marker-end="url(#ahg)"/>
+  <line class="arrow-g" x1="296" y1="112" x2="514" y2="220" marker-end="url(#ahg)"/>
+  <line class="arrow dash" x1="548" y1="130" x2="688" y2="125"/>
+  <line class="arrow" x1="272" y1="203" x2="288" y2="203"/>
+  <text class="t-sm" x="60" y="300">1 Detailed search in A to its border (dashed)</text>
+  <text class="t-sm" x="330" y="300">2 Overlay shortcuts across B (green)</text>
+  <text class="t-sm" x="590" y="300">3 Detailed search in C to dest</text>
+  <text class="t-sm" x="60" y="322">Dots on cell edges are border nodes. Only they appear in the overlay graph.</text>
+</svg>
+<figcaption>A cross-region query searches the detailed graph only in the origin and destination cells and uses precomputed border-to-border distances (the green overlay edges) in between. When traffic changes inside cell B, only B's overlay edges are recomputed.</figcaption>
+</figure>
+
+<h3>9.8 Alternatives, waypoints and map matching</h3>
+<p>Alternative routes are not the second-best path (which is nearly identical, differing by one lane change). The standard method finds paths that are <b>sufficiently different and not much slower</b>: for example the <i>via-node</i> method evaluates candidate via nodes from the CH search spaces and keeps those whose path shares less than about 60 to 70 percent of edges with the best route and whose length stays within about 25 percent of the best time; another is the plateau method. Multi-waypoint routes chain point-to-point queries. And for navigation the app must continuously <b>map match</b> noisy GPS points to the road (usually a hidden Markov model that scores candidate road projections by distance and by whether consecutive projections form a plausible path), because a raw GPS dot is often 10 or more meters off the road and could be on a parallel street.</p>
+
+<h2 id="traffic">10. Deep dive 4: live traffic and ETA</h2>
+
+<h3>10.1 The traffic pipeline</h3>
+<p>Phones that opt in send anonymous probes. The pipeline (<a href="../chapters/34-queues-kafka.html">Chapter 34</a> and <a href="../chapters/37-batch-stream.html">Chapter 37</a>) is a classic stream job.</p>
+<ol>
+<li><b>Ingest.</b> Probe servers authenticate, validate, strip identifiers, drop impossible points, and append to a partitioned log, partitioned by geographic cell so one cell's data stays together.</li>
+<li><b>Map match.</b> Each probe trace is matched to road segments. Matching a single point is unreliable; a short window of consecutive points per anonymous trip id is matched together.</li>
+<li><b>Derive segment observations.</b> From a matched trace, compute the time the device took to traverse each segment (interpolated between points), giving one speed sample per segment per traversal. Discard samples from stopped devices (parked cars, red light waiting is real delay, but a parked car is not) using speed and trip heuristics.</li>
+<li><b>Aggregate.</b> Per segment, per window (a sliding or tumbling one-minute window, using event time with allowed lateness because uploads are batched; see <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>), compute a robust statistic: a median or trimmed mean, with a sample count that sets a confidence. A single sample is noisy; with few samples the output blends toward the typical speed, using something like an exponentially weighted average or Bayesian shrinkage.</li>
+<li><b>Fill gaps.</b> Many segments have no probes in a given minute. Estimate from neighbouring segments (traffic is spatially correlated along a road), from the same road class, and from historical typical speed for this time of week.</li>
+<li><b>Publish.</b> Write the new speed table snapshot, send deltas to routing servers (only segments changed beyond a threshold), and update the tile layer that colors roads.</li>
+<li><b>Incidents.</b> Closures and crashes arrive from authority feeds, user reports and probe anomalies (many devices suddenly stop). They override speeds: a closure sets the edge weight to infinity.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Live traffic pipeline from phone probes to speed table and routing servers">
+  <rect class="ext" x="20" y="110" width="100" height="60" rx="8"/><text class="t-c t-b" x="70" y="136">Phones</text><text class="t-c t-sm" x="70" y="154">probes, 2M/s</text>
+  <rect class="box" x="150" y="110" width="110" height="60" rx="8"/><text class="t-c t-b" x="205" y="136">Ingest</text><text class="t-c t-sm" x="205" y="154">validate, anonymize</text>
+  <rect class="cache" x="290" y="110" width="110" height="60" rx="8"/><text class="t-c t-b" x="345" y="136">Log</text><text class="t-c t-sm" x="345" y="154">by geo cell</text>
+  <rect class="box" x="430" y="110" width="110" height="60" rx="8"/><text class="t-c t-b" x="485" y="136">Map match</text><text class="t-c t-sm" x="485" y="154">trace to segments</text>
+  <rect class="box" x="570" y="110" width="120" height="60" rx="8"/><text class="t-c t-b" x="630" y="136">Aggregate</text><text class="t-c t-sm" x="630" y="154">1-min windows</text>
+  <rect class="cache" x="720" y="40" width="160" height="56" rx="8"/><text class="t-c t-b" x="800" y="66">Live speed table</text><text class="t-c t-sm" x="800" y="84">routing nodes (RAM)</text>
+  <rect class="box" x="720" y="130" width="160" height="56" rx="8"/><text class="t-c t-b" x="800" y="156">Traffic tile layer</text><text class="t-c t-sm" x="800" y="174">road colors</text>
+  <rect class="db" x="720" y="220" width="160" height="56" rx="8"/><text class="t-c t-b" x="800" y="246">Archive + profiles</text><text class="t-c t-sm" x="800" y="264">typical speeds</text>
+  <rect class="miss" x="430" y="220" width="110" height="46" rx="8"/><text class="t-c t-b" x="485" y="240">Incident feeds</text><text class="t-c t-sm" x="485" y="256">closures, crashes</text>
+  <line class="arrow" x1="120" y1="140" x2="148" y2="140"/><line class="arrow" x1="260" y1="140" x2="288" y2="140"/><line class="arrow" x1="400" y1="140" x2="428" y2="140"/><line class="arrow" x1="540" y1="140" x2="568" y2="140"/>
+  <line class="arrow-g" x1="690" y1="125" x2="718" y2="80" marker-end="url(#ahg)"/><line class="arrow-g" x1="690" y1="150" x2="718" y2="156" marker-end="url(#ahg)"/><line class="arrow-g" x1="660" y1="170" x2="718" y2="240" marker-end="url(#ahg)"/>
+  <line class="arrow-r" x1="540" y1="235" x2="596" y2="172" marker-end="url(#ahr)"/>
+  <text class="t-sm" x="20" y="290">Typical end-to-end delay from probe to routing weight: about 1 to 3 minutes, dominated by upload batching and window size.</text>
+</svg>
+<figcaption>The pipeline is a standard stream job: partition by place, match, window, aggregate, publish. The speed table feeds routing and the traffic tile layer; the archive feeds the nightly job that learns typical speeds. Incident feeds bypass aggregation and override edge weights directly.</figcaption>
+</figure>
+
+<h3>10.2 ETA: more than adding up edge times</h3>
+<p>The naive ETA sums the current edge times along the route. Two things break this. First, <b>traffic changes while you drive</b>: a route that takes 90 minutes will reach its far end 90 minutes from now, so what matters is the speed there then, not now. A correct method is <b>time-dependent</b> evaluation: walk the path, track the clock, and look up each edge's speed for the time you will arrive at it, blending live data (valid for the next 15 to 30 minutes) into the typical profile for later segments. Second, <b>physics and delays</b> that speeds do not capture: traffic lights, stop signs, turns, parking and pickup. These are added as per-turn and per-intersection cost estimates, which can be learned from probe data per intersection and turn type.</p>
+<p>A learned model is then stacked on top. The routing engine produces a base ETA and features (distance, road class mix, number of turns and signals, time of day, day of week, weather, live and typical speed along the path, region). A model (gradient-boosted trees are a strong, cheap baseline; graph neural networks over road segments have been published by large map providers for the same purpose) predicts a residual correction or the final time. It is trained offline on historical trips that were actually driven, with the label being real elapsed time. The metric is error distribution, typically the median absolute percentage error and the 90th percentile of error, tracked per region and per trip length. The model is retrained regularly and rolled out gradually, like any ranking model.</p>
+
+<h3>10.3 Rerouting during navigation</h3>
+<p>Once a user is navigating, the phone sends position updates, and the service periodically re-evaluates. Two triggers exist. <b>Deviation:</b> the user left the planned route (a missed turn), so recompute from the current position and heading. <b>Improvement:</b> traffic changed and an alternative now saves a meaningful amount (say more than a few minutes or 10 percent), so propose it. To keep cost bounded, the service does not re-run full routing for each of millions of navigating users every minute: it stores the active route's remaining edge list and checks whether any segment on it had a large speed change, using an index from segment to active routes. Only affected routes are recomputed. Hysteresis (require a larger gain before suggesting a switch than before the last switch) prevents flapping between near-equal routes.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Sequence of a route request through gateway, routing service, speed table and ETA service">
+  <g>
+    <rect class="ext" x="20" y="20" width="100" height="34" rx="6"/><text class="t-c t-b" x="70" y="42">Phone</text>
+    <rect class="box" x="190" y="20" width="110" height="34" rx="6"/><text class="t-c t-b" x="245" y="42">Gateway</text>
+    <rect class="box" x="370" y="20" width="120" height="34" rx="6"/><text class="t-c t-b" x="430" y="42">Search svc</text>
+    <rect class="box" x="560" y="20" width="120" height="34" rx="6"/><text class="t-c t-b" x="620" y="42">Routing svc</text>
+    <rect class="cache" x="750" y="20" width="130" height="34" rx="6"/><text class="t-c t-b" x="815" y="42">Graph + speeds</text>
+  </g>
+  <line class="life" x1="70" y1="54" x2="70" y2="380"/><line class="life" x1="245" y1="54" x2="245" y2="380"/><line class="life" x1="430" y1="54" x2="430" y2="380"/><line class="life" x1="620" y1="54" x2="620" y2="380"/><line class="life" x1="815" y1="54" x2="815" y2="380"/>
+  <line class="arrow" x1="70" y1="85" x2="243" y2="85"/><text class="t-sm" x="80" y="78">1 POST /route (text or ids)</text>
+  <line class="arrow" x1="245" y1="115" x2="428" y2="115"/><text class="t-sm" x="255" y="108">2 resolve origin and dest</text>
+  <line class="arrow-g" x1="428" y1="140" x2="247" y2="140" marker-end="url(#ahg)"/><text class="t-sm" x="270" y="133">3 coordinates + road snap</text>
+  <line class="arrow" x1="245" y1="175" x2="618" y2="175"/><text class="t-sm" x="300" y="168">4 route(o, d, depart_at) to the owning region</text>
+  <line class="arrow" x1="620" y1="210" x2="813" y2="210"/><text class="t-sm" x="640" y="203">5 pin graph version, read speeds</text>
+  <rect class="hit" x="545" y="225" width="150" height="40" rx="4"/><text class="t-c t-sm" x="620" y="242">6 CH query, 2 alts,</text><text class="t-c t-sm" x="620" y="257">unpack shortcuts</text>
+  <line class="arrow" x1="620" y1="285" x2="813" y2="285"/><text class="t-sm" x="630" y="278">7 time-dependent re-time</text>
+  <rect class="hit" x="545" y="300" width="150" height="26" rx="4"/><text class="t-c t-sm" x="620" y="318">8 apply ETA model</text>
+  <line class="arrow-g" x1="618" y1="350" x2="247" y2="350" marker-end="url(#ahg)"/><text class="t-sm" x="300" y="343">9 routes, polyline, steps, ETA</text>
+  <line class="arrow-g" x1="243" y1="372" x2="72" y2="372" marker-end="url(#ahg)"/><text class="t-sm" x="95" y="365">10 response</text>
+</svg>
+<figcaption>Search resolves text to coordinates; the gateway routes the request to the region that owns the origin; the routing service pins one graph version and one speed snapshot for the whole computation, runs the hierarchy query, re-times the result with the clock-aware speeds, and applies the ETA model before replying.</figcaption>
+</figure>
+
+<h2 id="scaling">11. Scaling, bottlenecks, hot spots</h2>
+
+<h3>11.1 Tiles</h3>
+<p>The bottleneck is hit rate and shield capacity. Techniques: long TTLs with versioned URLs; tiered caches; coalescing; prefetching neighbours on the client; tile bundles at low zoom (small tiles at zoom 0 to 5 shipped inside the app); avoiding unique query parameters in tile URLs. Hot spots are city centres at rush hour and events; the CDN absorbs them since the same tile is requested by everyone. A cold spot problem appears after a base data release, when millions of new keys are all misses at once: <b>warm</b> the cache by pre-pushing the most popular tiles (known from request logs) before flipping the version pointer, and flip regions gradually.</p>
+
+<h3>11.2 Search</h3>
+<p>Replicas per shard scale reads. Hot prefixes (the first two characters of popular queries) are cached. Each autocomplete request is cancelled by the client when a new keystroke arrives, and the client debounces requests by 100 to 150 ms. Popular queries ("airport") are precomputed per region.</p>
+
+<h3>11.3 Routing</h3>
+<p>Routing servers are stateless apart from memory-mapped, read-only graph snapshots, so scaling is horizontal: add servers to a region. Route requests are sticky to a region by origin location (a consistent mapping from tile cell to region pool). Hot spots are metropolitan areas at commute hours; they have their own pools and autoscale (<a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>). A <b>result cache</b> helps more than expected: many requests are identical or nearly so (home to work, airport to downtown). Cache key: snapped origin cell, snapped destination cell, mode, a time bucket of a few minutes, and the speed snapshot version; entries live a minute or two. This also protects the service against bursts such as a stadium emptying. For huge origin-destination matrices (delivery, ride matching), use one-to-many hierarchy algorithms (compute the backward search from each target once, and reuse it) rather than n x m independent queries.</p>
+
+<h3>11.4 Traffic</h3>
+<p>Partition by geographic cell; late-arriving data is handled by event-time windows. A hot cell (a major city) is split into finer partitions, and aggregation is two-stage: partial aggregates per partition, then merge per segment. Backpressure and sampling: if ingest exceeds capacity in a region, sample probes uniformly, since aggregates are robust to subsampling. Speed table deltas are small (only segments whose speed changed beyond a threshold), so routing nodes ingest a few hundred thousand updates per minute rather than all 200 million.</p>
+
+<h3>11.5 A small calculator</h3>
+<p>The widget below reproduces the tile arithmetic from section 3 so you can see how hit rate drives origin load.</p>
+<div class="widget"><h4>Try it: tile origin load</h4>
+<div class="row"><label>Daily users (millions) <input id="w-users" type="number" value="500" min="1" style="width:80px"></label>
+<label>Tiles per user per day <input id="w-tiles" type="number" value="80" min="1" style="width:70px"></label>
+<label>Peak factor <input id="w-peak" type="number" value="3" min="1" step="0.5" style="width:60px"></label>
+<label>CDN hit rate % <input id="w-hit" type="number" value="98" min="0" max="100" step="0.5" style="width:70px"></label>
+<label>Tile KB <input id="w-kb" type="number" value="20" min="1" style="width:60px"></label></div>
+<div class="log" id="w-out"></div></div>
+
+<h2 id="failures">12. Failure modes, consistency and multi-region</h2>
+
+<table>
+<tr><th>Component</th><th>If it fails, slows, or returns wrong data</th><th>Mitigation</th></tr>
+<tr><td>CDN edge or region</td><td>Tiles slow or unavailable in an area</td><td>Multi-CDN or anycast failover to another edge; client keeps disk-cached tiles and over-zooms parents; low-zoom base bundled in the app (<a href="../chapters/41-ha-dr.html">Chapter 41</a>)</td></tr>
+<tr><td>Tile origin or store</td><td>Cache misses fail</td><td>Serve stale on error (<code>stale-if-error</code>); object storage replicated across zones; shield keeps old object while fetching</td></tr>
+<tr><td>Bad tile release (wrong style, corrupt tiles)</td><td>Global visual damage that is cached everywhere</td><td>Versioned URLs make rollback a pointer flip; canary the new version to 1 percent of regions; checksum and render-test samples before publishing</td></tr>
+<tr><td>Search index shard down</td><td>No results for a region</td><td>Replicas; fall back to wider-region shard; degrade autocomplete to cached popular queries</td></tr>
+<tr><td>Routing server crash</td><td>In-flight requests fail</td><td>Stateless, retry with a different instance, with a timeout and a retry budget (<a href="../chapters/40-resilience.html">Chapter 40</a>); memory-mapped snapshot makes restarts fast</td></tr>
+<tr><td>Traffic pipeline lag or outage</td><td>Speeds go stale; ETAs look optimistic or pessimistic</td><td>Each speed carries a timestamp and confidence; when older than a threshold, blend to typical speeds; alert on freshness lag; show the user "traffic data unavailable" rather than wrong colors</td></tr>
+<tr><td>Bad probe data (spoofing, a bus lane, a parade)</td><td>Phantom jam or phantom free flow routes everyone elsewhere</td><td>Robust statistics (median), minimum distinct-device count per segment, outlier checks against history, rate limits per device (<a href="../chapters/55-security.html">Chapter 55</a>)</td></tr>
+<tr><td>Wrong map data (one-way flag flipped, missing turn restriction)</td><td>Illegal or impossible routes</td><td>Data validation in the build (connectivity tests, comparing routes before and after), user reports feeding a fast edit queue, ability to patch a graph with an override list without a full rebuild</td></tr>
+<tr><td>New graph artifact is corrupt or inconsistent with speed table ids</td><td>Routes via nonsense segments</td><td>Segment ids are stable across releases or the speed table is keyed by (graph version, id); canary a new graph on shadow traffic and compare route results against the old one before switching</td></tr>
+<tr><td>Thundering herd after a closure or event</td><td>Many users reroute simultaneously, shifting congestion to the alternative</td><td>Randomize reroute suggestions among near-equal options, include predicted load (the effect of rerouting) in advanced systems</td></tr>
+</table>
+
+<h3>12.1 Consistency and idempotency</h3>
+<p>Routing, search and tiles are read-only from the user's perspective, so retries are safe and no idempotency key is needed for them (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>). The consistency rule that matters is <b>snapshot isolation of a route computation</b>: one request reads one graph version and one speed snapshot. During a hot swap of snapshots, old and new live side by side until in-flight queries finish (reference counted), then the old one is unmapped. Probe uploads are at-least-once and therefore deduplicated by (anonymous trip id, sequence number) in the aggregation step, or tolerated, because a duplicated sample barely moves a median.</p>
+
+<h3>12.2 Multi-region</h3>
+<p>Maps are naturally regional: a route is within one continent usually, and a user is served by the nearest region (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>). Each region holds the tile origin copy, the place index for nearby geography, the routing graph for its area plus a coarse overlay for the whole world (so intercontinental routes can be decomposed, with the long ocean leg precomputed), and a live speed table fed by regional probe ingest. Probes stay in the region they originate in (also good for data-residency rules). Cross-region routes are rare and handled by a coordinator that routes to the origin region, finds the border crossings (airports, ferries, land borders) from the overlay, and stitches. Base data releases roll out region by region with canaries.</p>
+
+<h2 id="security">13. Security, abuse, monitoring, cost</h2>
+
+<h3>13.1 Security and privacy</h3>
+<ul>
+<li><b>Location privacy:</b> probes carry no account id, are tagged with a short-lived random id that rotates every trip or every few minutes, and the trip start and end sections are trimmed (so a home address cannot be inferred). Aggregates are published only for segments with enough distinct contributors. See <a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>.</li>
+<li><b>Abuse:</b> API keys per developer, per-key quotas and rate limits (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>) on the route, matrix and geocode endpoints, which are expensive; the matrix endpoint is the usual abuse target because one request costs n x m queries. Bulk scrapers of tiles are limited at the edge by key and referrer.</li>
+<li><b>Integrity:</b> signed probe batches and device attestation reduce spoofed traffic reports.</li>
+</ul>
+
+<h3>13.2 Monitoring and SLOs</h3>
+<table>
+<tr><th>Signal</th><th>Target (example)</th><th>Why it matters</th></tr>
+<tr><td>Tile p95 latency at edge</td><td>Under 100 ms</td><td>Perceived map smoothness</td></tr>
+<tr><td>CDN hit ratio (by zoom)</td><td>Above 97 percent overall</td><td>Origin load and egress cost</td></tr>
+<tr><td>Route p99 latency</td><td>Under 300 ms in service</td><td>User wait; matrix and ETA callers rely on it</td></tr>
+<tr><td>Autocomplete p95</td><td>Under 100 ms</td><td>Typing feels broken above that</td></tr>
+<tr><td>Traffic freshness (age of newest speed per cell)</td><td>Under 3 minutes</td><td>Directly determines ETA quality</td></tr>
+<tr><td>ETA error (median and p90 absolute percent)</td><td>Median under 8 percent; p90 under 20 percent (illustrative)</td><td>The product's core promise; tracked by region and length</td></tr>
+<tr><td>Route quality regression test</td><td>Zero unexplained changes in a golden set of routes per release</td><td>Catches bad data or graph builds before users do</td></tr>
+</table>
+<p>The principles are those of <a href="../chapters/54-observability-slos.html">Chapter 54</a>. A good extra signal is <b>actual versus predicted</b>: when navigation completes, compare the elapsed time to the ETA made at the start and at each reroute, and feed it into dashboards and into model training.</p>
+
+<h3>13.3 Cost notes</h3>
+<ul>
+<li>CDN egress is the largest line item: 28 GB/s at peak, which is why vector tiles (smaller) and cache-hit rate are optimized relentlessly. Compressing tiles with gzip or brotli typically saves 50 to 70 percent on text-like vector data.</li>
+<li>Routing compute is modest (hundreds of cores) because preprocessing moved the cost offline; the build cluster is bursty and can use spot or preemptible capacity.</li>
+<li>Probe storage: 5 TB per day raw is expensive if kept forever; keep raw points days to weeks, keep aggregated segment statistics long term.</li>
+<li>Index and graph memory are small. Do not shard for capacity; shard for blast radius and locality.</li>
+</ul>
+
+<h2 id="evolution">14. Evolution, phasing and alternatives not chosen</h2>
+
+<h3>14.1 What I would build first</h3>
+<ol>
+<li><b>Phase 1:</b> licensed vector tiles on a CDN, a managed search index for places, Dijkstra plus ALT on a single-region graph with speed-limit speeds. ETA from free-flow speeds with a typical-hour multiplier.</li>
+<li><b>Phase 2:</b> contraction hierarchies with the hybrid live re-timing, probe ingest and a basic aggregated speed table, typical-speed profiles, on-demand tiles for deep zoom, shield caching.</li>
+<li><b>Phase 3:</b> customizable hierarchy or overlay-based partitioning, time-dependent routing, learned ETA model, incident feeds, rerouting service.</li>
+<li><b>Phase 4:</b> multi-modal routing, offline regions, personalised ranking, one-to-many and matrix services for platform partners.</li>
+</ol>
+
+<h3>14.2 What changes at 10x</h3>
+<ul>
+<li>Tiles: 14 million requests per second at peak. The same architecture holds, with more edge capacity, bundled low zooms in the client, and more aggressive client-side caching and prefetch; the origin must stay near 2 percent of the traffic, which needs the hit rate to improve to 99 percent or better with larger shield caches.</li>
+<li>Traffic: 20 million probes per second. Sample per segment (cap contributions per device per minute and per segment), move aggregation closer to the edge (regional processing before global merge) and consider on-device pre-aggregation of traversal times.</li>
+<li>Routing: 200,000 queries per second at 5 ms is 1,000 busy cores, still modest; the pressure moves to customization frequency and to matrix workloads.</li>
+</ul>
+
+<h3>14.3 Alternatives not chosen</h3>
+<ul>
+<li><b>Pre-computing all-pairs shortest paths:</b> 150 million nodes squared is 2 x 10^16 pairs, impossible, and traffic would invalidate it anyway.</li>
+<li><b>Only raster tiles:</b> simpler client but 3 to 5 times more egress and a combinatorial cache for styles and languages.</li>
+<li><b>Storing the road graph in a graph database or relational table:</b> pointer-chasing search with millions of edge reads per query needs in-memory arrays; a database round trip per node would take minutes.</li>
+<li><b>Pure Dijkstra with regional pruning:</b> acceptable for small countries but not at planet scale without hierarchy.</li>
+<li><b>Real-time hierarchy rebuild per minute:</b> too slow; hence customizable variants.</li>
+</ul>
+
+<h2 id="qa">15. Interview Q&amp;A</h2>
+
+<details><summary>Why not just run Dijkstra on the whole graph? What is the actual number?</summary>
+<p>Dijkstra settles nodes in order of distance from the origin, so for a long trip it processes nearly every node within the trip radius. On a continental network that is tens of millions of nodes, each popped from a priority queue and relaxed over several edges, which takes on the order of seconds even in optimized code. With a combined budget of about 20,000 route and ETA queries per second, plain Dijkstra would need tens of thousands of cores. Contraction hierarchies cut each query to hundreds or thousands of settled nodes, about a millisecond, at the cost of an offline preprocessing step. That is the central trade: spend hours of offline compute to save milliseconds of online compute on every one of billions of queries.</p></details>
+
+<details><summary>Explain contraction hierarchies in a minute, and what is the catch with traffic?</summary>
+<p>Rank all nodes by importance and remove them from least to most important. Whenever removing a node would break a shortest path between two of its neighbours, add a shortcut edge with the combined weight. A query then runs a forward search from the origin and a backward search from the destination, each allowed to follow only edges that go up in rank, and the paths meet near the top, in the highway-like nodes. The catch is that shortcut weights are sums of base edge weights, so when live traffic changes a speed, every shortcut built on that edge is stale. Rebuilding everything every minute is too slow, so we use a customizable variant that separates the structure (ordering and shortcut topology, stable) from the weights (recomputed bottom-up in seconds), and keep a hybrid fallback that re-times candidate routes with live speeds.</p></details>
+
+<details><summary>How do you partition the road graph, and does the whole graph fit on one machine?</summary>
+<p>The planet's car graph is roughly 200 million edges, about 3 to 10 GB in compact arrays, so the structure itself fits in one server's memory; I would say so and then explain why we partition anyway. Reasons are parallel preprocessing, regional blast radius, memory for time-of-week profiles (over 100 GB), and locality of reference. We cut with a balanced partitioner that minimizes border nodes, not with arbitrary rectangles, then build an overlay of border-to-border shortcuts so cross-cell queries do detailed search only in the origin and destination cells. When traffic changes inside a cell, only that cell's overlay edges are recomputed. The cost is more complex code and queries that cross cells doing a little extra work.</p></details>
+
+<details><summary>How do the tiles stay fast for a billion users without melting the origin?</summary>
+<p>Tiles are static objects whose URL contains zoom, x, y and a version, so every viewer of a place requests the same bytes and the CDN can cache them for a long time. At 1.4 million requests per second peak, a 98 percent hit rate leaves 28,000 per second for origin, and the shield tier plus request coalescing collapses simultaneous misses to a single fetch. We pre-generate tiles up to zoom 14 (about 1.6 TB) and generate deeper tiles on demand, while the phone over-zooms the parent tile in the meantime. New data goes out as a new version, warmed in the popular regions first, so there is never a mass invalidation.</p></details>
+
+<details><summary>How do you compute an ETA that is accurate for a trip that lasts an hour?</summary>
+<p>Summing current speeds is wrong, because the far end of the trip will be reached an hour from now, when traffic is different. I evaluate the route time-dependently: walk along the route keeping a clock, use live speeds for the first 15 to 30 minutes, and blend toward the typical speed for that time of week after that. Then I add intersection and turn delay estimates, and finally apply a learned correction model trained on completed trips that predicts the residual from features like road mix, time of day and weather. I judge it by the median and 90th-percentile absolute percentage error per region and trip length, and I log predicted versus actual for every completed navigation to retrain.</p></details>
+
+<details><summary>What if probe data is sparse on a road, or wrong?</summary>
+<p>Sparse: estimate with confidence. When a segment has few samples in a window, the output shrinks toward a prior built from neighbouring segments and the historical profile for that time slot, with a confidence value that routing can use (low confidence means rely on typical speeds). Wrong: use robust statistics such as the median, require a minimum number of distinct devices, compare against history to detect outliers, and treat sudden drops with caution unless several independent devices agree. Spoofing a traffic jam to divert others is a real abuse case, so device attestation and per-device rate limits matter. The fallback if the pipeline is unhealthy is always typical speeds, never an error.</p></details>
+
+<details><summary>How would you handle map data updates, such as a new road or a closed bridge?</summary>
+<p>Two speeds of update. Urgent changes like closures are applied as overrides: set the affected edges to infinite weight in the speed table, which reaches routing servers in a minute or two, and purge the related tiles by coordinate. Ordinary data changes (a new road) go through the build pipeline: edit the feature store, regenerate affected tiles, update the place index incrementally, and build a new routing graph snapshot on a daily or weekly schedule. The new graph is validated against a golden set of routes and canaried on shadow traffic before the pointer flips, and a snapshot swap keeps old and new in memory until in-flight queries finish. A small patch list lets us fix a known error in the live graph without waiting for the next full build.</p></details>
+
+<details><summary>How would you support route queries between continents or across many partitions?</summary>
+<p>Keep a coarse world overlay in every region: border nodes of cells plus precomputed distances between them, including long-distance edges such as ferry and flight-free links only where relevant. A coordinator takes the origin region's detailed search to its borders, the overlay for the middle, and the destination region's detailed search for the end, and stitches them. This is the same technique as inside a continent, with a multi-level overlay hierarchy. In practice cross-region requests are rare enough that I would accept a slightly slower path for them and avoid duplicating full graphs everywhere.</p></details>
+
+<details><summary>How would you decide between precomputing tiles and rendering on demand?</summary>
+<p>Look at the tile count, popularity and cost of a miss. Low zooms have few tiles which everyone requests, so precomputing is free benefit. Deep zooms have billions of tiles, most never requested, so on-demand rendering with caching stores only what is actually used. The risk of on-demand is a cold-start stampede after a release, so I coalesce requests at the shield, size the renderer pool for the peak miss rate, and warm known-popular tiles before switching versions. The threshold between the two regimes moves with measurements: choose the zoom where the fraction of tiles ever requested falls below a few percent.</p></details>
+
+<details><summary>How would the design change to support offline maps?</summary>
+<p>Offline needs a compact download for a region: vector tiles for zooms up to the detail level, a trimmed place index (names and addresses for search), and a routing graph with typical-speed profiles in a CH-style compact format that runs on a phone. Updates are delivered as diffs against the downloaded version. The phone cannot have live traffic offline, so ETAs use historical profiles by time of week, and the app clearly labels that. Storage per region is a few hundred MB to a couple of GB for a large country, which argues for letting users choose regions and for aggressive compression.</p></details>
+
+<h2 id="recap-sec">16. Connects to, and recap</h2>
+
+<p class="connects"><b>Connects to:</b> framework in <a href="../chapters/01-interview-framework.html">Chapter 1</a>; estimation in <a href="../chapters/02-estimation.html">Chapter 2</a>; API style in <a href="../chapters/05-api-design.html">Chapter 5</a> and encodings in <a href="../chapters/07-serialization.html">Chapter 7</a>; tile delivery in <a href="../chapters/12-cdn.html">Chapter 12</a> with cache design in <a href="../chapters/13-caching-patterns.html">Chapter 13</a> and stampede control in <a href="../chapters/14-caching-failures.html">Chapter 14</a>; object storage in <a href="../chapters/21-object-storage.html">Chapter 21</a>; geocoding on <a href="../chapters/22-search-engines.html">Chapter 22</a>; wide-column storage in <a href="../chapters/20-nosql.html">Chapter 20</a>; sharding in <a href="../chapters/25-sharding.html">Chapter 25</a>; spatial cells in <a href="../chapters/58-geospatial-text.html">Chapter 58</a>; the traffic pipeline in <a href="../chapters/34-queues-kafka.html">Chapter 34</a>, <a href="../chapters/37-batch-stream.html">Chapter 37</a> and <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>; resilience in <a href="../chapters/40-resilience.html">Chapter 40</a> and <a href="../chapters/41-ha-dr.html">Chapter 41</a>; observability in <a href="../chapters/54-observability-slos.html">Chapter 54</a>. A close relative that consumes this system's ETA and map matching is the <a href="c13-nearby-search.html">nearby search case study</a>.</p>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>Maps is four systems on one base layer: tiles, search, routing, traffic. Name the bottleneck of each: egress and hit rate, index latency, CPU per query, ingest and aggregation.</li>
+<li>Tiles are addressed by zoom, x and y, versioned in the URL, served from CDN with a shield tier; precompute up to about zoom 14 (about 1.6 TB), render deeper zooms on demand with request coalescing. Vector tiles beat raster for the base map.</li>
+<li>Geocoding is a search-engine problem with location bias, hierarchy-aware indexing and geographic sharding; reverse geocoding is a spatial cell lookup.</li>
+<li>The road graph (about 200 million edges) fits in memory. Dijkstra is too slow (seconds), A* is weak on roads, ALT helps; contraction hierarchies give about millisecond queries by climbing a precomputed hierarchy from both ends.</li>
+<li>Live traffic breaks plain CH, so use customizable hierarchies or overlay partitioning with fast weight refresh, plus hybrid re-timing of candidates. Partition by minimizing border nodes, mostly for preprocessing, blast radius and memory for profiles.</li>
+<li>Traffic is a stream pipeline: anonymous probes, map matching, windowed robust aggregation, gap filling by neighbours and history, publish a speed table about every minute.</li>
+<li>ETA is time-dependent route evaluation plus delay estimates plus a learned residual, measured by error percentiles; reroute only when gains exceed a threshold, with hysteresis.</li>
+<li>Failure modes are solved by degrading: stale tiles, typical speeds when traffic is stale, versioned snapshots for rollback, canaries on every data release.</li>
+</ul></div>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+<script>
+(function () {
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+  function num(id) { return parseFloat(document.getElementById(id).value) || 0; }
+  function fmt(n) { return Math.round(n).toLocaleString('en-US'); }
+  function run() {
+    var perDay = num('w-users') * 1e6 * num('w-tiles');
+    var avg = perDay / 86400;
+    var peak = avg * num('w-peak');
+    var origin = peak * (1 - num('w-hit') / 100);
+    var gbps = peak * num('w-kb') * 1000 * 8 / 1e9;
+    var out = document.getElementById('w-out');
+    out.textContent = '';
+    [
+      'Tiles per day: ' + fmt(perDay),
+      'Average per second: ' + fmt(avg) + ', peak per second: ' + fmt(peak),
+      'Origin requests per second at peak: ' + fmt(origin),
+      'Edge egress at peak: ' + gbps.toFixed(0) + ' Gbit/s'
+    ].forEach(function (line) { out.appendChild(el('div', null, line)); });
+  }
+  ['w-users', 'w-tiles', 'w-peak', 'w-hit', 'w-kb'].forEach(function (id) {
+    document.getElementById(id).addEventListener('input', run);
+  });
+  run();
+})();
+</script>
+</body>
+</html>

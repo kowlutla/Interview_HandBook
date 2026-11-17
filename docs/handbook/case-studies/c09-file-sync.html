@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 9: Design Dropbox / Google Drive | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c09-file-sync">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 9 · Worked solutions</div>
+<h1>Design Dropbox / Google Drive</h1>
+<p class="lead">A file sync service keeps a folder identical on a laptop, a phone and the cloud, even when devices go offline, edit the same file, or upload a 50 GB video over a flaky hotel network. This worked solution designs it for 500 million users: how files are cut into chunks, stored once, uploaded in parallel, tracked by a sharded metadata service, and propagated to other devices through a change journal, with conflict handling that never loses data.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is "Design Dropbox." The first job in an interview (see <a href="../chapters/01-interview-framework.html">Chapter 1</a>) is to turn that sentence into a scoped problem. The product is a <b>synced folder</b>: the user installs a client, drops files into a folder, and the same files appear on every other device they own, and on the web. Users can also share files and folders with other people, view older versions, and restore deleted files.</p>
+<p>Questions to ask, and the answers we will assume for the rest of the page:</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>How many users?</td><td>500 million registered, 100 million daily active (DAU).</td></tr>
+<tr><td>How much data per user?</td><td>Heavily skewed. Average about 2 GB stored across all users (most accounts are small or dormant); a few power users hold terabytes.</td></tr>
+<tr><td>File sizes?</td><td>Mostly small (documents, photos, source code), but the service must accept files up to 50 GB. Average file about 10 MB.</td></tr>
+<tr><td>How many devices per user?</td><td>About 3 (laptop, phone, web). Sync must work across all of them.</td></tr>
+<tr><td>What consistency do users expect?</td><td>The metadata (what files exist, in which version) must be strongly consistent per account. Propagation to other devices may take seconds.</td></tr>
+<tr><td>How fast should a change appear on another device?</td><td>Small files: p95 under 5 seconds when the other device is online. Large files: limited by bandwidth.</td></tr>
+<tr><td>Do we need real-time co-editing of documents?</td><td>No. That is a separate system (<a href="c16-collaborative-editor.html">collaborative editor</a>, see also <a href="../chapters/16-rate-limiting.html">Chapter 16</a> for protecting such APIs). Here two edits to one file produce a conflict, not a merge.</td></tr>
+<tr><td>Durability?</td><td>Extremely high. Losing a user's file is the worst possible failure. Target eleven nines of durability for stored data.</td></tr>
+<tr><td>Offline use?</td><td>Yes. Clients edit offline and sync on reconnect.</td></tr>
+<tr><td>Encryption, compliance?</td><td>Encryption in transit and at rest is required; end-to-end encryption is out of scope for the base design (discussed in the security section).</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements</h2>
+<h3>2.1 Functional</h3>
+<ul>
+<li>Upload, download, rename, move and delete files and folders from any device.</li>
+<li>Automatic sync: a change on one device appears on the user's other devices.</li>
+<li>Resume interrupted uploads and downloads; upload very large files reliably.</li>
+<li>Share a file or folder with other users with view or edit permission; shared folders appear in the recipient's tree.</li>
+<li>Version history (for example 30 days or 100 versions) and restore.</li>
+<li>Offline edits that reconcile on reconnect, with conflicts preserved rather than overwritten.</li>
+</ul>
+<h3>2.2 Non-functional</h3>
+<ul>
+<li><b>Durability over everything:</b> never lose acknowledged data.</li>
+<li><b>Efficiency:</b> do not re-upload bytes the server already has (dedup) or bytes that did not change (delta sync). Bandwidth and storage are the dominant costs.</li>
+<li><b>Consistency of the file tree:</b> a client must never see a file that points to chunks that do not exist, and two clients must converge on the same tree.</li>
+<li><b>Availability:</b> reads and syncs keep working during a single data center failure.</li>
+<li><b>Scalability:</b> hundreds of billions of files, exabytes of data, millions of sync connections.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Real-time collaborative editing, full-text search of file contents, photo/video transcoding (a streaming concern, see <a href="c10-video-streaming.html">Chapter 10</a>), billing, and end-to-end (zero-knowledge) encryption. We mention hooks for them in the evolution section.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>Estimation technique is covered in <a href="../chapters/02-estimation.html">Chapter 2</a>. Here are the numbers that drive design decisions, with the arithmetic shown.</p>
+<h3>3.1 Storage</h3>
+<ul>
+<li>Logical data: 500 M users × 2 GB = 1,000 PB = <b>1 EB</b> of user-visible data.</li>
+<li>Dedup (identical chunks across users and versions stored once) typically saves a large fraction; assume a ratio of 1.5. Unique data: 1 EB / 1.5 = about <b>670 PB</b>.</li>
+<li>Erasure coding in the block store (<a href="../chapters/21-object-storage.html">Chapter 21</a>), for example 10 data + 4 parity shards, costs 1.4x: 670 PB × 1.4 = about <b>940 PB raw</b>. Versions add more (we keep changed chunks only, so assume +30%), leading to roughly 1.2 EB raw. This is the budget line that dominates cost.</li>
+<li>Files: 500 M × 200 files = <b>100 billion files</b>. At average 10 MB this matches the 1 EB figure (100 B × 10 MB = 1 EB).</li>
+<li>Chunks: with 4 MB chunks, large files split into many chunks and small files into one, so assume an average of 3 MB per chunk: 670 PB / 3 MB = about <b>220 billion unique chunks</b>. A chunk index entry is about 50 bytes (hash, location, refcount): 220 B × 50 B = 11 TB. That fits comfortably in a sharded key-value store, but not in one machine's memory.</li>
+<li>Metadata: a file-version row is about 300 bytes plus a chunk list. 100 B files × about 3 retained versions × 300 B = about 90 TB, plus chunk lists (a pointer per chunk, about 40 bytes). Call it 150 TB of sharded relational metadata. Small compared with the blocks (about 0.015% of the volume), but it is the hot, latency-critical part.</li>
+</ul>
+<h3>3.2 Traffic</h3>
+<ul>
+<li>File changes (new files plus edits): 100 M DAU × 2 per day = 200 M per day. Average = 200 M / 86,400 = about <b>2,300 commits per second</b>; peak (3x, morning in each time zone) about <b>7,000 per second</b>.</li>
+<li>Uploaded bytes before optimization: 200 M × 10 MB = 2 PB per day. Delta sync and dedup remove about half: <b>1 PB per day</b> over the wire = 1 PB / 86,400 s = 11.6 GB/s = about <b>93 Gbit/s average</b>, about <b>280 Gbit/s at peak</b>.</li>
+<li>Chunk writes: 1 PB / 3 MB = 330 M per day = about 3,900 per second average, about 12,000 at peak.</li>
+<li>Downloads: each change is pulled by about 2 other devices, so egress is about 2 PB per day = <b>185 Gbit/s average</b>, about 550 Gbit/s at peak. Read:write byte ratio about 2:1; but read:write on metadata is much higher (see below).</li>
+<li>Metadata operations (list folder, get cursor, stat, commit): 100 M DAU × 50 per day = 5 B per day = about 58,000 per second average, about <b>175,000 per second at peak</b>. This is a classic read-heavy relational workload (read:write about 10:1).</li>
+</ul>
+<h3>3.3 Connections and notifications</h3>
+<p>If 50 M users are online at peak with 2 devices each, that is 100 M long-lived notification connections. At about 50,000 connections per server (memory per idle connection is a few KB) we need about 2,000 notification servers. The notification payload is tiny (a few bytes saying "namespace X changed"), so this tier is bound by connection count, not bandwidth. See <a href="../chapters/06-realtime.html">Chapter 6</a>.</p>
+<div class="callout key"><b>Key takeaway</b> The block store is huge in bytes but simple (immutable blobs). The metadata store is small in bytes but has the hard correctness and QPS requirements. The design splits the two on purpose and spends most of its cleverness on moving as few bytes as possible.</div>
+
+<h2 id="api">4. API design</h2>
+<p>The client talks to two kinds of endpoints: <b>metadata</b> endpoints (small JSON, strongly consistent) and <b>block</b> endpoints (large bytes, directly to storage). Separating them lets the bytes flow past the metadata servers entirely. API style is discussed in <a href="../chapters/05-api-design.html">Chapter 5</a>.</p>
+<pre>POST /v1/blocks/check          { hashes: [h1, h2, ...] }
+  -> { missing: [h2, ...] }                 // which chunks the server does not have yet
+
+PUT  /v1/blocks/{hash}                       // body = chunk bytes (up to ~4 MB)
+  -> 200 (idempotent: same hash, same bytes)
+
+POST /v1/files/commit
+  { namespace_id, path, parent_rev, size, mtime,
+    chunks: [{hash, size}, ...], client_id, idempotency_key }
+  -> { rev, cursor }  |  409 { conflict_with_rev }
+
+POST /v1/files/upload_session/start    -> { session_id }   // large files
+PUT  /v1/files/upload_session/{id}?offset=N                // append part, resumable
+POST /v1/files/upload_session/{id}/finish  { commit: {...} }
+
+GET  /v1/files/list_folder     { namespace_id, path, cursor? }
+  -> { entries: [...], cursor, has_more }
+GET  /v1/files/list_changes    { namespace_id, cursor, longpoll_timeout? }
+  -> { changes: [{op, path, rev, chunks...}], cursor, has_more }
+GET  /v1/notify/subscribe      { cursors: {ns1: c1, ns2: c2} }   // long-poll
+  -> { changed: [ns1] }
+
+POST /v1/shares                { namespace_id|path, grantee, role }
+GET  /v1/files/versions        { path }          POST /v1/files/restore { path, rev }
+GET  /v1/blocks/{hash}                           // download a chunk (pre-signed or via CDN)</pre>
+<p>Three details matter. First, <b>chunks are addressed by their hash</b>, not by a server-assigned id, so uploading the same chunk twice is naturally idempotent (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>). Second, <b>commit carries <code>parent_rev</code></b>: the revision the client's edit was based on. That is how the server detects conflicts (section 9). Third, <b>every change feed is cursor-based</b>: the client stores an opaque cursor and asks "what changed since this cursor", never "give me everything".</p>
+
+<h2 id="data-model">5. Data model and storage choice</h2>
+<p>Three kinds of data with very different needs, so three stores:</p>
+<table>
+<tr><th>Data</th><th>Shape and size</th><th>Store and reason</th></tr>
+<tr><td><b>Chunk bytes</b></td><td>Immutable blobs, 4 MB, about 1 EB</td><td>Object storage with erasure coding (<a href="../chapters/21-object-storage.html">Chapter 21</a>). Cheap per GB, eleven-nines durability, no random updates needed because chunks are never modified.</td></tr>
+<tr><td><b>Chunk index</b> (hash to location, refcount)</td><td>220 B small records, about 11 TB, point lookups at 10k+ per second</td><td>Sharded key-value store keyed by hash (<a href="../chapters/20-nosql.html">Chapter 20</a>). Hash keys spread evenly, so there are no hot shards.</td></tr>
+<tr><td><b>File tree, versions, sharing, journal</b></td><td>Relational, about 150 TB, 175k QPS peak</td><td>Sharded SQL (MySQL or Postgres) because we need transactions across several rows (a commit, a move) with strong consistency, plus secondary indexes. Sharded by <code>namespace_id</code> (<a href="../chapters/25-sharding.html">Chapter 25</a>).</td></tr>
+</table>
+<h3>5.1 The key concept: namespaces</h3>
+<p>A <b>namespace</b> is a file tree root: every user has a private root namespace, and every shared folder is its own namespace that is <i>mounted</i> into the tree of each member. All metadata is keyed by <code>namespace_id</code>. This single decision is what makes sharing and sharding work together: a shared folder is one unit with its own journal and its own permissions, no matter how many people mount it, and a transaction never needs to span two shards for ordinary edits.</p>
+<pre>namespace(ns_id, owner, kind[root|shared], created)
+mount(user_id, ns_id, mount_path, role)          -- who sees which namespace, and where
+file(ns_id, file_id, parent_id, name, is_dir,
+     latest_rev, deleted, UNIQUE(ns_id, parent_id, name))
+file_version(ns_id, file_id, rev, size, mtime, chunk_list[], client_id, created)
+journal(ns_id, seq BIGINT, file_id, op, rev, ts)    -- append-only change log
+block_index(hash, size, store_loc, refcount)        -- separate key-value store</pre>
+<p>The <code>journal</code> is the heart of sync. Every successful commit, move or delete appends one row with the next <b>sequence number</b> in that namespace (1, 2, 3...). A cursor is just "namespace N, sequence S". Because sequence numbers are allocated inside the same transaction as the change, the journal is gap-free and ordered.</p>
+<p>File identity uses a stable <code>file_id</code>, not the path, so a rename is a one-row update of <code>parent_id/name</code> and does not touch chunks. Moving a folder with a million files is also one row: children point to the folder's id, not to a path string.</p>
+
+<h2 id="first-design">6. A first simple design, then the scaled architecture</h2>
+<p>Start with the naive version to show why it fails. One web server stores each file as a file on disk and a row in one MySQL database. The client uploads the whole file in one POST, and other clients poll "list everything" every 30 seconds.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 190" role="img" aria-label="Naive single-server file sync design">
+  <rect class="ext" x="30" y="60" width="150" height="56" rx="8"/><text class="t-c t-b" x="105" y="86">Clients</text><text class="t-c t-sm" x="105" y="104">upload whole file</text>
+  <rect class="box" x="300" y="60" width="170" height="56" rx="8"/><text class="t-c t-b" x="385" y="86">App server</text><text class="t-c t-sm" x="385" y="104">local disk for files</text>
+  <rect class="db" x="640" y="60" width="170" height="56" rx="8"/><text class="t-c t-b" x="725" y="86">One MySQL</text><text class="t-c t-sm" x="725" y="104">files, users</text>
+  <path class="arrow" d="M180 88 L296 88"/><path class="arrow" d="M470 88 L636 88"/>
+  <text class="t-sm" x="30" y="160">Problems: whole-file re-upload on a 1-byte edit, no resume, one disk = data loss, polling everything, no dedup.</text>
+</svg>
+<figcaption>The naive design works for ten users. Each problem listed under it maps to a component in the scaled design.</figcaption>
+</figure>
+<p>Each flaw has a fix, and the fixes are the design: chunking and hashing (re-upload only what changed, dedup, resume), an object store (durability), sharded metadata (scale), and a change journal with notifications (no polling).</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 440" role="img" aria-label="Scaled high-level architecture of the file sync system">
+  <rect class="ext" x="20" y="150" width="150" height="70" rx="8"/><text class="t-c t-b" x="95" y="176">Desktop client</text><text class="t-c t-sm" x="95" y="194">chunker, watcher</text><text class="t-c t-sm" x="95" y="209">local index (SQLite)</text>
+  <rect class="ext" x="20" y="260" width="150" height="50" rx="8"/><text class="t-c t-b" x="95" y="290">Mobile / web</text>
+  <rect class="box" x="230" y="190" width="130" height="60" rx="8"/><text class="t-c t-b" x="295" y="216">API gateway</text><text class="t-c t-sm" x="295" y="234">auth, rate limit</text>
+  <rect class="box" x="440" y="40" width="160" height="60" rx="8"/><text class="t-c t-b" x="520" y="66">Block service</text><text class="t-c t-sm" x="520" y="84">check, put, get</text>
+  <rect class="box" x="440" y="150" width="160" height="60" rx="8"/><text class="t-c t-b" x="520" y="176">Metadata service</text><text class="t-c t-sm" x="520" y="194">commit, list, share</text>
+  <rect class="box" x="440" y="260" width="160" height="60" rx="8"/><text class="t-c t-b" x="520" y="286">Notification svc</text><text class="t-c t-sm" x="520" y="304">long-poll / push</text>
+  <rect class="box" x="440" y="360" width="160" height="50" rx="8"/><text class="t-c t-b" x="520" y="390">Sharing / ACL svc</text>
+  <rect class="db" x="720" y="30" width="190" height="44" rx="8"/><text class="t-c t-b" x="815" y="57">Object store (blocks)</text>
+  <rect class="db" x="720" y="86" width="190" height="44" rx="8"/><text class="t-c t-b" x="815" y="113">Chunk index (KV)</text>
+  <rect class="db" x="720" y="150" width="190" height="60" rx="8"/><text class="t-c t-b" x="815" y="176">Sharded SQL</text><text class="t-c t-sm" x="815" y="194">tree, versions, journal</text>
+  <rect class="cache" x="720" y="260" width="190" height="60" rx="8"/><text class="t-c t-b" x="815" y="286">Redis / pub-sub</text><text class="t-c t-sm" x="815" y="304">ns to connections</text>
+  <rect class="cache" x="720" y="360" width="190" height="50" rx="8"/><text class="t-c t-b" x="815" y="390">Async workers (queue)</text>
+  <path class="arrow" d="M170 185 L226 205"/><path class="arrow" d="M170 285 L226 235"/>
+  <path class="arrow" d="M360 210 L436 80"/><path class="arrow" d="M360 220 L436 180"/><path class="arrow" d="M360 235 L436 285"/><path class="arrow" d="M360 245 L436 380"/>
+  <path class="arrow" d="M600 60 L716 52"/><path class="arrow" d="M600 80 L716 108"/><path class="arrow" d="M600 180 L716 180"/><path class="arrow" d="M600 290 L716 290"/>
+  <path class="arrow dash" d="M600 190 L720 380"/>
+  <path class="arrow-g dash" d="M440 100 L170 170"/>
+  <text class="t-sm" x="190" y="130">clients send chunk bytes to the block tier</text>
+</svg>
+<figcaption>Clients split and hash files locally. Bytes go to the block service and object store; only small metadata commits touch the SQL shards. The notification service tells other devices that a namespace changed, and async workers do garbage collection, thumbnails and virus scanning.</figcaption>
+</figure>
+
+<h2 id="chunking">7. Deep dive 1: chunking, hashing and dedup</h2>
+<h3>7.1 Why chunk at all</h3>
+<p>Treating a file as one blob has three costs. A 1-byte edit to a 2 GB file re-uploads 2 GB. A connection drop at 99% restarts from zero. And two users uploading the same 2 GB installer store it twice. Splitting each file into <b>chunks</b>, naming each chunk by its content hash (SHA-256), solves all three: unchanged chunks are skipped, finished chunks survive a disconnect, and identical chunks collapse to one stored copy. A file is then just an ordered <b>chunk list</b>, which is what the metadata service stores. Content hashing and probabilistic structures are in <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>, and the Merkle-tree idea (hash of hashes) in <a href="../chapters/33-gossip-merkle.html">Chapter 33</a>.</p>
+<h3>7.2 Fixed-size versus content-defined chunking</h3>
+<p><b>Fixed-size chunking</b> cuts every 4 MB at byte offsets 0, 4 MB, 8 MB, and so on. It is trivial and fast. Its weakness is the <b>boundary shift problem</b>: insert one byte near the start of a file and every later byte moves by one position, so every later chunk has different content and a different hash. A small edit looks like a total rewrite.</p>
+<p><b>Content-defined chunking (CDC)</b> chooses cut points from the data itself. A rolling hash (Rabin fingerprint or a faster variant such as Gear/FastCDC) slides over a small window of bytes, and a boundary is declared wherever the hash satisfies a condition, for example its low 22 bits are zero, which happens on average once per 4 MB. Minimum and maximum sizes (say 1 MB and 16 MB) prevent pathological tiny or huge chunks. Because boundaries depend on local content, an insert only disturbs the chunk it lands in; the boundaries after it re-synchronize and all later chunks keep their old hashes.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Fixed-size chunking versus content-defined chunking after inserting bytes">
+  <text class="t-b" x="20" y="22">Original file</text>
+  <rect class="box" x="20" y="32" width="160" height="30" rx="4"/><text class="t-c" x="100" y="52">A</text>
+  <rect class="box" x="180" y="32" width="160" height="30" rx="4"/><text class="t-c" x="260" y="52">B</text>
+  <rect class="box" x="340" y="32" width="160" height="30" rx="4"/><text class="t-c" x="420" y="52">C</text>
+  <rect class="box" x="500" y="32" width="160" height="30" rx="4"/><text class="t-c" x="580" y="52">D</text>
+  <text class="t-b" x="20" y="100">Fixed-size, after inserting a few bytes into A</text>
+  <rect class="miss" x="20" y="110" width="160" height="30" rx="4"/><text class="t-c" x="100" y="130">A'</text>
+  <rect class="miss" x="180" y="110" width="160" height="30" rx="4"/><text class="t-c" x="260" y="130">B'</text>
+  <rect class="miss" x="340" y="110" width="160" height="30" rx="4"/><text class="t-c" x="420" y="130">C'</text>
+  <rect class="miss" x="500" y="110" width="160" height="30" rx="4"/><text class="t-c" x="580" y="130">D'</text>
+  <rect class="miss" x="660" y="110" width="40" height="30" rx="4"/><text class="t-c t-sm" x="680" y="130">E'</text>
+  <text class="t-sm" x="720" y="130">every chunk changed: re-upload all</text>
+  <text class="t-b" x="20" y="180">Content-defined, same insert</text>
+  <rect class="miss" x="20" y="190" width="175" height="30" rx="4"/><text class="t-c" x="107" y="210">A'</text>
+  <rect class="hit" x="195" y="190" width="145" height="30" rx="4"/><text class="t-c" x="267" y="210">B</text>
+  <rect class="hit" x="340" y="190" width="160" height="30" rx="4"/><text class="t-c" x="420" y="210">C</text>
+  <rect class="hit" x="500" y="190" width="160" height="30" rx="4"/><text class="t-c" x="580" y="210">D</text>
+  <text class="t-sm" x="680" y="210">only A' is new: re-upload 1 chunk</text>
+  <text class="t-sm" x="20" y="260">Boundaries are chosen where a rolling hash of the surrounding bytes meets a condition, so they move with the content, not with the byte offset.</text>
+</svg>
+<figcaption>Green chunks already exist on the server (same hash) and are skipped; red chunks must be uploaded. CDC limits the damage of an insertion to the chunk that contains it.</figcaption>
+</figure>
+<table>
+<tr><th>Aspect</th><th>Fixed-size</th><th>Content-defined</th></tr>
+<tr><td>CPU cost</td><td>Almost none</td><td>Rolling hash over every byte (FastCDC runs at GB/s per core, acceptable)</td></tr>
+<tr><td>Insert/delete in the middle</td><td>All following chunks change</td><td>Only 1-2 chunks change</td></tr>
+<tr><td>Append, overwrite in place</td><td>Excellent</td><td>Excellent</td></tr>
+<tr><td>Dedup across files</td><td>Poor for shifted copies</td><td>Good</td></tr>
+<tr><td>Chunk size variance</td><td>None</td><td>Varied; needs min/max</td></tr>
+<tr><td>Best for</td><td>VM images, databases, media (edits are in place)</td><td>Documents, source, archives (edits shift bytes)</td></tr>
+</table>
+<p><b>Choice:</b> content-defined chunking with a 4 MB average (1 MB minimum, 16 MB maximum) for files over a size threshold, and a single chunk for files under 4 MB (no need to chunk a 30 KB document). The client does the chunking, which keeps hashing CPU off our servers and means unchanged bytes never even cross the network.</p>
+<h3>7.3 Chunk size tradeoff</h3>
+<p>Smaller chunks give finer delta sync and better dedup, but they multiply metadata. At 64 KB average, the 670 PB of unique data would have 10 trillion chunks, and the index would be 500 TB, while each request moves little data so per-request overhead dominates. At 64 MB, the metadata is tiny but a one-byte edit uploads 64 MB. About 4 MB balances the two; mobile clients on poor links may use smaller chunks to make resume cheaper.</p>
+<h3>7.4 Dedup</h3>
+<p>Dedup works because the chunk hash is the chunk's identity. The upload protocol first sends the list of hashes to <code>/blocks/check</code>; the server answers with the subset it lacks, and the client uploads only those. This even lets a client "upload" a file instantly if all chunks already exist, because the same file was uploaded by someone else (the famous instant-upload effect).</p>
+<div class="callout watch"><b>Watch out: cross-user dedup leaks information</b> If the server says "I already have this chunk", an attacker who knows a file's hash can learn that someone stored it (the confirmation-of-file attack), and could even claim ownership of a chunk without having the bytes. Defenses: require the client to prove it has the bytes (the server challenges with a random offset range to hash with a nonce), scope dedup per account or per team for sensitive tiers, and never reveal "exists" to an unauthorized caller unless proof is supplied. Many real services accept cross-user dedup with proof-of-possession; strict zero-knowledge designs give it up.</div>
+<p>Each stored chunk has a <b>reference count</b>: the number of file versions that include it. Deleting a version decrements counts. A chunk with zero references is not deleted immediately but queued for <b>garbage collection</b> after a grace period (say 7 days), because a concurrent upload may be about to reference it. A mark-and-sweep scan, done offline, repairs any refcount drift. Getting this wrong deletes live data, so GC is slow and cautious by design.</p>
+
+<h2 id="upload">8. Deep dive 2: resumable, parallel upload and the sync protocol</h2>
+<h3>8.1 The upload flow</h3>
+<p>The ordering of steps is what guarantees consistency: <b>bytes first, then metadata</b>. A file version becomes visible only when its commit succeeds, and the commit succeeds only if every chunk it names is already durably stored. So no client can ever see a file whose chunks are missing.</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 470" role="img" aria-label="Sequence diagram of uploading a changed file">
+  <rect class="ext" x="30" y="10" width="120" height="34" rx="6"/><text class="t-c t-b" x="90" y="32">Client</text>
+  <rect class="box" x="260" y="10" width="130" height="34" rx="6"/><text class="t-c t-b" x="325" y="32">Block service</text>
+  <rect class="db" x="500" y="10" width="140" height="34" rx="6"/><text class="t-c t-b" x="570" y="32">Object store</text>
+  <rect class="box" x="710" y="10" width="130" height="34" rx="6"/><text class="t-c t-b" x="775" y="32">Metadata svc</text>
+  <path class="life" d="M90 44 L90 450"/><path class="life" d="M325 44 L325 450"/><path class="life" d="M570 44 L570 450"/><path class="life" d="M775 44 L775 450"/>
+  <text class="t-sm" x="96" y="72">1 chunk file, hash each chunk locally</text>
+  <path class="arrow" d="M90 96 L321 96"/><text class="t-sm" x="110" y="90">2 check(hashes)</text>
+  <path class="arrow-g" d="M321 124 L94 124"/><text class="t-sm" x="110" y="118">3 missing = [h2, h5]</text>
+  <path class="arrow" d="M90 160 L321 160"/><text class="t-sm" x="110" y="154">4 PUT h2, PUT h5 (in parallel)</text>
+  <path class="arrow" d="M325 190 L566 190"/><text class="t-sm" x="340" y="184">5 write (erasure coded)</text>
+  <path class="arrow-g" d="M566 218 L329 218"/><text class="t-sm" x="360" y="212">6 durable ack</text>
+  <path class="arrow-g" d="M321 246 L94 246"/><text class="t-sm" x="110" y="240">7 chunk acks</text>
+  <path class="arrow" d="M90 290 L771 290"/><text class="t-sm" x="110" y="284">8 commit(path, parent_rev, chunk list, idempotency key)</text>
+  <text class="t-sm" x="560" y="318">9 verify chunks exist, check parent_rev, then in ONE transaction:</text>
+  <text class="t-sm" x="560" y="336">insert version, bump latest_rev, append journal row</text>
+  <path class="arrow-g" d="M771 366 L94 366"/><text class="t-sm" x="110" y="360">10 {rev, cursor}</text>
+  <path class="arrow dash" d="M775 400 L775 430"/><text class="t-sm" x="560" y="425">11 publish "ns changed" to notifications</text>
+</svg>
+<figcaption>Bytes first (steps 2 to 7), metadata last (8 to 10). If the client dies between 7 and 8, the chunks are orphans that garbage collection reclaims; no user-visible state changed.</figcaption>
+</figure>
+<h3>8.2 Parallel and resumable</h3>
+<p>Chunks are independent, so the client uploads 4 to 8 in parallel over several connections, saturating the link far better than one TCP stream (a single stream's throughput is bounded by window size and round-trip time; see <a href="../chapters/03-networking-essentials.html">Chapter 3</a>). Each chunk is a separate small request, so a dropped connection costs at most one chunk. After reconnecting, the client simply repeats <code>check</code>: the server reports what it still lacks, and the upload continues. No server-side session state is required for normal files, because the hash makes everything idempotent.</p>
+<p>For very large files (tens of GB), the client keeps an <b>upload session</b> on the server recording the committed chunk offsets so a resumed client can ask "where was I", and so a half-finished 50 GB upload survives a laptop reboot. This is the same pattern as object-store multipart upload (<a href="../chapters/21-object-storage.html">Chapter 21</a>): parts are uploaded independently, then finalized by a single commit. Hashing a 50 GB file takes minutes of CPU, so the client hashes and uploads as a pipeline instead of hashing the whole file first.</p>
+<p>Bytes need not pass through our app servers. The block service can return a short-lived <b>pre-signed URL</b> per chunk so the client writes straight to the object store, or terminate the request at an edge proxy close to the user to cut round-trip time. Downloads go through a CDN where files are shared widely (<a href="../chapters/12-cdn.html">Chapter 12</a>), though most private file data has low reuse and is served directly.</p>
+<h3>8.3 Delta sync</h3>
+<p>Chunk-level dedup already is a coarse delta: only changed chunks move. A finer delta applies when a large file is edited in place (a 2 GB database dump with 30 KB changed). Within a 4 MB changed chunk, the client can use an rsync-style rolling checksum against the server's old version of that chunk to send just the changed byte ranges (a binary diff), and the server reconstructs the new chunk. This costs server CPU and requires the old chunk, so it is applied only to large chunks of files that change often, as an optimization on top of CDC. Compression (for compressible types) is applied before encryption and upload.</p>
+<h3>8.4 The sync protocol: journal, cursors and notifications</h3>
+<p>The other half is telling the other devices. The wrong design is polling "list everything" (millions of devices times a full tree scan). The right design is a <b>change journal with cursors</b>:</p>
+<ol>
+<li>Every namespace has an append-only journal with a monotonically increasing sequence number, written in the same transaction as the metadata change.</li>
+<li>A device remembers a <b>cursor</b> per namespace: the last sequence it has applied.</li>
+<li>When a device comes online or is told something changed, it calls <code>list_changes(ns, cursor)</code> and gets all journal entries after that sequence, in order, plus a new cursor. It applies them, downloads the missing chunks, and saves the cursor.</li>
+<li>To avoid polling, the device holds a <b>long-poll</b> request open to the notification service: "tell me if any of these (ns, cursor) pairs is stale". The server holds the request up to about 60 seconds and replies the moment a commit happens. The reply says only <i>which namespace</i> changed, not the details; the device then calls <code>list_changes</code>. (WebSocket or server-sent events work equally well; long-poll is simplest to run through corporate proxies. See <a href="../chapters/06-realtime.html">Chapter 6</a>.)</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 960 400" role="img" aria-label="Sequence of change propagation from device A to device B using journal and notification">
+  <rect class="ext" x="30" y="10" width="120" height="34" rx="6"/><text class="t-c t-b" x="90" y="32">Device A</text>
+  <rect class="box" x="270" y="10" width="140" height="34" rx="6"/><text class="t-c t-b" x="340" y="32">Metadata shard</text>
+  <rect class="cache" x="520" y="10" width="140" height="34" rx="6"/><text class="t-c t-b" x="590" y="32">Notify service</text>
+  <rect class="ext" x="780" y="10" width="120" height="34" rx="6"/><text class="t-c t-b" x="840" y="32">Device B</text>
+  <path class="life" d="M90 44 L90 380"/><path class="life" d="M340 44 L340 380"/><path class="life" d="M590 44 L590 380"/><path class="life" d="M840 44 L840 380"/>
+  <path class="arrow dash" d="M836 70 L594 70"/><text class="t-sm" x="640" y="64">0 B long-polls (ns, cursor=41)</text>
+  <path class="arrow" d="M90 110 L336 110"/><text class="t-sm" x="110" y="104">1 commit (becomes seq 42)</text>
+  <path class="arrow" d="M340 140 L586 140"/><text class="t-sm" x="360" y="134">2 publish ns changed (seq 42)</text>
+  <path class="arrow-g" d="M336 170 L94 170"/><text class="t-sm" x="120" y="164">3 ack to A</text>
+  <path class="arrow-g" d="M590 200 L844 200"/><text class="t-sm" x="640" y="194">4 reply: ns changed</text>
+  <path class="arrow" d="M840 240 L344 240"/><text class="t-sm" x="520" y="234">5 list_changes(ns, cursor=41)</text>
+  <path class="arrow-g" d="M344 270 L836 270"/><text class="t-sm" x="520" y="264">6 [seq 42: file X rev 7, chunks], cursor=42</text>
+  <path class="arrow" d="M840 310 L840 310"/><text class="t-sm" x="640" y="304">7 B downloads missing chunks, applies</text>
+  <path class="arrow dash" d="M836 350 L594 350"/><text class="t-sm" x="640" y="344">8 B long-polls again (cursor=42)</text>
+</svg>
+<figcaption>The notification is a hint, never the data. If it is lost, the next poll or reconnect still finds the change through the cursor, so the system is self-healing.</figcaption>
+</figure>
+<p>This design has useful properties. The journal is the single source of truth, so notifications can be best-effort. A device offline for a month sends its old cursor and catches up with one call (or, if the journal was compacted past that cursor, gets a "reset" response and does a full tree listing, then a new cursor). Delivery is at-least-once and applying a journal entry is idempotent (apply rev 7 of file X), which is the usual recipe from <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>. Clients also reconcile locally: a scan compares the local filesystem's files with the client's database (path, size, mtime, chunk hashes) and detects changes the filesystem watcher missed.</p>
+<p>The notification tier is stateless apart from the connection map. A pub-sub layer (Redis pub/sub or a Kafka topic, <a href="../chapters/34-queues-kafka.html">Chapter 34</a>) lets any metadata server publish "ns 8123 changed", and the notification servers holding a subscription for that namespace wake their waiting connections. Namespaces with many members (a shared folder of 10,000 employees) fan out to many connections, so large fan-out goes through batching and jittered re-fetch to avoid a thundering herd of <code>list_changes</code> calls.</p>
+
+<h2 id="metadata">9. Deep dive 3: the metadata service, the file tree and conflicts</h2>
+<h3>9.1 Sharded SQL and the commit transaction</h3>
+<p>Metadata uses relational shards because commits need a multi-row transaction: check that <code>parent_rev</code> equals the file's latest revision, insert the new version, update <code>latest_rev</code>, allocate the next journal sequence, and insert the journal row. All rows have the same <code>ns_id</code>, so all of this happens inside one shard in one local ACID transaction, with no distributed transaction (<a href="../chapters/31-distributed-transactions.html">Chapter 31</a> explains what that avoids).</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Metadata sharding by namespace id with routing and replicas">
+  <rect class="box" x="30" y="130" width="150" height="60" rx="8"/><text class="t-c t-b" x="105" y="156">Metadata svc</text><text class="t-c t-sm" x="105" y="174">stateless pods</text>
+  <rect class="cache" x="250" y="130" width="170" height="60" rx="8"/><text class="t-c t-b" x="335" y="156">Shard map</text><text class="t-c t-sm" x="335" y="174">ns_id to shard (cached)</text>
+  <rect class="db" x="520" y="20" width="170" height="60" rx="8"/><text class="t-c t-b" x="605" y="46">Shard 0001</text><text class="t-c t-sm" x="605" y="64">primary + 2 replicas</text>
+  <rect class="db" x="520" y="100" width="170" height="60" rx="8"/><text class="t-c t-b" x="605" y="126">Shard 0002</text><text class="t-c t-sm" x="605" y="144">ns 17, 91, 4020...</text>
+  <rect class="db" x="520" y="180" width="170" height="60" rx="8"/><text class="t-c t-b" x="605" y="206">Shard ...</text><text class="t-c t-sm" x="605" y="224">4096 logical shards</text>
+  <rect class="miss" x="520" y="260" width="170" height="50" rx="8"/><text class="t-c t-b" x="605" y="290">Hot shard: split</text>
+  <path class="arrow" d="M180 160 L246 160"/><path class="arrow" d="M420 150 L516 60"/><path class="arrow" d="M420 160 L516 130"/><path class="arrow" d="M420 175 L516 210"/>
+  <text class="t-sm" x="720" y="50">all rows of a namespace</text><text class="t-sm" x="720" y="66">live on one shard</text>
+  <text class="t-sm" x="720" y="140">256 physical clusters host</text><text class="t-sm" x="720" y="156">16 logical shards each</text>
+  <text class="t-sm" x="720" y="290">move logical shards, not rows</text>
+</svg>
+<figcaption>Requests map namespace id to a logical shard, and logical shards map to physical database clusters. Rebalancing moves whole logical shards between clusters without changing the hash.</figcaption>
+</figure>
+<p>Sharding by <code>ns_id</code> (not by user and not by file) is the central trade. Pros: a namespace's tree, versions and journal are co-located, so listing a folder, committing and reading changes are single-shard operations. Cons: one enormous namespace (a company's shared drive with 100 million files) becomes a hot shard that cannot be split by hash. Mitigations: give very large namespaces their own dedicated shard, tune per-namespace rate limits, and split such a namespace internally by top-level folder only as a last resort (and accept that cross-subtree moves then become cross-shard operations). Details on shard keys and rebalancing are in <a href="../chapters/25-sharding.html">Chapter 25</a>.</p>
+<p>Our scale: 150 TB of metadata over 256 physical clusters, each holding about 600 GB, is comfortable, and 175,000 peak QPS is about 700 per cluster, which is easy. Each cluster has one primary and two replicas (<a href="../chapters/24-replication.html">Chapter 24</a>). Reads that need the latest state (the commit check, <code>list_changes</code> right after a notification) go to the primary; pure browsing can read replicas, accepting a tiny staleness, and uses read-your-writes by pinning a session to the primary for a short time after its own write (<a href="../chapters/28-cap-consistency.html">Chapter 28</a>).</p>
+<p><b>Cross-namespace operations</b> are the awkward case. Moving a file from a private folder into a shared folder crosses two namespaces, possibly on two shards. Handle it as a copy-then-delete saga (<a href="../chapters/48-sagas.html">Chapter 48</a>): commit the new file in the destination (chunks are shared by hash, so no bytes are copied), then tombstone the source. The brief window where both exist is acceptable and the retry is idempotent.</p>
+<h3>9.2 Conflict detection</h3>
+<p>Two devices may edit the same file without seeing each other's change: laptop and phone both offline, or two collaborators on a shared folder. The server must not silently let one overwrite the other. The mechanism is <b>optimistic concurrency with a base revision</b>: each commit declares <code>parent_rev</code>, the revision it was based on. The server accepts the commit only if <code>parent_rev</code> equals the current <code>latest_rev</code> of that file. Otherwise some other commit landed first, and the second writer has a conflict.</p>
+<p>Why not use timestamps ("last write wins")? Device clocks disagree by seconds to minutes, and some are simply wrong (<a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>). LWW would pick a winner by a meaningless clock and destroy the loser's work. Revisions are ordered by the server, per file, inside the transaction, which is a total order we can trust. For whole-tree causality across devices, version vectors are overkill because the server is a single serialization point for each namespace; that central authority is why this is simpler than a peer-to-peer sync tool (<a href="../chapters/28-cap-consistency.html">Chapter 28</a> discusses when you do need vectors).</p>
+<h3>9.3 Conflict resolution: keep both</h3>
+<p>A file sync service cannot understand an arbitrary binary file well enough to merge it. The safe policy is: <b>the first commit wins the name, the second becomes a conflicted copy</b>. The server rejects the stale commit with <code>409</code>. The client then downloads the winning version, and uploads its own as a new file named for example <code>Report (Kiran's conflicted copy 2026-11-17).docx</code>, at the same location. Nothing is lost, and the human merges. For text and some structured formats, an application-level three-way merge using the common ancestor <code>parent_rev</code> could be attempted, but it is an optional enhancement because wrong merges are worse than visible conflicts.</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 300" role="img" aria-label="Timeline of a conflict between two devices editing the same file offline">
+  <text class="t-b" x="20" y="24">Server revisions of report.docx</text>
+  <rect class="db" x="30" y="40" width="110" height="40" rx="6"/><text class="t-c t-b" x="85" y="65">rev 5</text>
+  <rect class="db" x="400" y="40" width="130" height="40" rx="6"/><text class="t-c t-b" x="465" y="65">rev 6 (A)</text>
+  <path class="arrow" d="M140 60 L396 60"/>
+  <rect class="ext" x="30" y="110" width="250" height="40" rx="6"/><text class="t-c" x="155" y="135">Device A edits (base rev 5), online</text>
+  <path class="arrow-g" d="M280 130 L398 78"/><text class="t-sm" x="300" y="104">commit ok</text>
+  <rect class="ext" x="30" y="170" width="250" height="40" rx="6"/><text class="t-c" x="155" y="195">Device B edits (base rev 5), offline</text>
+  <path class="arrow dash" d="M280 190 L560 190"/><text class="t-sm" x="300" y="183">B reconnects later</text>
+  <rect class="miss" x="560" y="170" width="190" height="40" rx="6"/><text class="t-c" x="655" y="195">commit(parent=5): 409</text>
+  <rect class="hit" x="560" y="235" width="360" height="44" rx="6"/><text class="t-c" x="740" y="255">B uploads as "report (B's conflicted copy).docx"</text><text class="t-c t-sm" x="740" y="271">and downloads rev 6; both versions survive</text>
+  <path class="arrow-r" d="M655 210 L655 232"/>
+</svg>
+<figcaption>Both users' work survives. The server never has to decide which edit is "right".</figcaption>
+</figure>
+<table>
+<tr><th>Option</th><th>Behavior</th><th>Verdict</th></tr>
+<tr><td>Last write wins by timestamp</td><td>Later clock overwrites</td><td>Silent data loss, depends on clocks. Reject.</td></tr>
+<tr><td>Lock the file (check-out)</td><td>Only one editor at a time</td><td>Impossible offline; needs lock service (<a href="../chapters/30-coordination-locks.html">Chapter 30</a>). Optional for office docs.</td></tr>
+<tr><td>Automatic merge</td><td>3-way merge of content</td><td>Only for known text formats; risky for binary.</td></tr>
+<tr><td>Conflicted copy (chosen)</td><td>Both versions kept, user reconciles</td><td>Never loses data; some manual work.</td></tr>
+</table>
+<p>Other tree conflicts need rules too. <i>Edit versus delete</i>: if A deletes a file while B edits it, B's edit wins (resurrect the file with B's content) because data preserved beats data destroyed. <i>Rename versus edit</i> never conflicts because identity is the <code>file_id</code>. <i>Two files created with the same name</i>: the unique constraint on <code>(ns_id, parent_id, name)</code> rejects the second, which then gets a conflicted-copy name. <i>Move a folder into its own descendant</i> (A moves X into Y while B moves Y into X) would create a cycle: the commit transaction checks ancestry and rejects the second move.</p>
+
+<h2 id="sharing">10. Sharing, permissions and versioning</h2>
+<p><b>Sharing</b> maps onto namespaces. Sharing a folder converts that folder into its own namespace (if it is not already), then adds <code>mount</code> rows giving each member a path and role (viewer, editor, owner). Because the journal and commits belong to the namespace, collaborators sync the shared folder exactly as they sync their own files; nothing special exists on the sync path other than a permission check at the metadata service on every call. Permissions for nested sub-folders inherit from the namespace; an exception (a restricted sub-folder) is created by splitting it into its own namespace again. This avoids per-file ACL lookups on the hot path. The ACL service caches (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>) role lookups keyed by (user, ns), invalidated on membership changes, and revocation takes effect within seconds because notification connections are also closed for removed members.</p>
+<p><b>Link sharing</b> (anyone with the link) uses an unguessable random token (at least 128 bits) that maps to (ns, file, role, expiry, optional password). Links are served via the web/CDN path and are rate-limited and revocable.</p>
+<p><b>Versioning</b> falls out of the model. Each commit creates a new <code>file_version</code> row with its own chunk list; old versions remain until retention expires. Because versions share unchanged chunks by hash, keeping 100 versions of a 1 GB file that changes by 1% per edit costs about 2x, not 100x. Restore is just a new commit whose chunk list copies an old version's list (no bytes move). Deleting a file sets a tombstone and keeps its versions for the retention window (say 30 days free, 180 days paid) before their chunk references are released. Retention enforcement is a background job that decrements refcounts and feeds the chunk garbage collector.</p>
+
+<h2 id="clients">11. Offline clients and the many-small-files problem</h2>
+<p>The client is half the system. It keeps a <b>local database</b> (SQLite) mapping each path to the last synced revision, size, mtime and chunk hashes, and a pending-operations queue. A filesystem watcher (inotify, FSEvents, ReadDirectoryChangesW) produces events; because event delivery can drop under load, periodic full scans verify. Offline edits queue locally. On reconnect, the client first pulls remote changes (<code>list_changes</code>), then pushes local changes with their base revisions, so conflicts are detected exactly as in section 9 and resolved without losing anything. Moves detected as "delete plus create of the same content" are turned into a rename by matching hashes, avoiding a re-upload.</p>
+<p>Mobile uses <b>selective sync</b> and on-demand "smart" files: the tree is listed, but bytes are fetched only on open, and clients hold a bounded cache. Mobile also needs battery-aware behavior: no persistent long-poll connection; use the platform push service (APNs, FCM) to wake the app, which then calls <code>list_changes</code>. See <a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>.</p>
+<h3>11.1 Hot spots: large files and many small files</h3>
+<table>
+<tr><th>Case</th><th>Problem</th><th>Mitigation</th></tr>
+<tr><td>One 50 GB file</td><td>12,500 chunks; long upload; a single commit with a huge chunk list (500 KB of hashes)</td><td>Upload sessions with parallel parts and resume; chunk list stored as a compact blob keyed by version; hash-and-upload pipeline; larger chunks (16 MB) above a size threshold to cut list length to 3,000.</td></tr>
+<tr><td>A <code>node_modules</code> or photo folder with 200,000 tiny files</td><td>200,000 commits and 200,000 chunk checks; the per-request overhead dominates, and the journal and notification flood the other devices</td><td>Batch commit (up to 1,000 files per request, one transaction per namespace batch); bundle small files into a single packed object in the block store (a pack file of many small chunks with an index) so object-store requests are few; coalesce notifications (one "changed" signal per second per namespace).</td></tr>
+<tr><td>One viral shared file</td><td>Millions of downloads of the same chunks</td><td>CDN in front of block GET; cache chunk hot-set in the block service memory.</td></tr>
+<tr><td>A huge shared namespace</td><td>Single shard hot, long journal</td><td>Dedicated shard, per-namespace limits, journal compaction, paginated <code>list_folder</code> with cursor.</td></tr>
+<tr><td>Periodic sync storm (Monday 9 am)</td><td>Peak 3x with a thundering herd of reconnects</td><td>Jittered retry, admission control and backoff on the API gateway (<a href="../chapters/40-resilience.html">Chapter 40</a>).</td></tr>
+</table>
+<p>Small files are the more painful case in practice. Object stores charge per request and have a minimum efficient object size, and 100 B files at an average of 10 MB hide a long tail of tiny files. Packing small chunks into larger containers (a few tens of MB, with an in-memory index of offset and length), the way many production block stores do, turns millions of PUTs into thousands and lets the store use erasure coding efficiently.</p>
+
+<h2 id="scaling">12. Scaling, caching and cost</h2>
+<ul>
+<li><b>Block tier:</b> stateless, scale by adding nodes. 12,000 chunk writes per second at peak, 4 MB each, is about 48 GB/s; with 25 Gbit/s (about 3 GB/s) of usable NIC per node, we need about 16 nodes just for ingress, so provision about 50 for redundancy and headroom, and more for downloads. Place block services next to the object store region to keep bytes off the long haul.</li>
+<li><b>Chunk index:</b> a hash-keyed KV store (consistent hashing, <a href="../chapters/25-sharding.html">Chapter 25</a>). A Bloom filter in front of each node answers "definitely not stored" cheaply, so the common "new chunk" case avoids a disk lookup (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>).</li>
+<li><b>Metadata cache:</b> folder listings and ACLs cached in Redis (<a href="../chapters/15-redis.html">Chapter 15</a>) keyed by (ns, folder, journal seq); the sequence in the key makes invalidation implicit, since any change bumps the sequence. A cache stampede on a popular shared folder is avoided with request coalescing (<a href="../chapters/14-caching-failures.html">Chapter 14</a>).</li>
+<li><b>Tiering:</b> chunks untouched for 90 days move to cheaper cold storage classes (<a href="../chapters/21-object-storage.html">Chapter 21</a>). At 670 PB unique, if 70% is cold and the cold tier costs about a third as much, the saving is large. The catch is retrieval latency, which a "restoring from archive" state in the client hides.</li>
+<li><b>Cost drivers:</b> storage (about 1.2 EB raw) dominates; egress is second. Dedup (1.5x) and delta sync directly cut both. Erasure coding (1.4x) versus 3x replication saves about 1.6 bytes of storage per user byte, which at this scale is hundreds of petabytes.</li>
+</ul>
+<p>Worked bandwidth check: 93 Gbit/s average ingress at 1 PB per day. A single large region would need about 300 Gbit/s peak ingress, so spread across at least three regions with clients routed to the nearest by DNS or anycast (<a href="../chapters/04-dns.html">Chapter 4</a>).</p>
+
+<h2 id="failures">13. Failure modes and consistency decisions</h2>
+<table>
+<tr><th>Component</th><th>Failure</th><th>What happens and the mitigation</th></tr>
+<tr><td>Client dies mid-upload</td><td>Orphan chunks stored, no commit</td><td>No visible state changed. On restart, <code>check</code> finds the chunks present and the upload resumes. Unreferenced chunks are collected after the grace period.</td></tr>
+<tr><td>Object store node/zone down</td><td>Some shards of a stripe unavailable</td><td>Erasure coding reads from any 10 of 14 shards; repair in background. Writes need a quorum of shards; if not reached, return an error and the client retries.</td></tr>
+<tr><td>Block service slow</td><td>Uploads stall</td><td>Client retries with exponential backoff and jitter on another node; per-chunk idempotency makes it safe.</td></tr>
+<tr><td>Metadata primary fails</td><td>Writes to that shard blocked</td><td>Automated failover to a replica (<a href="../chapters/24-replication.html">Chapter 24</a>, <a href="../chapters/29-consensus.html">Chapter 29</a> for leader election). Use semi-synchronous replication so an acknowledged commit is on at least one replica; otherwise a lost commit's journal sequence could be reused and a device could miss a change. Clients retry commits with the idempotency key, so a commit that actually succeeded is not applied twice.</td></tr>
+<tr><td>Commit references a missing chunk</td><td>Corruption or race with GC</td><td>The commit transaction verifies chunks exist (and takes a reference) before inserting. GC honors a grace period and runs only against refcount zero plus a confirming mark phase.</td></tr>
+<tr><td>Notification lost or server crash</td><td>Device does not learn of change</td><td>Devices re-poll on reconnect and also on a slow heartbeat (for example every 10 minutes), and the cursor guarantees nothing is missed; the worst case is delayed sync, not wrong sync.</td></tr>
+<tr><td>Bit rot or wrong data</td><td>Chunk bytes corrupted</td><td>Chunk id is its hash: verify on read (client and server) and a background scrubber re-reads and checks. Rebuild from parity, or from other replicas.</td></tr>
+<tr><td>Journal gaps or compaction</td><td>Old cursor invalid</td><td>Return a reset error; the client re-lists the tree and starts a fresh cursor. Compaction keeps a minimum retention (for example 30 days) before this happens.</td></tr>
+<tr><td>Whole region lost</td><td>Data center failure</td><td>Chunks are stored across at least 3 zones with cross-region copies for hot data; metadata replicated asynchronously to a second region. Failover RPO is seconds for metadata (some recent commits may be lost: clients still hold them locally and re-commit, which the base-revision logic handles safely). See <a href="../chapters/41-ha-dr.html">Chapter 41</a> and <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>.</td></tr>
+</table>
+<p>The consistency summary: <b>strong</b> within a namespace for metadata (single primary per shard, serialized commits, journal in the same transaction); <b>immutable and content-addressed</b> for bytes, so there are no consistency problems on blocks; <b>eventual</b> for propagation to other devices, with a convergence bound of seconds. The commit is the linearization point. This matches the "choose per feature" advice of <a href="../chapters/28-cap-consistency.html">Chapter 28</a>: during a partition between regions we prefer consistency for writes to a namespace (route to its home region) and accept that remote readers see slightly old data.</p>
+
+<h2 id="security">14. Security, abuse and monitoring</h2>
+<ul>
+<li><b>Encryption:</b> TLS in transit; at rest each chunk is encrypted with a per-chunk or per-namespace data key, and data keys are wrapped by a master key held in a KMS (<a href="../chapters/55-security.html">Chapter 55</a>). Convergent encryption (key derived from content) preserves dedup but reveals whether a file is a known one; per-user keys give up cross-user dedup. This is a deliberate product decision. True end-to-end encryption means the server cannot chunk, dedup or preview, so it is out of scope.</li>
+<li><b>Authorization:</b> every block fetch checks that the caller can read a file that references that chunk (pre-signed URLs are scoped to a chunk and expire in minutes); knowing a hash must not be enough to download it.</li>
+<li><b>Abuse:</b> per-account quotas on storage and on request rate; malware scanning and known-bad-content hash matching run asynchronously after upload (the async workers), with sharing blocked for flagged files; link sharing is rate-limited to resist scraping and used as a bandwidth-abuse vector (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>).</li>
+<li><b>Monitoring and SLOs:</b> commit success rate 99.99%; p95 commit latency under 300 ms; p95 end-to-end propagation (commit to notification delivered) under 2 s for online devices; chunk durability checks (scrub error rate); GC backlog and refcount mismatch counters; notification connection counts; queue depth of the async workers. Alert on the sync-lag SLI, the time between a commit and the last online member of the namespace applying it, which is what users actually feel (<a href="../chapters/54-observability-slos.html">Chapter 54</a>).</li>
+</ul>
+
+<h2 id="evolution">15. Evolution, phasing and alternatives not chosen</h2>
+<h3>15.1 What to build first</h3>
+<ol>
+<li><b>MVP:</b> single region; fixed 4 MB chunks with hashing and dedup per user; object store for blocks; one SQL cluster with namespace-based schema and a journal; long-poll notifications; conflicted-copy resolution. This already supports resumable upload and efficient sync, and the namespace schema means it is shardable later without a rewrite.</li>
+<li><b>Scale-out:</b> shard the metadata by namespace, add the chunk-index KV, CDC chunking in the client, batch commits, notification fan-out tier.</li>
+<li><b>Maturity:</b> sharing and link sharing, versioning and retention, cold tiering, cross-user dedup with proof of possession, multi-region, delta sync for large files, pack files for small objects.</li>
+</ol>
+<h3>15.2 At 10x scale (5 billion users, 10 EB)</h3>
+<p>Metadata becomes about 1.5 PB; a two-level shard map (namespace to logical shard to cluster) already handles that, with more clusters. The chunk index grows to about 110 TB, still fine. Storage cost is the issue, so invest in better compression, cold tiers, and own hardware (the largest providers eventually build their own storage fleets to escape cloud object-store pricing). Notification fan-out hits 1 billion connections, which pushes toward cell-based architecture where each cell serves a subset of users end to end (<a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>) and toward hierarchical pub-sub.</p>
+<h3>15.3 Alternatives not chosen</h3>
+<ul>
+<li><b>One big key-value store for metadata:</b> scales easily, but loses multi-row transactions for commit and rename, and makes the tree-integrity rules (unique names, cycle checks) hard. Systems that do this (a NewSQL database or a KV store with a transaction layer) are valid, but sharded SQL is simpler to reason about for this shape of data.</li>
+<li><b>Whole-file storage with no chunking:</b> far simpler, fine for a small internal tool; fails on large files, resume and dedup.</li>
+<li><b>Peer-to-peer LAN sync</b> (devices on one office network exchange chunks directly): a real optimization of production services; it saves egress but adds a security and discovery surface. A good future item.</li>
+<li><b>CRDT-based merge</b> for documents: the right answer for collaborative documents, but a different product (see the <a href="c16-collaborative-editor.html">collaborative editor</a> case study).</li>
+<li><b>Polling instead of notifications:</b> trivial, but 100 M devices polling every 30 seconds is 3.3 M requests per second of pure waste. Long-poll plus cursors cuts that to near zero when nothing changes.</li>
+</ul>
+
+<h2 id="qa">16. Interview Q&amp;A</h2>
+<details><summary>Why chunk files instead of storing them whole, and how big should the chunks be?</summary>
+<p>Chunking gives you four things at once: you upload only changed pieces, an interrupted upload resumes from the last finished chunk, identical content across files and users is stored once through hash addressing, and large files can be transferred in parallel. Size is a tradeoff between metadata overhead and delta granularity. Very small chunks (64 KB) create trillions of index entries and request overhead; very large chunks (64 MB) make a tiny edit re-upload a lot. Around 4 MB average works well, with content-defined boundaries and 1 MB to 16 MB bounds. I would also not chunk files smaller than one chunk.</p></details>
+<details><summary>A user inserts a paragraph at the top of a large document. How much is re-uploaded?</summary>
+<p>With fixed-size chunks, every byte after the insertion shifts, so every chunk's hash changes and the whole file would be re-uploaded. With content-defined chunking, boundaries are set by a rolling hash over the local bytes, so only the chunk containing the insertion changes and the later boundaries re-synchronize to the same places. The client hashes its new chunks, asks the server which hashes are missing, and uploads only that one chunk plus the new commit with an updated chunk list. For a very large chunk you could also send a binary delta against the old chunk.</p></details>
+<details><summary>How do two devices stay in sync without polling the whole tree?</summary>
+<p>Each namespace has an ordered change journal, with a sequence number assigned inside the same transaction as the change. Each device stores a cursor, which is the last sequence it applied, and calls list_changes with that cursor to get only newer entries. To learn promptly that something changed, the device holds a long-poll or WebSocket to a notification service that is told by the metadata service on each commit. The notification only says which namespace changed, so losing it is harmless: the device will see the change on its next poll or reconnect. Cursors also let a device that was offline for weeks catch up with one call.</p></details>
+<details><summary>How do you detect and handle a conflict?</summary>
+<p>Every commit carries the revision the edit was based on, parent_rev. The metadata service, inside the commit transaction, compares it to the file's current latest revision. If they differ, another device committed first, so we reject with a conflict instead of overwriting. The client then keeps the winning version in place and uploads its own as a conflicted copy with a descriptive name, so no data is lost and the user merges. I avoid last-write-wins timestamps because device clocks are unreliable and would silently destroy edits. For edit versus delete I resurrect the edited file, since preserving data is safer.</p></details>
+<details><summary>Why shard metadata by namespace rather than by user or file id?</summary>
+<p>A commit must atomically check the base revision, insert the version, update the latest pointer and append to the journal, and a rename must update tree rows consistently. Putting everything for one namespace on one shard keeps these in a local ACID transaction, without distributed commit. Sharding by file id would scatter a folder across shards and make listing and moves multi-shard. Sharding by user breaks shared folders, which belong to several users. The namespace is the natural unit for sync, sharing and permissions. The cost is that a giant namespace can be a hot shard, which I handle with dedicated shards and per-namespace limits.</p></details>
+<details><summary>How does dedup work, and what are the security risks?</summary>
+<p>The chunk's SHA-256 hash is its key. The client sends hashes, the server replies which it lacks, and only those are uploaded, so identical content from any user is stored once with a reference count. The risk is that revealing a chunk exists leaks that someone stored that content, and a client who only knows the hash could claim the data. Mitigate with proof of possession (the server asks for a hash of a random byte range mixed with a nonce), scope dedup to a user or team for sensitive tiers, and authorize every block read through the files that reference it. Garbage collection of zero-reference chunks waits for a grace period to avoid racing with new uploads.</p></details>
+<details><summary>How do you make a 50 GB upload reliable?</summary>
+<p>Split it into chunks of several MB and upload many in parallel, each with its own retry. Because chunks are addressed by hash, a retry is idempotent, and after any disconnect the client asks the server what is missing and continues. An upload session on the server records progress so a restart of the client can resume. The client pipelines hashing and uploading rather than hashing the whole file first. Only after all chunks are durable does the client send a single commit with the chunk list, so a half-uploaded file is never visible. This mirrors multipart upload in object stores.</p></details>
+<details><summary>What if the notification service goes down entirely?</summary>
+<p>Sync becomes slower but not incorrect. The journal and cursors are the source of truth, and clients fall back to polling list_changes at a modest interval (with jitter to avoid a storm), so devices still converge, only in tens of seconds instead of a couple. The notification servers hold only soft state (the connection map), so they can be restarted or replaced at will, and clients reconnect with backoff. We alert on the sync-lag SLI. That is a strong reason to keep notifications as hints and never put data in them.</p></details>
+<details><summary>How would you support sharing a folder with 10,000 people?</summary>
+<p>The folder is its own namespace with one journal, so edits create one journal row regardless of members, and metadata cost does not multiply by member count. The notification fan-out does: one commit must wake up to 10,000 devices, then each calls list_changes. I batch and coalesce notifications, add random jitter before the follow-up fetch, and serve the journal read from a cache keyed by the sequence number so 10,000 identical requests are cheap. Chunk downloads of a popular file go through a CDN. The namespace gets its own dedicated shard and rate limits, because it is the likeliest hot spot.</p></details>
+<details><summary>How do you delete data safely, and implement versioning cheaply?</summary>
+<p>Each version is a chunk list, and chunks are shared by hash, so keeping many versions costs only the changed chunks. Deleting a file adds a tombstone and keeps its versions for the retention period. When a version expires, a background job decrements reference counts of its chunks. A chunk reaching zero is queued for garbage collection after a grace period, then confirmed by a mark phase that no version references it, and only then deleted from the object store. Slow and double-checked deletion is intentional: the cost of a leaked chunk is a few MB, but the cost of deleting a live chunk is a customer's lost file.</p></details>
+<details><summary>How would you handle end-to-end encryption if the product required it?</summary>
+<p>The client would encrypt chunks with keys the server never sees, so the server cannot chunk, hash for dedup, scan for malware, or generate previews. Chunking and hashing would move entirely to the client, and dedup would be limited to a single user's data (or use convergent encryption, accepting its leak that a known file is detectable). Sharing requires exchanging keys between users, typically by wrapping each namespace key with each member's public key, with rekeying on membership removal. Search, thumbnails, and server-side conflict merge are lost. It is a real product tradeoff, which is why I treat it as a separate tier rather than the default.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">17. Recap</h2>
+<ul>
+<li>Split the problem: immutable chunk bytes go to an erasure-coded object store; small, strongly consistent metadata goes to namespace-sharded SQL. Bytes flow around the metadata servers.</li>
+<li>Estimation drives choices: about 1 EB logical, 670 PB unique, 100 B files, 2,300 commits per second (7,000 peak), about 93 Gbit/s average ingress, 175,000 metadata QPS peak, 100 M notification connections.</li>
+<li>Content-defined chunking (about 4 MB) with hashing gives delta sync, dedup and resumable parallel upload; protect dedup with proof of possession and reference-counted, delayed garbage collection.</li>
+<li>Upload order is bytes first, commit last, so a file version never refers to missing chunks. Commits are idempotent and use a base revision for optimistic concurrency.</li>
+<li>Sync uses a per-namespace gap-free journal, per-device cursors, and long-poll notifications that are only hints; clients converge even if notifications are lost.</li>
+<li>Conflicts are detected by base revision and resolved by keeping both (conflicted copies); never trust timestamps.</li>
+<li>Sharing is namespaces plus mounts; versions are chunk lists; most hot spots (large files, many small files, huge shared folders) have specific mitigations: parallel sessions, batching, pack files, dedicated shards.</li>
+</ul></div>
+<p class="connects"><b>Connects to:</b> <a href="../chapters/01-interview-framework.html">Chapter 1</a> (framework), <a href="../chapters/02-estimation.html">Chapter 2</a> (estimation), <a href="../chapters/05-api-design.html">Chapter 5</a> (API design), <a href="../chapters/06-realtime.html">Chapter 6</a> (long-poll and push), <a href="../chapters/12-cdn.html">Chapter 12</a> (CDN), <a href="../chapters/21-object-storage.html">Chapter 21</a> (block store), <a href="../chapters/24-replication.html">Chapter 24</a> (replication), <a href="../chapters/25-sharding.html">Chapter 25</a> (sharding), <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a> (clocks and ordering), <a href="../chapters/28-cap-consistency.html">Chapter 28</a> (consistency), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotency), <a href="../chapters/33-gossip-merkle.html">Chapter 33</a> (Merkle trees), <a href="../chapters/55-security.html">Chapter 55</a> (security), <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a> (hashing). Related case study: <a href="c16-collaborative-editor.html">collaborative editor</a>.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

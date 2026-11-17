@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 26: Design a Stock Exchange | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="c26-stock-exchange">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 26 · Worked solutions</div>
+<h1>Design a Stock Exchange</h1>
+<p class="lead">We design the core of an electronic exchange: the order book, the matching engine, the sequencer that fixes one order of events, the market data feed that tells the world what happened, and the recovery story that rebuilds everything by replaying a log. This is the system design problem where the right answer is deliberately unlike a typical web service: one thread per order book, no database on the hot path, and every microsecond counted.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is "Design a stock exchange." That sentence hides several different systems: the matching core that pairs buyers and sellers, the brokerage front end that retail customers use, the clearing house that moves money and shares after the trade, and the market data distribution that vendors and trading firms consume. A strong candidate says which of these is in scope before drawing anything. We are designing the <b>exchange itself</b>: the part that accepts orders from member firms (brokers and trading firms), keeps an order book for each listed symbol, matches orders by strict rules, and publishes the result. We are not designing a retail brokerage app (that is a consumer of our API) and not the settlement system (we only hand it a trade record).</p>
+<p>Two ideas make this problem different from the other case studies and are worth stating at the start. First, <b>fairness is a hard requirement, not a nicety</b>: two orders must be processed in exactly the order the exchange received them, and every participant must see the same sequence of events. That pushes us to one authoritative order of events per symbol. Second, <b>latency is a product</b>: trading firms pay for being microseconds faster, so the design budgets time in microseconds and removes anything slow (disks on the critical path, locks, garbage collection, kernel network stack, even cross-thread queues with contention) from the hot path.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>What asset class and venue style?</td><td>Cash equities on a central limit order book (CLOB). The same core fits futures and options; we note differences where they matter (for example pro-rata matching in some futures markets).</td></tr>
+<tr><td>Who connects?</td><td>About 2,000 member firms and market data subscribers. Orders come over persistent binary sessions, not public HTTP.</td></tr>
+<tr><td>How many symbols?</td><td>About 5,000 listed instruments, very unevenly active: a few hundred account for most of the volume.</td></tr>
+<tr><td>Volume?</td><td>About 300 million order entry messages per day (new, cancel, replace) and about 15 million trades. Section 3 does the arithmetic.</td></tr>
+<tr><td>Matching rule?</td><td>Price-time priority (FIFO within a price level). Better price first; at the same price, earlier arrival first.</td></tr>
+<tr><td>Latency target?</td><td>Median inside-the-exchange latency (order in at the edge, acknowledgement out) in the tens of microseconds, with a very tight tail. We state p99 under 100 microseconds as the working goal and discuss what is realistic.</td></tr>
+<tr><td>Durability?</td><td>An acknowledged order or trade must never be lost, even if a machine dies the next microsecond. Recovery point objective (RPO) of zero for accepted orders.</td></tr>
+<tr><td>Availability?</td><td>Trading hours only (for example 09:30 to 16:00 plus pre and post sessions). Failover to a hot standby within seconds, and no duplicate or lost trades through a failover.</td></tr>
+<tr><td>Regions?</td><td>One primary data centre hosting the matching engines, a passive disaster recovery site in another metro area. Participants collocate (rent racks) next to the engine to cut network delay.</td></tr>
+<tr><td>Regulation?</td><td>Complete audit trail, retained for years, with timestamps from a synchronized clock. Circuit breakers on extreme price moves.</td></tr>
+</table>
+<div class="callout tip"><b>Interview tip</b> Say early: "The heart of the design is a deterministic state machine. A sequencer gives every input one global order, a single-threaded matching engine applies the inputs, and the output is a pure function of the input log. So replication, recovery, audit and even testing all reduce to replaying a log." Interviewers on this question are listening for determinism, single-writer, and replay.</div>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li><b>Place order.</b> A limit order (buy or sell up to a quantity at a limit price or better) and a market order (buy or sell at whatever the book offers now). Time-in-force options: <em>day</em> (rests until the close), <em>IOC</em> (immediate or cancel: take what is available, cancel the remainder) and <em>FOK</em> (fill or kill: execute completely or not at all).</li>
+<li><b>Cancel and replace.</b> A participant can cancel a resting order. A replace changes price or quantity. Following common exchange practice, lowering the quantity keeps queue position; changing the price or raising the quantity loses it and counts as a new order at the back of the queue.</li>
+<li><b>Match.</b> Pair an incoming order with resting orders on the opposite side, best price first and, within a price, oldest first. Each match produces a trade at the price of the resting order.</li>
+<li><b>Acknowledge.</b> Tell the sender, with an exchange-assigned order id, that the order was accepted, rejected, partially filled, fully filled or cancelled.</li>
+<li><b>Publish market data.</b> Stream every change of the order book and every trade to subscribers, with sequence numbers so they can detect loss. Provide snapshots so that a late joiner can catch up.</li>
+<li><b>Controls.</b> Reject orders that violate tick size, lot size, price bands, or a firm's pre-trade risk limits. Halt a symbol (circuit breaker) when the price moves too far too fast. Prevent a firm from trading with itself (self-trade prevention).</li>
+<li><b>Drop copy and clearing feed.</b> Send each trade to the clearing house and to the participants' risk systems.</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Determinism and fairness.</b> The same input sequence always produces the same output, and orders are processed strictly in arrival order. No participant can jump the queue by connecting through a faster gateway than another.</li>
+<li><b>Low and predictable latency.</b> Mean matters less than the tail. A stall of one millisecond once an hour is worse than a steady 30 microseconds.</li>
+<li><b>Durability and consistency.</b> No acknowledged order or trade is lost or duplicated. Every subscriber sees the same events in the same order.</li>
+<li><b>High availability with fast failover.</b> A hot standby takes over in seconds from the exact same state.</li>
+<li><b>Auditability.</b> Reconstruct the state of any book at any past instant from the stored log.</li>
+<li><b>Throughput.</b> Sustain the opening and closing auction bursts, around 20 times the average rate.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>We do not design the broker-side order management, the clearing and settlement network (the legal movement of cash and shares one or two days later), the listing and corporate actions process, or the surveillance analytics that look for manipulation. We touch the edges where they receive our feeds. We also leave out options-specific and futures-specific mechanics such as implied (spread) matching, mentioning them only in the evolution section.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>An exchange is sized by three streams: inbound order messages, the events the engine produces from them, and the market data that fans those events out to thousands of subscribers. Estimation technique is covered in <a href="../chapters/02-estimation.html">Chapter 2</a>. The numbers here are deliberately modest compared with a web-scale system; the difficulty is latency, not volume.</p>
+<h3>3.1 Order flow</h3>
+<p>Assume 300 million inbound messages per day: roughly 100 million new orders, 150 million cancels and 50 million replaces. That ratio is realistic because market makers continuously update quotes by cancelling and re-placing them, so the messages-to-trade ratio is high. Trades are about 15 million per day, so about 20 inbound messages per trade.</p>
+<p>The regular session is 6.5 hours, which is 6.5 x 3,600 = 23,400 seconds. Average rate: 300,000,000 / 23,400 = about <b>12,800 messages per second</b>. Traffic is far from flat. The opening and closing auctions and news events compress activity, so we plan for a peak of about 20 times average: 12,800 x 20 = about <b>250,000 messages per second</b> across all symbols. The busiest single symbol might see 5 percent of that at peak: 250,000 x 0.05 = about 12,500 per second. Remember this number: it is tiny for one modern CPU core.</p>
+<div class="callout key"><b>Key idea</b> A matching step (look up the price level, walk the queue, update a few fields, emit events) costs on the order of one microsecond when everything is in memory and in cache. One thread can therefore process roughly a million orders per second. Our whole peak of 250,000 per second would use a quarter of a single core. We still partition across machines, but for isolation, blast radius and growth, not because one engine could not keep up. This shapes everything: we do not need distributed consensus on the hot path for throughput, only for durability.</div>
+<h3>3.2 Journal (input log) volume</h3>
+<p>The only thing we must persist to rebuild everything is the sequence of inputs. An input message is about 64 bytes (message type, symbol id, side, integer price, quantity, participant id, client order id, timestamps). Daily journal: 300,000,000 x 64 B = 19.2 GB per day. Over 252 trading days: 19.2 GB x 252 = about <b>4.8 TB per year</b>. That is small enough to keep on ordinary SSDs and then archive. The engine outputs (acknowledgements, fills, book updates) are a deterministic function of the inputs, so we do not need to store them in the journal, although we archive them separately for audit convenience.</p>
+<h3>3.3 Market data</h3>
+<p>Every accepted add, cancel, replace and trade changes the book or the tape, so we produce about one market data message per inbound message plus the trades: 300 million + 15 million, about 315 million, which we round to 320 million per day. At about 40 bytes per message that is 320,000,000 x 40 B = 12.8 GB per day, or 12.8 GB x 252 = about 3.2 TB per year. At peak, 250,000 messages per second x 40 B = 10 MB per second, which is 80 megabits per second per full-depth feed. That is a small stream per subscriber. The problem is the multiplier: if 2,000 subscribers each received their own copy over unicast, the exchange would have to send 2,000 x 10 MB/s = 20 GB/s, which is 160 gigabits per second. So we use multicast (one copy, replicated by network switches) as section 11 explains.</p>
+<h3>3.4 Memory</h3>
+<p>At any moment suppose 10,000 orders rest per symbol on average, so 5,000 x 10,000 = 50 million resting orders. At about 64 bytes per order record, that is 50,000,000 x 64 B = 3.2 GB. A hash index from order id to order record adds roughly 16 B per entry: 0.8 GB. Total working set is about 4 GB for the entire exchange, partitioned across engines into a few hundred megabytes each. It fits in RAM, and the hot part (the top few price levels of active symbols) fits in a CPU cache. The whole book lives in memory and the disk is only a log.</p>
+<h3>3.5 Replay time</h3>
+<p>If recovery replays the whole day's journal at 1 million events per second (a conservative rate since replay skips network and disk work), 300 million events take 300 seconds, five minutes. With a snapshot of engine state every 5 minutes, recovery is a snapshot load plus at most five minutes of journal: 5 x 60 x 12,800 = about 3.8 million events on average, which replays in under 4 seconds at 1 million per second. This is the number that justifies "recovery by replay".</p>
+<h3>3.6 Summary table</h3>
+<table>
+<tr><th>Quantity</th><th>Value</th><th>Where it matters</th></tr>
+<tr><td>Inbound messages</td><td>300 M per day; 12,800 per second average; 250,000 per second peak</td><td>sequencer and engine capacity; gateways</td></tr>
+<tr><td>Trades</td><td>15 M per day</td><td>clearing feed; drop copy</td></tr>
+<tr><td>Busiest symbol at peak</td><td>about 12,500 per second</td><td>the unit one engine thread must handle</td></tr>
+<tr><td>Journal</td><td>19.2 GB per day; about 4.8 TB per year</td><td>sequential write only; archive tier</td></tr>
+<tr><td>Market data</td><td>12.8 GB per day; 10 MB/s (80 Mbps) per feed at peak</td><td>multicast required; unicast would be 160 Gbps</td></tr>
+<tr><td>Order book memory</td><td>about 4 GB total</td><td>everything fits in RAM</td></tr>
+<tr><td>Replay</td><td>full day 300 s; snapshot plus tail under 4 s</td><td>recovery time objective</td></tr>
+<tr><td>Latency budget</td><td>about 30 microseconds median, wire to wire</td><td>section 9.4</td></tr>
+</table>
+
+<h2 id="api">4. API design</h2>
+<p>Participants do not call REST endpoints. They hold a long-lived session to an order gateway using a compact binary protocol (the industry uses FIX for broad compatibility and exchange-specific binary protocols such as OUCH or BOE-style formats for speed; see <a href="../chapters/07-serialization.html">Chapter 7</a> for the cost of text versus binary encodings, and <a href="../chapters/03-networking-essentials.html">Chapter 3</a> for TCP behaviour). A TCP session gives ordered, reliable delivery of each participant's messages, and a session-level sequence number lets either side detect a gap after a reconnect. The message set is small.</p>
+<pre><code>// Participant -> exchange (order entry session, TCP, binary)
+Logon(participant_id, credentials, next_expected_seq)
+NewOrder(cl_ord_id, symbol, side, type, price_int, qty, tif, account, flags)
+CancelOrder(cl_ord_id, orig_cl_ord_id)
+ReplaceOrder(cl_ord_id, orig_cl_ord_id, new_price_int, new_qty)
+MassCancel(participant_id, [symbol])        // kill switch for a firm
+Heartbeat / Logout
+
+// Exchange -> participant (same session)
+Accepted(cl_ord_id, order_id, exchange_ts, seq)
+Rejected(cl_ord_id, reason_code)
+Executed(order_id, trade_id, fill_price_int, fill_qty, leaves_qty, liquidity_flag, exchange_ts)
+Cancelled(order_id, reason)     // user cancel, IOC remainder, self-trade prevention, halt
+Replaced(order_id, new_price_int, new_qty)
+
+// Exchange -> everyone (market data, UDP multicast, binary)
+AddOrder(seq, symbol, order_id, side, price_int, qty)
+DeleteOrder(seq, order_id)  ModifyOrder(seq, order_id, qty)  Execute(seq, order_id, qty, trade_id)
+Trade(seq, symbol, price_int, qty, trade_id)    Halt(seq, symbol, state)
+Snapshot(symbol, last_seq, [levels or orders])     // over a separate TCP/UDP recovery channel</code></pre>
+<p>Notes on the choices. <b>Prices are integers</b> (price in ticks or in units of a fixed fraction such as 1/10,000 of a currency unit), never floating point, because binary floating point cannot represent 0.10 exactly and comparisons at price boundaries must be exact. <b>The client order id</b> (<code>cl_ord_id</code>) is chosen by the participant and must be unique per session per day. It is the idempotency key: if the participant resends an order after a disconnect, the gateway recognizes the id and returns the original outcome instead of creating a second order (see <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>). The <b>exchange order id</b> is assigned inside the engine and is the key everything downstream uses. <b>Every outbound message carries a sequence number</b>, per session on order entry and per channel on market data. The <b>liquidity flag</b> on a fill says whether the order added or removed liquidity, which drives maker-taker fees.</p>
+
+<h2 id="data-model">5. Data model and storage choice</h2>
+<p>Unusually, the "database" of this system is a data structure in memory plus an append-only file. There is no relational store on the order path, and this is a decision to defend, not an omission. A database commit costs hundreds of microseconds to milliseconds even on fast disks, locks add contention, and the engine would spend its time in the storage layer instead of matching. We use the log-plus-state-machine pattern from <a href="../chapters/36-event-driven.html">Chapter 36</a> (event sourcing) and the write-ahead-log idea from <a href="../chapters/19-storage-engines.html">Chapter 19</a>.</p>
+<table>
+<tr><th>Data</th><th>Where it lives</th><th>Why</th></tr>
+<tr><td>Order book (per symbol)</td><td>RAM in the matching engine process</td><td>It is derived state. Any copy can be rebuilt from the journal.</td></tr>
+<tr><td>Input journal</td><td>Append-only files on local NVMe, replicated to the standby over the network; archived to object storage after the close</td><td>The single source of truth. Sequential appends are the fastest possible disk access.</td></tr>
+<tr><td>Snapshots</td><td>Periodic binary dump of all books plus the journal position</td><td>Bounds recovery time (section 10).</td></tr>
+<tr><td>Market data archive</td><td>Append-only files, later columnar tables in a warehouse</td><td>Historical data sales, analytics, regulator queries (<a href="../chapters/23-other-stores.html">Chapter 23</a>).</td></tr>
+<tr><td>Reference data (symbols, tick sizes, price bands, trading calendar)</td><td>A small relational database, loaded into engine memory at start of day</td><td>Changes rarely, needs transactions and an audit trail, never read on the hot path.</td></tr>
+<tr><td>Trade history and clearing records</td><td>Relational database fed from the trade stream</td><td>Downstream consumers need queries and reconciliation, not microsecond access.</td></tr>
+</table>
+<h3>5.1 The order record</h3>
+<p>The engine's in-memory order is a compact, fixed-size struct: <code>order_id</code> (8 B), <code>participant_id</code> (4 B), <code>side</code> and flags (1 B), <code>price</code> (8 B integer), <code>remaining_qty</code> (4 to 8 B), <code>original_qty</code>, <code>arrival_seq</code> (8 B, the sequencer's number, which is also the time priority), and the intrusive <code>prev</code> and <code>next</code> pointers or indices that link it into its price level's queue. Using indices into a pre-allocated array instead of heap pointers avoids garbage collection, avoids allocation on the hot path, and keeps neighbouring orders close together in memory.</p>
+<h3>5.2 The book</h3>
+<p>Each side of each symbol is a set of <em>price levels</em>. A price level is a FIFO queue of orders at that price plus a running total quantity. The bids are ordered from highest price down; the asks from lowest price up. The best bid and best ask are the "top of book", and their difference is the spread. We discuss the exact structure in section 8.</p>
+<div class="callout key"><b>Key idea</b> Because the book is derived state, correctness lives in the log. If the log is complete and ordered, the engine's memory is disposable: a crashed engine is replaced by loading a snapshot and replaying the tail. This is why we can keep the book in plain RAM without any fear of losing it.</div>
+
+<h2 id="simple-design">6. A first simple design, then the real one</h2>
+<h3>6.1 The naive design</h3>
+<p>The first design a candidate thinks of is a web-style service: participants send HTTPS requests to a load-balanced pool of stateless order servers, which read and write orders in a relational database, and a matching job queries "best opposite orders" with SQL inside a transaction. It would work for a toy and fails for an exchange for four reasons.</p>
+<ul>
+<li><b>No global order.</b> With many order servers and no single sequencer, "who arrived first" is decided by clock skew and network luck. That is unfair and unauditable.</li>
+<li><b>Locks and contention.</b> The best bid of a popular symbol is one row that every transaction wants to modify. Row locks serialize them anyway, but with large overhead (<a href="../chapters/18-relational-internals.html">Chapter 18</a>).</li>
+<li><b>Latency.</b> Each order costs several network round trips and a durable commit: milliseconds, three orders of magnitude over the target.</li>
+<li><b>Non-determinism.</b> The result depends on thread timing and query plans, so the outcome cannot be reproduced for an audit or a dispute.</li>
+</ul>
+<p>The lesson: matching is an inherently <em>sequential</em> problem per symbol. Parallelism comes from partitioning by symbol, not from concurrency within a book. The single-threaded loop that processes an ordered stream is faster than any lock-based parallel design because it never waits.</p>
+<h3>6.2 The real design</h3>
+<p>The scaled design is a pipeline of small, specialized components joined by ordered streams:</p>
+<ol>
+<li><b>Order gateways</b> terminate participant sessions, authenticate, validate syntax, apply pre-trade risk checks (fat-finger limits, credit limits), and translate to the internal binary format.</li>
+<li>The <b>sequencer</b> stamps each accepted inbound message with a monotonically increasing sequence number and a timestamp, and appends it to the journal. This is the moment of truth: the sequence number is the official arrival order.</li>
+<li>The <b>matching engine</b> consumes the sequenced stream and applies each message to the in-memory books in order, single-threaded, and emits output events (acks, fills, book updates, trades).</li>
+<li>A <b>hot standby</b> engine receives the same sequenced stream and applies it too, so its state is identical at all times. A third copy at the disaster recovery site applies it asynchronously.</li>
+<li>The <b>market data publisher</b> turns book events into multicast packets. <b>Drop copy and clearing</b> feeds receive trades.</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="High level architecture of the exchange">
+  <rect class="ext" x="20" y="130" width="130" height="90" rx="8"/><text class="t-c t-b" x="85" y="170">Participants</text><text class="t-c t-sm" x="85" y="190">brokers, HFT firms</text>
+  <rect class="box" x="190" y="90" width="150" height="170" rx="8"/><text class="t-c t-b" x="265" y="150">Order gateways</text><text class="t-c t-sm" x="265" y="172">session, auth</text><text class="t-c t-sm" x="265" y="190">pre-trade risk</text><text class="t-c t-sm" x="265" y="208">idempotency check</text>
+  <rect class="cache" x="380" y="90" width="130" height="170" rx="8"/><text class="t-c t-b" x="445" y="150">Sequencer</text><text class="t-c t-sm" x="445" y="172">assigns seq number</text><text class="t-c t-sm" x="445" y="190">appends to journal</text><text class="t-c t-sm" x="445" y="208">replicates stream</text>
+  <rect class="box" x="560" y="40" width="150" height="90" rx="8"/><text class="t-c t-b" x="635" y="76">Matching engine</text><text class="t-c t-sm" x="635" y="96">primary, in-memory</text><text class="t-c t-sm" x="635" y="114">books, 1 thread each</text>
+  <rect class="db" x="560" y="160" width="150" height="80" rx="8"/><text class="t-c t-b" x="635" y="194">Hot standby</text><text class="t-c t-sm" x="635" y="214">same stream, same state</text>
+  <rect class="db" x="380" y="310" width="130" height="64" rx="8"/><text class="t-c t-b" x="445" y="338">Journal</text><text class="t-c t-sm" x="445" y="358">append-only, NVMe</text>
+  <rect class="db" x="560" y="310" width="150" height="64" rx="8"/><text class="t-c t-b" x="635" y="338">DR site replica</text><text class="t-c t-sm" x="635" y="358">async, another metro</text>
+  <rect class="box" x="760" y="40" width="120" height="90" rx="8"/><text class="t-c t-b" x="820" y="76">Market data</text><text class="t-c t-b" x="820" y="94">publisher</text><text class="t-c t-sm" x="820" y="114">multicast A and B</text>
+  <rect class="ext" x="760" y="160" width="120" height="80" rx="8"/><text class="t-c t-b" x="820" y="194">Clearing and</text><text class="t-c t-b" x="820" y="212">drop copy</text>
+  <path class="arrow" d="M150 175 L186 175"/><path class="arrow" d="M340 175 L376 175"/>
+  <path class="arrow" d="M510 125 L556 90"/><path class="arrow" d="M510 205 L556 200"/>
+  <path class="arrow" d="M445 260 L445 306"/>
+  <path class="arrow dash" d="M510 240 C530 290 540 320 556 335"/>
+  <path class="arrow" d="M710 85 L756 85"/><path class="arrow" d="M710 110 L756 190"/>
+  <path class="arrow-g dash" d="M560 60 C400 20 250 20 190 100"/><text class="t-sm" x="300" y="34">acks and fills back to the sender via the gateway</text>
+</svg>
+<figcaption>All inbound traffic is funnelled through the sequencer, which fixes one order. The primary engine and its hot standby consume the identical ordered stream; the journal is the durable record. Outputs go to the market data publisher, clearing, and, as acks and fills, back through the gateway to the sender.</figcaption>
+</figure>
+
+<h2 id="flow">7. Request flow: the life of an order</h2>
+<p>Follow one limit order, "buy 300 shares of ACME at 100.01", through the system.</p>
+<ol>
+<li><b>Arrive.</b> The participant's session sends <code>NewOrder</code>. The gateway checks the session sequence number, authenticates (session credentials were verified at logon), and looks up the <code>cl_ord_id</code> in its small per-session table to catch a duplicate resend.</li>
+<li><b>Validate and risk-check.</b> The gateway checks tick size, lot size, price band around the reference price, order size against the firm's per-order limit, and the firm's remaining credit or position limit. Rejected orders get a <code>Rejected</code> reply here and never reach the sequencer, which keeps the core stream clean. These checks must be fast (counters in memory, a few hundred nanoseconds), which is why risk limits are updated incrementally by the gateway itself rather than queried from a database.</li>
+<li><b>Sequence.</b> The sequencer takes the validated message, assigns the next sequence number (say 9,000,001) and a timestamp from a hardware-synchronized clock, and writes it to the journal and to the replication stream.</li>
+<li><b>Replicate.</b> The sequenced message is sent to the primary engine, the hot standby and the journal writer. We acknowledge to the engine only once the message is durable under our policy (section 10.3).</li>
+<li><b>Match.</b> The engine finds the symbol's book, sees that the best ask is 100.01 with 100 + 400 + 100 shares queued, and matches: 100 against order D (fully filled, removed), then 200 against E (E has 200 left). The buy order is fully filled (300 = 100 + 200). Each match produces an <code>Execute</code> event at the resting order's price, 100.01.</li>
+<li><b>Output.</b> The engine emits, in this order: the <code>Accepted</code> for the new order, two executions (one per counterparty side), and market data events (delete D, modify E, trade). All carry the input's sequence number as their cause.</li>
+<li><b>Deliver.</b> The gateway routes acks and fills to the owning sessions. The publisher batches the market data events into multicast packets. The clearing feed gets the trade. The participant sees its fill typically tens of microseconds after sending.</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 900 410" role="img" aria-label="Sequence diagram of one order">
+  <rect class="ext" x="20" y="16" width="110" height="32" rx="8"/><text class="t-c t-b" x="75" y="37">Participant</text>
+  <rect class="box" x="200" y="16" width="110" height="32" rx="8"/><text class="t-c t-b" x="255" y="37">Gateway</text>
+  <rect class="cache" x="380" y="16" width="110" height="32" rx="8"/><text class="t-c t-b" x="435" y="37">Sequencer</text>
+  <rect class="box" x="560" y="16" width="110" height="32" rx="8"/><text class="t-c t-b" x="615" y="37">Engine</text>
+  <rect class="db" x="740" y="16" width="130" height="32" rx="8"/><text class="t-c t-b" x="805" y="37">Mkt data + standby</text>
+  <line class="life" x1="75" y1="48" x2="75" y2="400"/><line class="life" x1="255" y1="48" x2="255" y2="400"/><line class="life" x1="435" y1="48" x2="435" y2="400"/><line class="life" x1="615" y1="48" x2="615" y2="400"/><line class="life" x1="805" y1="48" x2="805" y2="400"/>
+  <path class="arrow" d="M75 84 L251 84"/><text class="t-sm" x="86" y="78">1. NewOrder (buy 300 @ 100.01)</text>
+  <rect class="hit" x="195" y="104" width="120" height="30" rx="6"/><text class="t-c t-sm" x="255" y="123">2. validate, risk</text>
+  <path class="arrow" d="M255 160 L431 160"/><text class="t-sm" x="268" y="154">3. validated order</text>
+  <rect class="hit" x="365" y="178" width="140" height="30" rx="6"/><text class="t-c t-sm" x="435" y="197">4. seq 9000001, log</text>
+  <path class="arrow" d="M435 234 L611 234"/><path class="arrow dash" d="M435 246 L801 246"/><text class="t-sm" x="448" y="228">5. sequenced stream</text>
+  <rect class="hit" x="545" y="262" width="140" height="30" rx="6"/><text class="t-c t-sm" x="615" y="281">6. match, 2 fills</text>
+  <path class="arrow-g" d="M611 318 L259 318"/><text class="t-sm" x="300" y="312">7. Accepted, Executed</text>
+  <path class="arrow-g" d="M255 344 L79 344"/><text class="t-sm" x="95" y="338">8. fills to the sender</text>
+  <path class="arrow-g dash" d="M619 370 L801 370"/><text class="t-sm" x="640" y="364">9. book events, trade</text>
+  <text class="t-sm" x="95" y="394">steps 1 to 8 are about 30 microseconds in the target design</text>
+</svg>
+<figcaption>Order lifecycle. Validation happens before sequencing so that rejected orders never consume a sequence number. The engine's outputs go back through the gateway to the sender and, in parallel, to the market data publisher and the standby.</figcaption>
+</figure>
+<p>Cancel flow is simpler and, critically, must be at least as fast as new order flow: a market maker that cannot cancel quickly is exposed to loss. The gateway forwards <code>Cancel</code> through the sequencer like any other input. The engine looks up the order id in its hash index, unlinks it from its price level in constant time (that is why the level queue is a doubly linked list), and emits <code>Cancelled</code> and a market data delete. If the order has already been fully filled by an earlier-sequenced message, the cancel is rejected as "too late to cancel". The sequence number decides, with no ambiguity, who won the race between a cancel and a fill.</p>
+
+<h2 id="matching">8. Deep dive 1: the order book and matching rules</h2>
+<h3>8.1 The structure</h3>
+<p>An order book must support four operations quickly: add an order at a price (usually near the top of the book), remove the best order (matching), cancel an arbitrary order by id, and read the best price. The standard solution is a pair of structures per side.</p>
+<ul>
+<li>A <b>price-ordered index</b> of active levels. For an equity with a small number of distinct active prices, a plain array indexed by price tick (offset from a reference price) gives O(1) access for prices near the market, with a fallback ordered tree or skip list for far-away prices (<a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>). A balanced tree alone gives O(log P), where P is the number of levels; in practice P is a few dozen near the touch, so the cost is a handful of cache misses.</li>
+<li>Per level, a <b>doubly linked FIFO queue</b> of orders with a cached total quantity. Append at the tail is O(1), and cancel by id is O(1) because the order knows its neighbours.</li>
+<li>A <b>hash map from order id to order record</b> for cancels and replaces.</li>
+<li>Cached <b>best bid and best ask pointers</b>, updated when a level empties or a better level appears.</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 900 380" role="img" aria-label="Order book with price levels and FIFO queues">
+  <text class="t-b" x="30" y="28">Asks (sellers): lowest price is best</text>
+  <rect class="miss" x="30" y="44" width="90" height="36" rx="6"/><text class="t-c t-b" x="75" y="67">100.03</text>
+  <rect class="box" x="140" y="44" width="90" height="36" rx="6"/><text class="t-c t-sm" x="185" y="67">A  300</text>
+  <rect class="box" x="240" y="44" width="90" height="36" rx="6"/><text class="t-c t-sm" x="285" y="67">B  200</text>
+  <rect class="miss" x="30" y="90" width="90" height="36" rx="6"/><text class="t-c t-b" x="75" y="113">100.02</text>
+  <rect class="box" x="140" y="90" width="90" height="36" rx="6"/><text class="t-c t-sm" x="185" y="113">C  500</text>
+  <rect class="miss" x="30" y="136" width="90" height="36" rx="6"/><text class="t-c t-b" x="75" y="159">100.01</text>
+  <rect class="box" x="140" y="136" width="90" height="36" rx="6"/><text class="t-c t-sm" x="185" y="159">D  100</text>
+  <rect class="box" x="240" y="136" width="90" height="36" rx="6"/><text class="t-c t-sm" x="285" y="159">E  400</text>
+  <rect class="box" x="340" y="136" width="90" height="36" rx="6"/><text class="t-c t-sm" x="385" y="159">F  100</text>
+  <line x1="30" y1="190" x2="480" y2="190" stroke="var(--fg)" stroke-dasharray="5 4"/><text class="t-sm" x="30" y="206">spread = 100.01 - 100.00 = 1 tick</text>
+  <text class="t-b" x="30" y="236">Bids (buyers): highest price is best</text>
+  <rect class="hit" x="30" y="248" width="90" height="36" rx="6"/><text class="t-c t-b" x="75" y="271">100.00</text>
+  <rect class="box" x="140" y="248" width="90" height="36" rx="6"/><text class="t-c t-sm" x="185" y="271">G  200</text>
+  <rect class="box" x="240" y="248" width="90" height="36" rx="6"/><text class="t-c t-sm" x="285" y="271">H  300</text>
+  <rect class="hit" x="30" y="294" width="90" height="36" rx="6"/><text class="t-c t-b" x="75" y="317">99.99</text>
+  <rect class="box" x="140" y="294" width="90" height="36" rx="6"/><text class="t-c t-sm" x="185" y="317">I  800</text>
+  <rect class="hit" x="30" y="340" width="90" height="30" rx="6"/><text class="t-c t-b" x="75" y="360">99.98</text>
+  <text class="t-sm" x="140" y="360">... deeper levels</text>
+  <rect class="cache" x="540" y="44" width="330" height="150" rx="8"/>
+  <text class="t-b" x="556" y="68">Incoming: BUY 350 limit 100.01</text>
+  <text class="t-sm" x="556" y="92">1. best ask 100.01 is within the limit, so match</text>
+  <text class="t-sm" x="556" y="112">2. D (oldest) fills 100 and leaves the book</text>
+  <text class="t-sm" x="556" y="132">3. E fills 250 and keeps 150 at the head</text>
+  <text class="t-sm" x="556" y="152">4. the buy is fully filled, nothing rests</text>
+  <text class="t-sm" x="556" y="172">trades print at 100.01, the resting price</text>
+  <rect class="db" x="540" y="214" width="330" height="156" rx="8"/>
+  <text class="t-b" x="556" y="238">Per side data structures</text>
+  <text class="t-sm" x="556" y="262">levels: array by tick near the touch + tree far away</text>
+  <text class="t-sm" x="556" y="282">level: doubly linked FIFO queue + total qty</text>
+  <text class="t-sm" x="556" y="302">order id -> order record (hash map)</text>
+  <text class="t-sm" x="556" y="322">best bid / best ask cached pointers</text>
+  <text class="t-sm" x="556" y="342">all records pre-allocated, no GC, no malloc</text>
+</svg>
+<figcaption>A book for one symbol. Each row is a price level holding a FIFO queue; the leftmost order in a row is the oldest and is matched first. The example shows an incoming buy that sweeps the best ask level in time order, partly filling E.</figcaption>
+</figure>
+<h3>8.2 The matching algorithm</h3>
+<p>For an incoming order, the engine runs this loop. If it is a buy, compare against the lowest ask; while the order has remaining quantity and the best ask price is at or below the buy's limit (or the order is a market order), take the oldest order at that level, trade <code>min(incoming_remaining, resting_remaining)</code> at the <b>resting order's price</b>, reduce both quantities, remove the resting order if it is empty, and emit events. If the best level empties, move to the next level. When the loop ends, any remainder rests on the book (for a limit day order), is cancelled (IOC or market), or the entire order is rejected if FOK could not be filled completely. FOK needs a pre-check: sum available quantity at acceptable prices before trading anything, so that no partial trade ever has to be undone.</p>
+<p>Executing at the resting order's price is deliberate: the resting order showed its price first, and the aggressor who crosses gets "price improvement" if the book has better prices than its limit. The side that arrived second is called the <em>taker</em> (removes liquidity) and the resting side the <em>maker</em> (adds liquidity), which exchanges price differently.</p>
+<h3>8.3 Allocation rule options</h3>
+<table>
+<tr><th>Rule</th><th>Behaviour</th><th>Pros</th><th>Cons</th><th>Used by</th></tr>
+<tr><td>Price-time (FIFO)</td><td>Best price, then earliest arrival</td><td>Simple, rewards early quoting and speed, easy to audit and to implement with a queue</td><td>Speed race: a tiny latency edge wins queue position</td><td>Most equity markets and many futures</td></tr>
+<tr><td>Pro-rata</td><td>At the best price, share the incoming quantity in proportion to resting sizes</td><td>Rewards displaying large size, less of a latency race</td><td>Encourages order inflation; needs rounding rules; allocation loop is more complex</td><td>Some short-term interest rate futures</td></tr>
+<tr><td>Price-size-time or hybrids</td><td>Part FIFO, part pro-rata, or priority to larger orders</td><td>Tunable incentives</td><td>Harder to explain and to test</td><td>Various futures venues</td></tr>
+</table>
+<p>We choose price-time because the problem statement asks for the classic CLOB, it maps to the simplest correct data structure, and the fairness story is one sentence: first in, first out. The code structure (level queue plus allocation function) lets us swap the allocation function per product.</p>
+<h3>8.4 Details that interviewers probe</h3>
+<ul>
+<li><b>Self-trade prevention.</b> If the incoming order would match a resting order from the same participant, the engine applies the configured policy (cancel the newest, cancel the oldest, cancel both, or decrement). Without it a firm could wash-trade by accident or on purpose.</li>
+<li><b>Auctions.</b> At the open and close, many exchanges collect orders for a period and then compute a single clearing price that maximizes executable volume, breaking ties with rules such as minimum imbalance. Auction logic is another state in the engine's per-symbol state machine (pre-open, auction call, continuous, halted, closed), switched by sequenced control messages, so it stays deterministic.</li>
+<li><b>Circuit breakers.</b> If the price moves more than a band (for example 5 percent) within a window, the symbol enters a halt or a short auction. The trigger is evaluated inside the engine, and the halt is itself a sequenced event, so every replica and subscriber sees the halt at the same point in the stream.</li>
+<li><b>Order types beyond limit and market.</b> Stop orders (dormant until a trigger price trades), iceberg orders (only a slice displayed, with the hidden part losing time priority when replenished), pegged orders (price follows the best bid). Each is an extension of the state machine and must never read the wall clock.</li>
+<li><b>Decimal prices and rounding.</b> All arithmetic is on integers. Notional value (price times quantity) uses a wide integer to avoid overflow.</li>
+</ul>
+
+<h2 id="sequencer">9. Deep dive 2: the sequencer, determinism and the low-latency core</h2>
+<h3>9.1 Why a sequencer</h3>
+<p>The sequencer is the system's single source of ordering. Its job is deliberately tiny: take validated messages from the gateways, assign consecutive sequence numbers, timestamp them, append them to the journal, and publish the ordered stream. By funnelling everything through one point we get fairness (one definition of "earlier"), determinism (all replicas see the same order), and a natural audit log. The concern is that it looks like a single point of failure and a bottleneck. It is neither, for two reasons. At 250,000 messages per second peak and about 64 bytes each, the sequencer handles 16 MB per second, trivial for one core and one NIC. And it is replicated: the sequencer itself has a hot standby and the sequence is only "official" once persisted and replicated (section 10).</p>
+<p>The sequencer's ordering decision is the "arrival" time. Gateways connect over equal-length cables inside the same data centre, and some exchanges even equalize cable lengths so no participant gains by being closer. Order of arrival at the sequencer is the order of the exchange's fairness definition.</p>
+<h3>9.2 Why one thread per order book</h3>
+<p>Imagine the alternative: many threads matching the same book under locks. Each lock operation costs tens to hundreds of nanoseconds when uncontended and microseconds when contended, because cores must transfer cache lines and the operating system may deschedule a lock holder. Worse, threads reordering is non-deterministic: the same inputs could produce different trades on different runs. The single-writer principle (popularized by the LMAX Disruptor architecture and the "mechanical sympathy" school) avoids all of it: one thread owns the data, so there are no locks, no atomic operations on the hot path, the data stays in that core's L1 and L2 cache, and the result is a pure function of the input order.</p>
+<p>The LMAX team reported processing on the order of six million orders per second on one thread with its business logic loop, which agrees with our estimate that one core could handle our entire exchange. Treat the exact number as a vendor-reported order of magnitude, not as a guarantee.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Single-threaded engine pipeline with ring buffers">
+  <rect class="ext" x="20" y="120" width="120" height="70" rx="8"/><text class="t-c t-b" x="80" y="150">NIC, kernel</text><text class="t-c t-b" x="80" y="168">bypass</text>
+  <rect class="box" x="180" y="120" width="130" height="70" rx="8"/><text class="t-c t-b" x="245" y="150">Receive thread</text><text class="t-c t-sm" x="245" y="170">decode, batch</text>
+  <rect class="cache" x="350" y="105" width="140" height="100" rx="8"/><text class="t-c t-b" x="420" y="140">Input ring</text><text class="t-c t-b" x="420" y="158">buffer</text><text class="t-c t-sm" x="420" y="180">pre-allocated, seq</text>
+  <rect class="db" x="540" y="30" width="150" height="60" rx="8"/><text class="t-c t-b" x="615" y="56">Journal thread</text><text class="t-c t-sm" x="615" y="76">sequential write</text>
+  <rect class="db" x="540" y="130" width="150" height="60" rx="8"/><text class="t-c t-b" x="615" y="156">Replication thread</text><text class="t-c t-sm" x="615" y="176">to standby, DR</text>
+  <rect class="hit" x="540" y="230" width="150" height="70" rx="8"/><text class="t-c t-b" x="615" y="258">Matching thread</text><text class="t-c t-sm" x="615" y="278">single writer, books</text>
+  <rect class="cache" x="740" y="220" width="140" height="90" rx="8"/><text class="t-c t-b" x="810" y="252">Output ring</text><text class="t-c t-b" x="810" y="270">buffer</text><text class="t-c t-sm" x="810" y="292">to publisher, acks</text>
+  <path class="arrow" d="M140 155 L176 155"/><path class="arrow" d="M310 155 L346 155"/>
+  <path class="arrow" d="M490 130 L536 70"/><path class="arrow" d="M490 155 L536 160"/><path class="arrow" d="M490 185 L536 255"/>
+  <path class="arrow" d="M690 265 L736 265"/>
+  <path class="arrow-g dash" d="M615 90 L615 126"/><text class="t-sm" x="625" y="114">durable position</text>
+  <text class="t-sm" x="20" y="320">the matching thread reads an entry only after the journal and replication positions have passed it</text>
+</svg>
+<figcaption>Pipeline in the Disruptor style. Threads communicate through pre-allocated ring buffers, each with a single writer and independent reader positions. Journalling and replication run in parallel with each other; matching waits until the entry is durable under the policy chosen in section 10.</figcaption>
+</figure>
+<h3>9.3 Techniques that remove microseconds</h3>
+<table>
+<tr><th>Technique</th><th>What it removes</th><th>Cost or caveat</th></tr>
+<tr><td>Kernel bypass networking (DPDK, Solarflare Onload or similar)</td><td>System calls, interrupts and kernel buffer copies; typically saves several microseconds per message</td><td>Specialized NICs and drivers; harder to debug</td></tr>
+<tr><td>CPU pinning and isolated cores, busy-spin polling</td><td>Context switches and scheduler jitter; the thread never sleeps</td><td>Burns 100 percent of a core, so cores are dedicated per role</td></tr>
+<tr><td>Pre-allocated memory, object pools, no garbage collection pauses</td><td>Allocation time and stop-the-world pauses (a garbage-collected runtime must be tuned heavily or avoided; many engines are written in C++, or in Java with off-heap memory and zero-allocation discipline)</td><td>Fixed capacity must be sized up front</td></tr>
+<tr><td>Cache-friendly layout (arrays, indices, fixed-size structs, hot and cold fields split)</td><td>Cache misses, which cost around 100 nanoseconds when going to main memory</td><td>Less flexible code</td></tr>
+<tr><td>NUMA awareness</td><td>Remote-memory access on multi-socket machines</td><td>Thread and memory placement must be explicit</td></tr>
+<tr><td>Binary protocols, fixed-width fields</td><td>Parsing and allocation; text FIX can cost microseconds per message</td><td>Needs a schema and versioning discipline</td></tr>
+<tr><td>Batching on the output side only</td><td>Per-packet overhead for market data</td><td>Adds small delay; the input side is never delayed to batch</td></tr>
+<tr><td>Hardware timestamping and PTP or GPS-disciplined clocks</td><td>Gives a trustworthy time for audit; not on the matching critical path</td><td>Needs specialized hardware</td></tr>
+<tr><td>FPGA for gateway risk or even matching</td><td>Nanosecond-level deterministic latency</td><td>Costly development; used by a few venues and by trading firms</td></tr>
+</table>
+<h3>9.4 Latency budget</h3>
+<p>Every stage is assigned a share of the budget so that a regression is caught by a metric, not an argument. A plausible median budget for the path in the figure, wire in to ack out, is: about 5 microseconds for the NIC and decoding, 8 for gateway validation and risk, 10 for sequencing plus replication to the standby (one network hop and a write into the replica's memory), 2 for matching, and 5 for encoding and sending the ack. That sums to about 30 microseconds. These are illustrative engineering targets, not figures from a particular venue; real venues quote anything from a few microseconds (FPGA-based) to a few hundred.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Latency budget bar for one order, about 30 microseconds">
+  <rect class="ext" x="30" y="90" width="100" height="44" rx="4"/><text class="t-c t-sm" x="80" y="117">5</text>
+  <rect class="box" x="130" y="90" width="160" height="44" rx="4"/><text class="t-c t-sm" x="210" y="117">8</text>
+  <rect class="cache" x="290" y="90" width="200" height="44" rx="4"/><text class="t-c t-sm" x="390" y="117">10</text>
+  <rect class="hit" x="490" y="90" width="40" height="44" rx="4"/><text class="t-c t-sm" x="510" y="117">2</text>
+  <rect class="db" x="530" y="90" width="100" height="44" rx="4"/><text class="t-c t-sm" x="580" y="117">5</text>
+  <text class="t-c t-b" x="80" y="168">NIC and decode</text>
+  <text class="t-c t-b" x="210" y="188">Gateway risk</text>
+  <text class="t-c t-b" x="390" y="168">Sequence and replicate</text>
+  <text class="t-c t-b" x="510" y="188">Match</text>
+  <text class="t-c t-b" x="580" y="208">Encode and send</text>
+  <text class="t-sm" x="30" y="60">Median budget in microseconds (20 px per microsecond), total about 30</text>
+  <path class="arrow" d="M30 76 L630 76"/>
+  <text class="t-sm" x="660" y="112">Where the tail comes from:</text>
+  <text class="t-sm" x="660" y="132">garbage collection or page faults</text>
+  <text class="t-sm" x="660" y="152">interrupts on non-isolated cores</text>
+  <text class="t-sm" x="660" y="172">a slow replica in the sync path</text>
+  <text class="t-sm" x="660" y="192">TCP retransmit on the order session</text>
+  <text class="t-sm" x="660" y="212">book resize or hash-table growth</text>
+</svg>
+<figcaption>The budget bar is drawn to scale. The sequencing and replication step is the largest because it contains the only network hop in the core path, which is why durability policy (section 10.3) matters so much for latency.</figcaption>
+</figure>
+<div class="callout watch"><b>Watch out</b> Averages hide the real enemy. A pause of 2 ms from a page fault or a background thread, occurring once per minute, is invisible in the median and ruinous in the tail. Pin and warm everything before the open (touch all memory, run synthetic orders through every code path), disable swap, and monitor the p99.9 and the maximum, not the mean (<a href="../chapters/02-estimation.html">Chapter 2</a> on percentiles, <a href="../chapters/40-resilience.html">Chapter 40</a> on tail latency).</div>
+
+<h2 id="replay">10. Deep dive 3: replication, determinism and recovery by replay</h2>
+<h3>10.1 The state-machine argument</h3>
+<p>The engine is a deterministic function: <code>(state, input) -> (new state, outputs)</code>. If two engines start from the same state and consume the same ordered input stream, they produce identical outputs and identical state at every step. This is the replicated state machine idea behind consensus-based systems (<a href="../chapters/29-consensus.html">Chapter 29</a>) and event sourcing (<a href="../chapters/36-event-driven.html">Chapter 36</a>). It gives us three powers from one mechanism: a hot standby (apply the stream live), recovery (apply the stream from a snapshot), and testing and audit (replay a past day and diff the outputs).</p>
+<p>Determinism has rules the code must obey. No reading the wall clock inside the engine (the sequencer stamps time into the message, and the engine uses that). No random numbers. No iteration over unordered hash maps where order affects output. No dependence on thread timing or on floating-point rounding that differs between CPUs. No calls to external services. Order ids are assigned from a counter inside the state, not from a UUID generator. A single violated rule causes a standby that quietly diverges from the primary, which is catastrophic and often only discovered at failover. So we continuously compare: the standby computes a rolling hash of its output events and the primary does too; they exchange hashes every second, and a mismatch raises a page.</p>
+<h3>10.2 Snapshots and replay</h3>
+<p>A snapshot is a consistent dump of all books plus the sequence number of the last applied message. Because the engine is single-threaded, taking one is easy: at a defined sequence number, fork the process (copy-on-write) or write the state while the next messages queue briefly, and record the number. Snapshots are taken on the standby, not the primary, so the primary's latency is untouched. Recovery then is: load the newest snapshot, say at sequence 8,950,000, then read the journal from 8,950,001 forward and apply each message. By section 3.5, the tail after a 5-minute snapshot is about 3.8 million messages, replayed in under 4 seconds. Replay must be exactly the same code path as live processing; a special "recovery mode" that takes shortcuts is a source of divergence.</p>
+<h3>10.3 Durability policy: what does "accepted" mean?</h3>
+<p>The sequencer must decide when a message is considered committed and may be passed to the engine. This is the central latency versus durability tradeoff, compared in the table.</p>
+<table>
+<tr><th>Policy</th><th>Commit point</th><th>Added latency</th><th>If the primary dies</th></tr>
+<tr><td>Local fsync before processing</td><td>Message flushed to the primary's disk</td><td>Tens of microseconds on fast NVMe (more with ordinary SSDs)</td><td>Safe only if the primary's disk is recoverable; a lost machine loses the tail</td></tr>
+<tr><td>Replicate to standby memory, then process</td><td>Message received by the standby and the journal writer (one network round trip, no fsync)</td><td>About 5 to 10 microseconds in the same data centre</td><td>The standby has every acknowledged message; both machines would have to fail together to lose data</td></tr>
+<tr><td>Quorum (Raft style) among three or more nodes</td><td>Majority has persisted</td><td>Tens of microseconds to hundreds, tail depends on the slower follower</td><td>Survives any single failure and network partitions safely; more moving parts</td></tr>
+<tr><td>Asynchronous replication only</td><td>Local write</td><td>Lowest</td><td>Orders acknowledged to participants can vanish: unacceptable for an exchange</td></tr>
+</table>
+<p>We choose <b>replicate to the standby's memory and the journal writer, then process</b>, which many real exchanges approximate: the sequencer pair acts as a two-node synchronous replica, and the journal is flushed to disk in the background in large sequential batches. The remaining risk, a simultaneous power loss of both machines before a flush, is handled by placing them in separate power domains and racks and by an uninterruptible power supply that allows flush on power loss. A quorum protocol such as Raft is a legitimate alternative when the exchange wants automatic, partition-safe leader election built in; it costs extra latency and a more complex tail. The honest summary: durability here means "present in the memory of two independent machines", not "on disk", and we say so explicitly in the interview.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Failover timeline: primary fails, standby takes over by replay">
+  <line x1="40" y1="130" x2="860" y2="130" stroke="var(--fg)" stroke-width="2"/>
+  <text class="t-sm" x="40" y="150">time</text>
+  <circle cx="120" cy="130" r="6" class="hit"/><text class="t-c t-sm" x="120" y="112">T0 normal</text>
+  <circle cx="260" cy="130" r="6" class="miss"/><text class="t-c t-sm" x="260" y="112">T1 primary dies</text>
+  <circle cx="400" cy="130" r="6" class="cache"/><text class="t-c t-sm" x="400" y="112">T2 detected</text>
+  <circle cx="540" cy="130" r="6" class="cache"/><text class="t-c t-sm" x="540" y="112">T3 fenced, promoted</text>
+  <circle cx="700" cy="130" r="6" class="hit"/><text class="t-c t-sm" x="700" y="112">T4 sessions back</text>
+  <rect class="hit" x="60" y="170" width="190" height="34" rx="6"/><text class="t-c t-sm" x="155" y="192">primary and standby in lockstep</text>
+  <rect class="miss" x="270" y="170" width="120" height="34" rx="6"/><text class="t-c t-sm" x="330" y="192">missed heartbeats</text>
+  <rect class="cache" x="410" y="170" width="120" height="34" rx="6"/><text class="t-c t-sm" x="470" y="192">stonith, epoch+1</text>
+  <rect class="box" x="550" y="170" width="140" height="34" rx="6"/><text class="t-c t-sm" x="620" y="192">gateways reconnect</text>
+  <rect class="db" x="60" y="224" width="640" height="34" rx="6"/><text class="t-c t-sm" x="380" y="246">standby has applied every sequenced message up to T1; nothing to replay except the tail it was still reading</text>
+  <text class="t-sm" x="60" y="290">Typical targets: detect 1 to 2 s, fence and promote under 1 s, resume trading within seconds.</text>
+  <text class="t-sm" x="60" y="310">Participants resend unacknowledged orders using the same cl_ord_id; the standby returns the stored result for duplicates.</text>
+</svg>
+<figcaption>Failover timeline. The standby is already caught up, so promotion is not a recovery from scratch. The risky part is making sure the old primary cannot continue to act, which is the job of fencing (an epoch number checked by the sequencer and gateways, and if needed power-off of the old machine).</figcaption>
+</figure>
+<h3>10.4 Split brain and fencing</h3>
+<p>If the standby promotes itself because it cannot hear the primary, while the primary is actually alive behind a network partition, we have two engines that both think they are in charge: split brain. Each would accept different orders and publish different trades. The defence is a <b>monotonically increasing epoch</b>, held by a small coordination service (<a href="../chapters/30-coordination-locks.html">Chapter 30</a>, <a href="../case-studies/c21-lock-service.html">Case study 21</a>). Promotion requires obtaining epoch N+1; gateways, publisher and downstream consumers reject any message tagged with an older epoch; and the promoter tries to power off the old machine through an out-of-band controller before it begins. This is the fencing-token idea, applied to a whole engine. The detailed election protocol is in <a href="../chapters/29-consensus.html">Chapter 29</a>.</p>
+
+<h2 id="market-data">11. Deep dive 4: market data fan-out</h2>
+<h3>11.1 The problem</h3>
+<p>Every market participant needs the same stream of book changes at nearly the same instant. Fairness again: if subscriber X receives an update 50 microseconds after subscriber Y, Y has an unfair advantage. Delivering the same bytes to 2,000 consumers with minimal and <em>equal</em> delay is the second core difficulty, and the answer is to push replication into the network.</p>
+<h3>11.2 Multicast, sequence numbers and gap recovery</h3>
+<p>The publisher sends each message once, to a multicast group address over UDP. Network switches duplicate the packet to every port that has subscribed, in hardware, with the same delay for each port (and some exchanges equalize cable lengths in the collocation room for the same reason). Our 10 MB per second peak is therefore transmitted once, not 2,000 times. UDP has no retransmission, so reliability is built at the application level, as in the well-known ITCH-style and similar feeds.</p>
+<ul>
+<li><b>Sequence numbers.</b> Every packet carries a channel sequence number and the count of messages inside. A receiver that sees 1,204 then 1,206 knows 1,205 is missing.</li>
+<li><b>A/B arbitration.</b> The same stream is sent on two independent multicast groups, A and B, over separate switches and links. Receivers read both and take whichever copy of each sequence number arrives first. A packet dropped on one path is almost always present on the other, so most loss never becomes visible. This is cheap, fast redundancy.</li>
+<li><b>Gap recovery.</b> If both copies are lost, the receiver asks a retransmission server over TCP (or a UDP request channel) for the missing range. The retransmission server is a separate process with a ring of the last few minutes of packets, so it never loads the matching path.</li>
+<li><b>Snapshots.</b> A subscriber that starts late or falls too far behind cannot replay from the open. It fetches a snapshot of the book (the current levels) tagged with the sequence number it reflects, then applies live messages with a greater sequence number, discarding duplicates. Snapshots are served from a separate service that itself consumes the feed, so it adds no load to the engine.</li>
+<li><b>Heartbeats.</b> When quiet, the feed sends periodic heartbeats with the current sequence number so that silence can be distinguished from loss.</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Market data fan out with multicast A and B and recovery services">
+  <rect class="box" x="20" y="150" width="130" height="80" rx="8"/><text class="t-c t-b" x="85" y="184">Matching</text><text class="t-c t-b" x="85" y="202">engine</text>
+  <rect class="cache" x="190" y="150" width="140" height="80" rx="8"/><text class="t-c t-b" x="260" y="184">Publisher</text><text class="t-c t-sm" x="260" y="204">encode, seq, batch</text>
+  <rect class="db" x="380" y="60" width="150" height="56" rx="8"/><text class="t-c t-b" x="455" y="84">Multicast A</text><text class="t-c t-sm" x="455" y="102">switch path 1</text>
+  <rect class="db" x="380" y="260" width="150" height="56" rx="8"/><text class="t-c t-b" x="455" y="284">Multicast B</text><text class="t-c t-sm" x="455" y="302">switch path 2</text>
+  <rect class="ext" x="600" y="30" width="120" height="50" rx="8"/><text class="t-c t-b" x="660" y="60">HFT firm</text>
+  <rect class="ext" x="600" y="100" width="120" height="50" rx="8"/><text class="t-c t-b" x="660" y="130">Broker</text>
+  <rect class="ext" x="600" y="170" width="120" height="50" rx="8"/><text class="t-c t-b" x="660" y="200">Data vendor</text>
+  <rect class="ext" x="600" y="240" width="120" height="50" rx="8"/><text class="t-c t-b" x="660" y="270">... 2,000</text>
+  <rect class="cache" x="780" y="100" width="100" height="100" rx="8"/><text class="t-c t-b" x="830" y="136">Gap and</text><text class="t-c t-b" x="830" y="154">snapshot</text><text class="t-c t-b" x="830" y="172">service</text>
+  <path class="arrow" d="M150 190 L186 190"/>
+  <path class="arrow" d="M330 170 L376 100"/><path class="arrow" d="M330 210 L376 275"/>
+  <path class="arrow" d="M530 88 L596 58"/><path class="arrow" d="M530 88 L596 122"/><path class="arrow" d="M530 98 L596 190"/>
+  <path class="arrow" d="M530 288 L596 100"/><path class="arrow" d="M530 288 L596 215"/><path class="arrow" d="M530 290 L596 262"/>
+  <path class="arrow-r dash" d="M720 130 L776 140"/>
+  <text class="t-sm" x="700" y="330">TCP retransmit and snapshot requests</text>
+  <text class="t-sm" x="20" y="360">The switches copy each packet. The exchange sends 10 MB/s once per feed, not 20 GB/s.</text>
+  <text class="t-sm" x="20" y="380">Subscribers keep the first copy of each sequence number and ask for retransmission only if both copies are missing.</text>
+</svg>
+<figcaption>Fan-out by multicast. Two independent paths carry identical packets; subscribers arbitrate by sequence number. Gap and snapshot service sits beside the feed and is reached by unicast so that recovery traffic never competes with the hot path.</figcaption>
+</figure>
+<h3>11.3 Tiers of data</h3>
+<p>Not everyone needs everything. We offer tiers: the <b>full order-by-order depth feed</b> (every add, delete, modify and execute, which lets a subscriber rebuild the entire book), a <b>top-of-book feed</b> (best bid and offer and last trade, a tiny fraction of the bandwidth), and a <b>delayed or consolidated feed</b> for retail display (delayed by a regulatory period such as 15 minutes) distributed over ordinary TCP and WebSockets by a separate service tier (<a href="../chapters/06-realtime.html">Chapter 6</a>). The retail tier is the one that does scale like a web system: it subscribes to our feed once, fans out to millions of browsers through a pub-sub layer, and may throttle or conflate updates (send only the latest price per symbol per 100 ms). The conflation is allowed there and forbidden in the depth feed. Fan-out patterns are in <a href="../chapters/35-messaging-patterns.html">Chapter 35</a> and <a href="../chapters/60-pattern-playbook.html">Chapter 60</a>.</p>
+<h3>11.4 Options compared</h3>
+<table>
+<tr><th>Option</th><th>Latency fairness</th><th>Bandwidth cost at the exchange</th><th>Reliability</th><th>Verdict</th></tr>
+<tr><td>Unicast TCP per subscriber</td><td>Poor: each connection has its own queue and retransmit delays</td><td>2,000 times the feed, about 160 Gbps at peak</td><td>Automatic retransmit, but head-of-line blocking</td><td>Only for the slow retail tier</td></tr>
+<tr><td>Kafka-style log with consumer pull</td><td>Medium: pull adds delay, per-consumer offsets</td><td>Broker fan-out is a multiple of the feed</td><td>Very strong, replayable (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>)</td><td>Good for post-trade, analytics and the clearing feed, not the trading feed</td></tr>
+<tr><td>UDP multicast with A/B and sequence numbers</td><td>Excellent: switch hardware copies at equal delay</td><td>One copy per feed per path</td><td>Application-level gap recovery needed</td><td>Chosen for the trading feeds</td></tr>
+<tr><td>Multicast inside the cloud</td><td>Not generally available across virtual networks</td><td>-</td><td>-</td><td>Why exchanges run in their own collocation data centres</td></tr>
+</table>
+
+<h2 id="scaling">12. Scaling, partitioning and bottlenecks</h2>
+<h3>12.1 Partition by symbol</h3>
+<p>Matching has no cross-symbol dependency in the simple CLOB case: an order for ACME touches only the ACME book. That makes <b>symbol the shard key</b> (<a href="../chapters/25-sharding.html">Chapter 25</a>). We run 10 partitions, each owning about 500 symbols, each partition with its own sequencer pair, engine primary, standby and journal. A symbol-to-partition map, a small reference table loaded by the gateways at start of day, routes each order. The map is static during the session, which removes any need for dynamic rebalancing mid-day. Moves happen overnight when a heavy symbol is reassigned.</p>
+<p>Why 10 when one thread could do it? First, <b>blast radius</b>: a bug triggered by one symbol takes down 500 symbols, not 5,000. Second, <b>tail latency isolation</b>: a flood in one symbol does not delay another partition's orders. Third, <b>headroom</b>: peak is 250,000 per second in total, so each partition sees an average of 25,000 per second at peak, about 2.5 percent of one core's capacity, leaving large safety margin for a 10x event. Fourth, <b>operational flexibility</b>: partitions can be upgraded one at a time. Fifth, the journal and publishing per partition are independent streams, so the consumer can subscribe only to the channels it needs.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Partitions by symbol range with separate sequencers and engines">
+  <rect class="box" x="20" y="130" width="150" height="80" rx="8"/><text class="t-c t-b" x="95" y="164">Gateways</text><text class="t-c t-sm" x="95" y="184">symbol map lookup</text>
+  <rect class="cache" x="250" y="20" width="200" height="86" rx="8"/><text class="t-c t-b" x="350" y="48">Partition 1</text><text class="t-c t-sm" x="350" y="68">symbols A to C (500)</text><text class="t-c t-sm" x="350" y="88">sequencer + engine + standby</text>
+  <rect class="cache" x="250" y="126" width="200" height="86" rx="8"/><text class="t-c t-b" x="350" y="154">Partition 2</text><text class="t-c t-sm" x="350" y="174">symbols D to F (500)</text><text class="t-c t-sm" x="350" y="194">sequencer + engine + standby</text>
+  <rect class="cache" x="250" y="232" width="200" height="86" rx="8"/><text class="t-c t-b" x="350" y="260">Partition 10</text><text class="t-c t-sm" x="350" y="280">symbols X to Z (500)</text><text class="t-c t-sm" x="350" y="300">sequencer + engine + standby</text>
+  <rect class="hit" x="540" y="60" width="150" height="190" rx="8"/><text class="t-c t-b" x="615" y="110">Market data</text><text class="t-c t-b" x="615" y="128">channels</text><text class="t-c t-sm" x="615" y="152">one multicast group</text><text class="t-c t-sm" x="615" y="170">pair per partition</text><text class="t-c t-sm" x="615" y="190">subscribers pick</text><text class="t-c t-sm" x="615" y="208">the channels they use</text>
+  <rect class="ext" x="750" y="100" width="130" height="110" rx="8"/><text class="t-c t-b" x="815" y="140">Consolidated</text><text class="t-c t-b" x="815" y="158">tape and</text><text class="t-c t-b" x="815" y="176">clearing feed</text>
+  <path class="arrow" d="M170 160 L246 70"/><path class="arrow" d="M170 170 L246 170"/><path class="arrow" d="M170 180 L246 270"/>
+  <path class="arrow" d="M450 63 L536 110"/><path class="arrow" d="M450 169 L536 160"/><path class="arrow" d="M450 275 L536 210"/>
+  <path class="arrow" d="M690 155 L746 155"/>
+  <text class="t-sm" x="20" y="330">Cross-symbol order types (spreads, baskets) must live in one partition or use a coordinator.</text>
+</svg>
+<figcaption>Symbols are statically partitioned. Each partition is a complete, independent sequenced pipeline with its own standby. Only reference data and the market data channel plan are shared.</figcaption>
+</figure>
+<h3>12.2 Hot symbols</h3>
+<p>Skew is the rule: a few hundred symbols carry most of the traffic. A single hot symbol on its own partition might peak at 12,500 per second, which is still easy. Larger loads, such as an index future with several million messages per second, push one engine to its limit. Options then are to dedicate a machine to that symbol, split the pipeline into stages (gateway decode and risk on many cores, matching on one), and shrink the per-message work; we do <em>not</em> shard a single book across threads because that destroys determinism. If the hardware ceiling is reached, the design says: speed up the single thread (leaner structures, FPGA), not parallelize it.</p>
+<h3>12.3 Other bottlenecks</h3>
+<ul>
+<li><b>Gateways.</b> They scale out horizontally: sessions are partitioned by participant, and each gateway does CPU-heavy risk and encoding. The sequencer pairs the stream from many gateways; if one sequencer's NIC becomes a limit, the partition is split.</li>
+<li><b>Risk state.</b> A firm may send orders through many gateways, so its risk limit must be shared. We use per-firm risk "budgets" allotted to each gateway in chunks (similar to distributed token buckets, <a href="../chapters/16-rate-limiting.html">Chapter 16</a>) with a conservative reservation, or route a firm's sessions to the same gateway.</li>
+<li><b>Journal disk.</b> 19.2 GB per day is a trivial sequential write rate (about 0.8 MB/s average, 16 MB/s at peak), so disks are not the constraint; fsync batching is. We batch by time (every few hundred microseconds) off the critical path.</li>
+<li><b>Network.</b> Each partition has its own links; the market data switches are the shared resource, so they are sized for line-rate bursts at the opening.</li>
+</ul>
+
+<h2 id="failures">13. Failure modes</h2>
+<table>
+<tr><th>Component fails or misbehaves</th><th>What happens</th><th>Mitigation</th></tr>
+<tr><td>A gateway crashes</td><td>Its sessions drop; open orders stay live on the book (exchange-side state is unaffected)</td><td>Participants reconnect to another gateway and resync by sequence number. An optional <em>cancel on disconnect</em> flag tells the engine to cancel that session's orders, which market makers rely on. The gateway is stateless apart from sequence counters, which are in the journal.</td></tr>
+<tr><td>Sequencer primary dies</td><td>No new sequence numbers; trading pauses</td><td>The sequencer standby holds the same stream and next-number state. Promote with epoch fencing; gateways resend unacknowledged messages, and duplicates are dropped by session sequence number. Seconds of pause, no loss.</td></tr>
+<tr><td>Matching engine primary dies</td><td>Outputs stop mid-stream</td><td>The hot standby, which has processed the same inputs, becomes primary. Output events carry the input sequence number, so the publisher and gateways drop duplicates if the old primary had already emitted the same events.</td></tr>
+<tr><td>Standby falls behind or is lost</td><td>Replication in the sync path stalls or the redundancy is gone</td><td>Time out after a few milliseconds and continue with a degraded warning, or halt trading if policy requires redundancy for fairness. A new standby is built from the last snapshot plus tail replay while trading continues.</td></tr>
+<tr><td>Both primary and standby lost</td><td>Data not yet flushed may be lost</td><td>Separate power and racks; journal flushed continuously; DR site receives the stream asynchronously. In a total site loss, the DR site comes up from the stream it has, the exchange reconciles with participants' view (drop copy) and may declare the last few seconds void by prior rule. This is the one scenario where RPO is not zero and the design says so.</td></tr>
+<tr><td>Engine bug or divergence</td><td>Standby's output hash differs, or a wrong trade is printed</td><td>Rolling output hashes between primary and standby; extensive replay testing of production days against new releases; kill switch to halt a symbol; ability to cancel trades under written rules.</td></tr>
+<tr><td>Market data packet loss</td><td>Subscriber sees a gap</td><td>A/B arbitration, retransmission service, snapshot (section 11).</td></tr>
+<tr><td>Slow consumer on the feed</td><td>Falls behind on multicast, loses packets</td><td>Not our problem to buffer: multicast has no per-receiver queue. The subscriber recovers via snapshot. This property protects the engine from slow clients.</td></tr>
+<tr><td>Clock fault</td><td>Timestamps wrong; audit trail inconsistent</td><td>Order of events is by sequence number, not by time. Redundant GPS and PTP sources; alarm on skew beyond a bound. Timestamps are metadata, not control flow.</td></tr>
+<tr><td>Runaway participant (infinite loop of orders)</td><td>Floods the gateway and the sequencer</td><td>Per-session message rate cap at the gateway, order-to-trade ratio monitoring, automatic disconnect and a mass cancel (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>).</td></tr>
+<tr><td>Market anomaly (flash crash)</td><td>Prices fall sharply</td><td>Price bands, limit up-limit down, circuit breakers as sequenced engine events; the exchange's operations team can halt manually.</td></tr>
+</table>
+<h3>13.1 Consistency and idempotency decisions</h3>
+<ul>
+<li><b>Per-symbol linearizability.</b> Every event for a symbol is totally ordered by sequence number. Reads of the book (the market data) lag the engine but are always a prefix of the true event sequence, never out of order.</li>
+<li><b>No cross-symbol consistency promise.</b> Two partitions have independent sequences. A consolidated tape that merges partitions is ordered by (partition timestamp, partition sequence), which is a best-effort total order with tolerances. This is acceptable because no trade depends on another symbol's order (<a href="../chapters/28-cap-consistency.html">Chapter 28</a>).</li>
+<li><b>Exactly-once effect through idempotency.</b> The wire is at-least-once (resends after disconnect), the effect is exactly-once because of the <code>cl_ord_id</code> table and the session sequence numbers (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>). The trade id is derived from the sequence number of the input that caused it plus an index within the message, so replaying produces the same trade ids and downstream systems dedupe on them.</li>
+<li><b>Trade finality.</b> A trade, once the engine emits it, is final and sent to clearing. Cancelling a trade ("busting") is a separate, manual, rules-governed event, not an engine rollback.</li>
+</ul>
+<h3>13.2 Multi-region</h3>
+<p>The matching engines live in one data centre, because cross-region latency (tens of milliseconds) would ruin fairness and speed, and an active-active matching of one book across regions would require consensus on every order (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>). The DR site receives the journal stream asynchronously (a few milliseconds behind within a metro area, more across distance) and is rehearsed regularly. The failover to DR is a deliberate operational decision with participant notification, not an automatic flip, because of the possible lost tail. Different exchanges run different regions for different products, so the multi-region story is "each product has one home, with a DR sibling" (<a href="../chapters/41-ha-dr.html">Chapter 41</a>).</p>
+
+<h2 id="ops">14. Security, monitoring, cost</h2>
+<h3>14.1 Security and abuse</h3>
+<ul>
+<li><b>Authentication and authorization.</b> Sessions use mutual TLS or equivalent credentials on private cross-connects, and each session is bound to a participant id and a list of allowed symbols and order types (<a href="../chapters/55-security.html">Chapter 55</a>). The gateway stamps the participant id; the engine never trusts an id from the payload.</li>
+<li><b>Network isolation.</b> Participants reach the exchange only through dedicated lines or collocated cross-connects. The order entry network is separate from the market data network and from administrative access.</li>
+<li><b>Pre-trade risk checks</b> protect both the firm and the market: maximum order size, maximum notional, price collar, rate limits and a firm-level kill switch. These are often legally required.</li>
+<li><b>Market abuse.</b> Spoofing (placing orders without intent to trade), wash trades, and quote stuffing are detected by surveillance that consumes the audit stream offline; the engine only enforces the cheap preventative controls (self-trade prevention, order-to-trade ratio fees).</li>
+<li><b>Integrity of the journal.</b> The journal is append-only and hash-chained (each batch includes a hash of the previous), so tampering is detectable by auditors.</li>
+</ul>
+<h3>14.2 Monitoring and SLOs</h3>
+<p>The golden signals here are latency distributions, not request counts (<a href="../chapters/54-observability-slos.html">Chapter 54</a>). We track: wire-to-wire latency per stage with p50, p99, p99.9 and max, taken from hardware timestamps; sequencer queue depth; standby replication lag (target: zero messages, alert at a few); journal flush lag; output-hash agreement between primary and standby; market data gap rate per subscriber channel; gateway reject rates by reason; and book-integrity checks (the sum of resting quantity per level equals the sum of orders in the level, crossed-book detection: best bid never above best ask outside an auction). Example SLOs: 99.99 percent of orders acknowledged within 100 microseconds during continuous trading; zero lost or duplicated acknowledged messages; failover to a caught-up standby within 5 seconds; market data gap-free for 99.999 percent of packets before recovery.</p>
+<p>Continuous verification matters as much as metrics: every night the day's journal is replayed through the production binary on a test cluster and the output compared byte for byte with the archived outputs. Any difference is a determinism bug found at night instead of at failover.</p>
+<h3>14.3 Cost notes</h3>
+<p>The expensive parts are not storage or compute volume but the specialized pieces: collocation space with power and cooling, kernel bypass NICs, low-latency switches, GPS clocks, redundant fibre cross-connects, and a 24-hour operations staff. The software footprint is small: perhaps 10 partitions times 3 machines (primary, standby, DR) of high clock speed CPUs with 64 to 256 GB of RAM each, plus gateway farms. Storage for 4.8 TB per year of journal and 3.2 TB per year of market data is a rounding error; they age to object storage (<a href="../chapters/21-object-storage.html">Chapter 21</a>) after the regulated hot period. Revenue comes from trading fees, data sales and collocation, so latency is a product spec worth paying for.</p>
+
+<h2 id="evolution">15. Evolution, phasing and alternatives</h2>
+<h3>15.1 Build order</h3>
+<ol>
+<li><b>Phase 1: the deterministic core.</b> One partition, one engine, the book data structure, price-time matching, limit and market orders, a file journal and replay tool. Test with property tests (random order streams checked against a slow reference implementation) and with replay.</li>
+<li><b>Phase 2: gateways and sequencer.</b> Binary protocol, sessions with sequence numbers, pre-trade risk, idempotency by <code>cl_ord_id</code>. Add the sequencer with its journal.</li>
+<li><b>Phase 3: market data.</b> Multicast publisher, A/B feeds, gap recovery, snapshots.</li>
+<li><b>Phase 4: redundancy.</b> Hot standby, output-hash comparison, fencing epochs, DR replication, rehearsed failover.</li>
+<li><b>Phase 5: more order types and auctions,</b> circuit breakers, more partitions, tiered data products.</li>
+<li><b>Phase 6: latency work.</b> Kernel bypass, core pinning, cache tuning, possibly FPGA gateways, once a metric shows where the time goes.</li>
+</ol>
+<h3>15.2 At 10x scale</h3>
+<p>At 2.5 million messages per second peak, we add partitions (each still easily within one thread) and scale the gateway farm and market data network. If one symbol becomes ten times hotter, we dedicate hardware to it and pipeline its stages. If we added derivatives with implied spread matching, orders in one product would create implied orders in another, so those products have to share a partition or use a deterministic cross-partition mechanism. For more participants, the multicast scheme is unchanged; the retail fan-out tier scales horizontally in the usual web way. For global distribution, we would not stretch one matching engine across regions but run regional venues and connect them with smart order routing at the brokers.</p>
+<h3>15.3 Alternatives not chosen</h3>
+<table>
+<tr><th>Alternative</th><th>Why we did not choose it</th></tr>
+<tr><td>Microservices with a shared database and queue between each step</td><td>Adds milliseconds, loses determinism, and each hop is a failure mode. Fine for the retail brokerage, wrong for the matching core (<a href="../chapters/44-monolith-to-microservices.html">Chapter 44</a>).</td></tr>
+<tr><td>Kafka as the sequencer and journal</td><td>Strong durability and replay, but a broker round trip and ISR replication cost milliseconds; good for downstream consumers, not the hot path (<a href="../case-studies/c17-message-queue.html">Case study 17</a>).</td></tr>
+<tr><td>Raft among three or five matching nodes</td><td>A valid design with automatic election and partition safety; costs extra latency and a heavier tail. A real choice if the interviewer prioritizes automation over microseconds.</td></tr>
+<tr><td>Multi-threaded matching on one book with fine-grained locks</td><td>Non-deterministic and slower than the single-threaded loop due to contention.</td></tr>
+<tr><td>Cloud-hosted exchange with generic VMs</td><td>No multicast, noisy neighbours, no hardware timestamps, jittery tail. Used for non-latency-sensitive venues (some crypto exchanges run in the cloud, accepting millisecond-class latency).</td></tr>
+<tr><td>Batch auction (frequent batch auctions) instead of continuous matching</td><td>Removes the speed race by clearing every few hundred milliseconds. It is a proposed design alternative to FIFO speed competition; it changes the product, so we mention it rather than build it.</td></tr>
+</table>
+
+<h2 id="qa">16. Interview Q&amp;A</h2>
+<details><summary>Why is the matching engine single-threaded? Is that not a bottleneck?</summary>
+<p>Matching for one symbol is inherently sequential, because each order's result depends on the book left by the previous order. A multithreaded design needs locks or atomic operations on the same price levels, and the contention costs more than the work itself, while also making the outcome depend on thread timing. A single thread that owns the data keeps it in its CPU cache, takes no locks and is deterministic, and can process on the order of a million orders per second, while our whole peak is 250,000 per second. We get parallelism where it is safe, across symbols through partitioning, and not within one book.</p></details>
+<details><summary>What exactly does the sequencer do, and is it a single point of failure?</summary>
+<p>It assigns a gap-free increasing sequence number and a timestamp to each validated inbound message and appends it to the journal and replication stream. That number is the official arrival order, which gives fairness, determinism and audit. It is a logical single point, but not a single machine: a hot standby holds the same stream and the next-number state, and promotion uses an epoch so that the old instance is fenced. Its throughput need is only about 16 MB per second at peak, so it is not a capacity bottleneck.</p></details>
+<details><summary>How do you recover after a crash without losing orders?</summary>
+<p>The journal of sequenced inputs is the source of truth, and the engine is a deterministic function of it. Because a message is not processed until it is on the standby and the journal writer, every acknowledged order is recoverable. In the common case the standby simply becomes primary since it is already caught up. For a fresh node we load the latest snapshot, which records the sequence number it reflects, then replay the journal after that number through the same code path as live traffic. With 5-minute snapshots the tail is about 3.8 million messages, so recovery takes seconds.</p></details>
+<details><summary>How do you keep the standby from silently diverging from the primary?</summary>
+<p>Determinism is enforced by rules: no wall clock reads in the engine, no randomness, no iteration over unordered collections that affects output, and ids generated from internal counters. We check it with rolling hashes of output events that the primary and standby exchange every second, so a divergence raises an alert within a second, not at failover. Every night we also replay the day's journal through the production binary and compare the output with what the live system produced. Any new release must pass the same replay test on recent production days before deployment.</p></details>
+<details><summary>How do you deliver market data to thousands of subscribers fairly and cheaply?</summary>
+<p>We use UDP multicast so the exchange sends each packet once and the network switches replicate it with the same delay to every subscriber port, which keeps outbound traffic at 10 MB per second per feed rather than 20 GB per second of unicast. Reliability is rebuilt on top: sequence numbers to detect gaps, two independent paths (A and B) arbitrated by the receiver, a TCP retransmission service for rare double loss, and a snapshot service for late joiners. Slow consumers cannot slow the engine because multicast has no per-receiver queue; they simply recover via snapshot.</p></details>
+<details><summary>What happens if the primary engine is partitioned from the standby but both are alive?</summary>
+<p>That is split brain: the standby may promote itself while the old primary keeps running. We prevent it with a monotonically increasing epoch obtained from a small consensus-backed coordinator, and every downstream component (gateways, publisher, clearing) rejects messages carrying an older epoch. The promoter also fences the old node out-of-band by powering it off or isolating its ports before it starts. If the coordinator cannot be reached by either side, trading halts rather than risking two sets of trades, which favours consistency over availability.</p></details>
+<details><summary>How do you handle a cancel racing with a fill?</summary>
+<p>The sequencer's order decides it, with no ambiguity. If the cancel is sequenced before the incoming order that would match, the resting order is gone and the incoming order does not trade with it. If the fill is sequenced first, the order is gone by the time the cancel is processed, and the participant receives a "too late to cancel" reject plus the execution report. The participant sees both messages in the same session sequence, so its own state converges with the exchange.</p></details>
+<details><summary>How would you test an engine like this?</summary>
+<p>Several layers. Unit and property tests generate random order streams and compare the engine's trades and final book with a simple, slow reference implementation (a sorted list), asserting invariants such as no crossed book, quantity conservation, and price-time priority. Replay tests run recorded production days through the new binary and diff outputs byte for byte. Fault injection kills the primary mid-stream, drops replication packets and delays the standby to verify failover and idempotent resends. Performance tests replay at peak and 10x rates while recording latency percentiles with hardware timestamps, and fail the build on a regression of the tail.</p></details>
+<details><summary>Why not use a database or Kafka for the order flow?</summary>
+<p>Both give durable ordered logs and are the right tools for downstream stages such as clearing, surveillance and analytics. On the hot path they cost milliseconds because of network round trips, broker replication and commit protocols, while our budget is tens of microseconds. We also want the book in memory and the log local and append-only. So we use a purpose-built journal for the matching path and stream the same events into Kafka and a database for the consumers that need queries, long retention and replay by many independent readers.</p></details>
+<details><summary>How do you make the exchange fair to participants at different distances?</summary>
+<p>We use collocation with equal-length cables from every rack to the gateways and the market data switches, so that propagation delay does not favour a participant. All orders pass through one sequencer, so arrival order is defined by one place, and the market data is replicated by switch hardware at equal delay. Pre-trade checks at the gateway are deterministic in cost, and no participant gets a special faster path. Some venues add a deliberately small, uniform delay (a speed bump) to blunt the advantage of the very fastest traders, which is a policy choice that we can add at the gateway.</p></details>
+<details><summary>What changes if the interviewer asks for a crypto or cloud-hosted exchange?</summary>
+<p>The logical design stays: sequencer, deterministic engine, journal, snapshot and replay. The physical choices change. Without multicast or kernel bypass, we publish market data over WebSockets from a fan-out tier with conflation, accept millisecond-class latency, and use a replicated log (for example Raft or a managed log service) as the sequencer so that failover is automatic across availability zones. We also gain easier elasticity for the gateway and data tiers but must manage noisy neighbours and clock quality, so we pin dedicated instances and use cloud time-sync services.</p></details>
+
+<h2 id="recap-sec">17. Connects to and recap</h2>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>The exchange is a deterministic state machine: an ordered input log feeds a single-threaded engine per symbol, and everything else (replication, recovery, audit, testing) is replay.</li>
+<li>A sequencer gives every message one global order; it is replicated and fenced by an epoch so it is neither a capacity nor an availability risk (about 16 MB per second at peak).</li>
+<li>The book is a pair of price-ordered sets of FIFO queues plus an order id index, held in pre-allocated memory; matching is price-time priority at the resting order's price, with prices as integers.</li>
+<li>Estimation: 300 M messages per day, 12,800 per second average, 250,000 peak, 15 M trades, 19.2 GB per day of journal, 4 GB of book memory, replay of a 5-minute tail in under 4 seconds.</li>
+<li>Durability means present on two independent machines before processing, with the journal flushed in the background; the DR site is asynchronous and the one scenario where RPO is not zero.</li>
+<li>Market data goes out by UDP multicast with sequence numbers, A/B paths, gap retransmission and snapshots, keeping fan-out cost at one copy and delay equal for all.</li>
+<li>Scale by partitioning symbols across independent pipelines for isolation and headroom, not by sharding a single book across threads.</li>
+<li>Latency is engineered in microseconds: kernel bypass, pinned cores, no garbage collection, cache-friendly layout, and tails measured at p99.9 and max.</li>
+</ul></div>
+<p class="connects"><b>Connects to:</b> builds on <a href="../chapters/02-estimation.html">Chapter 2</a> (estimation and percentiles), <a href="../chapters/07-serialization.html">Chapter 7</a> (binary encodings), <a href="../chapters/19-storage-engines.html">Chapter 19</a> (write-ahead logs), <a href="../chapters/24-replication.html">Chapter 24</a> (synchronous versus asynchronous replication), <a href="../chapters/25-sharding.html">Chapter 25</a> (partitioning), <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a> (clocks and ordering), <a href="../chapters/28-cap-consistency.html">Chapter 28</a> (consistency), <a href="../chapters/29-consensus.html">Chapter 29</a> (consensus, split brain), <a href="../chapters/30-coordination-locks.html">Chapter 30</a> (fencing), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotency), <a href="../chapters/34-queues-kafka.html">Chapter 34</a> (logs), <a href="../chapters/36-event-driven.html">Chapter 36</a> (event sourcing), <a href="../chapters/40-resilience.html">Chapter 40</a> (tail latency), <a href="../chapters/41-ha-dr.html">Chapter 41</a> (disaster recovery), <a href="../chapters/54-observability-slos.html">Chapter 54</a> (SLOs) and <a href="../chapters/55-security.html">Chapter 55</a> (security). Related case studies: <a href="c14-payment-system.html">Case study 14</a> (the post-trade money movement is a payment problem), <a href="c17-message-queue.html">Case study 17</a> (log-based messaging) and <a href="c21-lock-service.html">Case study 21</a> (fencing and consensus).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

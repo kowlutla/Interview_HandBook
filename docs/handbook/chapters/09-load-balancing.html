@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 9: Load Balancers | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="09-load-balancing">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Chapter 9 · Module 2 · Scaling the Stateless Tier</div>
+<h1>Load Balancers</h1>
+<p class="lead">A load balancer spreads incoming traffic over many identical servers, hides failed servers from users, and gives you one stable address in front of a changing fleet. This chapter explains how it works at layer 4 and layer 7, which algorithm to choose, how health checks really behave, how the balancer itself avoids becoming the weak point, and what goes wrong in production.</p>
+
+<h2 id="why">1. Why load balancers exist</h2>
+
+<p>Imagine a web service that runs on one server. That server can handle, say, 2,000 requests per second. When traffic grows to 5,000, you have two choices. You can buy a bigger machine (<b>vertical scaling</b>), which gets expensive quickly and always has a ceiling. Or you can run several copies of the same server and share the traffic between them (<b>horizontal scaling</b>). Horizontal scaling is the standard answer for the stateless tier, meaning servers that keep no important data of their own between requests (they read and write shared stores such as databases and caches instead).</p>
+
+<p>Horizontal scaling immediately raises a question: if you have ten servers, which one does a client talk to? You could give clients a list of all ten addresses, but then every client needs to know the list, pick a server, notice when one is dead, and update when you add a server. That logic would be copied into every browser and phone app, and you could never change it. The load balancer (LB) solves this by being <b>one stable address</b> in front of the fleet. Clients talk only to the LB. The LB decides which server gets each request.</p>
+
+<p>A load balancer gives you at least five things at once:</p>
+<ul>
+  <li><b>Capacity:</b> total throughput is roughly the sum of all servers behind it. Need more? Add servers.</li>
+  <li><b>Availability:</b> if a server crashes, the LB notices and stops sending it traffic. Users see no error (or at worst a few failed requests during detection).</li>
+  <li><b>Easy deployment:</b> you can take servers out of rotation one at a time, upgrade them, and put them back (a <i>rolling deploy</i>) without downtime.</li>
+  <li><b>Abstraction:</b> clients do not know how many servers exist or where they are. You can add, remove, or replace servers freely.</li>
+  <li><b>A central place for cross-cutting work:</b> terminating TLS, compressing, rate limiting, logging, and collecting metrics can all happen at the LB so each server does not repeat them.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 260" role="img" aria-label="Clients, one load balancer, and a pool of servers">
+  <rect class="ext" x="20" y="30" width="120" height="44" rx="8"/><text class="t-c t-b" x="80" y="58">Client A</text>
+  <rect class="ext" x="20" y="108" width="120" height="44" rx="8"/><text class="t-c t-b" x="80" y="136">Client B</text>
+  <rect class="ext" x="20" y="186" width="120" height="44" rx="8"/><text class="t-c t-b" x="80" y="214">Client C</text>
+  <rect class="cache" x="330" y="90" width="200" height="80" rx="10"/><text class="t-c t-b" x="430" y="122">Load balancer</text><text class="t-c t-sm" x="430" y="144">one stable address</text>
+  <rect class="box" x="720" y="20" width="150" height="44" rx="8"/><text class="t-c t-b" x="795" y="48">Server 1</text>
+  <rect class="box" x="720" y="80" width="150" height="44" rx="8"/><text class="t-c t-b" x="795" y="108">Server 2</text>
+  <rect class="box" x="720" y="140" width="150" height="44" rx="8"/><text class="t-c t-b" x="795" y="168">Server 3</text>
+  <rect class="miss" x="720" y="200" width="150" height="44" rx="8"/><text class="t-c t-b" x="795" y="228">Server 4 (down)</text>
+  <path class="arrow" d="M140 52 L326 120"/><path class="arrow" d="M140 130 L326 130"/><path class="arrow" d="M140 208 L326 142"/>
+  <path class="arrow" d="M530 110 L716 44"/><path class="arrow" d="M530 128 L716 102"/><path class="arrow" d="M530 146 L716 162"/>
+  <path class="arrow-r dash" d="M530 160 L716 218"/>
+  <text class="t-sm" x="590" y="228">health check fails, no traffic</text>
+</svg>
+<figcaption>Clients know one address. The load balancer shares requests among healthy servers and skips the failed one.</figcaption>
+</figure>
+
+<div class="callout key"><b>Key idea</b>
+A load balancer is not just a traffic splitter. It is the component that turns a pile of unreliable machines into one reliable service. Everything in this chapter is about doing that well: choosing a server fairly, detecting bad servers quickly, and not becoming a bad component yourself.
+</div>
+
+<p>A load balancer works best with stateless servers. If a server holds data that only it has (for example a user's login session in its own memory), requests from that user must always return to it, which fights the whole idea. Section 8 returns to this. The related topic of how to keep servers stateless is part of the scaling story in the surrounding chapters; DNS-based distribution is covered in <a href="04-dns.html">Chapter 4</a>.</p>
+
+<h2 id="layers">2. Layer 4 versus layer 7</h2>
+
+<p>The internet is described in layers. For load balancing only two matter. <b>Layer 4</b> is the transport layer: TCP and UDP, where a connection is identified by source address, source port, destination address, and destination port (the "4-tuple"). <b>Layer 7</b> is the application layer: HTTP, gRPC, and similar protocols, where there are URLs, headers, cookies, and request bodies. Load balancers come in both flavors, and the difference decides what the LB can do.</p>
+
+<h3>2.1 What a layer 4 load balancer sees</h3>
+<p>A layer 4 LB looks only at the packet headers. When a client opens a TCP connection to the LB's address, the LB picks a backend using the 4-tuple (and its algorithm) and then forwards every packet of that connection to that backend. It does not read the bytes inside. It cannot tell whether the connection carries HTTP, a database protocol, or encrypted traffic; it does not know the URL or any cookie.</p>
+<p>Because it does so little, a layer 4 LB is very fast and cheap. It can handle millions of connections per second on modest hardware, adds microseconds of delay, and works for any protocol: HTTP, MySQL, MQTT, game traffic, DNS over UDP. There are two common ways to forward packets. With <b>NAT mode</b> the LB rewrites the destination address to the backend and rewrites the replies on the way back, so all traffic passes through the LB in both directions. With <b>direct server return (DSR)</b> the LB only handles the incoming packets; the backend sends its reply straight to the client, bypassing the LB. DSR is attractive because replies are usually much larger than requests (think of a video or a large page), so the LB only carries a small fraction of the bytes. The cost is more complicated network setup: each backend must be configured to accept packets addressed to the LB's address.</p>
+
+<h3>2.2 What a layer 7 load balancer sees</h3>
+<p>A layer 7 LB terminates the client's connection, fully reads the HTTP request, and then opens (or reuses) a separate connection to a backend and sends a request on it. Because it understands HTTP, it can make decisions from the content:</p>
+<ul>
+  <li>Route <code>/api/*</code> to the API fleet and <code>/images/*</code> to the media fleet (<b>path-based routing</b>), or route by the <code>Host</code> header so one LB serves many domains.</li>
+  <li>Route by header, cookie, or query parameter, for example to send 5% of traffic to a canary version, or to keep a user on a given backend using a cookie.</li>
+  <li>Rewrite URLs, add headers (such as <code>X-Forwarded-For</code> carrying the real client address), compress responses, and enforce rate limits.</li>
+  <li>Retry a failed request on another backend, because it holds the whole request and can replay it.</li>
+  <li>Spread the individual <i>requests</i> of one long-lived HTTP/2 or gRPC connection over many backends, which a layer 4 LB cannot do (see section 6.3).</li>
+  <li>Record rich metrics: per-route latency, status codes, error rates.</li>
+</ul>
+<p>The price is CPU and latency. Parsing HTTP, holding buffers, and (usually) doing TLS costs far more than forwarding packets. A layer 7 LB handles perhaps tens to hundreds of thousands of requests per second per machine, rather than millions of connections. It also needs to understand the protocol: a layer 7 HTTP LB cannot balance an arbitrary binary protocol.</p>
+
+<table>
+<tr><th>Aspect</th><th>Layer 4 (transport)</th><th>Layer 7 (application)</th></tr>
+<tr><td>Sees</td><td>IP addresses, ports, TCP/UDP flags</td><td>URL, method, headers, cookies, body</td></tr>
+<tr><td>Connection to client</td><td>Passes through (or NAT). One client connection maps to one backend connection</td><td>Terminates it; opens its own separate backend connections</td></tr>
+<tr><td>Routing decisions</td><td>Algorithm over backends only</td><td>Content-aware: path, host, header, cookie</td></tr>
+<tr><td>Balances</td><td>Connections</td><td>Individual requests</td></tr>
+<tr><td>Speed and cost</td><td>Very fast, cheap, microseconds</td><td>Slower, more CPU, often sub-millisecond to a few ms</td></tr>
+<tr><td>Protocols</td><td>Anything over TCP/UDP</td><td>HTTP/1.1, HTTP/2, gRPC, WebSocket (known protocols)</td></tr>
+<tr><td>TLS</td><td>Usually passes it through untouched</td><td>Usually terminates it (to read the request)</td></tr>
+<tr><td>Typical products</td><td>AWS NLB, Linux IPVS, Maglev-style, HAProxy in TCP mode</td><td>AWS ALB, Nginx, Envoy, HAProxy in HTTP mode</td></tr>
+</table>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Layer 4 forwarding versus layer 7 proxying">
+  <text class="t-b" x="20" y="22">Layer 4: one connection, forwarded</text>
+  <rect class="ext" x="20" y="40" width="120" height="44" rx="8"/><text class="t-c t-b" x="80" y="68">Client</text>
+  <rect class="cache" x="330" y="40" width="170" height="44" rx="8"/><text class="t-c t-b" x="415" y="68">L4 LB</text>
+  <rect class="box" x="720" y="40" width="150" height="44" rx="8"/><text class="t-c t-b" x="795" y="68">Backend</text>
+  <path class="arrow" d="M140 62 L326 62"/><path class="arrow" d="M500 62 L716 62"/>
+  <text class="t-c t-sm" x="233" y="54">TCP packets</text><text class="t-c t-sm" x="608" y="54">same bytes, one backend</text>
+  <text class="t-sm" x="330" y="106">Sees only addresses and ports. Cannot read the URL or cookie.</text>
+
+  <text class="t-b" x="20" y="150">Layer 7: two connections, content-aware</text>
+  <rect class="ext" x="20" y="168" width="120" height="44" rx="8"/><text class="t-c t-b" x="80" y="196">Client</text>
+  <rect class="cache" x="330" y="160" width="170" height="60" rx="8"/><text class="t-c t-b" x="415" y="186">L7 LB</text><text class="t-c t-sm" x="415" y="206">reads the request</text>
+  <rect class="box" x="720" y="160" width="150" height="40" rx="8"/><text class="t-c t-b" x="795" y="185">API fleet</text>
+  <rect class="box" x="720" y="214" width="150" height="40" rx="8"/><text class="t-c t-b" x="795" y="239">Media fleet</text>
+  <path class="arrow" d="M140 190 L326 190"/><text class="t-c t-sm" x="233" y="182">connection 1</text>
+  <path class="arrow" d="M500 180 L716 180"/><text class="t-c t-sm" x="608" y="172">/api/* via connection 2</text>
+  <path class="arrow" d="M500 205 L716 234"/><text class="t-c t-sm" x="640" y="262">/images/* via connection 3</text>
+</svg>
+<figcaption>A layer 4 balancer forwards a connection blindly. A layer 7 balancer ends the client connection, reads the request, and chooses a backend pool by what it finds.</figcaption>
+</figure>
+
+<div class="callout tip"><b>Interview tip</b>
+Default answer: put a layer 7 LB at the edge for HTTP services (you need routing, TLS, and retries), and use layer 4 where you need raw speed, non-HTTP protocols, or a huge number of connections, or as the tier <i>in front of</i> a fleet of layer 7 proxies. Large companies often stack them: a layer 4 tier spreads traffic across many layer 7 proxies, which then route to services.
+</div>
+
+<h2 id="products">3. Hardware, software, and cloud load balancers</h2>
+
+<p>The same job is done by three kinds of products.</p>
+
+<h3>3.1 Hardware appliances</h3>
+<p>Vendors such as F5 and Citrix sell dedicated boxes with special network chips. They offer very high throughput per box, vendor support, and rich built-in features, and were the default in enterprise data centers for years. Downsides: they are expensive, have fixed capacity (you buy for peak and pairs for redundancy), need specialist skills, and do not fit well with automated, elastic infrastructure. Today they remain in traditional data centers; most new designs use software or cloud balancers.</p>
+
+<h3>3.2 Software load balancers</h3>
+<ul>
+  <li><b>HAProxy:</b> a very fast, mature, open source LB for TCP and HTTP. Known for fine-grained configuration, detailed health checks, and stick tables for affinity and rate limiting. A common choice when you run your own LB tier.</li>
+  <li><b>Nginx:</b> a web server and reverse proxy that is often used as an LB. Strong at HTTP, static content, and TLS. The open source edition has simpler health checking (mostly passive), while the commercial edition adds active checks and more.</li>
+  <li><b>Envoy:</b> a modern proxy designed for service-to-service traffic. It is configured dynamically through APIs, supports HTTP/2 and gRPC well, and has rich observability, retries, circuit breaking, and outlier detection. It is the data plane of many service meshes (section 11).</li>
+  <li><b>Linux IPVS, and kernel- or eBPF-based balancers:</b> layer 4 balancing in the kernel for very high packet rates. Several large companies built their own layer 4 balancers in this style (Google's Maglev, Facebook's Katran are public examples).</li>
+</ul>
+<p>Software LBs run on ordinary servers or containers, are cheap, scriptable, and can be scaled by adding machines. You operate them yourself, though: patching, capacity, and their own high availability (section 9).</p>
+
+<h3>3.3 Cloud load balancers</h3>
+<p>Cloud providers offer balancers as managed services. You do not run machines; the provider scales and replaces them. You pay per hour plus per unit of traffic.</p>
+<ul>
+  <li><b>AWS Application Load Balancer (ALB):</b> layer 7 for HTTP/HTTPS and gRPC, with host and path rules, redirect, authentication integration, and target groups for instances, containers, or Lambda.</li>
+  <li><b>AWS Network Load Balancer (NLB):</b> layer 4 for TCP/UDP/TLS, very high throughput and low latency, supports static IP addresses per availability zone, and preserves the client source address.</li>
+  <li><b>AWS Gateway Load Balancer:</b> a layer 3-style balancer for inserting fleets of network appliances such as firewalls.</li>
+  <li><b>Google Cloud Load Balancing:</b> offers both proxy-based (layer 7 global external, regional) and passthrough (layer 4) options. The global external HTTP(S) balancer uses a single anycast IP address that serves traffic from the Google edge worldwide, which makes multi-region setups simple.</li>
+  <li>Azure has analogous products (Application Gateway for layer 7, Load Balancer for layer 4, Front Door for global).</li>
+</ul>
+<p>Managed balancers hide the hard parts (HA, scaling, patching) but come with limits: you cannot tune every setting, they are scaled by the provider in steps (so a sudden huge spike may need a "pre-warm" request in some cases), and cost grows with traffic. They are the default recommendation in a cloud-based interview answer: "an ALB in front of an autoscaling group, in multiple availability zones".</p>
+
+<table>
+<tr><th>Choice</th><th>Strengths</th><th>Weaknesses</th><th>Pick when</th></tr>
+<tr><td>Hardware</td><td>Huge throughput per box, support</td><td>Costly, fixed capacity, slow to change</td><td>Legacy on-premises data center</td></tr>
+<tr><td>Software (HAProxy, Nginx, Envoy)</td><td>Cheap, flexible, portable, scriptable</td><td>You operate it, including its HA</td><td>Own data center, Kubernetes, need custom logic</td></tr>
+<tr><td>Cloud-managed (ALB, NLB, GCLB)</td><td>No operations, auto-scaling, built-in HA</td><td>Less control, per-usage cost, vendor tied</td><td>Anything already in that cloud</td></tr>
+</table>
+
+<h2 id="algorithms">4. Balancing algorithms</h2>
+
+<p>Once the LB has a pool of healthy backends, it needs a rule for choosing one. The rule is the <b>algorithm</b>. No algorithm is best everywhere: the right choice depends on whether requests are similar or very different in cost, whether servers are identical, and whether you need requests from the same key to go to the same place.</p>
+
+<h3>4.1 Round robin</h3>
+<p>Go through the servers in order: 1, 2, 3, 1, 2, 3, and so on. It is simple, needs no state beyond a counter, and gives each server an equal share of <i>requests</i>. It assumes that every request costs about the same and every server is equally powerful. When some requests are heavy and some light, one server can by bad luck receive several heavy ones in a row and fall behind, while the algorithm keeps feeding it because it only counts turns, not load.</p>
+
+<h3>4.2 Weighted round robin</h3>
+<p>Give each server a weight that reflects its capacity. A server with weight 3 gets three turns for every one turn of a server with weight 1. Use this when the fleet is heterogeneous: a mix of large and small instances, or while shifting a small percentage of traffic to a canary (weight 1 versus 99). Implementations interleave the turns smoothly so a weight-3 server does not get three requests in a burst.</p>
+
+<h3>4.3 Least connections</h3>
+<p>Send the request to the server that currently has the fewest open (active) connections or in-flight requests. This reacts to reality: a server stuck on slow requests accumulates connections and automatically receives fewer new ones. It is the best simple choice when request durations vary widely, or for long-lived connections such as WebSockets. The LB must track the count per server, and if several LBs run side by side each sees only its own connections, which is a good approximation but not exact. A weighted version divides the active count by the weight.</p>
+
+<h3>4.4 Least response time</h3>
+<p>Prefer the server that has recently answered fastest, often combining measured latency with active connections (some products use an exponentially weighted moving average of response time times active requests). It naturally steers traffic away from a server that is slow because of a noisy neighbor, garbage collection, or a cold cache. The risk: a server that fails <i>fast</i> (returns errors immediately) looks wonderfully quick and attracts even more traffic. Combine it with error tracking or outlier ejection.</p>
+
+<h3>4.5 Power of two choices</h3>
+<p>Choosing the globally least-loaded server needs a view of every server, which is costly with many backends and many LBs, and it has a subtle flaw: if all LBs see the same "emptiest" server at the same moment, they all pile onto it (the <b>herd effect</b>). The <b>power of two random choices</b> trick: pick two servers at random, then send the request to the one with fewer active requests. A well-known result in probability shows this gives load that is almost as even as full least-connections, and dramatically better than a purely random choice, with a tiny amount of work and no herd. Envoy and several other proxies offer this as "least request" with two choices. It is an excellent answer to the question "how do you balance across hundreds of backends with many independent LBs?".</p>
+
+<h3>4.6 Source IP hash</h3>
+<p>Compute a hash of the client's IP address and map it onto a server, for example <code>hash(ip) mod N</code>. The same client always reaches the same server, as long as the server list does not change. It needs no cookie and works at layer 4. Problems: when N changes (a server is added or dies), the modulo changes and <i>most</i> clients move to a different server, losing any state or cache on the old one. Also, many users behind one corporate network or mobile carrier gateway share one IP address, so one backend can get a disproportionate load.</p>
+
+<h3>4.7 Consistent hashing</h3>
+<p>Consistent hashing fixes the "most keys move" problem. Imagine a circle (a hash ring) with positions from 0 to 2<sup>32</sup>. Place each server on the ring at one or more points (several points per server, called <b>virtual nodes</b>, make the spread smoother). To route a key (a user ID, a URL, a session ID), hash it to a point on the ring and walk clockwise to the first server. When a server is added or removed, only the keys between it and its neighbor move; with N servers, roughly 1/N of the keys change owner instead of nearly all of them. Use it when the <i>backend holds a cache or partition</i> that is valuable for a given key: a cache fleet, or a sharded service, so that the same key keeps hitting the same warm server. A variant, <b>bounded-load consistent hashing</b>, caps how much extra load any one server takes, so a hot key cannot overload its owner. <a href="25-sharding.html">Chapter 25</a> discusses the technique in depth for sharded data, and <a href="14-caching-failures.html">Chapter 14</a> covers hot keys.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Hash ring: keys map to the next server clockwise; adding a server moves only some keys">
+  <circle cx="230" cy="150" r="105" fill="none" stroke="var(--muted)" stroke-width="2"/>
+  <circle cx="230" cy="45" r="14" class="box"/><text class="t-c t-b" x="230" y="50">S1</text>
+  <circle cx="321" cy="203" r="14" class="box"/><text class="t-c t-b" x="321" y="208">S2</text>
+  <circle cx="139" cy="203" r="14" class="box"/><text class="t-c t-b" x="139" y="208">S3</text>
+  <circle cx="310" cy="98" r="7" class="ext"/><text class="t-sm" x="322" y="94">k1</text>
+  <circle cx="280" cy="236" r="7" class="ext"/><text class="t-sm" x="290" y="256">k2</text>
+  <circle cx="125" cy="108" r="7" class="ext"/><text class="t-sm" x="94" y="104">k3</text>
+  <text class="t-c t-sm" x="230" y="146">hash ring</text>
+  <text class="t-c t-sm" x="230" y="164">key goes clockwise</text>
+  <text class="t-c t-sm" x="230" y="182">to the next server</text>
+  <rect class="hit" x="480" y="40" width="390" height="100" rx="10"/>
+  <text class="t-b" x="496" y="64">Consistent hashing</text>
+  <text class="t-sm" x="496" y="86">Add a 4th server: about 1/4 of keys move, all to the new one.</text>
+  <text class="t-sm" x="496" y="106">Remove a server: only its keys move, to its neighbor.</text>
+  <text class="t-sm" x="496" y="126">Caches on the other servers stay warm.</text>
+  <rect class="miss" x="480" y="160" width="390" height="100" rx="10"/>
+  <text class="t-b" x="496" y="184">hash(key) mod N</text>
+  <text class="t-sm" x="496" y="206">Going from 3 to 4 servers changes the owner of about</text>
+  <text class="t-sm" x="496" y="226">3 out of 4 keys. Caches go cold and the database</text>
+  <text class="t-sm" x="496" y="246">behind them takes a surge.</text>
+</svg>
+<figcaption>Each key belongs to the first server clockwise from its hash point. When servers change, only a small part of the key space is reassigned.</figcaption>
+</figure>
+
+<h3>4.8 Random</h3>
+<p>Pick any server uniformly at random. It is stateless, needs no coordination between several LBs, and is surprisingly decent for large numbers of similar requests. With few requests the spread is lumpy (some servers get noticeably more), which is why two random choices (4.5) are better. It is mostly useful as the building block of 4.5 or in client-side balancing (section 11).</p>
+
+<table>
+<tr><th>Algorithm</th><th>Needs state</th><th>Good when</th><th>Weak when</th></tr>
+<tr><td>Round robin</td><td>A counter</td><td>Uniform requests, identical servers</td><td>Variable request cost or mixed hardware</td></tr>
+<tr><td>Weighted round robin</td><td>Counter + weights</td><td>Mixed server sizes, gradual canary</td><td>Variable request cost; weights go stale</td></tr>
+<tr><td>Least connections</td><td>Active count per backend</td><td>Variable or long requests, WebSockets</td><td>Many independent LBs (partial view)</td></tr>
+<tr><td>Least response time</td><td>Latency per backend</td><td>Servers with uneven speed</td><td>Fast-failing server attracts traffic</td></tr>
+<tr><td>Power of two choices</td><td>Active count per backend</td><td>Large fleets, many LBs</td><td>Slightly less optimal than a perfect global view</td></tr>
+<tr><td>IP hash</td><td>None</td><td>Cheap affinity at layer 4</td><td>Remaps on resize; NAT clumping</td></tr>
+<tr><td>Consistent hashing</td><td>Ring</td><td>Cache or shard locality by key</td><td>Hot keys; needs bounded load for safety</td></tr>
+<tr><td>Random</td><td>None</td><td>Simple, huge scale, client-side</td><td>Lumpy at low volume</td></tr>
+</table>
+
+<h3>4.9 Try it: algorithm simulator</h3>
+<p>The widget below sends a stream of requests to four backends and shows how each algorithm spreads them. Backend 4 is deliberately slow (it takes about three times longer per request), and request durations vary randomly. Watch how round robin and random give the slow server the same share as the others, so its number of simultaneous requests climbs, while least connections, least response time, and power of two choices send it fewer. Weighted round robin uses weights 1, 1, 1, 0.33 as a manual correction. The hash algorithms pick by client identity (120 simulated clients), so their spread depends on the clients rather than on load.</p>
+
+<div class="widget" id="lbSim">
+  <h4>Try it: load balancing simulator</h4>
+  <div class="row">
+    <label>Algorithm
+      <select id="lb-alg">
+        <option value="rr">Round robin</option>
+        <option value="wrr">Weighted round robin</option>
+        <option value="lc">Least connections</option>
+        <option value="lrt">Least response time</option>
+        <option value="p2c">Power of two choices</option>
+        <option value="iph">IP hash (mod N)</option>
+        <option value="ch">Consistent hashing</option>
+        <option value="rnd">Random</option>
+      </select>
+    </label>
+    <label>Requests per tick <input id="lb-rate" type="number" value="6" min="1" max="30" step="1" style="width:70px"></label>
+    <label>Ticks <input id="lb-ticks" type="number" value="400" min="50" max="3000" step="50" style="width:80px"></label>
+    <label><input id="lb-kill" type="checkbox"> Backend 2 is down</label>
+    <button id="lb-run" type="button">Run</button>
+  </div>
+  <div id="lb-out" class="log">Choose an algorithm and press Run.</div>
+</div>
+
+<h2 id="health">5. Health checks and removing bad servers</h2>
+
+<p>An LB that sends traffic to a dead server is worse than no LB, so it must know which servers are healthy. There are two complementary approaches.</p>
+
+<h3>5.1 Active health checks</h3>
+<p>The LB itself probes every backend on a schedule, for example every 5 seconds. A probe can be a bare TCP connect (is the port open?), or an HTTP request to a path such as <code>/healthz</code> that must return status 200 within a timeout. TCP checks only prove the process listens; an HTTP check can verify the application is actually working, and a good health endpoint also checks things the server cannot work without (can it reach its database or cache?). Be careful here: if the endpoint fails whenever a <i>shared</i> dependency such as the database is slow, then <i>every</i> server fails at once and the LB removes the whole fleet, turning a partial problem into a total outage. Most teams make the health check test only the local process and fixed essentials, and use separate monitoring for shared dependencies. Many LBs also keep a "panic mode": if too many backends are unhealthy (Envoy's default threshold is around half), the LB ignores health status and spreads load over all of them, on the theory that sending traffic anywhere is better than nowhere.</p>
+
+<h3>5.2 Passive health checks</h3>
+<p>The LB also watches real traffic. If a backend returns connection errors, timeouts, or a run of 5xx responses, the LB marks it bad for a while, with no probe needed. Envoy calls this <i>outlier detection</i>: eject a host after, say, five consecutive 5xx responses, for a base time that grows each time the host is ejected again. Passive checks react to real user-facing failures in a fraction of a second, whereas an active check might need many seconds to notice. Their weakness is that a user request has to fail first, so they are used together with active checks and with retries (the retried request hides the failure from the user).</p>
+
+<h3>5.3 Thresholds</h3>
+<p>One failed probe should not eject a server (a single packet can be lost), and one success should not instantly re-admit a server that is still starting. So LBs use counts: for example <b>unhealthy threshold 3</b> (three consecutive failures to remove) and <b>healthy threshold 2</b> (two consecutive successes to restore). With a 5 second interval and an unhealthy threshold of 3, a crash is detected in about 10 to 15 seconds. During that time, a share of requests (one over the number of servers) goes to a dead server. Shorter intervals and lower thresholds detect faster but cause <b>flapping</b>: a server that is merely slow under load fails a probe, is removed, its traffic shifts to the others, it recovers, comes back, and the cycle repeats. Section 13 shows how that makes outages worse. Choose a check timeout comfortably above normal latency and a healthy threshold above the unhealthy one so that a server must prove itself before returning.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Backend state machine with health check thresholds">
+  <rect class="hit" x="40" y="90" width="170" height="64" rx="10"/><text class="t-c t-b" x="125" y="118">Healthy</text><text class="t-c t-sm" x="125" y="138">receives full traffic</text>
+  <rect class="miss" x="365" y="90" width="170" height="64" rx="10"/><text class="t-c t-b" x="450" y="118">Unhealthy</text><text class="t-c t-sm" x="450" y="138">receives none</text>
+  <rect class="cache" x="690" y="90" width="170" height="64" rx="10"/><text class="t-c t-b" x="775" y="118">Slow start</text><text class="t-c t-sm" x="775" y="138">ramping 10% to 100%</text>
+  <path class="arrow-r" d="M210 108 L361 108"/><text class="t-c t-sm" x="285" y="98">3 failed probes</text>
+  <path class="arrow-g" d="M535 108 L686 108"/><text class="t-c t-sm" x="610" y="98">2 passed probes</text>
+  <path class="arrow-g" d="M775 154 L775 210 L125 210 L125 158"/><text class="t-c t-sm" x="450" y="204">ramp finished, back to full share</text>
+  <rect class="box" x="365" y="20" width="170" height="40" rx="8"/><text class="t-c t-b" x="450" y="45">Draining</text>
+  <path class="arrow dash" d="M125 90 L125 40 L361 40"/><text class="t-sm" x="140" y="34">deploy: no new, finish old</text>
+  <text class="t-c t-sm" x="450" y="250">Probes every 5 s. Thresholds stop one lost packet from ejecting a healthy server.</text>
+</svg>
+<figcaption>A backend moves between states by counting consecutive probe results. Draining is the planned exit used during deploys; slow start is the careful return.</figcaption>
+</figure>
+
+<h3>5.4 Slow start</h3>
+<p>A freshly started server is cold: its caches are empty, its JIT compiler has not optimized hot code, and connection pools are unopened. If least-connections suddenly sees a new server with zero connections, it floods the newcomer with traffic, and the cold server may time out and be ejected again. <b>Slow start</b> ramps the server's effective weight from a small value to full over a window such as 30 to 60 seconds. HAProxy, Nginx Plus, Envoy, and ALB (through its slow start setting) offer it. It is especially important after a deploy and for autoscaling.</p>
+
+<h3>5.5 Connection draining</h3>
+<p>When you intentionally remove a server (a deploy, a scale-in, a maintenance), you do not want to cut requests that are in flight. <b>Connection draining</b> (also called deregistration delay) tells the LB to stop sending <i>new</i> requests to the server while letting existing requests finish, up to a timeout (commonly 30 to 300 seconds). Only after that is the server stopped. The sequence in a rolling deploy is: mark draining, wait for in-flight work to finish, stop the process, start the new version, wait for health checks to pass, slow start. Skipping drain is why some deploys cause a burst of 502 errors. Long-lived connections (WebSocket) need either a longer drain or a protocol-level "please reconnect" message.</p>
+
+<h2 id="connections">6. Connection reuse, keep-alive, and HTTP/2</h2>
+
+<h3>6.1 Why connections are expensive</h3>
+<p>Opening a connection costs a TCP handshake (one round trip), a TLS handshake (one or two more), and then a slow ramp-up as TCP discovers how fast it can send. Closing connections after every request wastes all of that. <b>Keep-alive</b> keeps a connection open so many requests reuse it. This is covered in <a href="03-networking-essentials.html">Chapter 3</a>; here we look at what it means for a balancer.</p>
+
+<h3>6.2 Two sides, two pools</h3>
+<p>A layer 7 LB manages two sets of connections. On the <b>front side</b>, thousands of clients each hold a connection (often idle for long stretches, such as mobile apps). On the <b>back side</b>, the LB keeps a pool of persistent connections to each server and multiplexes many client requests over them. This has real benefits. The backends see a few hundred steady connections rather than tens of thousands of short ones, which saves their memory and file descriptors. The LB-to-backend path is inside one data center, so connections are cheap to keep and very fast. And the LB absorbs slow clients: a client on a bad network may take seconds to send a request; the LB buffers it and sends it to the backend in one quick burst, so the backend's worker is busy for milliseconds rather than seconds.</p>
+<p>Idle timeouts must be consistent. If the LB's idle timeout on the backend connection is <i>longer</i> than the backend's own keep-alive timeout, the backend will close the connection just as the LB sends a request on it, producing sporadic 502 errors that are hard to reproduce. The rule: the backend's keep-alive timeout should be longer than the LB's idle timeout. The same applies to the client side (LB idle timeout versus the client's expectation, for example 60 seconds on ALB by default).</p>
+
+<h3>6.3 HTTP/2, gRPC, and why layer 4 balancing fails them</h3>
+<p>HTTP/2 and gRPC multiplex many requests over one long-lived connection. A client opens a single connection to a server and sends thousands of requests down it. A layer 4 LB balances <i>connections</i>, so it assigns that one connection to one backend, and every request on it goes there, even if you have twenty backends. The result is badly uneven load: new backends added during a scale-up receive nothing, because existing connections never move. The fixes are to use a layer 7 LB that understands HTTP/2 and balances each request or stream across backends, or to use client-side balancing (section 11). Long connections also need a maximum lifetime (the server sends a "go away" so the client reconnects), which lets load rebalance over time.</p>
+
+<h2 id="tls">7. TLS termination versus passthrough</h2>
+
+<p>Most traffic is encrypted with TLS. The LB can handle it in three ways.</p>
+<ul>
+  <li><b>TLS termination:</b> the LB holds the certificate and private key, decrypts incoming traffic, and sends plain HTTP to the backends over the private network. The LB can then read the request (required for layer 7 routing), and the backends are freed from cryptographic work and certificate management. Certificates live in one place and are easy to rotate. The downside is that traffic is unencrypted inside your network, which some compliance regimes forbid, and the LB holds sensitive keys.</li>
+  <li><b>TLS passthrough:</b> the LB forwards the encrypted bytes untouched to the backend, which terminates TLS. The LB works at layer 4, cannot read anything except the SNI hostname that the client sends in clear at the start of the handshake (which can be used for coarse routing), and so cannot do path routing, header changes, or HTTP retries. It gives true end to end encryption, and the private key never sits on the LB.</li>
+  <li><b>Re-encryption (TLS bridging):</b> terminate at the LB, inspect and route, then open a <i>new</i> TLS connection to the backend. This gives both layer 7 features and encrypted internal traffic, at the cost of encrypting twice. Many security-conscious organizations use this, or use a service mesh (section 11) to provide mutual TLS between all services.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 320" role="img" aria-label="Three TLS handling modes: terminate, passthrough, re-encrypt">
+  <text class="t-b" x="20" y="22">Terminate</text>
+  <rect class="ext" x="20" y="34" width="100" height="36" rx="8"/><text class="t-c t-b" x="70" y="57">Client</text>
+  <rect class="cache" x="370" y="34" width="160" height="36" rx="8"/><text class="t-c t-b" x="450" y="57">LB (decrypts)</text>
+  <rect class="box" x="780" y="34" width="100" height="36" rx="8"/><text class="t-c t-b" x="830" y="57">Server</text>
+  <path class="arrow-g" d="M120 52 L366 52"/><text class="t-c t-sm" x="243" y="46">HTTPS</text>
+  <path class="arrow-r" d="M530 52 L776 52"/><text class="t-c t-sm" x="653" y="46">plain HTTP inside</text>
+
+  <text class="t-b" x="20" y="116">Passthrough</text>
+  <rect class="ext" x="20" y="128" width="100" height="36" rx="8"/><text class="t-c t-b" x="70" y="151">Client</text>
+  <rect class="cache" x="370" y="128" width="160" height="36" rx="8"/><text class="t-c t-b" x="450" y="151">L4 LB (blind)</text>
+  <rect class="box" x="780" y="128" width="100" height="36" rx="8"/><text class="t-c t-b" x="830" y="151">Server</text>
+  <path class="arrow-g" d="M120 146 L366 146"/><text class="t-c t-sm" x="243" y="140">HTTPS</text>
+  <path class="arrow-g" d="M530 146 L776 146"/><text class="t-c t-sm" x="653" y="140">same encrypted bytes</text>
+
+  <text class="t-b" x="20" y="210">Re-encrypt</text>
+  <rect class="ext" x="20" y="222" width="100" height="36" rx="8"/><text class="t-c t-b" x="70" y="245">Client</text>
+  <rect class="cache" x="370" y="222" width="160" height="36" rx="8"/><text class="t-c t-b" x="450" y="245">LB (decrypts)</text>
+  <rect class="box" x="780" y="222" width="100" height="36" rx="8"/><text class="t-c t-b" x="830" y="245">Server</text>
+  <path class="arrow-g" d="M120 240 L366 240"/><text class="t-c t-sm" x="243" y="234">HTTPS</text>
+  <path class="arrow-g" d="M530 240 L776 240"/><text class="t-c t-sm" x="653" y="234">new HTTPS, optionally mutual</text>
+  <text class="t-sm" x="20" y="300">Green is encrypted, red is plain text. Terminate is simplest; passthrough keeps the LB blind; re-encrypt gives both.</text>
+</svg>
+<figcaption>Where encryption ends decides what the LB can see. Only the modes that decrypt at the LB allow routing by URL or header.</figcaption>
+</figure>
+
+<p>Other points worth knowing. TLS handshakes are the expensive part, so terminating at the LB with session resumption saves server CPU. Modern CPUs make the bulk encryption cheap, so the main cost is handshakes of new connections, not data. The LB should pass the original client IP in <code>X-Forwarded-For</code> (or use the PROXY protocol for layer 4) because backends otherwise see only the LB's address, which breaks logging, geolocation, and per-client rate limits. The proxy layer in general, including forward proxies and caching, is discussed in <a href="10-proxies.html">Chapter 10</a>.</p>
+
+<h2 id="affinity">8. Session affinity and why to avoid state</h2>
+
+<p><b>Session affinity</b> (sticky sessions) sends a given client to the same backend for repeated requests. People reach for it when the server stores something per user in memory: a login session, a shopping cart, a half-uploaded file, a WebSocket subscription. There are two common mechanisms.</p>
+<ul>
+  <li><b>Cookie-based:</b> the layer 7 LB inserts a cookie (for example <code>AWSALB</code> or a name you choose) holding the chosen backend or a hash of it. The browser returns it on each request and the LB routes accordingly. It is precise per browser and not affected by many users sharing an IP address.</li>
+  <li><b>IP hash:</b> works at layer 4 with no cookie, but is coarse (section 4.6).</li>
+</ul>
+<p>Affinity causes real problems. Load becomes uneven because heavy users stick to one server, and the LB can no longer balance them. If the pinned server dies, its users lose their in-memory state (logged out, cart gone). Deploys and scale-ins disrupt pinned users. Autoscaling is less effective, because new servers receive only new sessions while old ones stay busy. The cookie also expires or is dropped, and the user silently moves.</p>
+
+<div class="callout key"><b>Key idea</b>
+Prefer <b>stateless servers</b>: keep sessions in a shared store such as Redis (see <a href="15-redis.html">Chapter 15</a>) or in a signed token (JWT or an encrypted cookie) that the client carries. Then any server can handle any request, the LB can use simple algorithms, and failures cost nothing. Use affinity only where you cannot avoid it, and treat it as an optimization (a warm local cache) rather than a correctness requirement: if the pinned server vanishes, the request must still work, only slower.
+</div>
+
+<p>Legitimate uses: WebSocket and other long-lived connections (naturally pinned for their lifetime, covered in <a href="06-realtime.html">Chapter 6</a>), servers that cache per-user data where locality raises the hit rate, and systems where state really is partitioned (use consistent hashing on the key). Scaling and statelessness are discussed further in <a href="08-scalability-concurrency.html">Chapter 8</a>.</p>
+
+<h2 id="ha">9. The load balancer as a single point of failure</h2>
+
+<p>We introduced the LB to remove single points of failure from the servers, but it is now the one component every request passes through. If it fails, everything fails. It must therefore be redundant itself. How depends on the kind of LB.</p>
+
+<h3>9.1 Active-passive with a floating IP (VRRP)</h3>
+<p>Run two LBs. Clients know a <b>virtual IP address</b> (VIP). Normally LB A owns the VIP and handles all traffic, and LB B is on standby. The two exchange heartbeats using a protocol such as <b>VRRP</b> (Virtual Router Redundancy Protocol, implemented by keepalived on Linux). If B stops hearing A for a few seconds, B takes over the VIP, announcing the new owner to the network (a gratuitous ARP), and traffic now flows to B. Failover takes a few seconds. It is simple and well understood, and for stateful balancers the two can share connection state so existing connections survive. The cost: half your capacity sits idle, and a failover is visible as a brief interruption. There is also a risk of <b>split brain</b>, where a network problem makes both think they are active and both claim the VIP; careful heartbeat design and fencing are needed.</p>
+
+<h3>9.2 Active-active with ECMP and anycast</h3>
+<p>For scale, run many LBs that all work at once. A router in front uses <b>ECMP</b> (equal-cost multi-path routing) to spread incoming traffic over them, hashing each connection's 4-tuple so every packet of a connection reaches the same LB. The balancers can all announce the same VIP by BGP (the same technique CDNs use, see <a href="12-cdn.html">Chapter 12</a>), and if one stops announcing, routers shift its share to the others. This is the model used by large layer 4 balancers: a small group of routers and a pool of balancer machines with no idle capacity. A subtle problem: when an LB is added or removed, ECMP hashing can send an ongoing connection to a <i>different</i> LB that has never seen it. Solutions are consistent hashing in the LB tier so every LB picks the same backend for the same connection, plus connection tracking and state sharing. Cloud providers do all this for you.</p>
+
+<h3>9.3 DNS in front</h3>
+<p>Another tier of redundancy sits above: publish several LB addresses in DNS (or use health-checked DNS), so clients spread across them and a failed LB's address can be withdrawn. DNS has caching delays set by TTL, so it is slow to react and some clients ignore it (see <a href="04-dns.html">Chapter 4</a>). It is better as a coarse layer than as the main failover mechanism.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Active-passive pair with VIP versus active-active with ECMP">
+  <text class="t-b" x="20" y="22">Active-passive (VRRP)</text>
+  <rect class="ext" x="20" y="120" width="100" height="40" rx="8"/><text class="t-c t-b" x="70" y="145">Clients</text>
+  <rect class="cache" x="180" y="50" width="130" height="56" rx="8"/><text class="t-c t-b" x="245" y="74">LB A (active)</text><text class="t-c t-sm" x="245" y="93">owns the VIP</text>
+  <rect class="box" x="180" y="174" width="130" height="56" rx="8"/><text class="t-c t-b" x="245" y="198">LB B (standby)</text><text class="t-c t-sm" x="245" y="217">idle</text>
+  <path class="arrow" d="M120 130 L176 90"/><path class="arrow dash" d="M120 150 L176 200"/>
+  <path class="arrow dash" d="M245 106 L245 170"/><text class="t-sm" x="254" y="144">heartbeat</text>
+  <rect class="db" x="370" y="110" width="70" height="60" rx="8"/><text class="t-c t-b" x="405" y="144">Pool</text>
+  <path class="arrow" d="M310 78 L366 128"/><path class="arrow dash" d="M310 202 L366 156"/>
+
+  <text class="t-b" x="500" y="22">Active-active (ECMP)</text>
+  <rect class="ext" x="500" y="120" width="90" height="40" rx="8"/><text class="t-c t-b" x="545" y="145">Clients</text>
+  <rect class="ext" x="620" y="120" width="70" height="40" rx="8"/><text class="t-c t-b" x="655" y="145">Router</text>
+  <rect class="cache" x="730" y="40" width="130" height="44" rx="8"/><text class="t-c t-b" x="795" y="67">LB 1</text>
+  <rect class="cache" x="730" y="118" width="130" height="44" rx="8"/><text class="t-c t-b" x="795" y="145">LB 2</text>
+  <rect class="cache" x="730" y="196" width="130" height="44" rx="8"/><text class="t-c t-b" x="795" y="223">LB 3</text>
+  <path class="arrow" d="M590 140 L616 140"/>
+  <path class="arrow" d="M690 130 L726 66"/><path class="arrow" d="M690 140 L726 140"/><path class="arrow" d="M690 150 L726 216"/>
+  <text class="t-sm" x="500" y="280">All three work. Router hashes each connection to one LB.</text>
+  <text class="t-sm" x="500" y="300">One dies: its share spreads to the other two.</text>
+  <text class="t-sm" x="20" y="280">One works, one waits. Failover in seconds.</text>
+  <text class="t-sm" x="20" y="300">Simple, but half the capacity is idle.</text>
+</svg>
+<figcaption>Left: a standby takes over the shared virtual IP when heartbeats stop. Right: routers spread connections over many live balancers, so a failure removes only a fraction of capacity.</figcaption>
+</figure>
+
+<p>Within a cloud, availability zones add another dimension: a managed LB places nodes in each zone, and you should run backends in at least two or three zones so a zone outage leaves capacity. Cross-zone balancing (spreading evenly over all backends, regardless of zone) gives even load but adds cross-zone latency and sometimes data transfer cost; keeping traffic within a zone is cheaper and faster but can be uneven. High availability in general is a chapter of its own: <a href="41-ha-dr.html">Chapter 41</a>.</p>
+
+<h2 id="gslb">10. Global server load balancing and multi-region</h2>
+
+<p>One regional LB spreads traffic within a region. Serving the whole world adds a higher level: <b>global server load balancing (GSLB)</b> decides which <i>region</i> or data center should serve each user. The goals are low latency (nearest region), disaster recovery (shift away from a failed region), compliance (keep EU users in EU), and capacity (relieve an overloaded region).</p>
+
+<p>The three main mechanisms:</p>
+<ul>
+  <li><b>DNS-based:</b> a smart DNS service answers with the address of the best regional LB, based on the resolver's location, health checks of each region, latency measurements, or weights. See GeoDNS and latency-based routing in <a href="04-dns.html">Chapter 4</a>. Failover speed is limited by DNS caching, so TTLs are short (30 to 60 seconds), and clients and resolvers that ignore TTLs will lag.</li>
+  <li><b>Anycast:</b> every region announces the same IP; the network sends users to the nearest. Failover is fast because withdrawing the announcement redirects traffic in seconds, and Google's global load balancer works this way. See <a href="12-cdn.html">Chapter 12</a> for the technique.</li>
+  <li><b>Application-level redirection and edge steering:</b> a CDN or edge proxy terminates the user's connection nearby and forwards to a chosen region over a private backbone, choosing based on live health and load. The user's first hop is fast, and the edge can retry in another region.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Global load balancing: DNS or anycast directs users to the nearest healthy region">
+  <rect class="ext" x="20" y="30" width="130" height="40" rx="8"/><text class="t-c t-b" x="85" y="55">Users · EU</text>
+  <rect class="ext" x="20" y="130" width="130" height="40" rx="8"/><text class="t-c t-b" x="85" y="155">Users · US</text>
+  <rect class="ext" x="20" y="230" width="130" height="40" rx="8"/><text class="t-c t-b" x="85" y="255">Users · Asia</text>
+  <rect class="cache" x="300" y="115" width="180" height="70" rx="10"/><text class="t-c t-b" x="390" y="143">Global LB</text><text class="t-c t-sm" x="390" y="163">DNS / anycast / edge</text>
+  <rect class="box" x="670" y="20" width="200" height="60" rx="8"/><text class="t-c t-b" x="770" y="46">Region EU</text><text class="t-c t-sm" x="770" y="65">regional LB + servers</text>
+  <rect class="box" x="670" y="120" width="200" height="60" rx="8"/><text class="t-c t-b" x="770" y="146">Region US</text><text class="t-c t-sm" x="770" y="165">regional LB + servers</text>
+  <rect class="miss" x="670" y="220" width="200" height="60" rx="8"/><text class="t-c t-b" x="770" y="246">Region Asia (failed)</text><text class="t-c t-sm" x="770" y="265">health check fails</text>
+  <path class="arrow" d="M150 50 L296 130"/><path class="arrow" d="M150 150 L296 150"/><path class="arrow" d="M150 250 L296 170"/>
+  <path class="arrow-g" d="M480 130 L666 54"/><path class="arrow-g" d="M480 150 L666 150"/>
+  <path class="arrow-g dash" d="M480 168 L666 170"/>
+  <path class="arrow-r dash" d="M480 175 L666 240"/>
+  <text class="t-sm" x="500" y="205">Asia users fall back to US while Asia is down</text>
+</svg>
+<figcaption>The global tier picks a region by proximity and health. When a region fails its checks, its users are sent to the next best region.</figcaption>
+</figure>
+
+<p>Multi-region adds hard questions beyond routing: the failover region needs spare capacity (a US region that suddenly takes Asia's load needs headroom, or it fails too), data must already be replicated there (the subject of <a href="26-multi-region-migrations.html">Chapter 26</a>), and sticky data such as sessions must be available everywhere. Practical advice: route users to the nearest healthy region, keep each region able to survive on its own, and rehearse failover regularly because an untested failover usually fails.</p>
+
+<h2 id="placement">11. Internal and external balancers, client-side balancing, and service meshes</h2>
+
+<h3>11.1 External and internal</h3>
+<p>An <b>external</b> (internet-facing) LB takes traffic from the public internet and sits in a public subnet, hardened against attack and usually combined with a web application firewall and DDoS protection. An <b>internal</b> LB has only private addresses and balances traffic between your own services (web tier to API tier, API tier to a database proxy). A typical architecture has an external LB at the edge, then an API gateway (<a href="11-api-gateway.html">Chapter 11</a>) that handles authentication, rate limits, and routing between services, and internal LBs or a mesh between the services behind it. Static content is better served by a CDN (<a href="12-cdn.html">Chapter 12</a>) before it ever reaches an LB.</p>
+
+<h3>11.2 Client-side load balancing</h3>
+<p>With many internal services, putting a central LB between every pair adds a hop, a cost, and another thing to scale. In <b>client-side load balancing</b> the calling service itself holds the list of backends (learned from a service registry such as Consul, Eureka, or Kubernetes endpoints, or from DNS) and chooses one for each call, usually with power of two choices or round robin, and does its own health tracking and retries. It saves a network hop and removes the central bottleneck. The costs: every client language needs a library (gRPC has one built in), each client has only a partial view of load, and upgrading the logic means redeploying clients. Kubernetes shows both styles: a <code>Service</code> of type ClusterIP load-balances at layer 4 using kube-proxy rules, which is poor for long-lived gRPC connections (section 6.3), so people add a proxy or mesh.</p>
+
+<h3>11.3 Service mesh</h3>
+<p>A <b>service mesh</b> (Istio, Linkerd, Consul Connect) moves client-side balancing out of application code into a <b>sidecar proxy</b> (often Envoy) running next to each service instance. All traffic into and out of the service passes through the sidecar, which performs load balancing, retries with budgets, timeouts, circuit breaking, mutual TLS, and metrics. A central <b>control plane</b> pushes the routing and policy configuration to the sidecars, the <b>data plane</b>. You get uniform behavior across languages and rich traffic control (canary percentages, fault injection) without changing application code. The cost is extra CPU and memory per pod, one or two proxy hops of added latency (typically around a millisecond or less), and real operational complexity. Newer designs run the proxy once per node, or in the kernel, to reduce this.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Central load balancer, client-side balancing, and sidecar mesh">
+  <text class="t-b" x="20" y="22">Central LB</text>
+  <rect class="box" x="20" y="40" width="100" height="40" rx="8"/><text class="t-c t-b" x="70" y="65">Service A</text>
+  <rect class="cache" x="20" y="110" width="100" height="40" rx="8"/><text class="t-c t-b" x="70" y="135">LB</text>
+  <rect class="box" x="20" y="180" width="100" height="40" rx="8"/><text class="t-c t-b" x="70" y="205">B1, B2, B3</text>
+  <path class="arrow" d="M70 80 L70 106"/><path class="arrow" d="M70 150 L70 176"/>
+  <text class="t-sm" x="20" y="250">Extra hop, one place to manage</text>
+
+  <text class="t-b" x="330" y="22">Client-side</text>
+  <rect class="box" x="330" y="40" width="150" height="56" rx="8"/><text class="t-c t-b" x="405" y="64">Service A</text><text class="t-c t-sm" x="405" y="84">library picks a backend</text>
+  <rect class="box" x="330" y="160" width="60" height="40" rx="8"/><text class="t-c t-b" x="360" y="185">B1</text>
+  <rect class="box" x="400" y="160" width="60" height="40" rx="8"/><text class="t-c t-b" x="430" y="185">B2</text>
+  <rect class="box" x="470" y="160" width="60" height="40" rx="8"/><text class="t-c t-b" x="500" y="185">B3</text>
+  <path class="arrow" d="M380 96 L360 156"/><path class="arrow" d="M410 96 L430 156"/><path class="arrow dash" d="M440 96 L496 156"/>
+  <rect class="ext" x="500" y="40" width="80" height="40" rx="8"/><text class="t-c t-sm" x="540" y="56">registry</text><text class="t-c t-sm" x="540" y="72">list</text>
+  <text class="t-sm" x="330" y="250">No extra hop, logic in every client</text>
+
+  <text class="t-b" x="650" y="22">Service mesh</text>
+  <rect class="box" x="650" y="40" width="100" height="40" rx="8"/><text class="t-c t-b" x="700" y="65">A + sidecar</text>
+  <rect class="box" x="650" y="160" width="100" height="40" rx="8"/><text class="t-c t-b" x="700" y="185">B + sidecar</text>
+  <path class="arrow" d="M700 80 L700 156"/><text class="t-sm" x="708" y="124">mTLS, LB</text>
+  <rect class="ext" x="780" y="100" width="100" height="40" rx="8"/><text class="t-c t-b" x="830" y="125">Control plane</text>
+  <path class="arrow dash" d="M780 112 L754 70"/><path class="arrow dash" d="M780 130 L754 178"/>
+  <text class="t-sm" x="650" y="250">Uniform policy, extra CPU per pod</text>
+</svg>
+<figcaption>Three places to put the balancing logic: in a shared box, in each client, or in a sidecar beside each service.</figcaption>
+</figure>
+
+<h2 id="capacity">12. Capacity and scaling of the load balancer</h2>
+
+<p>The LB has limits too. Know which limit you will reach first:</p>
+<ul>
+  <li><b>Throughput</b> (bits per second): a 10 Gbps network card caps a software LB at about 1.25 GB/s of traffic unless it uses DSR so responses bypass it.</li>
+  <li><b>Connections per second:</b> each new connection costs CPU, particularly with TLS handshakes. Layer 7 LBs reach tens of thousands of new TLS connections per second per core at best, typically less.</li>
+  <li><b>Concurrent connections:</b> each held connection uses memory and a file descriptor. Millions are possible with tuned software, but the figure depends on buffers and tuning.</li>
+  <li><b>Requests per second:</b> for layer 7, parsing and routing cost. Tens to hundreds of thousands per second per machine, depending on features.</li>
+  <li><b>Ephemeral ports:</b> a proxy opening connections to one backend address uses a port for each, and a single source address and destination pair has about 64,000 ports. With many short connections this can run out; keep-alive or more addresses solve it.</li>
+</ul>
+
+<p>To scale: scale up (bigger machines) first because it is easy; then scale out by adding LB nodes behind ECMP or DNS (section 9.2); put a cheap layer 4 tier in front of expensive layer 7 proxies; terminate TLS on dedicated nodes if handshakes dominate; offload static content to a CDN; and keep connections alive to reduce handshakes. Managed LBs scale automatically but not instantly: ALB and similar add capacity within minutes, so a sudden tenfold spike (a flash sale, a push notification) can see errors until it scales. The remedy is to ask the provider to pre-warm, to use NLB (which handles abrupt spikes better), or to smooth the spike with queues and rate limits (<a href="16-rate-limiting.html">Chapter 16</a>). Always watch LB metrics: active connections, new connections per second, 4xx and 5xx counts split between LB-generated and backend-generated, backend response time, healthy host count, and rejected or queued requests.</p>
+
+<h2 id="failures">13. Common failure modes</h2>
+
+<h3>13.1 Thundering herd on recovery</h3>
+<p>A backend (or a whole tier) recovers after an outage, and the LB at once sends it its full share. If least-connections is used, a freshly healthy node with zero connections absorbs everything. The cold server is overwhelmed, fails its checks, is ejected, recovers, and the cycle repeats. A related herd happens when many clients that were waiting reconnect simultaneously. Mitigations: slow start (section 5.4), requiring several successful probes, a limit on concurrent connections per backend, client retry with exponential backoff and jitter (<a href="40-resilience.html">Chapter 40</a>), and warming caches before returning to rotation.</p>
+
+<h3>13.2 Uneven load</h3>
+<p>Round robin with variable request cost, a few heavy clients stuck by affinity, hash collisions, one backend on a noisy host, HTTP/2 connections pinned by a layer 4 LB, or fleet changes that leave old long-lived connections on old servers. Diagnose by comparing per-backend request rate, active connections, and latency. Fixes: least connections or power of two choices, layer 7 request-level balancing, maximum connection age, weights for different sizes, and bounded-load hashing.</p>
+
+<h3>13.3 Health check flapping</h3>
+<p>A server hovering near its limit fails a probe, is removed, load shifts to the others, pushing them over their limit, so they fail probes too. The fleet oscillates, or collapses completely. Causes: probe timeout too tight, a health endpoint that does expensive work or competes with real traffic for the same worker pool, too-low thresholds. Fixes: simple dedicated health endpoint on its own thread or port, sensible thresholds with hysteresis, panic mode that stops ejecting when too many are out, and enough headroom (N+1 or N+2 capacity) that losing one server does not overload the rest.</p>
+
+<h3>13.4 Retry storms</h3>
+<p>When a backend slows down, clients and the LB retry. Each retry adds work to an already struggling system, so more requests time out and are retried: load multiplies. If each of three layers (browser, gateway, service) makes three attempts, one user request can become 27 backend requests. Mitigations: limit retries to one extra attempt, use a <b>retry budget</b> (retries allowed only up to, say, 10% of normal traffic), retry only idempotent requests, use exponential backoff with jitter, add circuit breakers that stop calling a failing backend, and shed load at the edge (<a href="16-rate-limiting.html">Chapter 16</a>). Only retry on failures that are safe: connection refused (nothing was processed) is safe, a timeout after sending a POST is not unless the operation is idempotent.</p>
+
+<h3>13.5 Other traps</h3>
+<ul>
+  <li><b>Mismatched idle timeouts</b> cause intermittent 502s (section 6.2).</li>
+  <li><b>Lost client address</b> when the backend sees only the LB IP; use X-Forwarded-For or the PROXY protocol.</li>
+  <li><b>Slow clients and request smuggling:</b> an LB and backend that disagree on where one request ends can allow smuggled requests; keep software current and normalize requests.</li>
+  <li><b>Misconfigured health path</b> that returns 200 from a static page even when the app is broken, or 401 because it requires login.</li>
+  <li><b>LB as bottleneck without anyone noticing</b>, because its limits are not graphed.</li>
+  <li><b>Config pushed to all LBs at once</b>: roll out configuration gradually and keep the last good version, since a bad config can take down the front door.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 260" role="img" aria-label="Retry storm amplification across three layers">
+  <rect class="ext" x="20" y="100" width="110" height="50" rx="8"/><text class="t-c t-b" x="75" y="130">1 user request</text>
+  <rect class="cache" x="230" y="100" width="130" height="50" rx="8"/><text class="t-c t-b" x="295" y="122">Gateway</text><text class="t-c t-sm" x="295" y="140">3 attempts</text>
+  <rect class="box" x="460" y="100" width="130" height="50" rx="8"/><text class="t-c t-b" x="525" y="122">Service</text><text class="t-c t-sm" x="525" y="140">3 attempts each</text>
+  <rect class="miss" x="690" y="100" width="180" height="50" rx="8"/><text class="t-c t-b" x="780" y="122">Struggling backend</text><text class="t-c t-sm" x="780" y="140">up to 9 requests</text>
+  <path class="arrow" d="M130 125 L226 125"/><path class="arrow" d="M360 125 L456 125"/><path class="arrow-r" d="M590 125 L686 125"/>
+  <text class="t-c t-sm" x="178" y="116">x1</text><text class="t-c t-sm" x="408" y="116">x3</text><text class="t-c t-sm" x="638" y="116">x3</text>
+  <text class="t-sm" x="20" y="200">Add a client with 3 attempts and it is 27. Fix: one retry layer, a retry budget, backoff with jitter.</text>
+</svg>
+<figcaption>Retries multiply across layers. Each layer thinks it is being careful, but together they flood a backend that is already slow.</figcaption>
+</figure>
+
+<h2 id="example">14. Worked example with numbers</h2>
+
+<p>Design the front door for an API with a peak of 60,000 requests per second, average response 20 KB, average request 1.5 KB, 80% of requests reusing an existing connection, and servers that each handle 1,500 requests per second at a comfortable 60% CPU.</p>
+
+<h3>14.1 Backend fleet size</h3>
+<p>60,000 ÷ 1,500 = 40 servers at normal load. We want to survive the loss of one availability zone out of three, so after a zone loss the remaining two zones must carry the full peak. Each zone then needs 40 ÷ 2 = 20 servers, and three zones means 60 servers (versus 40 if no zone failure were tolerated). That is 50% extra, the price of surviving a zone loss. With two zones, each would need 40 servers (80 total, 100% extra), so three zones is the cheaper way to get zone-level resilience.</p>
+
+<h3>14.2 Bandwidth through the LB</h3>
+<p>Responses: 60,000 × 20 KB = 1.2 GB/s, which is 9.6 Gbps. Requests: 60,000 × 1.5 KB = 90 MB/s, about 0.72 Gbps. If all traffic passes through the LB (not DSR), it carries about 10.3 Gbps outbound plus inbound. A single 10 Gbps NIC is therefore already over its limit, and we want headroom, so we need at least 3 LB nodes (3 × 10 Gbps = 30 Gbps, running near 35% utilization, enough to lose one node and still have 20 Gbps for 10.3).</p>
+
+<h3>14.3 Connection rate and TLS</h3>
+<p>If 80% of requests reuse a connection, then 20% of requests open a new one: 60,000 × 0.2 = 12,000 new TLS connections per second. If one core can do roughly 2,000 to 4,000 full handshakes per second (a typical order of magnitude, depending on key type), we need 3 to 6 cores for handshakes at peak, trivial for three LB nodes with 8 or more cores each. Encryption of the data stream itself (10 Gbps) costs more CPU than handshakes in this example, which is why nodes with several cores are used. Raising the keep-alive reuse from 80% to 95% would cut new connections to 3,000 per second.</p>
+
+<h3>14.4 Health check and failure detection</h3>
+<p>Active probes every 5 s, unhealthy threshold 3: a hard crash is detected within 15 s at worst. During detection the dead server receives 1/60 of requests, which is 60,000 ÷ 60 = 1,000 requests per second, all failing. With one retry on connection errors (safe because nothing was processed), the users see nearly no errors. Passive outlier detection (eject after 5 consecutive 5xx) would remove it within about 5 failed requests, well under a second at 1,000 per second. The combined design: active checks plus outlier detection plus one retry with a retry budget.</p>
+
+<h3>14.5 Choice of algorithm and deployment</h3>
+<p>Requests vary from a 5 ms read to a 400 ms report, so round robin is risky. We pick least requests with two random choices. Rolling deploys drain for 60 s, and slow start ramps over 45 s. For LB high availability: a managed layer 7 balancer spanning three zones (or three self-run nodes behind ECMP) with the global address in DNS, and static content moved to a CDN, which at 80% of the 1.2 GB/s being static would cut LB bandwidth to about 2 Gbps and let us use fewer LB nodes. Finally, test: kill a server, kill a zone, and run a load test at 1.5 times the peak.</p>
+
+<table>
+<tr><th>Item</th><th>Calculation</th><th>Result</th></tr>
+<tr><td>Servers for peak</td><td>60,000 ÷ 1,500</td><td>40</td></tr>
+<tr><td>Servers surviving a zone loss (3 zones)</td><td>40 ÷ 2 per zone × 3</td><td>60</td></tr>
+<tr><td>Response bandwidth</td><td>60,000 × 20 KB × 8</td><td>about 9.6 Gbps</td></tr>
+<tr><td>LB nodes at 10 Gbps each</td><td>10.3 ÷ 10, plus N+1</td><td>3 or more</td></tr>
+<tr><td>New TLS handshakes</td><td>60,000 × 20%</td><td>12,000 per second</td></tr>
+<tr><td>Crash detection</td><td>5 s × 3</td><td>up to 15 s (under 1 s passive)</td></tr>
+</table>
+
+<h2 id="qa">15. Interview questions and answers</h2>
+
+<details><summary>What is the difference between a layer 4 and a layer 7 load balancer, and which would you choose?</summary>
+<p>A layer 4 balancer works on TCP or UDP connections and sees only addresses and ports, so it forwards packets quickly without understanding the content. A layer 7 balancer terminates the connection, reads the HTTP request, and can route by path, host, header, or cookie, retry, and balance individual requests. I choose layer 7 for HTTP services because routing, TLS handling, and retries are valuable, and layer 4 for non-HTTP protocols, extreme connection counts, or as a fast tier in front of layer 7 proxies. In large systems both are stacked.</p></details>
+
+<details><summary>Round robin versus least connections: when does each fit?</summary>
+<p>Round robin is fine when requests cost about the same and servers are identical, because equal turns give equal work. When request durations vary a lot, round robin can overload a server that happens to get several slow requests. Least connections tracks in-flight requests and naturally sends less to a server that is behind, so it is better for variable work and long-lived connections like WebSockets. With many independent balancers a pure least-connections choice can cause a herd, so power of two choices is a good compromise.</p></details>
+
+<details><summary>Explain the power of two choices and why it works.</summary>
+<p>For each request, pick two backends at random and send the request to the one with fewer active requests. It needs only two lookups instead of a view of the whole fleet, and it avoids every balancer choosing the same emptiest server at once. Probability theory shows the maximum load drops from roughly log n over log log n with one random choice to log log n with two, which is nearly as good as perfect balancing. That makes it attractive for big fleets and for client-side balancing.</p></details>
+
+<details><summary>How do health checks work, and how do you avoid flapping?</summary>
+<p>Active checks probe each backend periodically (TCP connect or an HTTP path with a timeout); passive checks watch real responses and eject a host after consecutive errors. Thresholds require several consecutive failures to remove a host and several successes to restore it, so one lost packet does not matter. To avoid flapping, keep the health endpoint cheap and independent of shared dependencies, set timeouts above normal latency, use hysteresis (healthy threshold above unhealthy), add slow start, and keep enough spare capacity that removing one server does not overload the rest. A panic mode that ignores health when too many hosts fail prevents a total self-inflicted outage.</p></details>
+
+<details><summary>Why should you avoid sticky sessions, and what do you do instead?</summary>
+<p>Sticky sessions pin a user to one server, which makes load uneven, loses state when that server dies, and complicates deploys and autoscaling. The better design is stateless servers with session data in a shared store like Redis or in a signed token the client holds, so any server can handle any request. When affinity is unavoidable (WebSockets, local caches), treat it as an optimization and make sure the system still works correctly, only slower, if the user lands elsewhere. Cookie-based affinity is more accurate than IP hash because many users share an IP address.</p></details>
+
+<details><summary>The load balancer is a single point of failure. How do you fix that?</summary>
+<p>Run several balancers. The simple way is an active-passive pair sharing a virtual IP using VRRP, so the standby takes the address within seconds when heartbeats stop. For more scale, run active-active nodes behind routers using ECMP, or announce the same address from all of them using anycast, so a failure removes only a fraction of capacity. Cloud managed balancers already do this across zones. DNS can also list multiple balancer addresses, but its caching makes it slow, so it is a coarse outer layer. You also need to avoid split brain in active-passive designs.</p></details>
+
+<details><summary>TLS termination at the LB versus passthrough: what are the tradeoffs?</summary>
+<p>Termination lets the LB read requests for layer 7 routing, centralizes certificates, and offloads cryptographic work from servers, but traffic inside is unencrypted unless re-encrypted and the LB holds private keys. Passthrough keeps encryption end to end and keys off the LB, but the LB only sees addresses and the SNI name, so it cannot route by path or retry HTTP. Many designs terminate and then re-encrypt to the backend, or use mutual TLS through a service mesh, getting both visibility and internal encryption.</p></details>
+
+<details><summary>Why does gRPC or HTTP/2 traffic often balance badly through a layer 4 load balancer?</summary>
+<p>HTTP/2 multiplexes many requests over a single long connection, and a layer 4 balancer assigns each connection, not each request, to a backend. A client with one connection sends all its traffic to one server, and newly added servers get nothing because existing connections never move. The fix is a layer 7 balancer that understands HTTP/2 and distributes streams, client-side balancing where the client holds several connections, and a maximum connection age so connections are periodically re-established.</p></details>
+
+<details><summary>How would you do global load balancing across regions, and what are the catches?</summary>
+<p>Use health-checked, latency- or geography-based DNS, or anycast, or edge proxies to direct each user to the nearest healthy region, with regional balancers inside. Failover by DNS is limited by TTL and clients that ignore it; anycast fails over faster. The real catches are capacity (the surviving region must absorb the extra load), data (it must already be replicated, see the multi-region chapter), and testing, since an unrehearsed failover often fails. Also consider data residency rules that restrict where certain users can be served.</p></details>
+
+<details><summary>What is a retry storm, and how does the load balancer layer contribute to it?</summary>
+<p>When a backend slows, each layer retries failed or timed out requests, and because retries multiply across layers (three attempts at each of three layers gives 27), the load on an already struggling service can grow far beyond normal and prevent recovery. The balancer contributes if it retries aggressively. I limit retries to one attempt, use a retry budget tied to a fraction of normal traffic, retry only idempotent or clearly safe failures, use backoff with jitter, add circuit breakers, and shed load at the edge so the system degrades instead of collapsing.</p></details>
+
+<details><summary>When would you use consistent hashing in a load balancer instead of round robin?</summary>
+<p>When the backend keeps valuable state per key, such as a cache or a shard, so that sending the same key to the same server raises the hit rate or is required for correctness. Plain hash modulo N reshuffles nearly every key when the server count changes, which would cool every cache at once. Consistent hashing moves only about one over N of the keys. A hot key can overload its owner, so bounded-load consistent hashing or replicating hot keys across several servers is a common refinement.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">16. Recap</h2><ul>
+<li>A load balancer provides one stable address over many servers, giving capacity, availability, easy deploys, and a central place for TLS and observability.</li>
+<li>Layer 4 forwards connections quickly without reading content; layer 7 reads requests and routes, retries, and balances per request. Large systems often stack both.</li>
+<li>Choose algorithms by workload: round robin for uniform work, least connections or power of two choices for variable work, consistent hashing when locality by key matters, weights for mixed hardware.</li>
+<li>Health checks combine active probes and passive outlier detection with thresholds, slow start, and connection draining so servers enter and leave rotation safely.</li>
+<li>Prefer stateless servers over sticky sessions; keep keep-alive timeouts consistent; use layer 7 or client-side balancing for HTTP/2 and gRPC.</li>
+<li>Terminate TLS at the LB for visibility, pass it through for end-to-end secrecy, or re-encrypt for both.</li>
+<li>The LB must itself be redundant: VRRP pairs, ECMP or anycast pools, managed multi-zone services, and DNS or global tiers above.</li>
+<li>Know the failure modes: thundering herds, uneven load, flapping health checks, and retry storms, and the limits (bandwidth, connections, handshakes, ports) that cap an LB.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="03-networking-essentials.html">Chapter 3</a> (TCP, TLS, keep-alive), <a href="04-dns.html">Chapter 4</a> (DNS-based distribution and GeoDNS), and <a href="08-scalability-concurrency.html">Chapter 8</a> (stateless design). Next, <a href="10-proxies.html">Chapter 10</a> covers proxies in general, <a href="11-api-gateway.html">Chapter 11</a> the API gateway behind the LB, and <a href="12-cdn.html">Chapter 12</a> the CDN in front of it. Resilience around retries is in <a href="40-resilience.html">Chapter 40</a>.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+<script>
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+function setParts(node, parts) { node.textContent = ''; parts.forEach(function (p) { if (typeof p === 'string') node.appendChild(document.createTextNode(p)); else node.appendChild(el('b', null, p.b)); }); }
+(function () {
+  var speed = [1, 1, 1, 3];            // backend 4 takes 3x longer
+  var weights = [1, 1, 1, 0.33];
+  var nClients = 120;
+  var seed = 12345;
+  function rnd() { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296; }
+  function hash(n) { var h = (n + 0x9e3779b9) | 0; h = Math.imul(h ^ (h >>> 16), 0x85ebca6b); h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35); return (h ^ (h >>> 16)) >>> 0; }
+  var ring = [];
+  for (var b = 0; b < 4; b++) for (var v = 0; v < 50; v++) ring.push({ p: hash(b * 1000 + v + 77), b: b });
+  ring.sort(function (x, y) { return x.p - y.p; });
+  function ringPick(key, alive) {
+    var h = hash(key * 7 + 3);
+    for (var i = 0; i < ring.length; i++) if (ring[i].p >= h && alive[ring[i].b]) return ring[i].b;
+    for (var j = 0; j < ring.length; j++) if (alive[ring[j].b]) return ring[j].b;
+    return -1;
+  }
+  function run() {
+    seed = 12345;
+    var alg = document.getElementById('lb-alg').value;
+    var rate = Math.max(1, parseInt(document.getElementById('lb-rate').value, 10) || 6);
+    var ticks = Math.max(50, parseInt(document.getElementById('lb-ticks').value, 10) || 400);
+    var alive = [true, !document.getElementById('lb-kill').checked, true, true];
+    var aliveIdx = [];
+    for (var a = 0; a < 4; a++) if (alive[a]) aliveIdx.push(a);
+    var active = [[], [], [], []], total = [0, 0, 0, 0], peak = [0, 0, 0, 0], ewma = [1, 1, 1, 1];
+    var rrCount = 0, wrrCur = [0, 0, 0, 0];
+    function pick(client) {
+      var i, best;
+      if (alg === 'rr') { var r = aliveIdx[rrCount % aliveIdx.length]; rrCount++; return r; }
+      if (alg === 'wrr') {
+        var sum = 0;
+        aliveIdx.forEach(function (k) { wrrCur[k] += weights[k]; sum += weights[k]; });
+        best = aliveIdx[0];
+        aliveIdx.forEach(function (k) { if (wrrCur[k] > wrrCur[best]) best = k; });
+        wrrCur[best] -= sum; return best;
+      }
+      if (alg === 'lc') { best = aliveIdx[0]; aliveIdx.forEach(function (k) { if (active[k].length < active[best].length) best = k; }); return best; }
+      if (alg === 'lrt') { best = aliveIdx[0]; aliveIdx.forEach(function (k) { if (ewma[k] * (active[k].length + 1) < ewma[best] * (active[best].length + 1)) best = k; }); return best; }
+      if (alg === 'p2c') { var x = aliveIdx[Math.floor(rnd() * aliveIdx.length)], y = aliveIdx[Math.floor(rnd() * aliveIdx.length)]; return active[x].length <= active[y].length ? x : y; }
+      if (alg === 'iph') { return aliveIdx[hash(client) % aliveIdx.length]; }
+      if (alg === 'ch') { return ringPick(client, alive); }
+      return aliveIdx[Math.floor(rnd() * aliveIdx.length)];
+    }
+    for (var t = 0; t < ticks; t++) {
+      for (var k = 0; k < 4; k++) active[k] = active[k].filter(function (end) { return end > t; });
+      for (var q = 0; q < rate; q++) {
+        var client = Math.floor(rnd() * nClients);
+        var s = pick(client);
+        var dur = Math.max(1, Math.round((1 + rnd() * rnd() * 8) * speed[s]));
+        active[s].push(t + dur);
+        total[s]++;
+        ewma[s] = 0.9 * ewma[s] + 0.1 * dur;
+        if (active[s].length > peak[s]) peak[s] = active[s].length;
+      }
+    }
+    var all = total[0] + total[1] + total[2] + total[3];
+    var out = document.getElementById('lb-out');
+    out.textContent = '';
+    for (var m = 0; m < 4; m++) {
+      var pct = all ? Math.round(1000 * total[m] / all) / 10 : 0;
+      var bar = '';
+      for (var c = 0; c < Math.round(pct / 2); c++) bar += '#';
+      var label = 'Backend ' + (m + 1) + (m === 3 ? ' (slow)' : '') + (alive[m] ? '' : ' (down)');
+      var line = el('div');
+      setParts(line, [label + ': ', { b: pct + '%' }, ' of requests, peak in flight ', { b: String(peak[m]) }, '  ' + bar]);
+      out.appendChild(line);
+    }
+    var hi = Math.max.apply(null, peak), lo = Math.min.apply(null, aliveIdx.map(function (i) { return peak[i]; }));
+    out.appendChild(el('div', null, 'Worst peak in flight: ' + hi + ' versus best ' + lo + '. A large gap means one server is struggling while others idle.'));
+  }
+  document.getElementById('lb-run').addEventListener('click', run);
+})();
+</script>
+</body>
+</html>

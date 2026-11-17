@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 20: Design Ad Click Aggregation | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c20-ad-click-aggregation">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 20 · Worked solutions</div>
+<h1>Design Ad Click Aggregation</h1>
+<p class="lead">Every time someone clicks an ad, an advertiser may owe money and a dashboard must change. This worked solution builds a pipeline that ingests a billion clicks a day, throws away duplicates and bots, counts clicks per ad per minute with correct handling of late events, stores the counts so advertisers can query them in under a second, and proves the numbers are billing-grade by reconciling the stream against a slower batch job.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+
+<p>An advertising platform shows ads on websites and apps. When a user clicks an ad, the browser or app is redirected through a click-tracking endpoint run by the platform, which records the click and then forwards the user to the advertiser's landing page. Advertisers pay per click (cost per click, CPC), so the number of clicks is literally money. Advertisers also want to watch campaigns live: "how many clicks did ad 4711 get in each of the last 60 minutes?" The task is to design the system that collects click events, aggregates them by ad and by minute, and serves the results.</p>
+
+<p>The first five minutes of an interview should go into questions, because the answers change the design. These are the questions I would ask, with the answers I will assume for the rest of the page (the framework is in <a href="../chapters/01-interview-framework.html">Chapter 1</a>).</p>
+
+<table>
+<tr><th>Question</th><th>Assumed answer</th><th>Why it matters</th></tr>
+<tr><td>How many clicks per day?</td><td>1 billion per day, average about 11.6k per second, peak about 50k per second</td><td>Sets the size of Kafka, the stream job and the store.</td></tr>
+<tr><td>Is the number used for billing?</td><td>Yes. Billed numbers must be exact and auditable. Dashboard numbers may be a few seconds fresh but should converge to the billed number.</td><td>Forces exactly-once effects and a reconciliation path.</td></tr>
+<tr><td>What aggregation granularity?</td><td>Clicks per ad per minute as the base. Rollups to hour and day are derived.</td><td>Drives the window design and the table schema.</td></tr>
+<tr><td>How fresh must the dashboard be?</td><td>Within about 30 seconds of the minute closing. Billing can wait for the finalized number (hours).</td><td>Allows a small amount of lateness waiting.</td></tr>
+<tr><td>How late can a click arrive?</td><td>Most within seconds. Mobile clients buffering offline can deliver minutes to hours late. Accept up to 15 minutes late into the live path, anything later through batch correction.</td><td>Defines the watermark and the allowed lateness.</td></tr>
+<tr><td>Do we count invalid clicks?</td><td>No. Duplicates and bot traffic must not be billed. The raw clicks are kept so a decision can be revisited.</td><td>Adds a filtering stage and a need to replay.</td></tr>
+<tr><td>What queries must be supported?</td><td>Per-ad time series for any range, per-advertiser totals, and top K ads in the last N minutes.</td><td>Drives the storage engine and an extra top-K path.</td></tr>
+<tr><td>Is attribution or conversion tracking in scope?</td><td>No. Only counting clicks (not impressions, not purchases that follow).</td><td>Keeps the scope to one pipeline.</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements</h2>
+
+<h3>2.1 Functional</h3>
+<ul>
+<li><b>Ingest</b> click events from the redirect tier with very low added latency to the user.</li>
+<li><b>Filter</b> duplicate clicks (the same physical click delivered more than once) and invalid clicks (bots, click farms, abusive repeats).</li>
+<li><b>Aggregate</b> valid clicks into per-ad, per-minute counts, with rollups to hour and day.</li>
+<li><b>Query</b> by advertiser: time series for an ad or campaign over a range, plus the top K ads by clicks over the last N minutes.</li>
+<li><b>Correct</b> history: late events and fraud decisions made after the fact must be reflected in the numbers.</li>
+<li><b>Replay</b>: rebuild any past period from the raw log after a bug or a rule change.</li>
+</ul>
+
+<h3>2.2 Non-functional</h3>
+<ul>
+<li><b>Accuracy first.</b> No click is lost, no click is counted twice. When speed and exactness conflict, exactness wins for billing and speed wins for the live dashboard (which later converges).</li>
+<li><b>Throughput:</b> sustain 50k clicks per second at peak, and survive a 3x surprise burst by buffering rather than dropping.</li>
+<li><b>Latency:</b> redirect path adds under 10 ms of our own time (p99). Dashboard freshness under 30 seconds after the minute closes. Query latency under 500 ms p99.</li>
+<li><b>Availability:</b> the click endpoint must be highly available (a lost click is lost revenue); the dashboard may degrade.</li>
+<li><b>Durability:</b> once the endpoint says "recorded", the event survives any single machine or zone failure.</li>
+<li><b>Fault tolerance:</b> any stage can crash and restart without changing the final counts.</li>
+</ul>
+
+<h3>2.3 Out of scope</h3>
+<p>Ad serving and auctions, budget pacing (stopping a campaign when its budget is spent, although it consumes our output), conversion attribution, the invoice generator, and the machine learning model that scores fraud (we treat it as a service that returns a score).</p>
+
+<h2 id="estimation">3. Estimation</h2>
+
+<p>All arithmetic is shown so each later choice can be defended (method in <a href="../chapters/02-estimation.html">Chapter 2</a>).</p>
+
+<h3>3.1 Traffic</h3>
+<ul>
+<li>1 billion clicks per day. A day has 86,400 seconds, so the average is 1,000,000,000 / 86,400 = about 11,574 per second, which I round to about 11.6k per second.</li>
+<li>Advertising traffic is diurnal and spiky (a sports final, a flash sale). Peak is about 4.3x average, so I take 50k per second as the design peak, and plan the pipeline to catch up from a short outage at 2x peak speed.</li>
+<li>Read side: advertisers number in the hundreds of thousands, and a dashboard auto-refreshes about every 30 seconds. With 100k advertisers watching at once at peak, that is about 3.3k dashboard queries per second. Queries are far fewer than writes, but each touches many rows, so they matter for the store design.</li>
+</ul>
+
+<h3>3.2 Raw event storage</h3>
+<p>A click event carries a click id, ad id, advertiser id, campaign id, placement/publisher id, user or device id, IP, user agent, event timestamp, and a few flags. Assume 200 bytes in a compact binary encoding (<a href="../chapters/07-serialization.html">Chapter 7</a>).</p>
+<ul>
+<li>Per day: 1e9 x 200 B = 200 GB. Per year: 200 GB x 365 = 73 TB. Compressed about 3 to 4 times in columnar files on object storage, roughly 20 TB per year.</li>
+<li>Kafka retention of 7 days: 200 GB x 7 = 1.4 TB, times replication factor 3 = 4.2 TB across the brokers. Small.</li>
+<li>Peak ingest bandwidth: 50k x 200 B = 10 MB per second. This is tiny for Kafka (a single broker handles tens to hundreds of MB per second), so partitions are chosen for consumer parallelism and key distribution, not for bandwidth. I choose 64 partitions for the raw topic.</li>
+</ul>
+
+<h3>3.3 Aggregate storage</h3>
+<p>Not every ad is clicked every minute. Assume that after aggregation there are about 300 million (ad, minute) rows per day, meaning the average non-empty row holds about 3 clicks. Each row is ad id (8 B), minute (4 B), count (8 B), plus a few columns such as advertiser id and a revision number, say 40 B stored.</p>
+<ul>
+<li>Minute table: 300M x 40 B = 12 GB per day, 4.4 TB per year before compression. Keep minute granularity for 30 days (360 GB), roll up to hour (about 40x fewer rows) kept for 2 years, and day kept forever.</li>
+<li>Dedup state: a click id is 16 bytes, plus overhead call it 40 B in the state backend. If we remember ids for 1 hour, the peak holds up to 50k x 3600 = 180 million ids, and 180M x 40 B = 7.2 GB, spread across 64 workers that is about 110 MB each. This fits comfortably in RocksDB state on local disk or even memory.</li>
+</ul>
+
+<h3>3.4 Stream job sizing</h3>
+<p>With 64 parallel tasks, each handles 50k / 64 = about 780 events per second at peak. Even with a 1 KB state lookup per event this is light; the real costs are checkpointing and the fraud model calls, not counting. I would still run 64 tasks (not 8) so that restarts, rescaling and catch-up after an outage have parallel headroom.</p>
+
+<h2 id="api">4. API design</h2>
+
+<h3>4.1 Click ingestion (write path)</h3>
+<pre><code>GET /c?ad=4711&amp;cid=7f3a...e1&amp;ts=1731800123456&amp;sig=9be0...
+  -&gt; 302 Location: https://advertiser.example/landing?utm=...
+  headers captured: IP, User-Agent, Referer, Cookie (device id)</code></pre>
+<p>The ad server embeds a click URL into each served ad. The query string contains the ad id, a <b>click id</b> (<code>cid</code>), generated at <i>impression</i> time when the ad was shown, and an HMAC signature of both with a secret key. The click id is the dedup key: if the user double-clicks or the browser retries, the same <code>cid</code> appears twice. The signature stops anyone from inventing click ids, so forged traffic can be rejected at the edge before it costs anything downstream. The endpoint writes to the log, then replies with a 302 redirect. The user does not wait for aggregation.</p>
+
+<h3>4.2 Event schema on the log</h3>
+<pre><code>ClickEvent {
+  click_id:    bytes16   // unique per impression, the dedup key
+  ad_id:       int64
+  advertiser:  int64
+  campaign_id: int64
+  publisher:   int64
+  device_id:   bytes16
+  ip:          bytes16
+  user_agent:  string
+  event_time:  int64     // when the click happened, client/edge clock (ms)
+  ingest_time: int64     // when our edge received it
+  sig_valid:   bool
+}</code></pre>
+
+<h3>4.3 Query API for advertisers (read path)</h3>
+<pre><code>GET /v1/ads/{adId}/clicks?from=2026-11-17T10:00Z&amp;to=2026-11-17T11:00Z&amp;granularity=minute
+  -&gt; { "adId": 4711, "granularity": "minute",
+       "points": [ { "t": "2026-11-17T10:00Z", "clicks": 12, "status": "provisional" }, ... ],
+       "watermark": "2026-11-17T10:58Z" }
+
+GET /v1/advertisers/{id}/clicks?from=...&amp;to=...&amp;groupBy=ad&amp;granularity=hour
+GET /v1/advertisers/{id}/top-ads?window=15m&amp;k=10
+  -&gt; [ { "adId": 4711, "clicks": 9120 }, ... ]</code></pre>
+<p>Each point carries a <code>status</code>: <code>provisional</code> (from the stream, may still change within the lateness bound), or <code>final</code> (confirmed by the batch reconciliation). The response also returns the watermark, so the client can show "data complete up to 10:58". This honesty is a design feature: it lets us serve fast numbers and exact numbers without lying about which is which. Pagination and rate limits follow <a href="../chapters/05-api-design.html">Chapter 5</a> and <a href="../chapters/16-rate-limiting.html">Chapter 16</a>.</p>
+
+<h2 id="data-model">5. Data model and storage choice</h2>
+
+<table>
+<tr><th>Data</th><th>Store</th><th>Why</th></tr>
+<tr><td>Raw click events (hot, 7 days)</td><td>Kafka topic <code>clicks.raw</code> (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>)</td><td>Durable, ordered per partition, replayable, decouples the click endpoint from everything downstream.</td></tr>
+<tr><td>Raw click events (cold, forever)</td><td>Object storage in columnar files, partitioned by date and hour (<a href="../chapters/21-object-storage.html">Chapter 21</a>)</td><td>Cheap, durable source of truth for batch reconciliation, audits and replay beyond Kafka retention.</td></tr>
+<tr><td>Dedup and window state</td><td>Local RocksDB inside the stream job, checkpointed to object storage</td><td>Per-key state at memory speed, with consistent snapshots (<a href="../chapters/37-batch-stream.html">Chapter 37</a>).</td></tr>
+<tr><td>Aggregates (minute, hour, day)</td><td>A columnar OLAP store such as ClickHouse, Druid or Pinot (<a href="../chapters/23-other-stores.html">Chapter 23</a>)</td><td>Fast range scans and group-bys over billions of rows; sum-friendly; supports upserts by key.</td></tr>
+<tr><td>Top-K ads, live</td><td>Redis sorted sets, one per minute bucket (<a href="../chapters/15-redis.html">Chapter 15</a>, <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>)</td><td>Small, hot, needs fast "top 10 of a sorted set".</td></tr>
+<tr><td>Billing ledger</td><td>Relational database fed only from finalized aggregates (<a href="../chapters/18-relational-internals.html">Chapter 18</a>)</td><td>Transactional, auditable; written once per ad per finalized hour, so volume is small.</td></tr>
+</table>
+
+<h3>5.1 Why an OLAP store, not a key-value or time-series database</h3>
+<p>The base aggregate is a table <code>(ad_id, minute_bucket, clicks)</code> with advertiser and campaign columns. The queries are "this ad over a range" (a range scan on a sorted key) and "this advertiser grouped by ad" (a scan and a group-by across many ads). A pure key-value store such as DynamoDB or Cassandra serves the first very well (partition key <code>ad_id</code>, sort key <code>minute</code>) but makes the second expensive, because it requires a secondary index or scatter-gather. A classic time-series database is natural for metrics with few series, but we have tens of millions of distinct ads, a high-cardinality problem for many of them. A column-oriented OLAP engine handles both: data sorted by (advertiser, ad, minute), compressed per column, and aggregation queries vectorized. It also supports idempotent writes: a row keyed by (ad, minute) that is re-inserted with the same revision replaces the old one (a ReplacingMergeTree in ClickHouse, or a primary-key table in Pinot or Druid segments replaced atomically).</p>
+<p>The table design, ordered by <code>(advertiser_id, ad_id, minute)</code>, looks like this:</p>
+<pre><code>ad_minute_clicks (
+  advertiser_id Int64, ad_id Int64, minute DateTime,
+  clicks Int64, revision Int32, status Enum(provisional, final)
+) ORDER BY (advertiser_id, ad_id, minute)  -- latest revision wins</code></pre>
+
+<h2 id="first-design">6. A first simple design</h2>
+
+<p>Before the scaled design, start with the version that works on one or two machines and say out loud why it breaks. The naive design: the click endpoint receives a click, runs <code>UPDATE ad_minute SET clicks = clicks + 1 WHERE ad = ? AND minute = ?</code> against one relational database, and then returns the redirect. A dashboard runs <code>SELECT</code> on the same table.</p>
+<p>This is correct at 100 clicks per second and fails in four ways at our scale.</p>
+<ol>
+<li><b>Write rate and hot rows.</b> 50k updates per second against a single table, with a popular ad producing thousands of updates per second to <i>one row</i>, serializes on row locks. The database becomes the bottleneck and the click endpoint's latency grows with it.</li>
+<li><b>Coupling.</b> If the database is slow or down, clicks are lost or users wait. Money is lost both ways.</li>
+<li><b>Retries double count.</b> If an update succeeds but the response is lost, the client retries and the counter increments twice. An increment is not idempotent (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>).</li>
+<li><b>No filtering, no history.</b> The raw click is not stored, so a bot decision made tomorrow cannot be applied to yesterday, and an audit has nothing to audit.</li>
+</ol>
+<p>The fixes define the real architecture: write the raw event to a durable log first (decouple and keep history), aggregate in batches in a stream processor (not one row update per click), identify every click with an id so counting becomes a set-union problem rather than increments, and write the result as an idempotent upsert.</p>
+
+<h2 id="architecture">7. Scaled high-level architecture</h2>
+
+<figure class="diagram">
+<svg viewBox="0 0 960 400" role="img" aria-label="High-level architecture of the ad click aggregation pipeline">
+  <rect class="ext" x="20" y="150" width="110" height="60" rx="10"/><text class="t-c t-b" x="75" y="176">Users</text><text class="t-c t-sm" x="75" y="194">click an ad</text>
+  <rect class="box" x="170" y="150" width="130" height="60" rx="10"/><text class="t-c t-b" x="235" y="176">Click tier</text><text class="t-c t-sm" x="235" y="194">verify, log, 302</text>
+  <rect class="cache" x="340" y="150" width="130" height="60" rx="10"/><text class="t-c t-b" x="405" y="176">Kafka</text><text class="t-c t-sm" x="405" y="194">clicks.raw (64)</text>
+  <rect class="box" x="510" y="60" width="150" height="60" rx="10"/><text class="t-c t-b" x="585" y="86">Filter job</text><text class="t-c t-sm" x="585" y="104">dedup + fraud</text>
+  <rect class="cache" x="510" y="150" width="150" height="60" rx="10"/><text class="t-c t-b" x="585" y="176">Kafka</text><text class="t-c t-sm" x="585" y="194">clicks.valid</text>
+  <rect class="box" x="510" y="240" width="150" height="60" rx="10"/><text class="t-c t-b" x="585" y="266">Aggregate job</text><text class="t-c t-sm" x="585" y="284">windows + watermark</text>
+  <rect class="db" x="720" y="150" width="130" height="60" rx="10"/><text class="t-c t-b" x="785" y="176">OLAP store</text><text class="t-c t-sm" x="785" y="194">minute/hour/day</text>
+  <rect class="cache" x="720" y="240" width="130" height="60" rx="10"/><text class="t-c t-b" x="785" y="266">Redis top-K</text><text class="t-c t-sm" x="785" y="284">live leaderboard</text>
+  <rect class="box" x="880" y="150" width="70" height="60" rx="10"/><text class="t-c t-b" x="915" y="176">Query</text><text class="t-c t-sm" x="915" y="194">API</text>
+  <rect class="db" x="340" y="330" width="150" height="50" rx="10"/><text class="t-c t-b" x="415" y="352">Object store</text><text class="t-c t-sm" x="415" y="370">raw archive (Parquet)</text>
+  <rect class="box" x="560" y="330" width="150" height="50" rx="10"/><text class="t-c t-b" x="635" y="352">Batch job</text><text class="t-c t-sm" x="635" y="370">hourly reconcile</text>
+  <rect class="db" x="760" y="330" width="170" height="50" rx="10"/><text class="t-c t-b" x="845" y="352">Billing ledger</text><text class="t-c t-sm" x="845" y="370">final numbers only</text>
+  <path class="arrow" d="M130 180 L166 180"/><path class="arrow" d="M300 180 L336 180"/>
+  <path class="arrow" d="M470 170 L506 100"/><path class="arrow" d="M585 120 L585 146"/>
+  <path class="arrow" d="M585 210 L585 236"/>
+  <path class="arrow" d="M660 270 L716 190"/><path class="arrow" d="M660 270 L716 270"/>
+  <path class="arrow" d="M850 180 L876 180"/>
+  <path class="arrow dash" d="M405 210 L405 326"/>
+  <path class="arrow dash" d="M490 355 L556 355"/>
+  <path class="arrow dash" d="M710 355 L756 355"/>
+  <path class="arrow-g dash" d="M650 326 L760 214"/>
+</svg>
+<figcaption>Clicks flow left to right through a log, a filter job, an aggregate job and into the OLAP store. The dashed lower path is the batch lane: raw events are archived, a batch job recomputes finalized numbers, overwrites the provisional rows in the store (green dashed) and feeds the billing ledger.</figcaption>
+</figure>
+
+<p>The components, in the order a click meets them:</p>
+<ol>
+<li><b>Click tier.</b> Stateless web servers behind a load balancer (<a href="../chapters/09-load-balancing.html">Chapter 9</a>). It validates the signature, appends the event to Kafka, waits for the broker acknowledgment (all in-sync replicas, <code>acks=all</code>), and returns the 302 redirect. If Kafka is unreachable it falls back to a local disk spool and drains later, so a Kafka outage does not lose clicks.</li>
+<li><b>Raw topic.</b> Partitioned by <code>click_id</code> hash. Choosing click id as the key spreads load evenly (ad id would create hot partitions for popular ads) and sends all duplicates of one click to the same partition, which is what makes the next stage's dedup cheap.</li>
+<li><b>Filter job.</b> A stream job that drops duplicates and invalid clicks, annotates the rest, and writes to <code>clicks.valid</code>. Rejected events go to <code>clicks.rejected</code> with a reason code, never silently deleted.</li>
+<li><b>Aggregate job.</b> Re-keys by ad id, counts per event-time window, emits results with a watermark, and upserts into the OLAP store and Redis.</li>
+<li><b>Archive and batch lane.</b> A sink copies every raw event to object storage in hourly files. An hourly batch job recomputes exact counts for each closed hour from the archive and overwrites the provisional rows. Only finalized hours reach billing.</li>
+<li><b>Query API.</b> Reads the OLAP store and Redis, adds the status and watermark fields.</li>
+</ol>
+
+<h3>7.1 Request flow of one click</h3>
+<figure class="diagram">
+<svg viewBox="0 0 960 420" role="img" aria-label="Sequence diagram of a click through the pipeline">
+  <rect class="ext" x="30" y="10" width="100" height="34" rx="8"/><text class="t-c t-b" x="80" y="32">Browser</text>
+  <rect class="box" x="190" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="245" y="32">Click tier</text>
+  <rect class="cache" x="360" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="415" y="32">Kafka</text>
+  <rect class="box" x="530" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="585" y="32">Filter job</text>
+  <rect class="box" x="700" y="10" width="110" height="34" rx="8"/><text class="t-c t-b" x="755" y="32">Agg job</text>
+  <rect class="db" x="850" y="10" width="90" height="34" rx="8"/><text class="t-c t-b" x="895" y="32">OLAP</text>
+  <line class="life" x1="80" y1="44" x2="80" y2="410"/><line class="life" x1="245" y1="44" x2="245" y2="410"/><line class="life" x1="415" y1="44" x2="415" y2="410"/><line class="life" x1="585" y1="44" x2="585" y2="410"/><line class="life" x1="755" y1="44" x2="755" y2="410"/><line class="life" x1="895" y1="44" x2="895" y2="410"/>
+  <path class="arrow" d="M80 75 L241 75"/><text class="t-sm" x="95" y="68">1 GET /c?ad&amp;cid&amp;sig</text>
+  <path class="arrow" d="M245 105 L411 105"/><text class="t-sm" x="262" y="98">2 append (acks=all)</text>
+  <path class="arrow-g" d="M411 135 L249 135"/><text class="t-sm" x="290" y="128">3 ack</text>
+  <path class="arrow-g" d="M241 165 L84 165"/><text class="t-sm" x="95" y="158">4 302 redirect</text>
+  <path class="arrow" d="M415 205 L581 205"/><text class="t-sm" x="440" y="198">5 poll batch</text>
+  <path class="arrow" d="M585 240 L585 270"/><text class="t-sm" x="595" y="260">6 dedup, fraud score</text>
+  <path class="arrow" d="M589 295 L751 295"/><text class="t-sm" x="610" y="288">7 clicks.valid</text>
+  <path class="arrow" d="M755 330 L755 355"/><text class="t-sm" x="765" y="349">8 window add</text>
+  <path class="arrow" d="M759 385 L891 385"/><text class="t-sm" x="775" y="378">9 upsert on close</text>
+</svg>
+<figcaption>Steps 1 to 4 are the synchronous user-facing path and finish in a few milliseconds. Steps 5 to 9 happen asynchronously, seconds later. The user never waits for counting.</figcaption>
+</figure>
+
+<h2 id="deep-dive-time">8. Deep dive: event time, windows and late data</h2>
+
+<p>This is the heart of the problem and the part an interviewer will press. The general theory (windows, watermarks, triggers) lives in <a href="../chapters/37-batch-stream.html">Chapter 37</a>; here is how it applies.</p>
+
+<h3>8.1 Event time versus processing time</h3>
+<p><b>Event time</b> is when the click happened. <b>Processing time</b> is when our job happens to see it. They differ because of network delay, retries, mobile clients that buffer clicks while offline, and our own backlogs. If we counted by processing time, then after a 10-minute pipeline outage the first minute after recovery would hold 10 minutes of clicks, and an advertiser would see a fake spike and fake gap. Billing by "the minute the click was processed" is also wrong when the contract says "the minute the user clicked". So we aggregate by event time, which means the job must decide when a minute's count is "complete enough" to emit. That decision is the watermark.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 960 300" role="img" aria-label="Event time versus processing time with a watermark">
+  <text class="t-b" x="20" y="22">Events arrive out of order (x = processing time, y = event time)</text>
+  <line x1="80" y1="260" x2="920" y2="260" stroke="var(--fg)"/><line x1="80" y1="260" x2="80" y2="40" stroke="var(--fg)"/>
+  <text class="t-sm" x="480" y="285">processing time (when the job sees the event)</text>
+  <text class="t-sm" x="8" y="150" transform="rotate(-90 20 150)">event time</text>
+  <path d="M80 260 L900 60" stroke="var(--muted)" stroke-dasharray="5 4" fill="none"/>
+  <text class="t-sm" x="640" y="110">ideal: no delay</text>
+  <path d="M80 260 L900 100" stroke="var(--good)" stroke-width="2" fill="none"/>
+  <text class="t-sm" x="720" y="170" style="fill:var(--good)">watermark = max event time seen minus 2 min</text>
+  <circle cx="200" cy="215" r="5" fill="var(--fg)"/><circle cx="300" cy="190" r="5" fill="var(--fg)"/><circle cx="380" cy="195" r="5" fill="var(--fg)"/><circle cx="470" cy="150" r="5" fill="var(--fg)"/><circle cx="560" cy="130" r="5" fill="var(--fg)"/><circle cx="640" cy="190" r="6" fill="var(--bad)"/><circle cx="760" cy="95" r="5" fill="var(--fg)"/>
+  <text class="t-sm" x="560" y="215" style="fill:var(--bad)">late: below the line, event time already passed by the watermark</text>
+  <path class="arrow-r" d="M640 196 L640 240"/>
+  <text class="t-sm" x="100" y="55">Points above the green line are on time. Points below arrive after the window may have been emitted.</text>
+</svg>
+<figcaption>The grey dashed line is the ideal where processing time equals event time. Real events lie below it because they arrive after they happened. The green watermark line says "no events older than this are expected". A dot below the line (red) is late data.</figcaption>
+</figure>
+
+<h3>8.2 Tumbling, hopping and sliding windows</h3>
+<p>A <b>tumbling window</b> is a fixed, non-overlapping interval: [10:00, 10:01), [10:01, 10:02), and so on. Each click belongs to exactly one. This is what the per-minute table needs, and it is the cheapest: one counter per (ad, minute). A <b>hopping (sliding) window</b> has a length and a smaller step, for example length 5 minutes and step 1 minute, so each click belongs to five windows. It answers "clicks in the last 5 minutes, refreshed every minute", used by the top-K board. Computing hopping windows by keeping a counter per window multiplies work by 5. The standard trick is to <b>never aggregate hopping windows from raw events</b>: keep the tumbling minute counts and compute the 5-minute sum by adding the last five minute counters at read time (or by a second, tiny, stage). The raw stream is touched once.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 960 250" role="img" aria-label="Tumbling and sliding windows over minute buckets">
+  <text class="t-b" x="20" y="22">Tumbling 1-minute windows (the stored aggregate)</text>
+  <rect class="box" x="40" y="35" width="130" height="36" rx="6"/><text class="t-c t-sm" x="105" y="58">10:00 to 10:01</text>
+  <rect class="box" x="180" y="35" width="130" height="36" rx="6"/><text class="t-c t-sm" x="245" y="58">10:01 to 10:02</text>
+  <rect class="box" x="320" y="35" width="130" height="36" rx="6"/><text class="t-c t-sm" x="385" y="58">10:02 to 10:03</text>
+  <rect class="box" x="460" y="35" width="130" height="36" rx="6"/><text class="t-c t-sm" x="525" y="58">10:03 to 10:04</text>
+  <rect class="box" x="600" y="35" width="130" height="36" rx="6"/><text class="t-c t-sm" x="665" y="58">10:04 to 10:05</text>
+  <rect class="box" x="740" y="35" width="130" height="36" rx="6"/><text class="t-c t-sm" x="805" y="58">10:05 to 10:06</text>
+  <text class="t-b" x="20" y="110">Sliding 5-minute window, step 1 minute (derived at read time)</text>
+  <rect class="hit" x="40" y="125" width="690" height="30" rx="6"/><text class="t-c t-sm" x="385" y="145">window ending 10:05 = sum of minutes 10:00 .. 10:04</text>
+  <rect class="cache" x="180" y="165" width="690" height="30" rx="6"/><text class="t-c t-sm" x="525" y="185">window ending 10:06 = sum of minutes 10:01 .. 10:05</text>
+  <text class="t-sm" x="40" y="225">Each click is counted once in a minute bucket. Sliding results reuse the buckets, so the raw stream is read once.</text>
+</svg>
+<figcaption>Only the tumbling buckets are persisted. A sliding window is a sum over the last N buckets, so its cost is N small additions, not N times the raw event volume.</figcaption>
+</figure>
+
+<h3>8.3 Watermarks and allowed lateness</h3>
+<p>A <b>watermark</b> is the job's running claim: "I do not expect any more events with event time earlier than W". A common heuristic is <code>W = (largest event time seen) - D</code>, where D is a bound on out-of-orderness, here 2 minutes. When W passes the end of a window, the window is <i>closed</i> and its result is emitted. With D = 2 minutes, the 10:00 to 10:01 window emits when the job sees an event stamped 10:03 or later, so freshness is about one minute of window plus 2 minutes of wait, which meets the "30 seconds after the minute closes" target only if we emit early, so we also emit <b>early provisional results</b>: a trigger fires every 10 seconds for the open window and upserts the running count with status <code>provisional</code>. The dashboard therefore shows a live number that is slightly low, then the final-for-stream value at window close.</p>
+<p>Events arriving after W passed the window are <b>late</b>. Three policies exist:</p>
+<table>
+<tr><th>Policy</th><th>Behaviour</th><th>Cost</th></tr>
+<tr><td>Drop</td><td>Late clicks are discarded.</td><td>Undercount; unacceptable for billing, acceptable only for approximate metrics.</td></tr>
+<tr><td>Allowed lateness (retract/update)</td><td>Keep window state for another L (we use 15 minutes). A late event updates the count and re-emits a new revision of the row.</td><td>State held longer (15 more windows per ad); downstream must accept updates, which an upsert by (ad, minute) handles.</td></tr>
+<tr><td>Side output + batch</td><td>Events later than L go to a side topic <code>clicks.late</code>, and the hourly batch job includes them from the archive.</td><td>Live number stays low until the batch fixes it, but the final number is right.</td></tr>
+</table>
+<p>I choose the last two together: allowed lateness of 15 minutes for the live path and the archive-based batch for everything later. This split is the reason the system is billing-grade without forcing the stream job to keep state forever. Because the archive keeps every raw event by its event time, a click that arrives six hours late is still counted in the right minute by the batch job, and the advertiser sees the row flip from <code>provisional</code> to <code>final</code>.</p>
+
+<div class="callout watch"><b>Watch out</b> A watermark derived from the maximum event time seen is dangerous if one client has a wrong clock set far in the future: it drags the watermark forward and makes legitimate events look late. Always clamp event times: use the edge's ingest time as a sanity bound (reject or clamp events more than a few minutes ahead of ingest time) before they reach the job. See <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a> on clock skew.</div>
+
+<p>Another subtlety is an idle partition. Watermarks in a parallel job are the <i>minimum</i> across the input partitions. If one Kafka partition receives no events (a quiet night, a stalled producer), its watermark never advances and the whole job stops closing windows. The fix is an idle-timeout setting that excludes a partition from the minimum after it has been quiet for, say, 30 seconds. With 64 partitions keyed by click id, an idle partition at peak is unlikely, but a drained or unevenly sized topic at night is common.</p>
+
+<h2 id="deep-dive-dedup">9. Deep dive: dedup and fraud filtering</h2>
+
+<h3>9.1 Duplicates</h3>
+<p>Duplicates appear for four reasons: the user double-clicks; the browser or a proxy retries the request; the click tier retried the Kafka send after a timeout though the first send succeeded; and the producer or a consumer replayed data after a failure. The click id, minted at impression time, identifies one click regardless of how many copies exist. The dedup rule is simple: for each click id, count only the first occurrence within a time horizon.</p>
+<p>The design question is where the "seen ids" set lives and how long it is kept. Compare the options.</p>
+<table>
+<tr><th>Option</th><th>How</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>A. External KV (Redis <code>SET key NX EX</code>)</td><td>Each event does a SETNX with a TTL; success means first.</td><td>Easy to understand; shared by any consumer.</td><td>50k round trips per second to a networked store; the check and the downstream write are not atomic, so a crash between them can lose or duplicate a click; the cache must be sized and replicated for 180M keys.</td></tr>
+<tr><td>B. Keyed state in the stream job</td><td>Partition by click id; each task keeps a RocksDB set of recent ids with a TTL; state is checkpointed with the offsets.</td><td>Local lookup, no network hop; state and offsets are snapshotted together, so dedup is consistent with exactly-once processing.</td><td>State size grows with the horizon; rescaling moves state.</td></tr>
+<tr><td>C. Bloom filter prefilter</td><td>A Bloom filter (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>) says "definitely new" or "maybe seen".</td><td>Tiny memory.</td><td>False positives would silently drop real clicks, which is unacceptable for billing, unless a "maybe" falls back to an exact check.</td></tr>
+<tr><td>D. Dedup in the sink</td><td>Use a unique key (click id) in the store.</td><td>Strongest final guarantee.</td><td>Billions of rows keyed by click id in the OLAP store; wasteful for aggregates that do not store clicks.</td></tr>
+</table>
+<p>I choose B as the main mechanism with an optional Bloom prefilter in front of it to skip RocksDB reads for obviously new ids (a hit on "maybe seen" always falls through to the exact check, so no false drops). The horizon is 1 hour: duplicates from user retries and producer retries occur within seconds to minutes, and longer-range duplicates are caught by the batch job, which does a global <code>SELECT DISTINCT click_id</code> across the whole hour (and the previous and next hour) from the archive. State size, from section 3.3, is about 7 GB across 64 tasks at the peak rate, which is modest. Two defenses together are the usual pattern: <b>approximate or windowed in the stream, exact in the batch</b>.</p>
+
+<h3>9.2 Fraud and bot filtering</h3>
+<p>Invalid clicks come from simple bots, click farms, competitors clicking to drain a rival's budget, publishers inflating their own revenue, and buggy clients. The filter is a pipeline of increasingly expensive checks, so cheap rules remove most of the junk before costly ones run:</p>
+<ol>
+<li><b>Edge checks (click tier, microseconds):</b> signature valid, ad id exists, click id not obviously forged, user agent not on a known bot list, IP not on a blocklist (data-center ranges, known proxies).</li>
+<li><b>Stateful rate rules (filter job, keyed state):</b> more than N clicks per device per minute on any ad; the same IP clicking the same ad more than M times per hour; click-to-impression time under 300 ms (a human cannot read an ad that fast); a publisher whose click-through rate is ten times the norm. These are counters in keyed state with sliding windows, so they cost no external calls.</li>
+<li><b>Model scoring (asynchronous, sampled or batched):</b> a machine learning service scores a click's fraud probability from many features. Calling it for every event at 50k per second is expensive and adds a failure dependency, so the job batches calls and uses a timeout; on timeout it passes the click through labeled <code>unscored</code> and lets the later batch stage score it.</li>
+<li><b>Offline fraud analysis (batch):</b> graph and cohort analysis over days of data finds coordinated behavior invisible to a single-event rule. Its output is a list of invalidated click ids or (publisher, time range) pairs, applied during reconciliation.</li>
+</ol>
+<p>Filtering is therefore split in the same way as counting: the stream applies quick, conservative rules so the dashboard is roughly right, and the batch applies the heavy ones so the bill is right. Every rejected click goes to <code>clicks.rejected</code> with a reason code. This matters in practice for two reasons: an advertiser may dispute a charge, and a bad rule that over-blocks (say, a corporate NAT sharing one IP among 5,000 real users) must be detectable and reversible by replaying with a fixed rule. See <a href="../chapters/55-security.html">Chapter 55</a> for the general abuse model.</p>
+
+<div class="callout tip"><b>Interview tip</b> Say explicitly that dropping a click is a financial decision with two error directions. Letting fraud through overcharges the advertiser; blocking a real click undercharges the platform. Real systems tune toward the advertiser first (credit-back policies exist for undetected fraud), but both errors are measured.</div>
+
+<h2 id="deep-dive-exactly-once">10. Deep dive: exactly-once counting</h2>
+
+<p>Delivery guarantees are covered in <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>; the stream engine's snapshotting is in <a href="../chapters/37-batch-stream.html">Chapter 37</a>. The practical statement is: no system delivers a message exactly once over a network, but you can make the <i>effect</i> happen exactly once by combining at-least-once delivery with idempotent or transactional processing. There are three places where duplicates or losses can enter, and each has its own fix.</p>
+
+<table>
+<tr><th>Boundary</th><th>Risk</th><th>Fix</th></tr>
+<tr><td>Producer to Kafka</td><td>A send times out, the producer retries, and the broker now has two copies.</td><td>Idempotent producer (broker deduplicates by producer id and sequence number within a partition). Also, application-level dedup by click id in the filter job catches what remains.</td></tr>
+<tr><td>Kafka to job to Kafka</td><td>The job crashes after processing some events but before committing its offsets; on restart it reprocesses and re-emits.</td><td>Checkpoint: periodically snapshot operator state <i>and</i> the input offsets as one consistent unit; on restart, restore both and rewind the input to the snapshot's offsets. Output to Kafka uses a transactional two-phase commit tied to the checkpoint, so downstream readers (with read-committed isolation) only see output from completed checkpoints.</td></tr>
+<tr><td>Job to OLAP store</td><td>A restart replays the window results written since the last checkpoint.</td><td>Idempotent upsert keyed by (ad, minute) carrying the full count, never "add 3": replaying the same result overwrites with the same value.</td></tr>
+</table>
+
+<figure class="diagram">
+<svg viewBox="0 0 960 330" role="img" aria-label="Checkpoint barrier and recovery">
+  <text class="t-b" x="20" y="22">Checkpoint N: barrier flows with the data, each task snapshots state plus offsets</text>
+  <rect class="cache" x="30" y="50" width="150" height="50" rx="8"/><text class="t-c t-b" x="105" y="72">Kafka source</text><text class="t-c t-sm" x="105" y="90">offset 1,204,500</text>
+  <rect class="box" x="290" y="50" width="160" height="50" rx="8"/><text class="t-c t-b" x="370" y="72">Dedup task</text><text class="t-c t-sm" x="370" y="90">seen-id set</text>
+  <rect class="box" x="560" y="50" width="160" height="50" rx="8"/><text class="t-c t-b" x="640" y="72">Window task</text><text class="t-c t-sm" x="640" y="90">minute counters</text>
+  <rect class="db" x="800" y="50" width="130" height="50" rx="8"/><text class="t-c t-b" x="865" y="72">OLAP upsert</text><text class="t-c t-sm" x="865" y="90">idempotent</text>
+  <path class="arrow" d="M180 75 L286 75"/><path class="arrow" d="M450 75 L556 75"/><path class="arrow" d="M720 75 L796 75"/>
+  <rect class="miss" x="205" y="58" width="60" height="34" rx="6"/><text class="t-c t-sm" x="235" y="79">barrier N</text>
+  <rect class="db" x="290" y="170" width="440" height="50" rx="8"/><text class="t-c t-b" x="510" y="192">Object store: snapshot N = offsets + dedup state + window state</text><text class="t-c t-sm" x="510" y="210">written asynchronously every 30 s; incremental for RocksDB</text>
+  <path class="arrow dash" d="M370 100 L370 166"/><path class="arrow dash" d="M640 100 L550 166"/><path class="arrow dash" d="M105 100 L300 166"/>
+  <text class="t-b" x="20" y="262">Crash after snapshot N: restore state, rewind source to 1,204,500, reprocess; upserts overwrite identical values</text>
+  <rect class="hit" x="30" y="278" width="900" height="36" rx="8"/><text class="t-c t-sm" x="480" y="301">Result: every click affects the count once, even though some were processed twice by the machinery</text>
+</svg>
+<figcaption>A barrier marker travels with the data. When a task sees it, it saves its state; the snapshot of all tasks plus the source offsets is a consistent cut. Recovery restores that cut and replays only events after it.</figcaption>
+</figure>
+
+<p>Why store the full count rather than a delta? Suppose the sink received "ad 4711, 10:03, +3" twice. A delta applied twice yields +6. A message "ad 4711, 10:03, count = 11, revision 7" applied twice yields 11. Making the unit of write a <i>complete, revisioned value</i> is the single most useful idempotency habit in this design. The revision number (the window's emission count) also protects against out-of-order writes: the store keeps the row with the highest revision, so a delayed write from a zombie task that survived a network partition cannot overwrite a newer value.</p>
+
+<p>There is a cost: checkpoint interval trades recovery time against overhead. A 30-second interval means a crash replays at most 30 seconds (about 1.5M events at peak, which the job re-reads in seconds), but the visible output of a transactional sink only advances at checkpoint boundaries, adding up to 30 seconds of latency for the output topic. For the OLAP upsert (idempotent, not transactional), provisional results can be written immediately. That is another reason to prefer the idempotent sink for the dashboard path.</p>
+
+<h2 id="deep-dive-hot">11. Deep dive: hot ads and key skew</h2>
+
+<p>Partitioning the aggregate job by ad id means all clicks for an ad land on one task. Ad popularity is heavily skewed (a Zipf-like distribution): during a major event one ad can receive 5% of all clicks, which is 2,500 per second at the 50k peak. A single task can count 2,500 per second without trouble, since counting is cheap, but the skew still hurts in three ways: one task runs hot while others idle (so the slowest task sets the pipeline's latency), a hot key's checkpoint state is large and uneven, and a downstream write to a single OLAP row key receives a burst. A pathological case, such as a bot attack on one ad generating 40k clicks per second, can saturate one task entirely.</p>
+
+<p>The standard remedy is <b>two-stage aggregation with key salting</b> (the general technique is in <a href="../chapters/60-pattern-playbook.html">Chapter 60</a> and <a href="../chapters/25-sharding.html">Chapter 25</a>).</p>
+<ol>
+<li><b>Stage 1 (partial):</b> key by <code>(ad_id, salt)</code> where <code>salt = hash(click_id) mod S</code>. Because the click id is unique per click, the salt spreads one ad evenly over S tasks. Each task keeps a local partial count per (ad, minute, salt).</li>
+<li><b>Stage 2 (final):</b> key by <code>ad_id</code> only and sum the S partials per (ad, minute). The data into stage 2 is tiny: at most S partial records per ad per minute per emission, regardless of click volume.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 960 330" role="img" aria-label="Two-stage aggregation with salting for a hot ad">
+  <text class="t-b" x="20" y="22">Hot ad 4711: 2,500 clicks per second</text>
+  <rect class="ext" x="30" y="130" width="130" height="60" rx="10"/><text class="t-c t-b" x="95" y="156">clicks.valid</text><text class="t-c t-sm" x="95" y="174">ad 4711 hot</text>
+  <rect class="box" x="290" y="45" width="190" height="44" rx="8"/><text class="t-c t-sm" x="385" y="72">partial (4711, salt 0)</text>
+  <rect class="box" x="290" y="105" width="190" height="44" rx="8"/><text class="t-c t-sm" x="385" y="132">partial (4711, salt 1)</text>
+  <rect class="box" x="290" y="165" width="190" height="44" rx="8"/><text class="t-c t-sm" x="385" y="192">partial (4711, salt 2)</text>
+  <rect class="box" x="290" y="225" width="190" height="44" rx="8"/><text class="t-c t-sm" x="385" y="252">partial (4711, salt 7)</text>
+  <text class="t-c t-sm" x="385" y="290">stage 1: S = 8 salts, about 310 per second each</text>
+  <rect class="cache" x="620" y="125" width="170" height="70" rx="10"/><text class="t-c t-b" x="705" y="153">Final sum</text><text class="t-c t-sm" x="705" y="173">key ad 4711, per minute</text>
+  <rect class="db" x="850" y="135" width="90" height="50" rx="8"/><text class="t-c t-b" x="895" y="165">OLAP</text>
+  <path class="arrow" d="M160 150 L286 70"/><path class="arrow" d="M160 160 L286 128"/><path class="arrow" d="M160 170 L286 186"/><path class="arrow" d="M160 180 L286 245"/>
+  <path class="arrow" d="M480 67 L616 150"/><path class="arrow" d="M480 127 L616 158"/><path class="arrow" d="M480 187 L616 168"/><path class="arrow" d="M480 247 L616 178"/>
+  <path class="arrow" d="M790 160 L846 160"/>
+  <text class="t-c t-sm" x="705" y="225">stage 2: one task sums 8 numbers per minute</text>
+</svg>
+<figcaption>Salting splits one hot key into S sub-keys for the expensive step, then a cheap second stage merges. Counts are additive, so the merge is exact; this does not work for non-additive metrics such as distinct users, which would need mergeable sketches.</figcaption>
+</figure>
+
+<p>The salt count S does not have to be the same for every ad. Applying 8 salts to every key multiplies state and output for the long tail of ads (millions of ads with a few clicks per minute) for no benefit. The better design detects hot keys dynamically: a lightweight heavy-hitter counter (Count-Min Sketch or a Space-Saving counter, see <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>) in front of stage 1 flags ads above a threshold, say 500 per second, and only those get salted (S = 8, rising to 64 for an attack). Cold ads use S = 1. Correctness is not affected by the choice of S because the second stage always sums.</p>
+
+<p>Another important option is <b>local pre-aggregation</b> inside each stage 1 task. Rather than emitting one event per click, the task holds a map keyed by (ad, minute) and flushes it every second. A hot ad then produces at most one partial record per task per second regardless of click rate. This reduces shuffle traffic by orders of magnitude at the cost of at most one second of added latency.</p>
+
+<h3>11.1 Hot rows in the store</h3>
+<p>Because stage 2 emits one cumulative value per window per revision, the store sees at most a few writes per (ad, minute) per second, not thousands. Batching upserts (a few thousand rows per request) and writing to the OLAP store's native bulk interface keeps ingest efficient, since OLAP engines are poor at one-row-at-a-time writes. Query-side hot spots (a famous advertiser's dashboard loading continuously) are served by a short-lived cache keyed by (advertiser, range) with a TTL of 10 to 30 seconds (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>); stale by 10 seconds is invisible on a minute chart.</p>
+
+<h2 id="deep-dive-lambda">12. Deep dive: reconciliation and billing-grade accuracy</h2>
+
+<p>The stream layer is fast and approximately right. The batch layer is slow and exactly right. Running both and letting the batch layer overwrite the stream layer is the <b>Lambda architecture</b>; the term and its alternative, the Kappa architecture (one stream pipeline, replay for corrections), are discussed in <a href="../chapters/37-batch-stream.html">Chapter 37</a>. For this problem I choose Lambda-style reconciliation, and I will justify it against the alternative below.</p>
+
+<h3>12.1 Why the stream alone is not enough for billing</h3>
+<ul>
+<li>Clicks later than the allowed lateness are not in the live counts.</li>
+<li>The stream's dedup horizon is one hour. A duplicate two hours later gets counted.</li>
+<li>Fraud decisions improve with hindsight: a click farm is identified only after a day of analysis.</li>
+<li>Code bugs happen. A deployment with a wrong filter, discovered after four hours, must be fixable.</li>
+<li>Streaming state can be lost or corrupted in rare, ugly failure combinations (a checkpoint restore from the wrong version, an operator rescaling mistake).</li>
+</ul>
+
+<h3>12.2 The reconciliation job</h3>
+<figure class="diagram">
+<svg viewBox="0 0 960 330" role="img" aria-label="Lambda-style reconciliation between stream and batch">
+  <rect class="cache" x="30" y="40" width="150" height="56" rx="10"/><text class="t-c t-b" x="105" y="66">clicks.raw</text><text class="t-c t-sm" x="105" y="84">Kafka, 7 days</text>
+  <rect class="db" x="30" y="190" width="150" height="56" rx="10"/><text class="t-c t-b" x="105" y="216">Raw archive</text><text class="t-c t-sm" x="105" y="234">hourly Parquet files</text>
+  <rect class="box" x="290" y="40" width="190" height="56" rx="10"/><text class="t-c t-b" x="385" y="66">Stream path</text><text class="t-c t-sm" x="385" y="84">fast, provisional</text>
+  <rect class="box" x="290" y="190" width="190" height="56" rx="10"/><text class="t-c t-b" x="385" y="216">Batch path (hourly)</text><text class="t-c t-sm" x="385" y="234">dedup all, full fraud, exact</text>
+  <rect class="db" x="620" y="115" width="170" height="70" rx="10"/><text class="t-c t-b" x="705" y="143">OLAP store</text><text class="t-c t-sm" x="705" y="163">rev N+1 final replaces</text><text class="t-c t-sm" x="705" y="177">provisional rev</text>
+  <rect class="miss" x="620" y="245" width="170" height="56" rx="10"/><text class="t-c t-b" x="705" y="269">Diff monitor</text><text class="t-c t-sm" x="705" y="287">alert if gap above 0.5%</text>
+  <rect class="db" x="840" y="115" width="100" height="70" rx="10"/><text class="t-c t-b" x="890" y="145">Billing</text><text class="t-c t-sm" x="890" y="165">final only</text>
+  <path class="arrow" d="M180 68 L286 68"/><path class="arrow" d="M105 96 L105 186"/>
+  <path class="arrow" d="M180 218 L286 218"/><path class="arrow" d="M480 68 L616 135"/>
+  <path class="arrow-g" d="M480 218 L616 165"/><path class="arrow" d="M790 150 L836 150"/>
+  <path class="arrow dash" d="M705 185 L705 241"/>
+  <text class="t-sm" x="30" y="300">Late events, global dedup, offline fraud list and bug fixes all flow through the batch path.</text>
+</svg>
+<figcaption>Both paths read the same raw events. The batch path writes a higher revision flagged final for each closed hour, replacing the stream's provisional rows. A diff monitor compares the two and alerts when they diverge more than expected, which is the earliest signal of a stream bug.</figcaption>
+</figure>
+
+<p>The flow for hour H, starting after H plus 30 minutes (to cover the 15-minute lateness window with margin):</p>
+<ol>
+<li>Read archive files for H-1, H and H+1 (neighbors are needed because a late click for H may sit in H+1's file by ingest time and a duplicate may sit in H-1).</li>
+<li>Deduplicate by click id across that full range.</li>
+<li>Apply the full fraud rule set plus the latest offline invalidation lists.</li>
+<li>Group by (ad, minute of event time) and count.</li>
+<li>Compare with the stream's numbers for the hour and record the discrepancy per advertiser.</li>
+<li>Write the results to the OLAP store as revision <code>max + 1</code> with status <code>final</code> (idempotent upsert), then publish a finalized-hour event; the billing service reads only finalized hours.</li>
+</ol>
+
+<p>Because the batch recount is a pure function of (archive files, rule version), it is deterministic and rerunnable. If rules change or a bug is found, rerun the job for the affected hours; it writes a still higher revision. An <b>audit table</b> stores, per (advertiser, hour), the rule version, input file list and checksum, and count produced, so any billed number can be traced to its inputs. Billing adjustments after finalization (a rerun that lowers a previous charge) go through the ledger as credit entries, never by editing history.</p>
+
+<h3>12.3 Lambda versus Kappa for this problem</h3>
+<table>
+<tr><th>Aspect</th><th>Lambda (stream plus batch)</th><th>Kappa (stream only, replay)</th></tr>
+<tr><td>Code</td><td>Two implementations of the logic; they can drift (a classic pain).</td><td>One implementation; reprocessing is the same job on old data.</td></tr>
+<tr><td>Exactness</td><td>Batch is an independent check; protects against stream bugs and state loss.</td><td>Correctness depends entirely on the stream job and retained log.</td></tr>
+<tr><td>Late and fraud corrections</td><td>Natural: batch reads the whole hour with hindsight.</td><td>Needs unlimited allowed lateness or a replay run for each correction.</td></tr>
+<tr><td>Cost</td><td>Two systems to run; batch compute hourly.</td><td>One system; replay needs long-retention log storage.</td></tr>
+<tr><td>Audit story</td><td>Strong: independent recomputation from immutable files.</td><td>Weaker: "we ran the same code twice".</td></tr>
+</table>
+<p>For money, I take Lambda, and I reduce the drift problem by making both paths share one library of parsing, dedup-key and fraud-rule code, and by testing them against the same golden data set. If an interviewer pushes for Kappa, I say it is a fair choice when the batch engine and stream engine are the same (for example, the same Flink SQL job run in batch mode over the archive), which keeps one code path while still giving an independent run from immutable input.</p>
+
+<h3>12.4 Replay</h3>
+<p>Replay is the safety net for everything. Within 7 days, reset the consumer group offsets of the filter or aggregate job to a time and re-run into a <i>new</i> output (a shadow table or a new revision namespace), validate it against the live numbers, then swap or let the revision rule take over. Beyond 7 days the archive is the source. Replay needs three properties: the job must be deterministic given the same input (no wall-clock reads inside business logic; use event time), sinks must be idempotent (so replay overwrites), and replays should be throttled so a catch-up does not starve live traffic: run on separate resources and cap at about 2x peak rate.</p>
+
+<h2 id="deep-dive-topk">13. Top-K ads</h2>
+<p>"Show the ten most-clicked ads in the last 15 minutes" is a different query shape: a global ranking across many ads, which the OLAP store can answer (<code>ORDER BY sum(clicks) DESC LIMIT 10</code> over 15 minute-buckets) but not cheaply if called thousands of times per second across millions of ads. The structure and theory (heaps, sorted sets, mergeable sketches) are in <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>.</p>
+<p>My design uses the same minute counts, which the stage 2 task already produces. For each minute bucket m, a Redis sorted set <code>top:m</code> holds ad id as member and count as score, updated by <code>ZADD</code> with the cumulative value (idempotent, same reasoning as above). To get the top 10 over the last 15 minutes, the query service does <code>ZUNIONSTORE</code> over the 15 minute keys with sum aggregation, then <code>ZREVRANGE 0 9</code>. With millions of members that union is expensive, so I bound it: each minute set is trimmed to the top 10,000 ads (an ad outside the top 10,000 of every single minute cannot enter a 15-minute top 10 unless adversarially spread, so the result is approximate in an extreme edge case), and the merged result is cached for 5 to 10 seconds because all dashboards want the same answer. For exact top-K the batch job recomputes from the OLAP store. Per-advertiser top-K (their own best ads) is trivial and served directly from OLAP because it ranges over only that advertiser's few hundred ads.</p>
+
+<h2 id="query">14. Serving queries</h2>
+<p>The query service is a thin layer in front of the OLAP store and Redis. Design points:</p>
+<ul>
+<li><b>Granularity choice.</b> The service picks the table by range: up to 6 hours uses minute rows, up to 30 days uses hour rollups, beyond that uses day rollups. A 30-day minute-level chart would pull 43,200 points per ad, far more than a screen can show. Rollups are produced by the stream/batch pipeline itself (hour rollup computed from the finalized minute rows) rather than by the query at read time.</li>
+<li><b>Merging provisional and final.</b> The store holds, per (ad, minute), the highest revision only. The service just reads it and returns the row's status. For the current hour, rows are provisional; for hours older than about an hour they are final.</li>
+<li><b>Partial data honesty.</b> The response includes the watermark. A chart can draw the part after the watermark as a dashed "incomplete" region.</li>
+<li><b>Multi-tenancy and authorization.</b> Every query is scoped to the caller's advertiser id taken from the verified token, never from a request parameter (<a href="../chapters/55-security.html">Chapter 55</a>). A noisy advertiser is rate-limited (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>) and a query cost cap (maximum rows scanned) prevents one expensive request from hurting others.</li>
+<li><b>Capacity.</b> About 3.3k queries per second at peak, each scanning a few hundred rows sorted contiguously by (advertiser, ad, minute), is comfortable for a small OLAP cluster with replicas; the cache absorbs repeated dashboard refreshes.</li>
+</ul>
+
+<h2 id="scaling">15. Scaling, bottlenecks and sharding</h2>
+<table>
+<tr><th>Component</th><th>How it scales</th><th>Bottleneck to watch</th></tr>
+<tr><td>Click tier</td><td>Stateless, add instances behind the load balancer, autoscale on CPU and request rate (<a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>)</td><td>Kafka produce latency (it is on the user path); keep batching small and timeouts short</td></tr>
+<tr><td>Kafka</td><td>Add partitions (but this reorders key assignment, so over-provision early at 64) and brokers</td><td>Partition count caps consumer parallelism; broker disk for 7 days of retention</td></tr>
+<tr><td>Filter job</td><td>Keyed by click id, scale tasks up to the partition count, state rescales by key group</td><td>Fraud model call latency, state size of the dedup set</td></tr>
+<tr><td>Aggregate job</td><td>Salting for hot keys, local pre-aggregation</td><td>Skew; checkpoint duration for large state</td></tr>
+<tr><td>OLAP store</td><td>Shard by advertiser id (keeps one advertiser's data local to a shard, making per-advertiser queries single-shard); replicas for reads</td><td>Ingest of many small writes: batch them; background merges</td></tr>
+<tr><td>Archive and batch</td><td>Object storage scales; batch parallelizes by hour and by hash of click id</td><td>Dedup shuffle size on a peak hour (about 40M events x 200 B = 8 GB, small)</td></tr>
+</table>
+<p>Sharding the OLAP store by advertiser id has a skew risk of its own: a handful of huge advertisers could own a disproportionate share of rows. The mitigation is to shard by a hash of (advertiser, ad) while keeping the sort order such that one ad's rows are contiguous; per-advertiser queries then scatter to several shards and merge, which an OLAP engine does efficiently, since the merge is of pre-aggregated partials.</p>
+
+<h3>15.1 Back-pressure and burst handling</h3>
+<p>If the aggregate job slows (a bad deploy, a downstream store outage), Kafka absorbs the backlog: 10 MB per second times a 1-hour outage is only 36 GB, far below the retention capacity. The job catches up at several times the real-time rate because it is CPU-bound counting. The important property is that nothing upstream is blocked: the click tier writes to Kafka and does not care how far behind consumers are. The dashboard shows a growing "data delay" via the watermark, so staleness is visible rather than silent. Compare with a design that writes straight to a database, where the same slowdown would propagate to users (<a href="../chapters/40-resilience.html">Chapter 40</a> on load shedding and back-pressure).</p>
+
+<h2 id="failures">16. Failure modes</h2>
+<table>
+<tr><th>Failure</th><th>What happens</th><th>Mitigation</th></tr>
+<tr><td>Click tier instance dies</td><td>In-flight requests fail; users may see an error and retry, producing a second click with the same click id</td><td>Load balancer health checks remove it; dedup by click id absorbs the retry; redirect on best effort even if logging fails would lose revenue, so we return the redirect only after the append is acknowledged, with a short local spool as the fallback</td></tr>
+<tr><td>Kafka broker or zone fails</td><td>Leaders move; produce latency spikes briefly</td><td>Replication factor 3 across zones, <code>min.insync.replicas=2</code>, <code>acks=all</code>; the click tier retries with the idempotent producer (<a href="../chapters/24-replication.html">Chapter 24</a>)</td></tr>
+<tr><td>Kafka entirely unavailable</td><td>Clicks cannot be logged</td><td>Local disk spool on click tier hosts (a few minutes' buffer, 50k x 200 B x 600 s = 6 GB), replayed on recovery; alert immediately</td></tr>
+<tr><td>Stream job crashes</td><td>Output stops; watermark lags</td><td>Automatic restart from the last checkpoint; replay of at most about 30 seconds of input; idempotent upserts make the replay harmless</td></tr>
+<tr><td>Checkpoint storage unavailable</td><td>Checkpoints fail repeatedly; a crash would lose more progress</td><td>Alert after N consecutive failures; the job keeps running; in the worst case, restart from an older checkpoint and rely on Kafka retention (7 days)</td></tr>
+<tr><td>OLAP store down or slow</td><td>Upserts fail or back up</td><td>The job retries with backoff and applies back-pressure; Kafka holds the backlog; queries serve from cache and replicas or return stale data with the watermark showing the delay</td></tr>
+<tr><td>Fraud service down</td><td>Scores unavailable</td><td>Circuit breaker; pass clicks through marked <code>unscored</code>; the batch stage scores them later (<a href="../chapters/51-microservice-resilience.html">Chapter 51</a>)</td></tr>
+<tr><td>Wrong data: bad deploy over-filters</td><td>Counts are too low; may go unnoticed</td><td>Rejection-rate and stream-versus-batch diff alerts; replay from the raw topic or archive with the fixed rule</td></tr>
+<tr><td>Wrong data: clock skew or future timestamps</td><td>Watermark jumps ahead, valid events marked late</td><td>Clamp event time to ingest time plus a bounded skew; idle and outlier handling for watermarks</td></tr>
+<tr><td>Zombie task after a partition</td><td>An old task instance writes stale values</td><td>Revision/epoch fencing: the store keeps the highest revision, and transactional producers fence older epochs (<a href="../chapters/30-coordination-locks.html">Chapter 30</a>)</td></tr>
+<tr><td>Region outage</td><td>Whole pipeline in one region unavailable</td><td>See below</td></tr>
+</table>
+
+<h3>16.1 Multi-region</h3>
+<p>Clicks must be accepted wherever the user is, so the click tier runs in every region and writes to a regional Kafka cluster. Counting, however, is by (ad, minute), which spans regions. There are two choices. Option one: mirror each region's raw topic to a central region (MirrorMaker-style replication) and run one global aggregation there. This is simplest and exact, and costs one cross-region hop of seconds. Option two: aggregate in each region and merge partial counts centrally, which is cheaper in bandwidth, works because counts are additive, but makes global dedup harder (the same click id could appear in two regions after a failover). I choose option one, because 10 MB per second of cross-region traffic is trivial, and a single place for dedup and billing is worth much more than saving bandwidth. For disaster recovery the central pipeline is restorable in another region from the archive plus the latest checkpoint, with a recovery time measured in tens of minutes and a recovery point of seconds, since the mirrored log is the source (<a href="../chapters/41-ha-dr.html">Chapter 41</a>, <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>).</p>
+
+<h2 id="ops">17. Security, abuse, monitoring, cost</h2>
+
+<h3>17.1 Security and abuse</h3>
+<ul>
+<li>Signed click URLs prevent forged or modified clicks, and a timestamp inside the signed payload limits replay of captured URLs.</li>
+<li>The redirect target is looked up server-side from the ad id, never taken from a request parameter, to avoid an open-redirect vulnerability.</li>
+<li>Privacy: IP and device id are personal data. Keep them in the raw archive under access controls and delete or hash them after the fraud-analysis retention period (for example 90 days) while retaining the aggregates indefinitely (<a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>).</li>
+<li>Rate limit the query API per advertiser. Authenticate with tokens and scope every query to the caller.</li>
+</ul>
+
+<h3>17.2 Monitoring and SLOs</h3>
+<table>
+<tr><th>SLI</th><th>Target</th><th>Alert signal</th></tr>
+<tr><td>Click acceptance success rate</td><td>99.99%</td><td>Click tier 5xx rate, Kafka produce errors, spool depth above zero</td></tr>
+<tr><td>Pipeline freshness (now minus watermark)</td><td>p99 under 3 minutes</td><td>Watermark lag, consumer lag by partition</td></tr>
+<tr><td>Dashboard query latency</td><td>p99 under 500 ms</td><td>Query service histograms, store CPU</td></tr>
+<tr><td>Accuracy: stream versus batch difference</td><td>Under 0.5% per advertiser-hour after lateness</td><td>Diff monitor; a sudden increase signals a logic or data bug</td></tr>
+<tr><td>Invalid click ratio</td><td>Within the historical band (for example 3 to 8%)</td><td>Sudden jump means attack or an over-aggressive rule</td></tr>
+<tr><td>Checkpoint duration and failures</td><td>Under 10 s, zero failures</td><td>Checkpoint metrics; growing duration precedes outages</td></tr>
+</table>
+<p>The SLO framework is in <a href="../chapters/54-observability-slos.html">Chapter 54</a>. A synthetic canary is valuable here: inject a known test ad receiving a known number of clicks each minute and assert that the dashboard and the batch output show exactly that number. This end-to-end check catches failures that no component metric does.</p>
+
+<h3>17.3 Cost</h3>
+<p>The dominant costs are not the counting. Kafka at 10 MB per second is cheap; the OLAP cluster for 360 GB of hot minute data plus rollups is modest; the large line items are the fraud model inference (if every click is scored), the cold archive (about 20 TB per year compressed at object storage prices), and the engineers who maintain two pipelines. Levers: tier the archive to colder storage after 90 days, sample-score with the expensive model only the clicks that cheap rules mark suspicious, and drop minute-level granularity after 30 days.</p>
+
+<h2 id="evolution">18. Evolution, phasing and alternatives</h2>
+
+<h3>18.1 What I would build first</h3>
+<ol>
+<li><b>Phase 1 (MVP):</b> click tier, Kafka, a single stream job that dedups with keyed state and counts tumbling minute windows, idempotent upsert into the OLAP store, raw archive sink, basic query API. This already gives correct (if provisional) numbers with replay.</li>
+<li><b>Phase 2:</b> allowed lateness, provisional/final status, the hourly batch reconciliation with a diff monitor, and billing integration on finalized hours only.</li>
+<li><b>Phase 3:</b> rule-based fraud filtering with a rejected topic, hot-key salting, top-K in Redis, hour/day rollups.</li>
+<li><b>Phase 4:</b> model-based fraud scoring, multi-region mirroring, the canary and audit tables, advanced replay tooling.</li>
+</ol>
+
+<h3>18.2 At 10x scale (10 billion clicks per day, 500k per second peak)</h3>
+<ul>
+<li>Kafka: 100 to 200 partitions and more brokers; traffic becomes 100 MB per second, still modest per broker.</li>
+<li>Dedup state grows to about 70 GB at a 1-hour horizon, so shorten the stream horizon to 15 minutes (the batch covers longer duplicates), and use incremental RocksDB checkpoints.</li>
+<li>Hot keys become routine, so dynamic salting and local pre-aggregation are mandatory, not optional.</li>
+<li>OLAP: shard across more nodes, shift storage to tiered (SSD for 7 days, object storage beyond), and pre-aggregate rollups at ingest.</li>
+<li>Batch reconciliation moves from hourly to a rolling 15-minute cadence, with per-hour partitioned work to bound its size.</li>
+</ul>
+
+<h3>18.3 Alternatives not chosen</h3>
+<table>
+<tr><th>Alternative</th><th>Why not (here)</th></tr>
+<tr><td>Increment a counter per click directly in Redis or a database</td><td>Not idempotent; hot keys; no history, no replay, no fraud hindsight.</td></tr>
+<tr><td>Pre-aggregation inside the click tier (each web server counts and flushes)</td><td>Reduces Kafka volume but loses the raw event; dedup by click id and fraud rules need the raw record; lost on server crash.</td></tr>
+<tr><td>Approximate counting (HyperLogLog, Count-Min) for the billed figure</td><td>Fine for dashboards of unique users or heavy-hitters, unacceptable for exact money; used here only for hot-key detection and unique-reach metrics.</td></tr>
+<tr><td>Kappa-only pipeline</td><td>A strong option with a unified engine, discussed in section 12.3; I preferred an independent recount for an audit trail.</td></tr>
+<tr><td>Store clicks in OLAP and aggregate at query time</td><td>Possible for modest scale (the OLAP engine is fast), but 1B rows per day makes every dashboard query scan hundreds of millions of rows; pre-aggregation is cheaper by a factor of about 3 to 1 in rows here and by far more where ads receive many clicks per minute.</td></tr>
+</table>
+
+<h2 id="qa">19. Interview Q&amp;A</h2>
+
+<details><summary>Why is a Kafka log between the click tier and the counting, instead of counting directly in the click tier?</summary>
+<p>The log makes the system durable, decoupled and replayable. The click tier's only duty is to persist the event and redirect the user, which takes milliseconds, so a slowdown or crash in aggregation never affects users or loses revenue. Because Kafka retains events for days, we can replay after bugs, add new consumers (fraud analysis, archive) without touching the click tier, and rebuild state after a failure. Counting in the click tier would lose counts on a crash, would not allow dedup across servers, and would keep no raw data for audits.</p></details>
+
+<details><summary>How do you make sure a click is counted exactly once?</summary>
+<p>I combine at-least-once delivery with idempotent effects at each hop. The producer is idempotent, so retries do not duplicate in Kafka. The stream job deduplicates by click id in keyed state that is snapshotted together with the input offsets, so a crash restores a consistent cut and replays only the tail. The sink write is an upsert of the full revisioned count for (ad, minute), so replays overwrite with identical values instead of adding. Finally the hourly batch job recounts from the immutable archive with global dedup, which catches anything the streaming layer missed.</p></details>
+
+<details><summary>What is the difference between event time and processing time, and which do you use?</summary>
+<p>Event time is when the click happened and processing time is when our system handled it. After outages, retries or offline mobile buffering, the two diverge, and counting by processing time would shift clicks into the wrong minute and produce fake spikes. I aggregate by event time because both advertisers and billing care about when the click happened. That requires a watermark to decide when a window is complete, plus an allowed-lateness policy for stragglers. I also clamp event timestamps to a sane range around ingest time so a bad client clock cannot corrupt the watermark.</p></details>
+
+<details><summary>How do you handle late events?</summary>
+<p>There are three tiers. Events within the watermark delay (2 minutes) are simply part of the window. Events up to 15 minutes late are handled by allowed lateness: window state is retained, the late event updates the count, and a new revision of the row is upserted. Events later than that go to a late side output and are included by the hourly batch job, which reads the archive by event time and rewrites the row as final. The dashboard exposes a provisional or final status and the watermark so users know which numbers can still move.</p></details>
+
+<details><summary>One ad gets 5% of all clicks. How do you avoid a hot partition?</summary>
+<p>Aggregate in two stages. In stage 1 the key is (ad id, salt) where the salt is a hash of the click id modulo S, so one hot ad is spread across S tasks, each also doing local pre-aggregation and flushing once per second. Stage 2 sums the S partial counts per ad and minute, which is a tiny amount of data. This is exact because counts are additive. To avoid paying the cost for all ads, I detect heavy hitters with a sketch and salt only those. Since the partitioning of the raw topic is by click id, ingestion is already even.</p></details>
+
+<details><summary>Why keep a batch job if the stream job already counts exactly once?</summary>
+<p>Because "exactly once" in the stream is limited by the information the stream has at the time. It has a bounded dedup horizon, a bounded lateness window, and only real-time fraud rules, while billing needs hindsight: very late clicks, duplicates days apart, and fraud decisions made after analysis. The batch job also gives an independent recount from immutable files, which protects against stream bugs and state corruption and gives an audit trail. The diff between the two paths is my best monitoring signal for correctness.</p></details>
+
+<details><summary>How would you pick the dedup storage, and what about its size?</summary>
+<p>I keep a set of recent click ids in the stream job's local keyed state (RocksDB), partitioned by click id so that all copies of a click reach the same task, and snapshotted with the offsets. At the peak rate with a one-hour horizon that is about 180 million ids and about 7 GB total across 64 tasks, which is easy. An external Redis check adds a network call per event and is not atomic with the downstream write. A Bloom filter alone is risky because a false positive would drop a legitimate paid click, though it can sit in front as a prefilter if a positive always falls through to the exact check.</p></details>
+
+<details><summary>Which database holds the aggregates, and why not Cassandra or a time-series database?</summary>
+<p>I use a columnar OLAP engine such as ClickHouse, Druid or Pinot, sorted by advertiser, ad and minute. The workload is a high-volume batched upsert plus range scans and group-bys across many ads, which columnar engines do well. Cassandra serves the single-ad time series well but makes advertiser-level group-bys and rollups costly, and a classic time-series database struggles with tens of millions of series. If the product only needed per-ad charts, a wide-column store would be a fine and simpler choice, so I would say that tradeoff out loud.</p></details>
+
+<details><summary>How do you compute "clicks in the last 5 minutes" and a top-10 board efficiently?</summary>
+<p>I store only tumbling one-minute counts and derive sliding windows by adding the last N minute buckets, so the raw events are processed once. For the top 10, the aggregate job maintains a Redis sorted set per minute with ad id and cumulative count; the query merges the last N sets and takes the top ten, with each set trimmed to a few thousand members and the merged result cached for several seconds. It is approximate only in a contrived edge case, and the batch job can produce the exact board for reports.</p></details>
+
+<details><summary>What if a bug in your fraud rules is discovered after six hours?</summary>
+<p>Because every raw event and every rejection is retained with the rule version, I fix the rule and replay. For the last 7 days I can reset consumer offsets and re-run into a shadow output, compare, and swap; for older data, the batch job reruns over the archive for the affected hours and writes higher revisions. Billing reads only finalized hours, and if an hour was already billed, the difference goes through the ledger as an adjustment entry with the audit record explaining it. The monitoring that detects it early is the rejection-rate band and the stream-versus-batch diff.</p></details>
+
+<details><summary>How do you size the number of Kafka partitions and stream tasks?</summary>
+<p>Bandwidth is not the constraint: 50k events per second of 200 bytes is about 10 MB per second. Partition count sets maximum consumer parallelism and cannot be reduced, while increasing it later changes key-to-partition mapping, so I over-provision to 64 for the raw topic. That gives roughly 780 events per second per task at peak, with plenty of headroom for catch-up at 2x. At 10x scale I would grow to 128 to 256 partitions and rescale tasks by key group.</p></details>
+
+<h2 id="connects">20. Connects to, and recap</h2>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>Log first: the click tier appends a signed, id-carrying event to Kafka and redirects; everything else is asynchronous and replayable.</li>
+<li>Numbers: 1B clicks per day, 11.6k per second average, 50k per second peak, about 200 GB per day raw, about 12 GB per day of minute aggregates, about 7 GB of dedup state.</li>
+<li>Aggregate by event time with tumbling minute windows; derive sliding windows from the buckets; use a watermark with 2 minutes of tolerance, 15 minutes of allowed lateness, and a late side output for the rest.</li>
+<li>Dedup by click id in checkpointed keyed state; fraud filtering in layers (edge, stateful rules, model, offline), recording every rejection with a reason.</li>
+<li>Exactly-once effect: idempotent producer, checkpointed state plus offsets, idempotent upsert of full revisioned counts.</li>
+<li>Hot ads: salt into S sub-keys, pre-aggregate locally, and sum in a second stage; salt only detected heavy hitters.</li>
+<li>Store minute, hour and day aggregates in a columnar OLAP engine; top-K in Redis sorted sets; status and watermark in every response.</li>
+<li>Lambda-style hourly batch recount from the immutable archive produces final numbers, feeds billing, and its diff against the stream is the main correctness alarm.</li>
+<li>Failures degrade to lateness, not loss: Kafka buffers, the spool covers a Kafka outage, replay repairs bad logic.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> <a href="../chapters/02-estimation.html">Chapter 2</a> (estimation method), <a href="../chapters/05-api-design.html">Chapter 5</a> (API design), <a href="../chapters/13-caching-patterns.html">Chapter 13</a> (query caching), <a href="../chapters/15-redis.html">Chapter 15</a> (Redis), <a href="../chapters/23-other-stores.html">Chapter 23</a> (OLAP stores), <a href="../chapters/25-sharding.html">Chapter 25</a> (sharding and hot keys), <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a> (clock skew), <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> (idempotency and delivery semantics), <a href="../chapters/34-queues-kafka.html">Chapter 34</a> (Kafka), <a href="../chapters/37-batch-stream.html">Chapter 37</a> (windows, watermarks, checkpoints, Lambda), <a href="../chapters/41-ha-dr.html">Chapter 41</a> (disaster recovery), <a href="../chapters/54-observability-slos.html">Chapter 54</a> (SLOs), <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a> (Bloom filters and sketches), <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a> (top-K), <a href="../chapters/60-pattern-playbook.html">Chapter 60</a> (hot key patterns). Related case studies: <a href="c01-url-shortener.html">Case study 1</a> (click analytics on redirects) and <a href="c11-autocomplete.html">Case study 11</a> (top-K at scale).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

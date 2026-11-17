@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 58: Geospatial and Text Structures | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="58-geospatial-text">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Chapter 58 · Module 9 · Data structures for system design</div>
+<h1>Geospatial and Text Structures</h1>
+<p class="lead">Two kinds of questions break ordinary database indexes: "what is near this point on the map?" and "what words start with, contain, or resemble this text?". This chapter explains the data structures built for them: geohash, quadtrees, S2 and H3 for space, and tries, inverted indexes, edit-distance structures, Aho-Corasick and ropes for text. It ends with how to choose among them and a worked example with one million moving drivers.</p>
+
+<h2 id="problem">1. The nearby-search problem and why latitude/longitude indexes fail</h2>
+
+<p>Imagine a ride-hailing app. A rider opens the app at some latitude and longitude, and the system must find the available drivers within about two kilometres. The naive design is a table <code>drivers(id, lat, lon, status)</code> with a query such as <code>WHERE lat BETWEEN a AND b AND lon BETWEEN c AND d</code>, which asks for every driver inside a small box around the rider. The natural first instinct is to create an index on <code>lat</code> and another on <code>lon</code>. This does not work well, and it is worth understanding exactly why, because every structure in the first half of this chapter exists to fix this one problem.</p>
+
+<p>A B-tree index (see the database indexing chapters) keeps values in <b>one sorted order</b>. It answers "give me everything between value A and value B" very efficiently, because everything in that range sits next to each other in the sorted structure. Latitude alone is one dimension, so a B-tree on latitude can return all drivers in a horizontal <i>band</i> of the world between two latitudes. But that band is the entire width of the planet. A band 4 km tall around a big city contains every driver in every city at that latitude: thousands of drivers in other countries that you will immediately throw away. The same is true for a longitude index, which returns a vertical stripe from the North Pole to the South Pole.</p>
+
+<p>The database could use both indexes, fetch both candidate sets and intersect them. That is better than a full scan, but each of the two sets is still enormous (a whole band and a whole stripe), and only their small intersection is the answer. The cost is proportional to the size of the bands, not the size of the answer. A composite index on <code>(lat, lon)</code> does not rescue us either: the sort order is latitude first, then longitude, so within one exact latitude the longitudes are sorted, but two points 100 metres apart north-south are far apart in the sorted order, separated by every point with a latitude in between.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="A latitude index returns a wide band, a longitude index returns a tall stripe, but the answer is a small box">
+  <text class="t-b" x="20" y="22">Two separate one-dimensional indexes</text>
+  <rect class="box" x="30" y="40" width="360" height="230" rx="4" style="fill-opacity:0.08"/>
+  <rect class="miss" x="30" y="130" width="360" height="50" rx="0"/>
+  <text class="t-c t-sm" x="210" y="160">latitude index returns this whole band</text>
+  <rect class="cache" x="180" y="40" width="50" height="230" rx="0" style="fill-opacity:0.45"/>
+  <text class="t-sm" x="236" y="70">longitude</text><text class="t-sm" x="236" y="84">stripe</text>
+  <rect class="hit" x="180" y="130" width="50" height="50" rx="0"/>
+  <text class="t-c t-b" x="205" y="160">box</text>
+  <text class="t-c t-sm" x="210" y="290">the answer is only the tiny overlap</text>
+
+  <text class="t-b" x="470" y="22">One-dimensional order that keeps neighbours together</text>
+  <rect class="ext" x="470" y="60" width="400" height="60" rx="8"/>
+  <text class="t-sm" x="486" y="82">cell id = a single number or string per map cell</text>
+  <text class="t-sm" x="486" y="102">nearby places share a prefix or fall in a short id range</text>
+  <path class="arrow-g" d="M670 120 L670 160"/>
+  <rect class="db" x="470" y="160" width="400" height="60" rx="8"/>
+  <text class="t-sm" x="486" y="182">ordinary B-tree on cell id: one range scan per cell</text>
+  <text class="t-sm" x="486" y="202">a handful of scans replace a world-wide band</text>
+  <text class="t-c t-sm" x="670" y="250">this is the trick behind geohash, S2 and H3</text>
+</svg>
+<figcaption>Left: separate latitude and longitude indexes each return huge regions. Right: map the two dimensions to a single cell identifier and a normal sorted index works again.</figcaption>
+</figure>
+
+<div class="callout key"><b>Key idea</b>
+Two-dimensional proximity cannot be answered by a one-dimensional sorted index directly. Every geospatial structure does one of two things: it <b>flattens</b> the plane into a one-dimensional key whose locality is mostly preserved (geohash, S2, H3), or it builds a <b>spatial tree</b> that divides the plane hierarchically (quadtree, k-d tree, R-tree).
+</div>
+
+<p>There are two more facts that shape every design in this chapter. First, the Earth is a sphere (really an oblate spheroid), so distance is not Euclidean. One degree of latitude is always about 111 km, but one degree of longitude is about 111 km at the equator and shrinks to zero at the poles, proportional to the cosine of the latitude. At London (about 51 degrees north) a degree of longitude is about 70 km. A "square" in degrees is therefore not a square on the ground. Second, an index only <i>narrows down candidates</i>. After the index returns, say, 500 drivers from nearby cells, the application still computes the true distance (the haversine formula, or a cheaper flat-earth approximation for short ranges), filters by the exact radius and sorts. A good geo index returns a small superset of the answer; it does not have to return exactly the answer.</p>
+
+<p>The related case study, <a href="../case-studies/c13-nearby-search.html">Design Uber / Nearby Search</a>, puts these pieces into a full system. This chapter is the toolbox.</p>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="geohash">2. Geohash</h2>
+
+<p>Geohash, invented by Gustavo Niemeyer in 2008, is the simplest flattening scheme and the one interviewers expect you to know. It turns a latitude/longitude pair into a short string such as <code>ezs42</code>. The string names a rectangular cell on the map; longer strings name smaller cells inside it. Because it is just a string, you can store it in any database column, index it with an ordinary B-tree, and search it with a prefix match.</p>
+
+<h3 id="geohash-encode">2.1 How encoding works: interleaving bits, then base32</h3>
+
+<p>The idea is repeated halving, like a binary search on the map. Start with the whole longitude range, -180 to 180. Ask: is the point's longitude in the lower half (-180 to 0) or the upper half (0 to 180)? Write down 0 for lower, 1 for upper, and keep the half that contains the point. Repeat on the surviving half. Each answer is one bit, and after 20 steps the range has shrunk from 360 degrees to about 360 / 2^20 = 0.00034 degrees, around 38 metres. Do exactly the same for latitude, whose range is -90 to 90. You now have a string of longitude bits and a string of latitude bits.</p>
+
+<p>The next step is the heart of the scheme: <b>interleave</b> the two bit strings, taking one longitude bit, then one latitude bit, then the next longitude bit, and so on, starting with longitude. Finally, cut the combined bit string into groups of 5 bits and write each group as one character of a base32 alphabet. Geohash uses the alphabet <code>0123456789bcdefghjkmnpqrstuvwxyz</code>, which is the digits plus the lowercase letters except <code>a</code>, <code>i</code>, <code>l</code> and <code>o</code>, removed because they are easy to confuse with other characters. Five bits give 32 values, so 5 bits per character matches the 32-letter alphabet exactly.</p>
+
+<p>Here is the classic worked example, the point latitude 42.6, longitude -5.6 (northern Spain):</p>
+<ul>
+<li>Longitude -5.6 in [-180, 180]: midpoint 0, the point is below it, bit 0. In [-180, 0]: midpoint -90, point is above, bit 1. In [-90, 0]: midpoint -45, above, bit 1. In [-45, 0]: -22.5, above, bit 1. In [-22.5, 0]: -11.25, above, bit 1. The first five longitude bits are 0 1 1 1 1.</li>
+<li>Latitude 42.6 in [-90, 90]: midpoint 0, above, bit 1. In [0, 90]: 45, below, bit 0. In [0, 45]: 22.5, above, bit 1. In [22.5, 45]: 33.75, above, bit 1. In [33.75, 45]: 39.375, above, bit 1. The first five latitude bits are 1 0 1 1 1.</li>
+<li>Interleave, longitude first: 0 1 1 0 1 1 1 1 1 1. The first group of five bits is 01101 which is 13, the 14th symbol of the alphabet, <code>e</code>. The second group is 11111 which is 31, the last symbol, <code>z</code>. Continuing the same process gives <code>s</code>, <code>4</code> and <code>2</code>, so the result is <code>ezs42</code>.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Geohash encoding: halve longitude and latitude, interleave bits, group by five, base32">
+  <text class="t-b" x="20" y="22">Encode latitude 42.6, longitude -5.6</text>
+  <text class="t-sm" x="20" y="52">longitude bits</text>
+  <rect class="box" x="140" y="36" width="36" height="26" rx="4"/><text class="t-c" x="158" y="54">0</text>
+  <rect class="box" x="216" y="36" width="36" height="26" rx="4"/><text class="t-c" x="234" y="54">1</text>
+  <rect class="box" x="292" y="36" width="36" height="26" rx="4"/><text class="t-c" x="310" y="54">1</text>
+  <rect class="box" x="368" y="36" width="36" height="26" rx="4"/><text class="t-c" x="386" y="54">1</text>
+  <rect class="box" x="444" y="36" width="36" height="26" rx="4"/><text class="t-c" x="462" y="54">1</text>
+  <text class="t-sm" x="20" y="92">latitude bits</text>
+  <rect class="cache" x="178" y="76" width="36" height="26" rx="4"/><text class="t-c" x="196" y="94">1</text>
+  <rect class="cache" x="254" y="76" width="36" height="26" rx="4"/><text class="t-c" x="272" y="94">0</text>
+  <rect class="cache" x="330" y="76" width="36" height="26" rx="4"/><text class="t-c" x="348" y="94">1</text>
+  <rect class="cache" x="406" y="76" width="36" height="26" rx="4"/><text class="t-c" x="424" y="94">1</text>
+  <rect class="cache" x="482" y="76" width="36" height="26" rx="4"/><text class="t-c" x="500" y="94">1</text>
+  <text class="t-sm" x="20" y="150">interleaved</text>
+  <text class="t-b" x="140" y="150">0 1 1 0 1 1 1 1 1 1 ...</text>
+  <path class="arrow dash" d="M158 62 L158 130"/>
+  <path class="arrow dash" d="M196 102 L190 130"/>
+  <rect class="hit" x="140" y="170" width="190" height="40" rx="8"/><text class="t-c t-b" x="235" y="195">01101 = 13 = e</text>
+  <rect class="hit" x="350" y="170" width="190" height="40" rx="8"/><text class="t-c t-b" x="445" y="195">11111 = 31 = z</text>
+  <rect class="hit" x="560" y="170" width="190" height="40" rx="8"/><text class="t-c t-b" x="655" y="195">11000 = 24 = s</text>
+  <text class="t-c t-sm" x="445" y="236">... and so on, giving the string  e z s 4 2</text>
+  <rect class="ext" x="20" y="260" width="860" height="52" rx="8"/>
+  <text class="t-sm" x="36" y="282">Each extra character adds 5 bits, which splits the cell again: odd characters add 3 longitude bits and 2 latitude bits,</text>
+  <text class="t-sm" x="36" y="300">even characters add 2 longitude bits and 3 latitude bits, so cells alternate between wide and square-ish shapes.</text>
+</svg>
+<figcaption>Every bit is one halving of the remaining range. Longitude and latitude bits alternate, and every five bits become one base32 character.</figcaption>
+</figure>
+
+<p>Decoding is the reverse: expand each character to 5 bits, de-interleave, and replay the halvings. The result is not a point but a <b>rectangle</b>, and the centre of that rectangle is the usual decoded coordinate. So a geohash always means "somewhere inside this box", never an exact location.</p>
+
+<h3 id="geohash-precision">2.2 Precision versus cell size</h3>
+
+<p>Each additional character multiplies the number of cells by 32, so cells shrink quickly. The table lists the approximate size of a cell at the equator. The width is the east-west extent, which shrinks at higher latitudes; the height is fixed.</p>
+
+<table>
+<tr><th>Length</th><th>Cell size (width x height)</th><th>Typical use</th></tr>
+<tr><td>1</td><td>about 5,000 km x 5,000 km</td><td>continent scale</td></tr>
+<tr><td>2</td><td>about 1,250 km x 625 km</td><td>large country or region</td></tr>
+<tr><td>3</td><td>about 156 km x 156 km</td><td>metropolitan region</td></tr>
+<tr><td>4</td><td>about 39 km x 19.5 km</td><td>city</td></tr>
+<tr><td>5</td><td>about 4.9 km x 4.9 km</td><td>district; coarse "nearby" search</td></tr>
+<tr><td>6</td><td>about 1.2 km x 0.6 km</td><td>neighbourhood; typical ride-hailing cell</td></tr>
+<tr><td>7</td><td>about 153 m x 153 m</td><td>a few city blocks</td></tr>
+<tr><td>8</td><td>about 38 m x 19 m</td><td>a building</td></tr>
+<tr><td>9</td><td>about 4.8 m x 4.8 m</td><td>a room or parked car</td></tr>
+<tr><td>10 to 12</td><td>from about 1.2 m down to a few centimetres</td><td>rarely needed; beyond GPS accuracy</td></tr>
+</table>
+
+<p>You choose the length from the search radius. A good rule is to pick the precision whose cell is at least as large as the radius, so that the query circle can overlap at most the cell it sits in and its eight neighbours. A 1 km search suggests length 5 or 6; a 100 m search suggests length 7. Notice the physical limit: GPS on a phone is typically accurate to 3 to 10 metres, so characters beyond 9 or 10 carry no real information.</p>
+
+<h3 id="geohash-prefix">2.3 The prefix property</h3>
+
+<p>Because every longer geohash is formed by subdividing the cell of its prefix, <b>all points inside a cell share that cell's geohash as a prefix</b>. The cell <code>ezs4</code> contains the 32 cells <code>ezs40</code> through <code>ezs4z</code>, and every point in it has a geohash starting with <code>ezs4</code>. This turns a geographic query into a string prefix query. In SQL it is <code>WHERE geohash LIKE 'ezs4%'</code>, which a plain B-tree index serves with one range scan (everything from <code>ezs4</code> up to just before <code>ezs5</code>). A key-value store can do the same with a sort key and a "begins with" condition. In a hash-sharded store you can also group by prefix. The ordering is also hierarchical, so you can reduce precision simply by truncating the string, which is handy for heat maps and aggregation ("how many rides started in each 5-character cell?").</p>
+
+<div class="callout watch"><b>Watch out</b>
+The prefix property goes only one way. A shared prefix guarantees two points are close (they are in the same cell). The <i>absence</i> of a shared prefix does <b>not</b> mean two points are far apart. This is the boundary problem, next.
+</div>
+
+<h3 id="geohash-boundary">2.4 Neighbours and the boundary problem</h3>
+
+<p>Suppose a rider stands exactly on the line between two geohash cells, <code>ezs42</code> and <code>ezs48</code>. A driver 20 metres away on the other side of the line has a different geohash, even though they are very close. If the system queried only the rider's own cell, it would miss that driver completely. Worse, at some boundaries the two sides share almost no prefix. The prime meridian (longitude 0) and the equator (latitude 0) are the very first halvings, so a point at longitude -0.0001 and a point at longitude +0.0001 differ in the very first bit and therefore in the first character, although they are 22 metres apart. The same happens at every boundary where a high-order bit flips.</p>
+
+<p>The standard fix is to <b>query the cell and its eight neighbours</b> (north, north-east, east, south-east, south, south-west, west, north-west): nine cells in a 3 by 3 block. If the cell size is at least the search radius, any point within the radius of the rider must lie in one of those nine cells, so no true result is missed. You then compute exact distances for the candidates and discard those outside the circle. The neighbour of a geohash can be computed by a small lookup table (the algorithm decodes the cell, steps by one cell width or height, and re-encodes, or uses border/neighbour tables per character), and libraries provide a <code>neighbors()</code> function.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Boundary problem: a circle crosses cell boundaries, so we query 9 cells">
+  <text class="t-b" x="20" y="22">Querying only the home cell misses a close driver</text>
+  <rect x="40" y="40" width="120" height="120" fill="none" stroke="var(--muted)"/>
+  <rect x="160" y="40" width="120" height="120" class="hit" style="fill-opacity:0.5"/>
+  <rect x="280" y="40" width="120" height="120" fill="none" stroke="var(--muted)"/>
+  <text class="t-c t-sm" x="220" y="100">home cell</text><text class="t-c t-sm" x="220" y="116">ezs42</text>
+  <circle cx="158" cy="100" r="6" fill="var(--accent)"/><text class="t-sm" x="60" y="82">rider on edge</text>
+  <circle cx="128" cy="100" r="5" fill="var(--bad)"/><text class="t-sm" x="62" y="130">driver</text>
+  <text class="t-c t-sm" x="220" y="190">driver is 30 m away</text>
+  <text class="t-c t-sm" x="220" y="206">but in a different cell: missed</text>
+
+  <text class="t-b" x="480" y="22">Fix: query the 3 x 3 block of cells</text>
+  <rect class="miss" x="480" y="40" width="80" height="80" style="fill-opacity:0.25"/><text class="t-c t-sm" x="520" y="84">NW</text>
+  <rect class="miss" x="560" y="40" width="80" height="80" style="fill-opacity:0.25"/><text class="t-c t-sm" x="600" y="84">N</text>
+  <rect class="miss" x="640" y="40" width="80" height="80" style="fill-opacity:0.25"/><text class="t-c t-sm" x="680" y="84">NE</text>
+  <rect class="miss" x="480" y="120" width="80" height="80" style="fill-opacity:0.25"/><text class="t-c t-sm" x="520" y="164">W</text>
+  <rect class="hit" x="560" y="120" width="80" height="80"/><text class="t-c t-b" x="600" y="164">home</text>
+  <rect class="miss" x="640" y="120" width="80" height="80" style="fill-opacity:0.25"/><text class="t-c t-sm" x="680" y="164">E</text>
+  <rect class="miss" x="480" y="200" width="80" height="80" style="fill-opacity:0.25"/><text class="t-c t-sm" x="520" y="244">SW</text>
+  <rect class="miss" x="560" y="200" width="80" height="80" style="fill-opacity:0.25"/><text class="t-c t-sm" x="600" y="244">S</text>
+  <rect class="miss" x="640" y="200" width="80" height="80" style="fill-opacity:0.25"/><text class="t-c t-sm" x="680" y="244">SE</text>
+  <circle cx="600" cy="160" r="70" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="5 4"/>
+  <text class="t-sm" x="740" y="140">dashed circle = search</text><text class="t-sm" x="740" y="158">radius, never larger</text><text class="t-sm" x="740" y="176">than one cell width</text>
+  <text class="t-sm" x="740" y="214">then filter by exact</text><text class="t-sm" x="740" y="232">distance in the app</text>
+  <text class="t-c t-sm" x="600" y="312">9 prefix scans, each a plain B-tree range</text>
+</svg>
+<figcaption>Left: a nearby driver can sit just across a cell line. Right: always scan the home cell plus its eight neighbours, then filter by true distance.</figcaption>
+</figure>
+
+<h3 id="geohash-edges">2.5 Edge cases: poles, the antimeridian, and variable cell shape</h3>
+
+<p>Longitude wraps around: +180 and -180 are the same meridian (the antimeridian, near the International Date Line). A cell on the eastern edge of the geohash grid has a neighbour on the western edge, and good neighbour code wraps. Latitude does not wrap: there is nothing north of the North Pole, so cells in the top row have no north neighbours, and the query should simply skip them. Near the poles the grid itself becomes strange. All geohash cells at a given length have the same angular size, but a degree of longitude near 85 degrees north is only about 10 km wide instead of 111 km. Cells become tall thin slivers and the "square" approximation breaks, so a ring of neighbours covers a much smaller ground distance east-west than north-south. For consumer apps with users in cities this rarely matters, but you should mention it, and it is one reason Redis GEO restricts latitudes to roughly plus or minus 85.05 degrees.</p>
+
+<p>Cell shape also varies with latitude in the other direction: in Oslo a length-6 cell is physically narrower than the same cell in Singapore. This is called <b>variable cell size</b>. Distances computed from "number of cells" are therefore approximate, which is another reason to always filter with the real distance formula. If you need cells of uniform area (for example to compare supply and demand fairly across regions), geohash is a poor choice and S2 or H3 are better.</p>
+
+<h3 id="geohash-pros">2.6 Why geohash is popular anyway</h3>
+
+<p>Despite the boundary and distortion issues, geohash is widely used because it is trivial to implement, human readable, works in any store that supports string keys, and needs no special database extension. Its weaknesses are the discontinuity at high-order boundaries, the poor shape at high latitudes, and the fact that a rectangular z-order curve jumps: consecutive cell ids in sort order can be far apart on the map, so a radius query becomes several scattered range scans rather than one contiguous one. Those jumps are what the Hilbert curve in S2 reduces.</p>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="quadtree">3. Quadtrees</h2>
+
+<p>A geohash divides the world on a fixed grid, the same whether a cell holds one driver or ten thousand. A <b>quadtree</b> divides the map <i>adaptively</i>: it splits a region into four equal quadrants only when that region contains too many points. Dense areas get small cells, empty areas stay as one large cell.</p>
+
+<h3 id="qt-build">3.1 Building and inserting</h3>
+<p>Each tree node covers a rectangle. A <b>leaf</b> node stores a small list of points. The node has a <b>capacity</b>, also called the split threshold, for example 100 points. The procedure is:</p>
+<ol>
+<li>Start with a single root leaf that covers the whole map (or the whole service area).</li>
+<li>To insert a point, walk from the root down to the leaf whose rectangle contains the point: at each internal node, pick one of the four children (north-west, north-east, south-west, south-east) by comparing the point's coordinates to the node's centre.</li>
+<li>Add the point to that leaf's list. If the list now exceeds the capacity, <b>split</b> the leaf: create four child leaves, each covering a quarter of the rectangle, redistribute the points among them, and turn the node into an internal node that stores only child pointers.</li>
+<li>If many points are identical or extremely close, splitting repeats and the tree gets very deep. Real implementations set a maximum depth (or minimum cell size) and let the deepest leaves exceed the capacity.</li>
+</ol>
+
+<p>With N points and capacity C, a balanced-ish tree has about log base 4 of (N / C) levels in dense areas. One million points with capacity 100 need about 10,000 leaves, so about 7 levels if the distribution were uniform; clustered data goes deeper in the clusters but is still logarithmic. Insert and point lookup are therefore O(depth), cheap and predictable.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="A quadtree: dense region splits further than sparse regions">
+  <text class="t-b" x="20" y="22">Map divided by density</text>
+  <rect x="30" y="36" width="280" height="280" fill="none" stroke="var(--fg)" stroke-width="2"/>
+  <line x1="170" y1="36" x2="170" y2="316" stroke="var(--fg)"/><line x1="30" y1="176" x2="310" y2="176" stroke="var(--fg)"/>
+  <line x1="100" y1="36" x2="100" y2="176" stroke="var(--muted)"/><line x1="30" y1="106" x2="170" y2="106" stroke="var(--muted)"/>
+  <line x1="65" y1="36" x2="65" y2="106" stroke="var(--muted)"/><line x1="30" y1="71" x2="100" y2="71" stroke="var(--muted)"/>
+  <line x1="135" y1="106" x2="135" y2="176" stroke="var(--muted)"/><line x1="100" y1="141" x2="170" y2="141" stroke="var(--muted)"/>
+  <circle cx="45" cy="50" r="3" fill="var(--accent)"/><circle cx="52" cy="58" r="3" fill="var(--accent)"/><circle cx="80" cy="48" r="3" fill="var(--accent)"/><circle cx="86" cy="62" r="3" fill="var(--accent)"/><circle cx="50" cy="85" r="3" fill="var(--accent)"/><circle cx="80" cy="90" r="3" fill="var(--accent)"/>
+  <circle cx="115" cy="120" r="3" fill="var(--accent)"/><circle cx="150" cy="125" r="3" fill="var(--accent)"/><circle cx="120" cy="155" r="3" fill="var(--accent)"/><circle cx="150" cy="160" r="3" fill="var(--accent)"/>
+  <circle cx="240" cy="90" r="3" fill="var(--accent)"/><circle cx="270" cy="140" r="3" fill="var(--accent)"/>
+  <circle cx="90" cy="250" r="3" fill="var(--accent)"/><circle cx="250" cy="260" r="3" fill="var(--accent)"/>
+  <text class="t-c t-sm" x="240" y="60">NE: sparse</text><text class="t-c t-sm" x="100" y="250" style="opacity:0">x</text>
+  <text class="t-c t-sm" x="240" y="300">SE: sparse</text>
+
+  <text class="t-b" x="400" y="22">The same data as a tree</text>
+  <rect class="box" x="560" y="40" width="100" height="34" rx="8"/><text class="t-c t-b" x="610" y="62">root</text>
+  <rect class="box" x="400" y="130" width="90" height="34" rx="8"/><text class="t-c t-b" x="445" y="152">NW</text>
+  <rect class="hit" x="520" y="130" width="90" height="34" rx="8"/><text class="t-c t-sm" x="565" y="152">NE leaf</text>
+  <rect class="hit" x="640" y="130" width="90" height="34" rx="8"/><text class="t-c t-sm" x="685" y="152">SW leaf</text>
+  <rect class="hit" x="760" y="130" width="90" height="34" rx="8"/><text class="t-c t-sm" x="805" y="152">SE leaf</text>
+  <path class="arrow" d="M590 74 L450 128"/><path class="arrow" d="M605 74 L565 128"/><path class="arrow" d="M620 74 L680 128"/><path class="arrow" d="M635 74 L800 128"/>
+  <rect class="box" x="380" y="230" width="70" height="30" rx="6"/><text class="t-c t-sm" x="415" y="250">NW-NW</text>
+  <rect class="box" x="460" y="230" width="70" height="30" rx="6"/><text class="t-c t-sm" x="495" y="250">NW-NE</text>
+  <rect class="box" x="540" y="230" width="70" height="30" rx="6"/><text class="t-c t-sm" x="575" y="250">NW-SW</text>
+  <rect class="box" x="620" y="230" width="70" height="30" rx="6"/><text class="t-c t-sm" x="655" y="250">NW-SE</text>
+  <path class="arrow" d="M435 164 L415 228"/><path class="arrow" d="M445 164 L490 228"/><path class="arrow" d="M455 164 L570 228"/><path class="arrow" d="M465 164 L650 228"/>
+  <text class="t-sm" x="400" y="300">Only the crowded NW quadrant was split twice.</text>
+  <text class="t-sm" x="400" y="318">Leaves hold at most the capacity (here 4 points).</text>
+</svg>
+<figcaption>A quadtree with capacity 4. The crowded north-west quadrant is subdivided again; the sparse quadrants remain single leaves.</figcaption>
+</figure>
+
+<h3 id="qt-query">3.2 Range and nearest-neighbour queries</h3>
+<p><b>Range query</b> (all points inside a rectangle or circle): start at the root and recurse only into children whose rectangle overlaps the query region. At a leaf, test each stored point. Whole subtrees that do not overlap are skipped, which is the pruning that makes the structure fast. If the query region fully contains a node, every point beneath it qualifies and can be returned without per-point checks.</p>
+<p><b>Nearest-neighbour or k-nearest</b>: a simple method searches a circle of growing radius using range queries. A better method is <b>best-first search</b>: keep a priority queue ordered by the minimum possible distance from the query point to each node's rectangle. Pop the closest node; if it is a leaf, test its points and update the best-k list; if internal, push its children. Stop when the closest remaining node is farther than the k-th best point found. This visits only the few nodes near the query.</p>
+
+<h3 id="qt-dyn">3.3 Dynamic versus static, and where quadtrees live</h3>
+<p>A <b>static</b> quadtree is built once from a fixed set of points (shops, restaurants, ATMs) and rebuilt occasionally, for instance nightly. It can be packed tightly and shipped to servers as a read-only snapshot. A <b>dynamic</b> quadtree supports inserts, deletes and splits while serving traffic. Deleting is the harder half: if sibling leaves become sparse, the tree should <b>merge</b> four children back into one leaf, otherwise it slowly fills with empty nodes. A common rule is to merge when the combined count falls below half the capacity, which prevents a node from flapping between split and merged states when its count hovers around the threshold.</p>
+<p>A quadtree is normally an <b>in-memory</b> structure, because it is pointer-based and does not map neatly onto disk pages the way a B-tree does. That is fine for location data: one million points of 16 to 32 bytes plus tree overhead fit in under 100 MB. The typical deployment keeps one quadtree per service-area shard in memory on the "location service" and rebuilds it from a durable store after a restart. Compare this with geohash, which leans on the database; this is the main operational difference between the two.</p>
+<p><b>Moving objects.</b> A driver who moves is a delete followed by an insert. That is wasteful if most moves stay inside the same leaf. Implementations therefore update the stored coordinates in place and only remove and reinsert when the new position falls outside the leaf's rectangle. A second trick is <b>lazy update</b>: tolerate stale positions for a few seconds and batch the structural changes. Even so, a heavily mutated tree with locks can become a bottleneck, which is why systems that track millions of moving objects often prefer a flat grid (a fixed-size version of the same idea) with simple hash-map buckets; see section 9.</p>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="rtree-kd">4. R-trees and k-d trees, briefly</h2>
+<p>Two more spatial trees appear often enough to name.</p>
+<p>A <b>k-d tree</b> is a binary tree where each level splits the points by the median value of one coordinate, alternating between x (longitude) and y (latitude). A node is a point; its left subtree holds points below the splitting coordinate, its right subtree the points above. Nearest-neighbour search is fast, roughly O(log n), and the structure is compact. Its weakness is updates: inserting and deleting points can unbalance it, and rebalancing is expensive, so it suits static data sets (for example the points of interest in a map tile) and machine-learning nearest-neighbour search more than live fleets.</p>
+<p>An <b>R-tree</b> is a balanced tree, similar to a B-tree, where each node stores the <b>minimum bounding rectangle</b> that encloses all its children. Leaves hold the actual objects, which may be points, lines or polygons such as a city boundary or a delivery zone. Sibling rectangles may overlap, and a search must follow every child whose rectangle intersects the query. Because it is balanced and page-oriented, an R-tree works on disk. This is what GIS databases use: the PostGIS GiST index is an R-tree variant (section 8). Variants such as R*-trees reduce overlap through smarter splitting. Choose an R-tree when you store <i>shapes</i> rather than just points, or when the index must live on disk and support concurrent updates.</p>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="s2">5. Google S2</h2>
+<p>S2 is the geometry library developed at Google and used by Google Maps, MongoDB (the 2dsphere index), and many ride-sharing and delivery systems. It addresses the weaknesses of geohash: distortion near the poles and the discontinuous curve. It is useful to know both the idea and the names of its parts.</p>
+<ul>
+<li><b>Sphere to cube faces.</b> S2 imagines the Earth enclosed in a cube. Each point on the sphere is projected outward onto one of the cube's six faces. A non-linear adjustment is applied so cells at the corner of a face are not much smaller than cells at the centre; this keeps the area of cells at the same level within a factor of roughly two. Compare that with geohash, whose cells shrink to slivers toward the poles. Because every face is a square, each face is a clean quadtree.</li>
+<li><b>Hierarchical levels.</b> Each face is subdivided like a quadtree. Level 0 is the whole face (one sixth of the Earth, roughly 85 million square kilometres). Each level splits every cell into 4, down to level 30, where a cell is about one square centimetre. Level 12 cells are a few square kilometres, level 15 are roughly the size of a city block or two.</li>
+<li><b>Hilbert curve ids.</b> Cells are numbered along a <b>Hilbert space-filling curve</b>. Geohash numbers cells along a Z-shaped curve that has long jumps. The Hilbert curve visits the cells of a square in a continuous path, so cells that are close along the curve are almost always close in space and vice versa; far fewer big jumps. A cell is identified by a 64-bit integer: 3 bits for the face, then 2 bits for each level of subdivision, then a trailing 1-bit marker followed by zeros that tells you the level. Because every cell is a contiguous range along the curve, <b>the cell id range of a parent contains the ids of all its descendants</b>. A region of the map therefore turns into a few ranges of integers, and an ordinary sorted index answers range queries.</li>
+<li><b>Region covering.</b> To find everything inside a circle, polygon or rectangle, S2's <code>RegionCoverer</code> computes a small set of cells, possibly of mixed levels, that together cover the region. You give it a minimum level, a maximum level and a maximum cell count (for example 8 or 16). Large interior areas use big cells and the ragged edge uses small cells. Each covering cell then becomes one range scan: <code>cell_id BETWEEN cell.range_min AND cell.range_max</code>. Unlike geohash's "always 9 cells", the number and sizes of scans adapt to the query shape, so large radii work without enumerating hundreds of fine cells.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 320" role="img" aria-label="S2: cube faces, Hilbert curve through four cells, region covering with mixed sized cells">
+  <text class="t-b" x="20" y="22">1. Sphere to cube face</text>
+  <rect class="ext" x="30" y="50" width="120" height="120" rx="6"/>
+  <text class="t-c t-sm" x="90" y="106">one of 6 faces</text><text class="t-c t-sm" x="90" y="124">each a square</text>
+  <circle cx="90" cy="230" r="40" fill="none" stroke="var(--fg)" stroke-width="2"/><text class="t-c t-sm" x="90" y="234">Earth</text>
+  <path class="arrow" d="M90 188 L90 174"/>
+
+  <text class="t-b" x="320" y="22">2. Hilbert curve order</text>
+  <rect x="320" y="50" width="100" height="100" fill="none" stroke="var(--fg)"/>
+  <line x1="370" y1="50" x2="370" y2="150" stroke="var(--muted)"/><line x1="320" y1="100" x2="420" y2="100" stroke="var(--muted)"/>
+  <path d="M345 125 L345 75 L395 75 L395 125" fill="none" stroke="var(--accent)" stroke-width="3" marker-end="url(#ah)"/>
+  <text class="t-c t-sm" x="345" y="141">0</text><text class="t-c t-sm" x="345" y="91" style="opacity:0">1</text>
+  <text class="t-c t-sm" x="320" y="170">path never jumps far:</text><text class="t-c t-sm" x="370" y="186" style="opacity:0">x</text>
+  <text class="t-sm" x="320" y="188">cells 0,1,2,3 are all adjacent</text>
+  <text class="t-sm" x="320" y="214">parent id range holds all children</text>
+
+  <text class="t-b" x="560" y="22">3. Covering a circular region</text>
+  <rect x="560" y="40" width="300" height="240" fill="none" stroke="var(--fg)"/>
+  <rect class="hit" x="620" y="100" width="120" height="120"/><text class="t-c t-sm" x="680" y="164">level 12</text>
+  <rect class="hit" x="560" y="100" width="60" height="60"/><rect class="hit" x="560" y="160" width="60" height="60"/>
+  <rect class="hit" x="740" y="100" width="60" height="60"/><rect class="hit" x="740" y="160" width="60" height="60"/>
+  <rect class="hit" x="620" y="40" width="60" height="60"/><rect class="hit" x="680" y="40" width="60" height="60"/>
+  <rect class="hit" x="620" y="220" width="60" height="60"/><rect class="hit" x="680" y="220" width="60" height="60"/>
+  <circle cx="680" cy="160" r="100" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="5 4"/>
+  <text class="t-c t-sm" x="710" y="300">few big cells inside, small ones on the rim</text>
+</svg>
+<figcaption>S2 flattens each cube face with a Hilbert curve, then covers a region with a small mix of cell sizes. Each covering cell is one contiguous id range.</figcaption>
+</figure>
+
+<div class="callout key"><b>Key idea</b>
+S2 gives you hierarchical cells (like geohash), near-uniform area on the sphere (unlike geohash), contiguous 64-bit ids (so a B-tree range scan suffices), and a covering algorithm for arbitrary shapes. The price is a library dependency and ids that are not human readable.
+</div>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="h3">6. Uber H3 and why hexagons</h2>
+<p>H3 is a hierarchical geospatial index open-sourced by Uber in 2018. It divides the globe into <b>hexagonal cells</b> at 16 resolutions (0 to 15). Resolution 0 has 122 base cells; at resolution 9 a cell is about 0.1 square kilometres (edge around 170 m), and at resolution 15 about one square metre. Every cell has a 64-bit index. H3 starts from an icosahedron (a 20-faced solid) laid over the sphere rather than a cube, which spreads distortion more evenly. Twelve of the base cells are pentagons, because a sphere cannot be tiled by hexagons alone, but they are placed over open ocean, away from most cities.</p>
+
+<p><b>Why hexagons?</b> Consider a square grid. A square has 8 neighbours but two kinds: the four edge neighbours whose centres are one cell width away, and the four diagonal corner neighbours whose centres are about 1.41 times as far. When you ask "all cells within one step of this cell", the distance to the farthest result differs by 41 percent depending on direction. A hexagon has <b>6 neighbours, all sharing an edge, and the distance between the centre of a cell and the centre of each neighbour is identical</b>. Walking outward k steps (an H3 "k-ring" or grid disk) gives rings that approximate a circle far better than squares do. This matters for things Uber actually does: smoothing surge pricing across adjacent cells, finding "drivers within roughly 2 cells", computing travel-time estimates, and aggregating demand without directional bias. Hexagons also approximate a circle more closely for the same area, so there is less wasted area when covering a radius.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Square grid has two neighbour distances, hexagon grid has one">
+  <text class="t-b" x="20" y="22">Squares: two kinds of neighbour</text>
+  <rect x="60" y="50" width="60" height="60" fill="none" stroke="var(--muted)"/><rect x="120" y="50" width="60" height="60" fill="none" stroke="var(--muted)"/><rect x="180" y="50" width="60" height="60" fill="none" stroke="var(--muted)"/>
+  <rect x="60" y="110" width="60" height="60" fill="none" stroke="var(--muted)"/><rect class="hit" x="120" y="110" width="60" height="60"/><rect x="180" y="110" width="60" height="60" fill="none" stroke="var(--muted)"/>
+  <rect x="60" y="170" width="60" height="60" fill="none" stroke="var(--muted)"/><rect x="120" y="170" width="60" height="60" fill="none" stroke="var(--muted)"/><rect x="180" y="170" width="60" height="60" fill="none" stroke="var(--muted)"/>
+  <path class="arrow" d="M150 140 L210 140"/><text class="t-sm" x="188" y="132">1.0</text>
+  <path class="arrow-r" d="M150 140 L90 80"/><text class="t-sm" x="72" y="76">1.41</text>
+  <text class="t-sm" x="30" y="256">edge neighbours 1.0, diagonals 1.41</text>
+
+  <text class="t-b" x="400" y="22">Hexagons: one neighbour distance</text>
+  <polygon points="620,100 650,117 650,152 620,169 590,152 590,117" class="hit"/>
+  <polygon points="620,30 650,47 650,82 620,99 590,82 590,47" fill="none" stroke="var(--muted)"/>
+  <polygon points="680,65 710,82 710,117 680,134 650,117 650,82" fill="none" stroke="var(--muted)"/>
+  <polygon points="680,135 710,152 710,187 680,204 650,187 650,152" fill="none" stroke="var(--muted)"/>
+  <polygon points="620,170 650,187 650,222 620,239 590,222 590,187" fill="none" stroke="var(--muted)"/>
+  <polygon points="560,135 590,152 590,187 560,204 530,187 530,152" fill="none" stroke="var(--muted)"/>
+  <polygon points="560,65 590,82 590,117 560,134 530,117 530,82" fill="none" stroke="var(--muted)"/>
+  <path class="arrow-g" d="M620 135 L620 70"/><path class="arrow-g" d="M620 135 L680 100"/><path class="arrow-g" d="M620 135 L680 170"/>
+  <path class="arrow-g" d="M620 135 L620 205"/><path class="arrow-g" d="M620 135 L560 170"/><path class="arrow-g" d="M620 135 L560 100"/>
+  <text class="t-sm" x="740" y="120">All six centre-to-centre</text><text class="t-sm" x="740" y="138">distances are equal, so</text><text class="t-sm" x="740" y="156">rings of k steps are</text><text class="t-sm" x="740" y="174">close to circles</text>
+</svg>
+<figcaption>With squares, a "one step" neighbourhood mixes distances 1.0 and 1.41. With hexagons every neighbour is the same distance away.</figcaption>
+</figure>
+
+<p>Two caveats are worth stating. H3 cells do not nest exactly: a parent hexagon contains about seven children, but the child hexagons are not perfectly inside the parent (the boundary is approximate), so a "children of" query is not exactly equal to a "within parent" query. Also, pentagon cells have 5 neighbours and need special handling in the library. These are why H3 is excellent for aggregation, analytics and neighbour-based reasoning, while S2 is stronger when you need exact hierarchical containment and polygon coverings.</p>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="compare">7. Comparison: geohash, quadtree, S2, H3</h2>
+<table>
+<tr><th>Property</th><th>Geohash</th><th>Quadtree</th><th>S2</th><th>H3</th></tr>
+<tr><td>Cell shape</td><td>rectangle (lat/lon)</td><td>rectangle, adaptive</td><td>quasi-square on cube faces</td><td>hexagon (12 pentagons)</td></tr>
+<tr><td>Cell size</td><td>varies with latitude</td><td>varies with density by design</td><td>within about 2x across the globe</td><td>nearly uniform per resolution</td></tr>
+<tr><td>Representation</td><td>string, base32</td><td>in-memory tree</td><td>64-bit integer</td><td>64-bit integer</td></tr>
+<tr><td>Hierarchy</td><td>prefix</td><td>tree depth</td><td>exact parent/child, 31 levels</td><td>approximate parent/child, 16 levels</td></tr>
+<tr><td>Neighbours</td><td>8, boundary hazard</td><td>needs tree walk</td><td>edge and vertex neighbours</td><td>6, equal distance</td></tr>
+<tr><td>Where it lives</td><td>any database column</td><td>application memory</td><td>database or library</td><td>database or library</td></tr>
+<tr><td>Adapts to density</td><td>no (fixed grid)</td><td>yes</td><td>choose level per query</td><td>choose resolution per query</td></tr>
+<tr><td>Best for</td><td>simple prefix search, sharding keys</td><td>in-memory nearest and range search</td><td>polygon covering, accuracy, global</td><td>aggregation, smoothing, analytics</td></tr>
+<tr><td>Main weakness</td><td>boundary and pole distortion</td><td>updates, not persistent</td><td>library dependence</td><td>no exact nesting</td></tr>
+</table>
+<p>In an interview the typical stance is: "I would start with geohash or a fixed grid because it is simple and works with any store; I would mention S2 or H3 if the interviewer asks about accuracy near the poles or uniform cells."</p>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="databases">8. Geospatial indexing in real databases</h2>
+<p>You rarely implement these structures yourself; you pick a database that has one. Know what each product does under the hood, because that predicts its limits.</p>
+<ul>
+<li><b>PostgreSQL with PostGIS.</b> Adds geometry and geography types and functions such as <code>ST_DWithin(point, point, metres)</code> and <code>ST_Distance</code>. A <b>GiST</b> index (Generalized Search Tree) on the column implements an R-tree over bounding boxes. The planner uses it to prune candidates, then the exact function filters. The <code>&lt;-&gt;</code> operator gives index-assisted k-nearest-neighbour ordering. Best choice when you also need polygons, joins, transactions and rich queries, and the data volume fits a relational database. Updates at hundreds of thousands per second are not its sweet spot, since each update writes to a disk-based tree and generates WAL.</li>
+<li><b>Elasticsearch / OpenSearch.</b> A field of type <code>geo_point</code> stores latitude/longitude, and the <code>geo_distance</code>, <code>geo_bounding_box</code> and <code>geo_shape</code> queries use it. Internally, Lucene indexes points in a BKD tree (a k-d tree variant organised in blocks), so it is a spatial tree rather than geohash. Geohash and geotile grids appear in <b>aggregations</b> (<code>geohash_grid</code>) for map heat-maps. It combines geo filters with full text and ranking, ideal for "restaurants near me matching 'ramen' sorted by rating". See <a href="22-search-engines.html">Chapter 22</a>. Because documents are immutable segments, frequent location updates are expensive.</li>
+<li><b>Redis GEO.</b> <code>GEOADD key lon lat member</code> stores each member in a <b>sorted set</b> whose score is a 52-bit geohash integer. <code>GEOSEARCH key FROMLONLAT lon lat BYRADIUS 2 km</code> (older name <code>GEORADIUS</code>) computes the covering cells (the centre cell plus neighbours at a suitable precision), runs range scans on the sorted set, and filters by exact distance. In-memory, very fast, easy to update, perfect for live positions; limits are the memory size of one node, the single-threaded command execution, and latitudes restricted to about plus or minus 85.05 degrees. Scale out by running one key per region or per shard (section 9).</li>
+<li><b>MongoDB 2dsphere.</b> Stores GeoJSON points and shapes and indexes them with S2 cells in a B-tree. Operators <code>$near</code>, <code>$geoNear</code> (aggregation) and <code>$geoWithin</code> serve proximity and containment. It covers both points and polygons and can combine with other fields in compound indexes.</li>
+<li><b>DynamoDB and other key-value stores.</b> There is no native spatial index, so you use the <b>geohash pattern</b>: store each item with a geohash attribute, use a coarse prefix (say 5 characters) as the partition key, and the full-length geohash as the sort key. A nearby search computes the cell and its 8 neighbours, issues up to 9 queries with <code>begins_with</code> or a sort-key range, and merges and filters the results. Hot cells (a stadium, a city centre) become hot partitions, so pick the precision with that in mind. The same pattern works on Cassandra, HBase or any ordered key-value store.</li>
+</ul>
+<p>As a rule of thumb: relational plus shapes, use PostGIS; text plus geo, use Elasticsearch; real-time positions, use Redis or an in-memory grid; global scale with simple points, use a key-value store with geohash or S2 keys.</p>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="moving">9. Handling moving objects at scale</h2>
+<p>A restaurant does not move; a driver moves every few seconds. Static points are a read-heavy problem and ordinary indexes suffice. Moving objects turn it into a <b>write-heavy</b> problem. A disk-based index with a durable write for every update will not survive. The approach is to separate three concerns:</p>
+<ol>
+<li><b>The latest position</b> of every object, kept in memory, updated constantly, tolerant of loss (the next update arrives in seconds).</li>
+<li><b>A grid or tree</b> over those positions that answers "who is near here?" It is derived from the latest positions and changes only when an object crosses a cell boundary.</li>
+<li><b>History</b>, the track of positions, written asynchronously to a log (a message queue and then a data lake), possibly sampled at a lower rate for analytics and disputes.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Pipeline for driver location updates: gateway, shard by cell, in-memory grid, history stream, nearby query path">
+  <rect class="ext" x="20" y="40" width="130" height="50" rx="10"/><text class="t-c t-b" x="85" y="62">Drivers</text><text class="t-c t-sm" x="85" y="78">lat, lon / 4 s</text>
+  <rect class="box" x="200" y="40" width="130" height="50" rx="10"/><text class="t-c t-b" x="265" y="62">Gateway</text><text class="t-c t-sm" x="265" y="78">auth, batch</text>
+  <rect class="box" x="380" y="40" width="150" height="50" rx="10"/><text class="t-c t-b" x="455" y="62">Router</text><text class="t-c t-sm" x="455" y="78">cell id to shard</text>
+  <path class="arrow" d="M150 65 L196 65"/><path class="arrow" d="M330 65 L376 65"/>
+  <rect class="cache" x="600" y="20" width="270" height="50" rx="10"/><text class="t-c t-b" x="735" y="42">Shard A: cells 0-9</text><text class="t-c t-sm" x="735" y="58">in-memory grid + TTL</text>
+  <rect class="cache" x="600" y="90" width="270" height="50" rx="10"/><text class="t-c t-b" x="735" y="112">Shard B: cells 10-19</text><text class="t-c t-sm" x="735" y="128">in-memory grid + TTL</text>
+  <rect class="cache" x="600" y="160" width="270" height="50" rx="10"/><text class="t-c t-b" x="735" y="182">Shard C: cells 20-29</text><text class="t-c t-sm" x="735" y="198">in-memory grid + TTL</text>
+  <path class="arrow" d="M530 55 L596 45"/><path class="arrow" d="M530 65 L596 115"/><path class="arrow" d="M530 75 L596 185"/>
+  <rect class="db" x="380" y="260" width="170" height="50" rx="10"/><text class="t-c t-b" x="465" y="282">Log / Kafka</text><text class="t-c t-sm" x="465" y="298">history, sampled</text>
+  <path class="arrow dash" d="M265 90 L265 285 L376 285"/>
+  <rect class="ext" x="20" y="210" width="130" height="50" rx="10"/><text class="t-c t-b" x="85" y="232">Rider app</text><text class="t-c t-sm" x="85" y="248">nearby?</text>
+  <rect class="box" x="200" y="210" width="130" height="50" rx="10"/><text class="t-c t-b" x="265" y="232">Search svc</text><text class="t-c t-sm" x="265" y="248">9 cells</text>
+  <path class="arrow" d="M150 235 L196 235"/>
+  <path class="arrow dash" d="M330 225 L596 185"/>
+  <text class="t-sm" x="620" y="240">Shard = a group of cells, so one query</text><text class="t-sm" x="620" y="256">touches one or two shards.</text><text class="t-sm" x="620" y="272">TTL drops drivers that stop reporting.</text>
+</svg>
+<figcaption>Location updates flow through a router that maps the cell id to a shard; each shard keeps the latest positions in an in-memory grid. History is a side stream. Riders' nearby queries read the same shards.</figcaption>
+</figure>
+
+<h3 id="moving-write">9.1 The write rate and what reaches the index</h3>
+<p>The raw rate is simply the number of drivers divided by the update interval: 1 million drivers every 4 seconds is 250,000 updates per second. That is fine for an in-memory store sharded over a few machines, impossible for a single relational primary. Two observations reduce the real work. First, a driver at 10 m/s (36 km/h) travels only 40 m in 4 seconds, so for a cell about a kilometre across only about 3 to 4 percent of updates move a driver into a different cell. Overwriting the stored coordinates is cheap; the grid itself changes on only those boundary crossings. Second, the clients can reduce traffic: send updates only if the driver moved more than some threshold, adapt the interval to speed, and batch several updates per request.</p>
+
+<h3 id="moving-grid">9.2 The in-memory grid</h3>
+<p>The simplest and most robust structure is a <b>fixed grid</b>: a hash map from cell id (geohash, S2 or H3) to the set of driver ids in that cell, plus a hash map from driver id to its current position and cell. An update looks up the old cell, compares it with the new cell, and moves the id between sets only if it changed. A nearby query computes the cell and neighbour ids, unions the sets, fetches positions and filters by distance. All operations are O(1) per cell and need no tree rebalancing, which is why this beats a dynamic quadtree for high churn. It is effectively a quadtree frozen at one level.</p>
+
+<h3 id="moving-ttl">9.3 TTL, liveness and failure</h3>
+<p>Drivers disappear: the phone loses signal, the app is killed, the battery dies. A stale entry that says "available driver here" leads to failed matches. Each entry carries a last-seen timestamp and a <b>TTL</b> (time to live), typically about 2 to 3 update intervals, so 8 to 15 seconds. Redis can expire a key natively; with a sorted-set GEO structure you instead store a separate heartbeat key or run a periodic sweep that removes members older than the TTL. Reads also filter by timestamp, so a delayed sweep does not return ghosts. When a shard crashes, the grid is rebuilt simply by waiting a few seconds, since every live driver re-reports on its next update; no heavy recovery is needed, which is why durability is not required here.</p>
+
+<h3 id="moving-shard">9.4 Sharding by cell</h3>
+<p>One machine cannot hold or serve everything forever, so shard the grid (see <a href="25-sharding.html">Chapter 25</a>). The shard key should be a <b>spatial</b> key so that a nearby query touches few shards: choose a coarse cell (for example geohash length 4 or S2 level 8) and map those cells to shards. Hashing the coarse cell id with consistent hashing (see <a href="57-hashing-probabilistic.html">Chapter 57</a>) spreads cells evenly and allows adding shards with little movement. Hashing the driver id instead would spread load perfectly but forces every nearby query to fan out to all shards, which is why spatial sharding is preferred. The issues are hotspots (an airport, a concert, central Manhattan on Friday night) and boundary queries that cross two shards. Mitigate by sharding at a granularity fine enough that a single big city spans many shards, by splitting hot cells further, and by letting the search service query two or three shards in parallel and merge.</p>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="density">10. Dense versus sparse regions and radius expansion</h2>
+<p>A fixed-precision grid has a built-in mismatch. A cell of 1.2 km by 0.6 km in central Tokyo might hold 400 drivers; the same-sized cell in rural Montana might hold none. Two failure modes follow.</p>
+<p><b>Dense cells.</b> If a cell has thousands of entries, a query that scans the 3 by 3 block returns tens of thousands of candidates and distance checks become costly; the shard that owns it becomes hot. Remedies: use a finer precision in dense areas (a quadtree does this automatically; with a grid you can choose precision per region or split a hot cell into children on demand); cap the number of candidates returned by the index and sort by approximate distance; or give the matching service a bounded top-N rather than the complete list.</p>
+<p><b>Sparse cells and radius expansion.</b> If the 9-cell search returns fewer drivers than needed, widen the search. The standard approach is to <b>step the precision up</b> (shorter geohash, bigger cells) or add rings: first try the 3 by 3 block at length 6, then if fewer than k results, repeat at length 5 (cells about 5 km), then length 4 (about 20 to 40 km), until you have enough candidates or reach a maximum radius. With H3 you grow the k-ring by one step each round. Each round is a bounded number of cell lookups, and because the distance filter is exact, expanding never returns wrong results, only more candidates. Define a stopping rule (maximum radius, maximum rounds, or a time budget) so the sparse case does not scan the planet. A useful hybrid is an <b>adaptive</b> index: a quadtree whose leaves are keyed by cell id, or a grid that records a count per cell so the search can pick the first precision likely to return enough points.</p>
+<div class="callout tip"><b>Interview tip</b>
+When asked "what if there are no drivers nearby?", answer with radius expansion in rounds and a hard cap, and mention that you stop early once you have k good candidates. When asked "what if a stadium empties?", mention hot-cell splitting and per-shard rate limits.
+</div>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="text-intro">11. From space to text: structures for strings</h2>
+<p>The second half of this chapter turns from maps to words. Text problems have the same shape as geospatial ones: an ordinary B-tree on a whole string handles "equals" and "starts with" well enough, but cannot do "contains this word", "words that start with these three letters ranked by popularity", "close to this misspelling", or "does any of 10,000 banned phrases occur in this paragraph". Each need has a structure designed for it, and the pattern is again to pre-organise data so the question is answered by walking a small structure rather than scanning everything.</p>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="trie">12. Tries</h2>
+<p>A <b>trie</b> (pronounced "try", from re<i>trie</i>val), also called a prefix tree, stores a set of strings so that strings sharing a prefix share the same path. Each edge represents one character; each node represents the prefix spelled by the path from the root. A node is marked as a <b>terminal</b> if a stored word ends there. The root is the empty prefix.</p>
+
+<h3 id="trie-ops">12.1 Insert, search and prefix queries</h3>
+<p><b>Insert</b> a word by walking from the root, following the child for each character and creating it when missing; mark the last node terminal. <b>Search</b> (exact lookup) walks the same path and succeeds if every step exists and the final node is terminal. <b>Prefix query</b> ("is there any word starting with <code>ca</code>?") walks the prefix and succeeds if the path exists; to list all words with that prefix, walk to that node and then traverse its entire subtree. The cost of insert and lookup is O(L), where L is the word's length, <b>independent of how many words are stored</b>. Compare a balanced tree of strings, which needs O(L log n) because each comparison costs up to L.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="A trie for car, cat, cart, dog with top-K suggestions cached at each node">
+  <circle cx="300" cy="40" r="20" class="box"/><text class="t-c t-b" x="300" y="45">root</text>
+  <circle cx="200" cy="120" r="18" class="box"/><text class="t-c t-b" x="200" y="125">c</text>
+  <circle cx="420" cy="120" r="18" class="box"/><text class="t-c t-b" x="420" y="125">d</text>
+  <circle cx="200" cy="200" r="18" class="box"/><text class="t-c t-b" x="200" y="205">a</text>
+  <circle cx="420" cy="200" r="18" class="box"/><text class="t-c t-b" x="420" y="205">o</text>
+  <circle cx="140" cy="290" r="18" class="hit"/><text class="t-c t-b" x="140" y="295">r</text>
+  <circle cx="260" cy="290" r="18" class="hit"/><text class="t-c t-b" x="260" y="295">t</text>
+  <circle cx="420" cy="290" r="18" class="hit"/><text class="t-c t-b" x="420" y="295">g</text>
+  <circle cx="140" cy="350" r="0"/>
+  <path class="arrow" d="M290 58 L210 104"/><path class="arrow" d="M310 58 L410 104"/>
+  <path class="arrow" d="M200 138 L200 182"/><path class="arrow" d="M420 138 L420 182"/>
+  <path class="arrow" d="M190 216 L150 274"/><path class="arrow" d="M210 216 L250 274"/><path class="arrow" d="M420 218 L420 272"/>
+  <text class="t-sm" x="30" y="322">car (end)</text><text class="t-sm" x="215" y="322">cat (end)</text><text class="t-sm" x="378" y="322">dog (end)</text>
+  <text class="t-sm" x="30" y="338">green nodes = a word ends here (r also continues to "cart")</text>
+  <rect class="cache" x="560" y="60" width="320" height="100" rx="8"/>
+  <text class="t-b" x="576" y="84">Top-K cache at node "ca"</text>
+  <text class="t-sm" x="576" y="106">1. cat   (9,200 searches)</text>
+  <text class="t-sm" x="576" y="124">2. car   (7,100 searches)</text>
+  <text class="t-sm" x="576" y="142">3. cart  (3,400 searches)</text>
+  <path class="arrow dash" d="M556 110 L220 190"/>
+  <rect class="ext" x="560" y="190" width="320" height="110" rx="8"/>
+  <text class="t-sm" x="576" y="214">User types "ca": walk 2 nodes,</text>
+  <text class="t-sm" x="576" y="232">read the stored top-K list, return.</text>
+  <text class="t-sm" x="576" y="250">No subtree scan, so the cost is</text>
+  <text class="t-sm" x="576" y="268">O(prefix length + K) regardless</text>
+  <text class="t-sm" x="576" y="286">of how many words share the prefix.</text>
+</svg>
+<figcaption>A trie shares prefixes. Storing the K most popular completions at each node answers autocomplete by reading one node.</figcaption>
+</figure>
+
+<h3 id="trie-topk">12.2 Autocomplete: top-K per node</h3>
+<p>Naive autocomplete walks to the prefix node and traverses its whole subtree, which for the prefix "a" can mean millions of words, then sorts them by popularity. That is far too slow for a request that must answer in tens of milliseconds. The fix is to <b>precompute and store at each node the top K completions</b> (K around 5 to 10) with their scores. A lookup then costs O(prefix length) plus K to return. The cost moves to the write path: when a score changes, the lists of every ancestor node must be updated (up to L nodes), which is why autocomplete systems update scores in batches from aggregated logs rather than on every keystroke. Memory grows by K entries per node, often acceptable if you store ids or pointers to a shared string table rather than copying strings. The full design (data collection, aggregation, trie building, serving and freshness) is in <a href="../case-studies/c11-autocomplete.html">Design Search Autocomplete</a>.</p>
+
+<h3 id="trie-mem">12.3 Memory and compressed (radix) tries</h3>
+<p>A plain trie is memory hungry. A node with an array of 26 child pointers uses 26 x 8 = 208 bytes even if it has one child; for full Unicode an array is impossible, so nodes use maps, which have their own overhead. A trie of one million English words has several million nodes, most of them in long single-child chains, such as the tail <code>-ization</code>. Two techniques help.</p>
+<ul>
+<li><b>Compressed trie or radix tree (Patricia trie).</b> Collapse every chain of single-child nodes into one edge labelled with a string. The words <code>romane</code>, <code>romanus</code>, <code>romulus</code> become a root edge <code>rom</code> with branches <code>an</code> (then <code>e</code>, <code>us</code>) and <code>ulus</code>. The number of nodes is bounded by about twice the number of stored words, instead of the number of characters. Radix trees are used for IP routing tables, in the Linux kernel, and in key-value stores such as Redis streams and ART (adaptive radix tree) indexes.</li>
+<li><b>Compact child storage.</b> Use sorted small arrays or bitmaps for sparse nodes and only switch to bigger arrays when a node has many children (the idea behind ART), or store the whole trie as a flat array of bytes (a double-array trie) for a read-only dictionary.</li>
+</ul>
+
+<h3 id="tst">12.4 Ternary search trees and DAWGs</h3>
+<p>A <b>ternary search tree</b> (TST) gives each node one character and three pointers: <i>less</i>, <i>equal</i> and <i>greater</i>. To search for a word, compare the next letter with the node's character: go left if smaller, right if larger, and go to the middle child (consuming the letter) if equal. It behaves like a binary search tree on characters nested inside a trie. A node needs 3 pointers instead of a 26-slot array, so it uses far less memory, it supports prefix and "near" searches, and it is slightly slower per lookup. It is a good compromise when the alphabet is large or memory is tight.</p>
+<p>A <b>DAWG</b> (directed acyclic word graph, also called a minimal acyclic finite-state automaton) goes further: it merges not only common prefixes but also common <i>suffixes</i>. The words <code>walking</code>, <code>talking</code>, <code>working</code> share the ending <code>-ing</code>, which becomes one shared sub-graph. A DAWG of an English dictionary is a fraction of the size of the equivalent trie and is used in word games, spell checkers and, as finite-state transducers (FST), in the term dictionary of Lucene. The cost is that it is built offline and is effectively read-only, and storing per-word data such as popularity needs extra care.</p>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="inverted">13. Inverted index and posting-list compression (recap)</h2>
+<p>Where a trie answers prefix questions, the <b>inverted index</b> answers "which documents contain this word?". It maps each term (word) to its <b>posting list</b>, the sorted list of ids of documents containing the term, possibly with positions and frequencies. A multi-word query fetches the lists for each term and intersects them (AND) or merges them (OR), then ranks the results. Elasticsearch, Lucene, Solr and most search engines are built on it; the full treatment, including analyzers, shards and ranking, is in <a href="22-search-engines.html">Chapter 22</a>, so only the data-structure points are repeated here.</p>
+<p><b>Why compress posting lists?</b> Common terms have lists with hundreds of millions of ids, and a search engine's speed is largely determined by how fast it can stream these lists through memory. The central trick is <b>delta encoding</b>: since the list is sorted, store the differences between consecutive ids instead of the ids. The list 1000, 1003, 1010, 1012 becomes 1000, 3, 7, 2; the numbers are small, so they fit in few bits. Then compress the small numbers:</p>
+<ul>
+<li><b>Variable-byte (varint) encoding</b>: use 7 bits of each byte for data and the top bit to say "more bytes follow". A number below 128 takes one byte.</li>
+<li><b>Frame of reference and PForDelta</b>: split the list into blocks of, say, 128 deltas, find the number of bits needed for the largest typical value, and pack them all at that width, storing a few exceptions separately. This is very fast with modern CPU vector instructions and is what Lucene uses.</li>
+<li><b>Roaring bitmaps</b>: for dense lists, store a set of ids as a bitmap per chunk of 65,536 ids and switch the chunk representation among array, bitmap and run-length depending on density. Intersection is bitwise AND. Used by Lucene for filters, and widely in analytics systems.</li>
+<li><b>Skip pointers</b>: store extra markers every 128 or so entries so an intersection of a short list with a long one can jump forward instead of reading every entry.</li>
+</ul>
+<p>Compression is both a space saving (often 4 to 10 times smaller than raw 32-bit ids) and a speed gain, because less memory bandwidth is needed.</p>
+
+<!-- ======================= 14 ======================= -->
+<h2 id="fuzzy">14. N-grams, edit distance and fuzzy search</h2>
+<p>Users misspell. A search for "recieve" should find "receive". To support this, define "close" precisely: the <b>Levenshtein edit distance</b> between two strings is the minimum number of single-character insertions, deletions and substitutions needed to turn one into the other. "kitten" to "sitting" is 3 (substitute k with s, substitute e with i, insert g). The standard dynamic programming algorithm fills a table of size m by n with the cost of converting each prefix of one string into each prefix of the other, in O(mn) time. That is fine for comparing two words, but far too slow to compare a query against a dictionary of millions of words, so we need structures that avoid most comparisons. (A variant, Damerau-Levenshtein, also counts the swap of two adjacent letters as one edit, matching typical typos better.)</p>
+
+<h3 id="ngrams">14.1 N-grams</h3>
+<p>An <b>n-gram</b> is a run of n consecutive characters. The 3-grams (trigrams) of "hello", padded with spaces, are "  h", " he", "hel", "ell", "llo", "lo ". Index every dictionary word by its n-grams, using an inverted index from n-gram to word. To find candidates for a misspelled query, look up its trigrams and keep the words that share many of them (measured with the Jaccard or Dice overlap); then compute exact edit distance on only that small candidate set. Two strings within edit distance 1 or 2 usually share most of their n-grams, so the filter rarely loses the right answer. N-grams also power "contains" substring search (PostgreSQL <code>pg_trgm</code>) and search-as-you-type with <b>edge n-grams</b>, which index only the prefixes of each word ("h", "he", "hel", "hell", "hello"), turning prefix matching into an exact term lookup in an ordinary inverted index.</p>
+
+<h3 id="bktree">14.2 BK-trees</h3>
+<p>A <b>BK-tree</b> (Burkhard-Keller tree) indexes words in any metric space, including edit distance. Pick any word as the root. To insert a word, compute its distance d to the root; follow (or create) the child edge labelled d, and repeat recursively. To search for all words within distance r of a query q, compute d = distance(q, node). If d is at most r, the node is a match. Then, by the <b>triangle inequality</b>, only children whose edge label lies between d minus r and d plus r can contain matches, so every other branch is pruned. For small r (1 or 2) this typically inspects a small fraction of the dictionary.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="BK-tree: query book with radius 1 prunes branches by triangle inequality">
+  <rect class="box" x="360" y="30" width="120" height="40" rx="8"/><text class="t-c t-b" x="420" y="55">book</text>
+  <rect class="box" x="60" y="140" width="110" height="40" rx="8"/><text class="t-c t-b" x="115" y="165">books</text>
+  <rect class="hit" x="250" y="140" width="110" height="40" rx="8"/><text class="t-c t-b" x="305" y="165">boo</text>
+  <rect class="hit" x="440" y="140" width="110" height="40" rx="8"/><text class="t-c t-b" x="495" y="165">boot</text>
+  <rect class="miss" x="640" y="140" width="110" height="40" rx="8"/><text class="t-c t-b" x="695" y="165">cake</text>
+  <path class="arrow" d="M380 70 L150 138"/><text class="t-sm" x="240" y="96">d=1</text>
+  <path class="arrow" d="M405 70 L320 138"/><text class="t-sm" x="340" y="104">d=1</text>
+  <path class="arrow" d="M435 70 L490 138"/><text class="t-sm" x="470" y="104">d=1</text>
+  <path class="arrow-r dash" d="M470 70 L680 138"/><text class="t-sm" x="600" y="96">d=3</text>
+  <rect class="ext" x="60" y="220" width="780" height="60" rx="8"/>
+  <text class="t-sm" x="76" y="244">Query "boom", radius 1: distance to root "book" is 1, so only edges labelled 0 to 2 can hold answers.</text>
+  <text class="t-sm" x="76" y="264">The d=3 branch (cake) is skipped entirely; "boot" and "boo" are checked and match.</text>
+</svg>
+<figcaption>The edge label is the distance between parent and child. For a query at distance d from a node, only edges labelled between d minus r and d plus r are explored.</figcaption>
+</figure>
+
+<p>Search engines such as Lucene use an even faster approach for fuzzy queries: they build a <b>Levenshtein automaton</b>, a small finite-state machine that accepts exactly the strings within distance k of the query, and intersect it with the FST of the term dictionary, so the traversal visits only plausible terms. In practice, the distance is limited to 1 or 2 because the number of matches grows quickly, and the first letter is often required to match to cut candidates.</p>
+
+<!-- ======================= 15 ======================= -->
+<h2 id="suffix">15. Suffix arrays and suffix trees</h2>
+<p>If you must find a pattern anywhere inside one very long string (a genome, a log file, a whole book), a trie of words does not help, because the match can begin at any character. A <b>suffix array</b> sorts all suffixes of the text (the strings starting at every position) and stores the starting positions in sorted order. Any substring is a prefix of some suffix, so a pattern of length m can be found by binary search in O(m log n). A <b>suffix tree</b> is a compressed trie of all suffixes and finds a pattern in O(m), independent of text length, but needs roughly 10 to 20 times the memory of the text, whereas a suffix array takes about 4 to 8 bytes per character. For that reason suffix arrays (and the FM-index derived from them, used in bioinformatics) are more common in practice. In interviews a mention is enough: "for substring search in one big text I would use a suffix array; for many documents I use an inverted index with n-grams".</p>
+
+<!-- ======================= 16 ======================= -->
+<h2 id="tokenize">16. Tokenization basics</h2>
+<p>Before any text structure can be used, raw text must be split into <b>tokens</b>, and the quality of this step decides search quality. A typical analysis pipeline does the following in order: normalise Unicode and case (so "Cafe" and "cafe" match, and accents optionally fold); split on whitespace and punctuation (with care for tokens like <code>c++</code>, email addresses and URLs); remove very common <b>stop words</b> (the, of) if desired, although modern engines often keep them for phrase queries; apply <b>stemming</b> or <b>lemmatization</b> to reduce "running" and "ran" to a common root; and optionally expand synonyms. The same pipeline must be applied at index time and query time, or the tokens will not match. Languages without spaces, such as Chinese and Japanese, need dictionary-based segmentation or character n-grams. Mixed-language and emoji content are other common sources of mismatches. In an interview, state that the analyzer is part of the index definition and changing it requires a reindex.</p>
+
+<!-- ======================= 17 ======================= -->
+<h2 id="aho">17. Aho-Corasick: matching many patterns at once</h2>
+<p>Suppose you must scan every chat message for any of 50,000 banned words, or scan network packets for thousands of malware signatures. Running one search per pattern costs 50,000 passes over the text. The <b>Aho-Corasick</b> algorithm finds all occurrences of all patterns in a single pass, in time O(length of text + number of matches), independent of the number of patterns.</p>
+<p>It has two ingredients. First, build a trie of all the patterns. Second, add <b>failure links</b>: for each node, the failure link points to the longest proper suffix of the node's string that is also a prefix of some pattern (i.e. another node in the trie). These links are computed by a breadth-first traversal of the trie. When scanning text, you keep a current node and consume one character at a time. If the node has a child for the next character, move to it. If not, follow failure links until a node with that child is found (or reach the root). Whenever the current node, or any node reachable along its <b>output links</b>, ends a pattern, report a match. The scanner never moves backwards in the text, which is why it is linear.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 280" role="img" aria-label="Aho-Corasick automaton for patterns he, she, his, hers with a failure link">
+  <circle cx="60" cy="130" r="18" class="box"/><text class="t-c t-b" x="60" y="135">0</text>
+  <circle cx="190" cy="60" r="18" class="box"/><text class="t-c t-b" x="190" y="65">h</text>
+  <circle cx="320" cy="60" r="18" class="box"/><text class="t-c t-b" x="320" y="65">he</text>
+  <circle cx="460" cy="60" r="18" class="hit"/><text class="t-c t-b" x="460" y="65">her</text>
+  <circle cx="190" cy="200" r="18" class="box"/><text class="t-c t-b" x="190" y="205">s</text>
+  <circle cx="320" cy="200" r="18" class="box"/><text class="t-c t-b" x="320" y="205">sh</text>
+  <circle cx="460" cy="200" r="18" class="hit"/><text class="t-c t-b" x="460" y="205">she</text>
+  <path class="arrow" d="M76 122 L174 68"/><text class="t-sm" x="106" y="84">h</text>
+  <path class="arrow" d="M76 138 L174 192"/><text class="t-sm" x="106" y="180">s</text>
+  <path class="arrow" d="M208 60 L300 60"/><text class="t-sm" x="248" y="52">e</text>
+  <path class="arrow" d="M338 60 L440 60"/><text class="t-sm" x="384" y="52">r</text>
+  <path class="arrow" d="M208 200 L300 200"/><text class="t-sm" x="248" y="192">h</text>
+  <path class="arrow" d="M338 200 L440 200"/><text class="t-sm" x="384" y="192">e</text>
+  <path class="arrow-r dash" d="M452 182 L336 72"/><text class="t-sm" x="404" y="132" style="fill:var(--bad)">failure: she to he</text>
+  <rect class="ext" x="560" y="40" width="320" height="180" rx="8"/>
+  <text class="t-b" x="576" y="64">Scanning "ushers"</text>
+  <text class="t-sm" x="576" y="88">u: stay at root. s, h, e: reach "she"</text>
+  <text class="t-sm" x="576" y="106">and report "she". Its output link</text>
+  <text class="t-sm" x="576" y="124">also reports "he" (a suffix of she).</text>
+  <text class="t-sm" x="576" y="142">r: from "she" follow failure to "he",</text>
+  <text class="t-sm" x="576" y="160">then edge r gives "her"; s then ends</text>
+  <text class="t-sm" x="576" y="178">the scan. Text is read exactly once.</text>
+  <text class="t-sm" x="576" y="204">(Pattern "hers" would extend "her".)</text>
+</svg>
+<figcaption>A trie of patterns plus failure links. When a character does not extend the current match, the failure link falls back to the longest useful shorter match instead of restarting.</figcaption>
+</figure>
+
+<p>Uses include profanity and spam filters, intrusion detection engines (Snort uses it), antivirus signature scanners, <code>fgrep</code>, and entity tagging ("find every product name from this list in the article"). It lives in memory, and for very large pattern sets the state table can be stored as a compact array.</p>
+
+<!-- ======================= 18 ======================= -->
+<h2 id="rope">18. Ropes and piece tables for text editors</h2>
+<p>An editor holds a document and applies inserts and deletes at a cursor. A single contiguous array or string makes every insertion in the middle copy all the text after it, O(n), which is painful for a 50 MB file. Editors therefore use structures that make edits cheap.</p>
+<ul>
+<li><b>Gap buffer</b>: an array with an empty "gap" kept at the cursor; typing fills the gap and moving the cursor moves the gap. Simple and fast for local edits (used by Emacs) but moving the cursor far means copying.</li>
+<li><b>Rope</b>: a balanced binary tree whose leaves hold short string chunks, and whose internal nodes store the total length of the left subtree. To find character i, walk down comparing i to the stored lengths. Insertion splits a leaf and re-links; delete and concatenation also take O(log n). Ropes make large concatenations and splits cheap and are used where huge text is manipulated (and in some language runtimes).</li>
+<li><b>Piece table</b>: keeps two read-only-ish buffers, the <b>original</b> file and an append-only <b>add</b> buffer for everything typed, plus a list of <b>pieces</b>, each saying "take length L from buffer B starting at offset O". The document is the concatenation of the pieces. Inserting text appends it to the add buffer and splits one piece into two with a new piece between them; deleting just trims or removes piece entries; nothing is copied or overwritten. Undo is easy because old text is never destroyed. VS Code stores the pieces in a balanced tree (a "piece tree") to find the piece at a character offset in O(log n).</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Piece table: original buffer, add buffer, piece list before and after inserting text">
+  <text class="t-b" x="20" y="22">Original buffer (never changes)</text>
+  <rect class="db" x="20" y="34" width="360" height="36" rx="6"/><text class="t-c" x="200" y="57">The quick fox jumps</text>
+  <text class="t-b" x="460" y="22">Add buffer (append only)</text>
+  <rect class="cache" x="460" y="34" width="300" height="36" rx="6"/><text class="t-c" x="610" y="57">brown </text>
+  <text class="t-b" x="20" y="110">Piece list before insert</text>
+  <rect class="box" x="20" y="122" width="360" height="36" rx="6"/><text class="t-c t-sm" x="200" y="145">orig, offset 0, length 19</text>
+  <text class="t-b" x="20" y="196">Piece list after typing "brown " at position 10</text>
+  <rect class="box" x="20" y="208" width="190" height="40" rx="6"/><text class="t-c t-sm" x="115" y="232">orig 0, len 10</text>
+  <rect class="cache" x="220" y="208" width="160" height="40" rx="6"/><text class="t-c t-sm" x="300" y="232">add 0, len 6</text>
+  <rect class="box" x="390" y="208" width="190" height="40" rx="6"/><text class="t-c t-sm" x="485" y="232">orig 10, len 9</text>
+  <text class="t-sm" x="600" y="226">Result: The quick brown fox jumps</text>
+  <text class="t-sm" x="600" y="244">No text was moved or copied.</text>
+  <text class="t-c t-sm" x="450" y="282">One insert = one append plus one split of a list entry. Undo restores the old list.</text>
+</svg>
+<figcaption>The document is a list of slices of two buffers. Edits change only the small list.</figcaption>
+</figure>
+
+<p>For collaborative editing the problem changes: several users edit concurrently and the system must merge operations, using operational transformation or CRDTs, usually on top of a rope or piece-table representation per replica. That is covered in <a href="../case-studies/c16-collaborative-editor.html">Design a Collaborative Editor</a>.</p>
+
+<!-- ======================= 19 ======================= -->
+<h2 id="decision">19. Decision table</h2>
+<table>
+<tr><th>Need</th><th>Choose</th><th>Why</th></tr>
+<tr><td>Nearby points, simple, any store</td><td>Geohash prefix plus 8 neighbours</td><td>String key, B-tree range scans, easy to shard</td></tr>
+<tr><td>Live positions, heavy updates</td><td>In-memory grid (cell id to set), Redis GEO</td><td>O(1) updates, loss tolerable, TTL expiry</td></tr>
+<tr><td>Adaptive density, in-memory k-nearest</td><td>Quadtree</td><td>Splits where crowded, best-first nearest search</td></tr>
+<tr><td>Polygons, joins, transactions</td><td>PostGIS (GiST R-tree)</td><td>Shapes, SQL, exact functions</td></tr>
+<tr><td>Geo plus text relevance</td><td>Elasticsearch geo_point</td><td>Combine geo filter with text scoring</td></tr>
+<tr><td>Global, accurate, region covering</td><td>S2 (or MongoDB 2dsphere)</td><td>Uniform cells, Hilbert ranges, coverings</td></tr>
+<tr><td>Aggregation, smoothing, neighbour analytics</td><td>H3</td><td>Equal-distance neighbours, hex rings</td></tr>
+<tr><td>Prefix completion with popularity</td><td>Trie with top-K per node</td><td>O(prefix) lookup, no subtree scan</td></tr>
+<tr><td>Static dictionary, tight memory</td><td>DAWG / FST, or radix trie</td><td>Shared suffixes and prefixes</td></tr>
+<tr><td>Full-text word search</td><td>Inverted index, compressed postings</td><td>Fast intersections, ranking</td></tr>
+<tr><td>Typos</td><td>Edge n-grams, BK-tree, Levenshtein automaton</td><td>Narrow candidates before exact distance</td></tr>
+<tr><td>Substring in one huge text</td><td>Suffix array</td><td>O(m log n) search, small memory</td></tr>
+<tr><td>Many patterns in a stream</td><td>Aho-Corasick</td><td>Single pass, linear time</td></tr>
+<tr><td>Editor buffer</td><td>Piece table or rope</td><td>Cheap inserts, deletes, undo</td></tr>
+</table>
+
+<!-- ======================= 20 ======================= -->
+<h2 id="worked">20. Worked example: nearby drivers for 1 million drivers updating every 4 seconds</h2>
+<p><b>Requirements.</b> One million online drivers, each reporting position every 4 seconds. Riders request "drivers within 1 km" at a peak of 20,000 requests per second across the world. The answer must come back within 100 ms, and a stale position older than about 12 seconds must not be returned.</p>
+
+<h3 id="w-writes">20.1 Write load</h3>
+<ul>
+<li>Updates: 1,000,000 / 4 = <b>250,000 updates per second</b>.</li>
+<li>Payload per update (driver id 8 B, lat and lon as two 8 B doubles, timestamp 8 B, heading and speed, headers): around 50 to 60 bytes at the application level. 250,000 x 50 B = about <b>12.5 MB/s</b>, or 100 Mbit/s. Network-wise this is modest; the request count, not the bytes, is the concern. Batching 10 updates per HTTP call at the gateway cuts requests to 25,000 per second.</li>
+<li>Persisting every point to history: 12.5 MB/s x 86,400 s = about <b>1.08 TB per day</b>. Sampling history to one point every 20 seconds cuts this to roughly 215 GB per day; this is written to a log stream, not the serving store.</li>
+</ul>
+
+<h3 id="w-mem">20.2 Memory</h3>
+<p>For each driver keep id, lat, lon, timestamp, cell id and status: about 48 bytes, rounded to roughly 100 bytes with hash map overhead. 1,000,000 x 100 B = <b>100 MB</b>. The cell map adds another small amount. Memory is not the bottleneck at all; one machine could hold the data. We shard for write throughput and availability, not capacity.</p>
+
+<h3 id="w-shards">20.3 Sharding</h3>
+<p>A single Redis or in-process grid handles on the order of 100,000 simple operations per second, so 250,000 writes per second plus 20,000 queries (each touching 9 cells) needs several nodes. Choose <b>8 shards</b> by hashing a coarse cell (geohash length 4, cells about 39 km by 20 km) to a shard with consistent hashing. This gives about 31,000 writes per second per shard, leaving headroom, and each shard has replicas for failover. A city is split over many length-4 cells so no shard owns an entire metropolis. A rider query at a boundary may contact two shards; the search service issues those requests in parallel.</p>
+
+<h3 id="w-cell">20.4 Choosing the cell size and the query cost</h3>
+<p>The radius is 1 km, so use geohash length 6 (about 1.2 km by 0.6 km). The cell height of 0.6 km is smaller than the radius, so the 3 by 3 block covers only 1.8 km north-south, which is not enough margin on the sides in the worst case; to be safe we have two options: length 5 (4.9 km cells, the 3 by 3 block is safe but large) or length 6 with the 5 by 5 block (25 cells). Compare the candidate counts for both. A dense city has maybe 50,000 online drivers over 600 square kilometres, about 83 per square kilometre. A length-5 cell has 24 square kilometres, so about 2,000 drivers per cell and 18,000 for the 3 by 3 block; filtering 18,000 candidates per query at about 50 ns for a distance computation is 0.9 ms, but at 20,000 queries per second that is 18 seconds of CPU per second, 18 cores. It is feasible yet wasteful. Using length 6 with the 5 by 5 block (25 cells of 0.72 square kilometres = 18 square kilometres) gives about 1,500 candidates and 75 microseconds of distance work per query, 1.5 cores in total. Finer cells win here. In sparse areas, the same query returns few drivers and the radius expansion of section 10 kicks in.</p>
+
+<h3 id="w-index">20.5 What actually changes in the index</h3>
+<p>A driver moves about 40 metres in 4 seconds at 36 km/h. With cells 600 to 1,200 m wide, a crossing happens roughly once every 15 to 30 updates, so only about 3 to 7 percent of updates change cell membership: about <b>7,500 to 17,500 set mutations per second</b> across all shards, while the other updates only overwrite a position field. TTL is 12 seconds (three missed updates): a driver silent for longer is removed by a sweep and filtered out at read time.</p>
+
+<h3 id="w-summary">20.6 Latency budget and summary</h3>
+<table>
+<tr><th>Step</th><th>Cost</th></tr>
+<tr><td>Compute 25 cell ids from the rider location</td><td>under 0.1 ms</td></tr>
+<tr><td>Fan out to one or two shards, set union, about 1,500 ids</td><td>1 to 3 ms including network</td></tr>
+<tr><td>Fetch positions, filter by distance, sort, take top 10</td><td>under 1 ms</td></tr>
+<tr><td>Enrich with ETA from the routing service (separate call)</td><td>20 to 50 ms</td></tr>
+<tr><td>Total p99 target</td><td>under 100 ms</td></tr>
+</table>
+<p>The full system around this (matching, dispatch, surge pricing, trip state) is in <a href="../case-studies/c13-nearby-search.html">Design Uber / Nearby Search</a>.</p>
+
+<!-- ======================= 21 ======================= -->
+<h2 id="qa">21. Interview Q&amp;A</h2>
+
+<details><summary>Why can't I just index latitude and longitude with ordinary B-trees?</summary>
+<p>A B-tree orders values along one axis, so an index on latitude returns a band that spans the whole world and one on longitude returns a pole-to-pole stripe. The real answer is only the small overlap, but the database must read and intersect both huge sets, so cost scales with the band size, not the answer size. A composite (lat, lon) index also fails because points that are close north-south can be far apart in the sorted order. The fix is either to flatten the two dimensions into one locality-preserving key (geohash, S2, H3) or to use a genuinely spatial tree (quadtree, R-tree, k-d tree).</p></details>
+
+<details><summary>Explain how a geohash is computed and what its prefix means.</summary>
+<p>Repeatedly halve the longitude range and the latitude range, writing 0 for the lower half and 1 for the upper half each time. Interleave the two bit sequences starting with longitude and group them in fives, mapping each group to a character of the base32 alphabet. Each extra character subdivides the cell into 32. All points in a cell share its geohash as a prefix, so a geographic area becomes a string prefix, and a B-tree range scan or a "begins with" query finds everything in it.</p></details>
+
+<details><summary>What is the geohash boundary problem and how do you handle it?</summary>
+<p>Two points a few metres apart can fall in different cells, and at the top-level boundaries (the equator and prime meridian) they share no prefix at all. Querying only the home cell therefore misses close neighbours. The remedy is to query the home cell plus its eight neighbours, choosing a precision whose cell is at least as large as the search radius, and then filter by exact distance. Wrap longitude at the antimeridian and skip non-existent northern or southern neighbours at the poles.</p></details>
+
+<details><summary>Geohash versus quadtree: when do you pick each?</summary>
+<p>Geohash is a fixed-grid key that fits in any database column, shards naturally by prefix and is trivial to implement; its cells do not adapt to density. A quadtree adapts by splitting crowded cells, so a dense city gets fine cells and an ocean gets one big one, which gives good nearest-neighbour performance, but it is an in-memory pointer structure that must be rebuilt after a crash and is awkward to update under heavy churn. I would use geohash or a grid for the persistent, sharded side and possibly a quadtree inside a service for adaptive in-memory search.</p></details>
+
+<details><summary>Why do S2 and H3 exist if geohash works?</summary>
+<p>Geohash cells distort with latitude, its Z-order curve jumps so a region becomes scattered ranges, and neighbours are awkward at boundaries. S2 projects the sphere onto cube faces so cells have near-uniform area, orders them with a Hilbert curve so ranges are contiguous, and offers region covering for arbitrary shapes. H3 uses hexagons, whose six neighbours are all the same distance away, which is ideal for smoothing, aggregation and "within k rings" reasoning. They cost a library dependency and unreadable ids, which is why simple systems still use geohash.</p></details>
+
+<details><summary>How do you handle a million drivers updating location every few seconds?</summary>
+<p>That is 250,000 writes per second, so I keep only the latest position in memory, in a sharded grid keyed by cell id, rather than writing to a disk index. Updates overwrite the position and change set membership only when a driver crosses a cell, which is a few percent of updates. A TTL of a few update intervals removes drivers who disappear, and history goes to a Kafka-style log asynchronously, sampled. Shards are chosen by coarse cell so that a nearby query touches one or two of them.</p></details>
+
+<details><summary>How would you shard a location service and what goes wrong?</summary>
+<p>Shard by a coarse spatial cell, hashed with consistent hashing, so that all drivers in an area live together and a query fans out to few shards. Sharding by driver id gives even load but forces every query to hit all shards. The problems are hotspots such as airports or event venues, which you fix by using finer cells for hot regions or splitting hot cells further, and boundary queries that need two shards, which you handle by querying them in parallel and merging. See the sharding chapter for rebalancing.</p></details>
+
+<details><summary>What happens when a search area is empty or very dense?</summary>
+<p>In sparse areas, expand in rounds: re-run the query with a shorter geohash (larger cells) or a bigger ring until you have enough candidates or hit a maximum radius, and stop early once k good results are found. In dense areas, a fixed cell holds too many points, so use finer cells, cap the candidate count, or split the hot cell; a quadtree does this automatically. Since the final step always filters by exact distance, expansion changes only cost, not correctness.</p></details>
+
+<details><summary>How does a trie support autocomplete efficiently, and what are its costs?</summary>
+<p>Walking the prefix takes O(length of prefix), but listing and ranking the subtree is expensive for short prefixes. So each node stores its top-K completions with scores, making the lookup read a single node. The cost is memory (K entries per node, mitigated by storing ids) and write amplification, because changing a score means updating up to L ancestors; therefore scores are updated in periodic batches from aggregated query logs, and a radix trie or FST shrinks the structure.</p></details>
+
+<details><summary>How would you support typo-tolerant search over a large dictionary?</summary>
+<p>Computing edit distance against every word costs O(mn) per word, so first narrow candidates. Index words by n-grams in an inverted index and keep the words sharing most n-grams with the query, or use a BK-tree where the triangle inequality prunes most branches, or a Levenshtein automaton intersected with the term dictionary as Lucene does. Then compute exact edit distance on the small candidate set, restrict to distance 1 or 2, and rank by popularity and distance.</p></details>
+
+<details><summary>When would you use Aho-Corasick instead of regular expressions or repeated searches?</summary>
+<p>When there are many fixed patterns, say thousands of banned phrases or signatures, and the text is a stream. Searching each pattern separately costs patterns times text length, whereas Aho-Corasick builds one trie with failure links and reads the text once, in time linear in the text plus the matches. It does not handle general regex, so for flexible patterns you combine it with a regex confirmation step on the matches.</p></details>
+
+<details><summary>Why does a text editor not store the document as one big string?</summary>
+<p>An insertion in the middle of a flat array shifts everything after it, O(n), which is slow for large files and makes undo costly. A rope stores chunks in a balanced tree so edits cost O(log n); a piece table keeps the original file and an append-only buffer and represents the document as a list of slices, so edits modify only the list and undo is trivial. Editors like VS Code use a piece tree for this reason.</p></details>
+
+<!-- ======================= 22 ======================= -->
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">22. Recap</h2>
+<ul>
+<li>B-trees on latitude and longitude fail because proximity is two-dimensional; flatten it to a cell id (geohash, S2, H3) or use a spatial tree (quadtree, k-d tree, R-tree).</li>
+<li>Geohash interleaves longitude and latitude bits and writes them in base32; shared prefix means same cell, but a missing prefix does not mean far, so query the cell plus 8 neighbours and filter by exact distance. Mind poles, the antimeridian and variable cell size.</li>
+<li>Quadtrees split crowded cells, support range and best-first nearest queries, live in memory, and handle high-churn moving objects less gracefully than a flat grid. R-trees index shapes on disk (PostGIS GiST); k-d trees suit static data.</li>
+<li>S2 uses cube faces and Hilbert-ordered 64-bit ids with region covering; H3 uses hexagons so all neighbours are equidistant.</li>
+<li>Databases: PostGIS (R-tree), Elasticsearch (BKD tree), Redis GEO (geohash in a sorted set), MongoDB 2dsphere (S2), DynamoDB (geohash key pattern).</li>
+<li>Moving objects: keep latest positions in a sharded in-memory grid with TTL, send history to a log, shard by coarse cell, expand the radius in rounds for sparse areas and split cells for dense ones.</li>
+<li>Text: tries give O(L) prefix lookup, top-K per node gives autocomplete, radix tries, TSTs and DAWGs save memory; inverted indexes with delta-compressed postings power full-text search; n-grams, BK-trees and Levenshtein automata give fuzzy search; suffix arrays find substrings; Aho-Corasick matches many patterns in one pass; ropes and piece tables make editing cheap.</li>
+<li>With 1 million drivers every 4 seconds: 250,000 writes per second, about 100 MB of state, 8 shards, and only a few percent of updates change cell membership.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="25-sharding.html">Chapter 25</a> (sharding and hot partitions), <a href="22-search-engines.html">Chapter 22</a> (inverted indexes and analyzers) and <a href="57-hashing-probabilistic.html">Chapter 57</a> (consistent hashing and probabilistic structures). Leads to the case studies <a href="../case-studies/c13-nearby-search.html">Design Uber / Nearby Search</a>, <a href="../case-studies/c11-autocomplete.html">Design Search Autocomplete</a> and <a href="../case-studies/c16-collaborative-editor.html">Design a Collaborative Editor</a>.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

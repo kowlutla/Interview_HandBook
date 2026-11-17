@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 8: Scalability and Concurrency | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="08-scalability-concurrency">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Chapter 8 · Module 2 · Component deep dive</div>
+<h1>Scalability and Concurrency</h1>
+<p class="lead">Scaling a service means keeping it fast and correct as the load grows. This chapter explains what to measure, why adding machines does not give perfect speed-up, how to design the application tier so that machines are interchangeable, how threads, event loops and pools really behave under load, and which concurrency bugs appear the moment two requests touch the same data.</p>
+
+<!-- ======================= 1 ======================= -->
+<h2 id="meaning">1. What scalability actually means</h2>
+
+<p>People say "this design does not scale" without saying what they mean. A precise definition makes every later discussion easier. A system is <b>scalable</b> if, when the load grows, you can keep its quality of service (latency and availability) acceptable by adding resources, and the cost of doing so grows in a reasonable way, ideally roughly in proportion to the load. A system that needs ten times the money to handle ten times the load is fine. A system that needs a complete rewrite at twice the load is not.</p>
+
+<h3>1.1 Load parameters</h3>
+<p>Before you can talk about growth you must say <b>what</b> is growing. The numbers that describe load are called <b>load parameters</b>, and they depend on the system. For a web service the main one is requests per second. For a chat system it may be the number of open connections and messages per second. For a database it may be the ratio of reads to writes, or the number of rows. For a social feed it is the number of followers per user, which decides how much work one post creates (this "fan-out" is the textbook example of a load parameter that dominates the design). Picking the wrong parameter leads to sizing the wrong thing. If your real problem is that a few celebrity accounts have millions of followers, adding web servers will not help.</p>
+
+<h3>1.2 Throughput and latency</h3>
+<p>Two measures describe how a service performs under a given load.</p>
+<ul>
+  <li><b>Throughput</b> is how much work completes per unit of time: requests per second, messages per second, megabytes per second.</li>
+  <li><b>Latency</b> is how long one piece of work takes from the moment it arrives until the answer is complete. Strictly, <i>response time</i> includes waiting in queues, while <i>service time</i> is only the time spent being processed. Under load the waiting part grows and dominates.</li>
+</ul>
+<p>Latency must be described with <b>percentiles</b>, not the average. The p50 (median) says what a typical request sees. The p99 says that one request in a hundred is slower than this value. A user who loads a page that makes 30 backend calls will almost certainly hit the p99 of at least one of them, so tail latency decides the experience. Chapter <a href="02-estimation.html">2</a> covers estimation of the numbers themselves; <a href="54-observability-slos.html">Chapter 54</a> covers how targets are written as SLOs.</p>
+
+<h3>1.3 The shape of the curve</h3>
+<p>Throughput and latency are linked, and the link is not linear. At low load each request is served immediately, so latency is flat at the service time. As utilization of the bottleneck resource approaches 100 percent, requests start to arrive while others are still being processed, so they wait in a queue. Queueing theory shows that waiting time grows steeply: for a simple single-server queue the average time in the system is proportional to 1 / (1 - utilization). At 50 percent utilization the factor is 2, at 90 percent it is 10, at 99 percent it is 100. Throughput meanwhile flattens at the maximum the resource can do, and if load keeps rising the system can even get <i>worse</i> (more work in progress, more memory, more context switching), which is called <b>congestion collapse</b>.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Latency and throughput versus offered load, showing the knee">
+  <text class="t-b" x="20" y="22">Latency and throughput as offered load rises</text>
+  <line x1="70" y1="250" x2="860" y2="250" stroke="var(--fg)" stroke-width="1.5"/>
+  <line x1="70" y1="40" x2="70" y2="250" stroke="var(--fg)" stroke-width="1.5"/>
+  <text class="t-sm" x="400" y="280">offered load (requests per second)</text>
+  <text class="t-sm" x="14" y="36">time / rate</text>
+  <path d="M70 210 L500 205 L600 190 L680 150 L740 90 L780 50" fill="none" stroke="var(--bad)" stroke-width="3"/>
+  <text x="700" y="44" style="fill:var(--bad)">latency (p99)</text>
+  <path d="M70 240 L300 175 L500 120 L600 110 L700 110 L860 110" fill="none" stroke="var(--good)" stroke-width="3"/>
+  <text x="720" y="136" style="fill:var(--good)">throughput</text>
+  <line x1="600" y1="40" x2="600" y2="250" stroke="var(--fg)" stroke-width="1" stroke-dasharray="5 4"/>
+  <text class="t-sm" x="606" y="66">the knee: roughly 70-80% utilization</text>
+  <text class="t-sm" x="110" y="232">flat: no queueing</text>
+  <text class="t-sm" x="640" y="236">saturated: queues grow, latency explodes</text>
+</svg>
+<figcaption>Latency stays almost flat while there is spare capacity, then bends upward sharply at the knee. Throughput rises with load and then plateaus at the capacity of the bottleneck. Good operation means staying left of the knee.</figcaption>
+</figure>
+
+<div class="callout key"><b>Key idea</b>
+You never run a service at 100 percent of capacity, because the latency cost of the last 20 percent is enormous. "Capacity" in interviews should mean the load at which p99 latency still meets the target, not the load at which the machine melts. This is the origin of headroom (section 14).
+</div>
+
+<h3>1.4 Dimensions of scaling</h3>
+<p>Load can grow in different ways: more users, more data per user, more requests per user, or heavier requests. Each stresses a different resource. More users mostly stress the app tier and connection counts. More data stresses storage, indexes and memory for caching. Heavier requests stress CPU. When asked "how would you scale this", first ask which of these is growing, because the cure differs.</p>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="vertical-horizontal">2. Vertical versus horizontal scaling, and the limits</h2>
+
+<h3>2.1 Two directions</h3>
+<p><b>Vertical scaling</b> (scale up) means moving to a bigger machine: more cores, more memory, faster disks. It is the simplest thing that can possibly work, because the software does not change. There is no distribution, no network between components, no data placement problem, and transactions on one database stay trivially consistent. Its limits are that the biggest machine has a ceiling, price rises faster than capacity near the top of the range, and one machine is one failure domain: if it dies, everything dies, and replacing it usually means downtime.</p>
+<p><b>Horizontal scaling</b> (scale out) means adding more machines and spreading the work over them. In principle the ceiling is much higher, machines are cheap commodity units, and losing one machine loses only a fraction of capacity. The price is complexity: you need a way to split the work (a load balancer, <a href="09-load-balancing.html">Chapter 9</a>, or partitioning of data, <a href="25-sharding.html">Chapter 25</a>), the machines must be able to cooperate, and every network hop adds latency and a new way to fail.</p>
+
+<table>
+<tr><th>Aspect</th><th>Vertical (scale up)</th><th>Horizontal (scale out)</th></tr>
+<tr><td>Code changes</td><td>None</td><td>Often required (statelessness, partitioning)</td></tr>
+<tr><td>Ceiling</td><td>Largest available machine</td><td>Very high, limited by coordination</td></tr>
+<tr><td>Failure impact</td><td>Total, single point of failure</td><td>Partial, capacity shrinks by 1/N</td></tr>
+<tr><td>Cost curve</td><td>Super-linear at the top end</td><td>Roughly linear</td></tr>
+<tr><td>Consistency</td><td>Easy (one box)</td><td>Needs design (replication, partitions)</td></tr>
+<tr><td>Typical use</td><td>Databases early on, caches, quick wins</td><td>Stateless app tier, workers, read replicas</td></tr>
+</table>
+
+<p>A sound default in interviews: scale the stateless tiers horizontally, scale the stateful tier vertically as far as is sensible (it is the hard one to distribute), and only then partition the data. Do not jump to sharding when a bigger instance and a read replica would carry you for another two years.</p>
+
+<h3>2.2 Why ten machines are not ten times faster: Amdahl's law</h3>
+<p>Adding machines only speeds up the part of the work that can be done in parallel. If a fraction <i>s</i> of the work is inherently serial (it must happen one after another, for example a single lock, a single leader, a single database writer), then no matter how many machines <i>N</i> you add, the speed-up is limited. <b>Amdahl's law</b> says:</p>
+<pre>speedup(N) = 1 / ( s + (1 - s) / N )</pre>
+<p>Take s = 0.05, so 5 percent of the work is serial. With N = 10 the speed-up is 1 / (0.05 + 0.095) = 6.9. With N = 100 it is 1 / (0.05 + 0.0095) = 16.8. With N = infinity it is 1 / 0.05 = 20. A mere 5 percent serial section caps you at 20 times, however many servers you buy. The practical lesson is to find and shrink the serial part (a global lock, a single-row counter, a sequential ID generator, a single-threaded step) rather than to keep adding hardware.</p>
+
+<h3>2.3 It gets worse: the Universal Scalability Law</h3>
+<p>Amdahl is optimistic, because it says adding machines never hurts. Real systems have a second cost: the workers must talk to each other. Neil Gunther's <b>Universal Scalability Law</b> (USL) adds a term for this. The relative capacity with N workers is:</p>
+<pre>C(N) = N / ( 1 + a (N - 1) + b N (N - 1) )</pre>
+<p>The two coefficients mean different things:</p>
+<ul>
+  <li><b>a (contention)</b> is the cost of waiting for a shared resource that only one worker can use at a time: a lock, a queue head, a single database row. This is the same effect as Amdahl's serial fraction. It bends the curve toward a flat ceiling.</li>
+  <li><b>b (coherency, or crosstalk)</b> is the cost of keeping the workers' views consistent with each other: cache invalidation messages, replication of shared state, distributed locks, all-to-all gossip. Because every worker may have to talk to every other, this cost grows with N squared. It bends the curve <i>downward</i>, so that past some N adding workers makes throughput <b>fall</b>.</li>
+</ul>
+<p>Example with a = 0.03 and b = 0.0005. At N = 8 the denominator is 1 + 0.03 × 7 + 0.0005 × 56 = 1.238, so capacity is 8 / 1.238 = 6.5. At N = 32 it is 1 + 0.93 + 0.0005 × 992 = 2.426, giving 13.2. At N = 64 it is 1 + 1.89 + 2.016 = 4.906, giving 13.0. At N = 128 it is 1 + 3.81 + 8.13 = 12.94, giving 9.9. The peak is near N = sqrt((1 - a) / b) = sqrt(1940) which is about 44. More machines past that point make the cluster slower.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Ideal linear, Amdahl and USL scaling curves">
+  <text class="t-b" x="20" y="22">Capacity versus number of workers N</text>
+  <line x1="80" y1="280" x2="860" y2="280" stroke="var(--fg)" stroke-width="1.5"/>
+  <line x1="80" y1="40" x2="80" y2="280" stroke="var(--fg)" stroke-width="1.5"/>
+  <text class="t-sm" x="420" y="312">number of workers N</text>
+  <text class="t-sm" x="14" y="36">capacity</text>
+  <path d="M80 280 L760 50" fill="none" stroke="var(--fg)" stroke-width="2" stroke-dasharray="6 4"/>
+  <text class="t-sm" x="560" y="98">ideal: linear</text>
+  <path d="M80 280 C200 200 320 150 480 128 C620 112 740 108 850 106" fill="none" stroke="var(--good)" stroke-width="3"/>
+  <text x="700" y="96" style="fill:var(--good)">Amdahl: flat ceiling</text>
+  <path d="M80 280 C200 205 300 160 400 142 C470 134 520 136 600 156 C700 190 780 230 850 262" fill="none" stroke="var(--bad)" stroke-width="3"/>
+  <text x="640" y="236" style="fill:var(--bad)">USL: peaks, then falls</text>
+  <circle cx="445" cy="137" r="5" fill="var(--bad)"/>
+  <text class="t-sm" x="360" y="124">optimum N</text>
+</svg>
+<figcaption>The dashed line is perfect scaling. A serial fraction (Amdahl, green) flattens the curve. Coherency cost (USL, red) makes it turn down, so there is an N beyond which extra workers hurt.</figcaption>
+</figure>
+
+<div class="callout tip"><b>Interview tip</b>
+You do not need to recite formulas, but naming the two enemies earns credit: contention (waiting for something shared) and coherency (keeping copies in agreement). Then say how your design reduces them: partition the shared thing, avoid shared state, or relax consistency.
+</div>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="stateless">3. Stateless service design and where state goes</h2>
+
+<p>The easiest tier to scale horizontally is one whose servers are <b>interchangeable</b>. A server is <b>stateless</b> when it does not keep anything between requests that the next request would depend on. Any request can then go to any server, so a load balancer can use simple round robin or least-connections, you can add or remove servers at will, and a crashed server loses nothing (the next request just goes elsewhere). Most of horizontal scaling in practice is the work of <i>making the app tier stateless</i> and pushing state to a place that is designed to hold it.</p>
+
+<p>"Stateless" does not mean the system has no state. It means the app servers do not own the only copy. Durable state belongs in databases, object storage, or queues, and short-lived shared state belongs in an in-memory store such as Redis (<a href="15-redis.html">Chapter 15</a>). Local memory is still fine for things that are <i>rebuildable</i> and <i>safe if different servers disagree briefly</i>, such as a local cache of configuration or a compiled template.</p>
+
+<h3>3.1 What counts as hidden state</h3>
+<ul>
+  <li><b>Login sessions</b> kept in server memory, the classic case.</li>
+  <li><b>Uploaded files</b> written to a local disk, so a later request on another server cannot find them. Use object storage (<a href="21-object-storage.html">Chapter 21</a>).</li>
+  <li><b>In-process caches</b> that hold the only copy of a computed result, or whose staleness causes visible disagreement between servers.</li>
+  <li><b>Scheduled jobs</b> inside every instance, so that with 10 instances the nightly job runs 10 times. Use a single scheduler or a lock (<a href="30-coordination-locks.html">Chapter 30</a>).</li>
+  <li><b>WebSocket connections</b> and in-memory subscriptions: connections are inherently attached to one server, so message delivery needs a shared fan-out layer (<a href="06-realtime.html">Chapter 6</a>).</li>
+  <li><b>Local counters</b> such as a rate limiter that counts per instance and therefore allows N times the intended rate (<a href="16-rate-limiting.html">Chapter 16</a>).</li>
+</ul>
+
+<h3>3.2 Sessions: three ways to handle them</h3>
+<p>A <b>session</b> is the server-side memory that says "this browser is logged in as user 42, with this cart". There are three standard designs.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Sticky sessions, shared session store, signed tokens">
+  <text class="t-c t-b" x="150" y="22">A. Sticky sessions</text>
+  <rect class="ext" x="20" y="40" width="80" height="34" rx="8"/><text class="t-c t-b" x="60" y="62">Client</text>
+  <rect class="box" x="130" y="40" width="40" height="34" rx="8"/><text class="t-c t-b" x="150" y="62">LB</text>
+  <rect class="box" x="210" y="40" width="80" height="34" rx="8"/><text class="t-c t-b" x="250" y="62">App 1</text>
+  <rect class="box" x="210" y="100" width="80" height="34" rx="8"/><text class="t-c t-b" x="250" y="122">App 2</text>
+  <path class="arrow" d="M100 57 L128 57"/><path class="arrow" d="M170 57 L208 57"/><path class="arrow dash" d="M170 65 L208 112"/>
+  <text class="t-sm" x="20" y="170">Session lives in App 1 memory.</text>
+  <text class="t-sm" x="20" y="190">LB pins the client to App 1.</text>
+  <text class="t-sm" x="20" y="210">If App 1 dies, sessions are lost.</text>
+  <text class="t-sm" x="20" y="230">Load can become uneven.</text>
+
+  <text class="t-c t-b" x="450" y="22">B. Shared session store</text>
+  <rect class="box" x="350" y="40" width="80" height="34" rx="8"/><text class="t-c t-b" x="390" y="62">App 1</text>
+  <rect class="box" x="350" y="100" width="80" height="34" rx="8"/><text class="t-c t-b" x="390" y="122">App 2</text>
+  <rect class="cache" x="500" y="60" width="100" height="54" rx="8"/><text class="t-c t-b" x="550" y="84">Redis</text><text class="t-c t-sm" x="550" y="102">session store</text>
+  <path class="arrow" d="M430 57 L498 80"/><path class="arrow" d="M430 117 L498 96"/>
+  <text class="t-sm" x="320" y="170">Any app server reads the session by ID.</text>
+  <text class="t-sm" x="320" y="190">Cost: one extra network call per request.</text>
+  <text class="t-sm" x="320" y="210">The store must itself be highly available.</text>
+  <text class="t-sm" x="320" y="230">Logout / revoke is immediate.</text>
+
+  <text class="t-c t-b" x="760" y="22">C. Signed tokens</text>
+  <rect class="ext" x="650" y="40" width="80" height="34" rx="8"/><text class="t-c t-b" x="690" y="62">Client</text>
+  <rect class="box" x="780" y="40" width="90" height="34" rx="8"/><text class="t-c t-b" x="825" y="62">Any app</text>
+  <path class="arrow" d="M730 52 L778 52"/>
+  <text class="t-sm" x="735" y="46">token</text>
+  <text class="t-sm" x="640" y="170">Client holds state, signed by the server.</text>
+  <text class="t-sm" x="640" y="190">No lookup: verify the signature only.</text>
+  <text class="t-sm" x="640" y="210">Cost: hard to revoke before expiry.</text>
+  <text class="t-sm" x="640" y="230">Token size grows with its contents.</text>
+
+  <rect class="hit" x="20" y="260" width="850" height="60" rx="8"/>
+  <text class="t-sm" x="34" y="284">Rule of thumb: signed short-lived tokens for the identity claim, plus a shared store for anything that must be changed or revoked at once.</text>
+  <text class="t-sm" x="34" y="304">Sticky sessions are a stopgap for legacy apps, not a design to start with.</text>
+</svg>
+<figcaption>Three places the session can live: in one server (sticky), in a store all servers share, or in the client itself as a signed token. The right answer in most modern designs is C for identity with B for revocable data.</figcaption>
+</figure>
+
+<h4>Sticky sessions (session affinity)</h4>
+<p>The load balancer remembers which server handled the first request of a user, usually by a cookie or by hashing the client address, and sends all later requests to the same one. The application can keep the session in local memory unchanged. It is the cheapest fix for a legacy application, but it has real costs: when that server dies or is replaced during a deploy, its users lose their sessions and are logged out; load becomes uneven because heavy users stay glued to one server; and autoscaling down is awkward because you must drain servers that still hold live sessions.</p>
+
+<h4>Shared session store</h4>
+<p>The app server keeps only a session ID in a cookie. The data lives in a fast shared store, typically Redis or Memcached, keyed by that ID. Every server can serve every user. Costs: one extra network round trip (usually under a millisecond within a data center), and the store becomes a critical dependency that must be replicated and sized. Benefits: a server crash loses nothing, logout and permission changes take effect at once, and you can inspect or expire sessions centrally.</p>
+
+<h4>Signed tokens (for example JWT)</h4>
+<p>The server puts the identity and a few claims into a token, signs it with a secret or private key, and gives it to the client, which sends it back each time. Any server holding the verification key can validate it without a lookup, so no shared store is needed on the hot path. The trade-offs: a signed token cannot be recalled before it expires unless you add a deny list (which reintroduces a lookup), so keep lifetimes short (minutes) and combine them with a longer-lived refresh credential; the token travels on every request, so keep it small; and it must never hold data the user should not read, because the payload is signed, not encrypted, unless you use an encrypted variant. Authentication details are in <a href="55-security.html">Chapter 55</a>.</p>
+
+<div class="callout watch"><b>Watch out</b>
+Making servers stateless moves the state, it does not delete it. The shared store, the database and the object store are now where scaling pressure lands. Stateless app tiers are easy to scale precisely because you handed the hard problem to systems built for it, so be ready to say how those scale (replication, sharding, cluster mode).
+</div>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="reads-writes">4. Scaling reads versus scaling writes</h2>
+
+<p>Most systems read far more than they write (ratios of 10 to 1 up to 1000 to 1 are common), and reads and writes scale by <b>different techniques</b>. Treat them separately.</p>
+
+<h3>4.1 Scaling reads</h3>
+<p>Reads can be copied because they do not change anything. The ladder of techniques, roughly in order of how cheap they are:</p>
+<ol>
+  <li><b>Avoid the work</b>: HTTP caching in the browser and a CDN (<a href="12-cdn.html">Chapter 12</a>) so many requests never reach you.</li>
+  <li><b>Cache in front of the database</b> with an in-memory cache (<a href="13-caching-patterns.html">Chapter 13</a>, <a href="15-redis.html">Chapter 15</a>). A cache that serves 95 percent of reads cuts database read load by 20 times.</li>
+  <li><b>Read replicas</b>: copies of the database that receive changes from the primary (<a href="24-replication.html">Chapter 24</a>) and serve reads. They add read capacity linearly but data may be slightly stale (replication lag), so a user who just wrote may not see the write if the next read hits a replica. The usual fix is to read your own writes from the primary for a short time.</li>
+  <li><b>Precompute</b> expensive answers (materialized views, denormalized tables, search indexes) so a read is a simple lookup.</li>
+  <li><b>Partition</b> the data (<a href="25-sharding.html">Chapter 25</a>) when a single dataset no longer fits one machine's memory or disk.</li>
+</ol>
+
+<h3>4.2 Scaling writes</h3>
+<p>Writes are harder, because every write must reach the authoritative copy and copies cannot simply be multiplied: adding replicas does not add write capacity (each replica must apply every write too). The tools:</p>
+<ul>
+  <li><b>Make each write cheaper</b>: fewer indexes, narrower rows, batching many small writes into one transaction, using an append-only log structure (<a href="19-storage-engines.html">Chapter 19</a>).</li>
+  <li><b>Buffer and smooth</b> with a queue (<a href="34-queues-kafka.html">Chapter 34</a>): accept the request quickly, write it to a durable log, and let workers apply it at a steady rate. This converts spikes into a steady stream, at the price of eventual visibility.</li>
+  <li><b>Partition by key</b> (sharding) so that different keys are written on different machines. This is the only approach that scales write throughput without limit, and its difficulty is the choice of key, rebalancing, and cross-shard operations.</li>
+  <li><b>Reduce what must be written</b>: aggregate counters in memory and flush periodically, sample, or drop writes that carry no lasting value.</li>
+  <li><b>Relax consistency</b> where the business allows, so that writes can be accepted in several places (<a href="28-cap-consistency.html">Chapter 28</a>).</li>
+</ul>
+
+<div class="callout key"><b>Key idea</b>
+Reads scale by <i>copying</i> (caches, replicas, CDNs). Writes scale by <i>splitting</i> (sharding) or by <i>smoothing</i> (queues, batching). Ask early what the read to write ratio is, because it tells you which half of this section you need.
+</div>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="bottleneck">5. Bottleneck analysis: a method</h2>
+
+<p>The throughput of a pipeline is the throughput of its slowest stage. Improving any other stage changes nothing. So scaling is a loop: find the current bottleneck, relieve it, and measure again, because the bottleneck then moves somewhere else. In an interview you do the same thing on paper.</p>
+
+<h3>5.1 The method</h3>
+<ol>
+  <li><b>Draw the request path</b>: client, edge, load balancer, app server, cache, database, downstream services.</li>
+  <li><b>Estimate the load at each stage</b> in the unit that stage cares about: requests per second at the load balancer, concurrent threads at the app server, queries per second and rows touched at the database, bytes per second on the network. Chapter <a href="02-estimation.html">2</a> gives the arithmetic.</li>
+  <li><b>Compare each against its capacity</b> and compute utilization. The stage with the highest utilization is the candidate bottleneck.</li>
+  <li><b>Classify the resource</b>: CPU, memory, disk I/O, network bandwidth, connections, locks, or a downstream dependency. Different resources need different cures.</li>
+  <li><b>Relieve it by the cheapest effective means</b>: remove the work (cache), make it cheaper (index, batch), add capacity (replicate, scale out), or split the data.</li>
+  <li><b>Repeat</b> until the target load is met with headroom.</li>
+</ol>
+
+<h3>5.2 Signals that tell you which resource is saturated</h3>
+<table>
+<tr><th>Symptom</th><th>Likely bottleneck</th><th>Typical response</th></tr>
+<tr><td>CPU near 100 percent, latency rising</td><td>CPU-bound work (serialization, crypto, regex, compression)</td><td>Profile, optimize hot path, add instances</td></tr>
+<tr><td>CPU low but latency high, threads all busy</td><td>Waiting on I/O or a downstream service</td><td>Fix the slow dependency, add timeouts, more concurrency, non-blocking I/O</td></tr>
+<tr><td>Memory climbing, long garbage-collection pauses</td><td>Too much per-request data, unbounded queues, caches without limits</td><td>Bound everything, reduce object retention</td></tr>
+<tr><td>Database CPU high, many similar queries</td><td>Missing index or N+1 query pattern</td><td>Index, batch, cache</td></tr>
+<tr><td>App threads blocked waiting for a connection</td><td>Connection pool exhausted</td><td>Section 9</td></tr>
+<tr><td>One shard or one row much hotter than others</td><td>Skew, hot key</td><td>Section 12</td></tr>
+<tr><td>Throughput capped well below hardware limits</td><td>Lock or serial section (Amdahl)</td><td>Reduce critical section, partition the lock</td></tr>
+</table>
+
+<p>A useful framing is the <b>USE method</b>: for every resource check <i>Utilization</i> (how busy), <i>Saturation</i> (is work queued waiting for it), and <i>Errors</i>. Saturation is the most informative of the three because a resource at 100 percent utilization with no queue is fine, while one at 70 percent with a growing queue is already a problem.</p>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="models">6. Concurrency models of a server</h2>
+
+<p>A server must handle many requests at once. How it organizes that decides how many concurrent requests it can hold, how much memory they cost, and what kind of bugs you will meet. There are four main models.</p>
+
+<h3>6.1 Thread per request</h3>
+<p>The server assigns each incoming request to an operating-system thread, which runs the request from start to finish. Code is written in a plain sequential style: call the database, wait for the answer, continue. This is how classic Java servlet containers, Apache prefork and many Python and Ruby servers work. It is easy to write and to debug, and a blocked thread does not stop others. The costs: each thread has its own stack (commonly 512 KB to 1 MB reserved, though only the used part is committed), the kernel must schedule thousands of them and switch between them (a context switch costs microseconds and pollutes CPU caches), and a thread that waits on I/O sits idle yet occupies memory. A few thousand threads per machine is a practical upper range, which caps concurrent requests at roughly that figure.</p>
+
+<h3>6.2 Event loop</h3>
+<p>One thread (or a small number, one per core) runs a loop. It asks the operating system "which of my many connections are ready?", then runs short handlers for the ones that are, and never blocks. When a handler needs to wait, such as for a database reply, it registers a callback and returns to the loop. This is the Node.js model and also how Nginx, Redis and Netty are built. One thread can hold tens of thousands of idle connections, since an idle connection costs only a small data structure instead of a thread. The cost is discipline: <b>any handler that blocks or computes for a long time stalls every other connection on that loop</b>. A 200 ms CPU-heavy JSON transform blocks everyone for 200 ms. CPU-heavy work must be moved to a worker pool.</p>
+
+<h3>6.3 Async and reactive styles</h3>
+<p>An event loop is awkward to write by hand because the logic is split into callbacks. Languages added syntax to restore a readable shape. <b>Promises and async/await</b> (JavaScript, Python asyncio, C#, Rust) let you write sequential-looking code that suspends at each wait and resumes later on the loop. <b>Reactive streams</b> (Reactor, RxJava) model data as streams with operators and add <i>backpressure</i>, a protocol by which a slow consumer tells the producer to slow down (section 10). They run on an event loop too, so the same rule applies: do not block.</p>
+
+<h3>6.4 Lightweight threads: coroutines, goroutines, virtual threads, actors</h3>
+<p>A third route keeps the readable thread-per-request style but makes "threads" cheap. Go's <b>goroutines</b>, Kotlin <b>coroutines</b> and Java's <b>virtual threads</b> are scheduled by the language runtime, not the kernel, start with a few kilobytes of stack, and when one performs blocking I/O the runtime parks it and runs another on the same OS thread. You can have hundreds of thousands of them. You write straight-line code, and the runtime does the multiplexing that the event loop made you do by hand.</p>
+<p>The <b>actor model</b> (Erlang/OTP, Akka) is a related idea with a different safety story. Each actor owns its private state and handles one message at a time from its mailbox, and actors communicate only by sending messages. Because only one message touches the state at once, there are no locks inside an actor, and a failure is contained by supervision. This suits many independent stateful entities (one actor per user, device or game room). The cost is that sequences across actors are asynchronous and need explicit design for ordering, timeouts and mailbox growth (an unbounded mailbox is an unbounded queue).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Thread per request versus event loop">
+  <text class="t-c t-b" x="225" y="22">Thread per request</text>
+  <rect class="ext" x="20" y="44" width="90" height="34" rx="8"/><text class="t-c t-b" x="65" y="66">Req 1</text>
+  <rect class="ext" x="20" y="94" width="90" height="34" rx="8"/><text class="t-c t-b" x="65" y="116">Req 2</text>
+  <rect class="ext" x="20" y="144" width="90" height="34" rx="8"/><text class="t-c t-b" x="65" y="166">Req 3</text>
+  <rect class="box" x="170" y="44" width="110" height="34" rx="8"/><text class="t-c t-b" x="225" y="66">Thread A</text>
+  <rect class="box" x="170" y="94" width="110" height="34" rx="8"/><text class="t-c t-b" x="225" y="116">Thread B</text>
+  <rect class="box" x="170" y="144" width="110" height="34" rx="8"/><text class="t-c t-b" x="225" y="166">Thread C</text>
+  <path class="arrow" d="M110 61 L168 61"/><path class="arrow" d="M110 111 L168 111"/><path class="arrow" d="M110 161 L168 161"/>
+  <rect class="db" x="350" y="84" width="90" height="54" rx="8"/><text class="t-c t-b" x="395" y="108">Database</text><text class="t-c t-sm" x="395" y="126">slow reply</text>
+  <path class="arrow dash" d="M280 61 L348 100"/><path class="arrow dash" d="M280 111 L348 111"/><path class="arrow dash" d="M280 161 L348 122"/>
+  <text class="t-sm" x="20" y="212">Each request owns a thread for its whole life.</text>
+  <text class="t-sm" x="20" y="232">While waiting for the database the thread is idle</text>
+  <text class="t-sm" x="20" y="252">but still holds its stack. Limit: thousands.</text>
+
+  <line x1="470" y1="30" x2="470" y2="310" stroke="var(--fg)" stroke-dasharray="4 4" stroke-width="1"/>
+
+  <text class="t-c t-b" x="690" y="22">Event loop</text>
+  <rect class="ext" x="500" y="44" width="90" height="34" rx="8"/><text class="t-c t-b" x="545" y="66">Conn 1</text>
+  <rect class="ext" x="500" y="94" width="90" height="34" rx="8"/><text class="t-c t-b" x="545" y="116">Conn 2</text>
+  <rect class="ext" x="500" y="144" width="90" height="34" rx="8"/><text class="t-c t-b" x="545" y="166">Conn 3</text>
+  <rect class="box" x="650" y="64" width="110" height="94" rx="8"/><text class="t-c t-b" x="705" y="100">One loop</text><text class="t-c t-sm" x="705" y="120">epoll: which</text><text class="t-c t-sm" x="705" y="136">are ready?</text>
+  <path class="arrow" d="M590 61 L648 90"/><path class="arrow" d="M590 111 L648 111"/><path class="arrow" d="M590 161 L648 130"/>
+  <rect class="cache" x="810" y="84" width="76" height="54" rx="8"/><text class="t-c t-b" x="848" y="108">Pool</text><text class="t-c t-sm" x="848" y="126">CPU work</text>
+  <path class="arrow" d="M760 111 L808 111"/>
+  <text class="t-sm" x="500" y="212">Many connections share one thread.</text>
+  <text class="t-sm" x="500" y="232">Waiting costs almost nothing, but any blocking</text>
+  <text class="t-sm" x="500" y="252">call or long computation stalls every connection.</text>
+  <rect class="hit" x="20" y="272" width="866" height="42" rx="8"/>
+  <text class="t-sm" x="34" y="298">Coroutines and virtual threads give the readable left-hand style with the cheap waiting of the right-hand model.</text>
+</svg>
+<figcaption>Left: one thread per request, simple but each waiting request costs a thread. Right: an event loop multiplexes many connections on one thread, cheap to wait but intolerant of blocking code.</figcaption>
+</figure>
+
+<table>
+<tr><th>Model</th><th>Strength</th><th>Weakness</th><th>Examples</th></tr>
+<tr><td>Thread per request</td><td>Simple code, isolation of blocking</td><td>Memory and switching cost, thousands max</td><td>Tomcat, classic Spring MVC, Django with workers</td></tr>
+<tr><td>Event loop</td><td>Huge numbers of idle connections</td><td>One blocking call stalls all</td><td>Node.js, Nginx, Redis, Netty</td></tr>
+<tr><td>Async / reactive</td><td>Event loop with composable code, backpressure</td><td>Harder to read and debug</td><td>Reactor, RxJava, asyncio, Vert.x</td></tr>
+<tr><td>Coroutines / virtual threads</td><td>Readable code and cheap waiting</td><td>Pinning or blocking native calls can hurt</td><td>Go, Kotlin, Java 21+ virtual threads</td></tr>
+<tr><td>Actors</td><td>No locks, fault containment</td><td>Asynchronous design burden, mailbox limits</td><td>Erlang/OTP, Akka</td></tr>
+</table>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="io">7. Blocking and non-blocking I/O</h2>
+
+<p>The concurrency models above differ in how they treat <b>waiting</b>. Most server work is waiting: for the network, the disk, the database. Understanding what the operating system offers explains why event loops exist.</p>
+
+<h3>7.1 Blocking I/O</h3>
+<p>With a <b>blocking</b> call, such as <code>read()</code> on a socket with no data yet, the operating system puts the calling thread to sleep until data arrives. The thread cannot do anything else meanwhile. To serve 10,000 connections this way you need 10,000 threads.</p>
+
+<h3>7.2 Non-blocking I/O and readiness notification</h3>
+<p>With <b>non-blocking</b> mode, <code>read()</code> returns immediately with "nothing available yet" instead of sleeping. A program could poll every socket in a loop, but that wastes CPU. So operating systems provide a way to ask the kernel to <b>watch many sockets at once and report which are ready</b>. The older calls <code>select</code> and <code>poll</code> take the full list every time, so they cost time proportional to the number of watched sockets. On Linux the efficient call is <b>epoll</b>: you register sockets once, and the kernel gives back only the ones that are ready, so the cost scales with the number of <i>active</i> sockets rather than the number watched. BSD and macOS have <b>kqueue</b>, Windows has I/O completion ports, and newer Linux has <b>io_uring</b>, which batches submission and completion of I/O through shared ring buffers and also covers file I/O.</p>
+
+<p>An event loop is exactly this: call epoll, get a list of ready sockets, run a handler for each (each reads or writes what is available without blocking), and go back to epoll. That is how one thread can multiplex thousands of connections, which is known as solving the "C10K problem" (ten thousand concurrent connections), and today's servers target hundreds of thousands or a million connections per machine, limited by memory and file descriptor limits.</p>
+
+<h3>7.3 Where non-blocking helps and where it does not</h3>
+<p>Non-blocking I/O helps when requests spend most of their time <b>waiting</b>: proxies, gateways, chat servers, services that fan out to many other services. It does <b>not</b> help CPU-bound work, which keeps a core busy regardless. It also does not make a slow database fast: if the database takes 200 ms, the request still takes 200 ms, but the app server can hold thousands of such waiting requests cheaply. Be careful with libraries: a blocking JDBC call or a synchronous file read inside an event-loop handler silently turns your scalable server into a one-request-at-a-time server. Check that the whole call chain is non-blocking, or push blocking calls to a separate pool.</p>
+
+<div class="callout watch"><b>Watch out</b>
+Async does not remove the need for limits. An event-loop server can accept 50,000 requests while only 100 can proceed against a database. The other 49,900 sit in memory as pending work. Without bounds on in-flight work (sections 9 and 10) you replace thread exhaustion with memory exhaustion.
+</div>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="sizing">8. CPU-bound versus I/O-bound sizing, thread pools and queues</h2>
+
+<h3>8.1 Two kinds of work</h3>
+<p>A task is <b>CPU-bound</b> if it spends nearly all of its time computing (image resizing, encryption, parsing large documents). It is <b>I/O-bound</b> if it spends most of its time waiting for something else (a database, an HTTP call). Real requests are a mixture: for instance 5 ms of CPU and 45 ms of waiting. The mixture determines how many threads (or concurrent tasks) each core can usefully keep busy.</p>
+
+<h3>8.2 The sizing rule</h3>
+<p>For CPU-bound work, more threads than cores only add context switching, so use about one thread per core (cores or cores + 1). For mixed work, a widely used estimate is:</p>
+<pre>threads per core  ≈  1 + (wait time / compute time)</pre>
+<p>If a request computes for 5 ms and waits 45 ms, the ratio is 9, so about 10 threads per core keep the core busy: while nine are waiting, one is computing. On an 8-core machine that means about 80 worker threads. If the same request waits 495 ms (500 ms total), you would want about 100 threads per core, which is why thread-per-request servers with slow dependencies run out of threads long before CPU, and why event loops and cheap threads are attractive.</p>
+<p>This is a starting point to be confirmed by load testing, because real behaviour depends on garbage collection, lock contention, and the capacity of what the threads are waiting for. More threads help only until the downstream dependency (the database) saturates, at which point extra threads just queue up there.</p>
+
+<h3>8.3 Little's Law</h3>
+<p>The most useful single formula in this chapter, first met in Chapter <a href="02-estimation.html">2</a>, is <b>Little's Law</b>. For any stable system:</p>
+<pre>L = λ × W</pre>
+<p>where <i>L</i> is the average number of items in the system (in progress plus waiting), <i>λ</i> (lambda) is the average arrival rate, and <i>W</i> is the average time each item spends in the system. It holds regardless of distribution or scheduling, which is what makes it so powerful. Uses:</p>
+<ul>
+  <li><b>Concurrency needed.</b> If a service gets 2,000 requests per second and each takes 50 ms on average (0.05 s), then L = 2,000 × 0.05 = 100 requests are in flight at any moment. You need at least 100 concurrent slots (threads, coroutines) to keep up, plus headroom.</li>
+  <li><b>Pool size.</b> The same formula sizes a database connection pool (section 9).</li>
+  <li><b>Throughput ceiling.</b> If you have 200 threads and each request takes 100 ms, the most you can do is λ = L / W = 200 / 0.1 = 2,000 per second. If the downstream slows to 400 ms, the ceiling drops to 500 per second with no change in your code. This is how a slow dependency becomes an outage.</li>
+  <li><b>Queue length.</b> The number waiting is arrival rate times waiting time, so a queue of 1,000 items at 500 per second means each item waits 2 seconds.</li>
+</ul>
+
+<h3>8.4 Separating pools (bulkheads)</h3>
+<p>Do not run all work in one big pool. Give separate pools to separate dependencies and workloads, so that if one dependency becomes slow, only its pool fills and the rest of the service continues. This is the <b>bulkhead</b> pattern named after the watertight compartments of a ship (see <a href="40-resilience.html">Chapter 40</a> and <a href="51-microservice-resilience.html">Chapter 51</a>). In an event-loop server the equivalent is to keep the loop free and send CPU-heavy or blocking work to dedicated pools.</p>
+
+<h3>8.5 Queue sizing in front of a pool</h3>
+<p>A pool with N workers is normally paired with a <b>queue</b> that holds tasks when all workers are busy. The queue absorbs short bursts, which is its only legitimate job. Think of the queue length in terms of time: a queue of 100 items for a pool that completes 1,000 per second adds at most 100 ms of delay, acceptable. A queue of 100,000 would add 100 seconds of delay, by which time the clients have given up, so the server is now doing work whose results nobody wants. A queue should be sized so that <i>the worst-case wait is within the latency budget</i>, which is Little's Law again: max queue length ≈ throughput × acceptable wait.</p>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="conn-pools">9. Connection pools to databases and their math</h2>
+
+<p>Opening a database connection is expensive: a TCP handshake, TLS, authentication, and on the database side a process or thread and memory (PostgreSQL uses a process per connection, roughly several megabytes each; MySQL a thread). So applications keep a <b>connection pool</b>: a set of already-open connections that requests borrow and return. A request that needs the database takes a connection from the pool, uses it, and puts it back. If none is free, the request waits (up to a timeout) for one to be returned.</p>
+
+<h3>9.1 The math</h3>
+<p>Apply Little's Law. If each query holds a connection for W seconds on average and queries arrive at λ per second, the number of connections in use is λ × W. With 1,000 queries per second each holding a connection for 5 ms, that is 1,000 × 0.005 = 5 connections busy on average. A pool of 10 to 20 gives comfortable room for variation. People are often surprised that the right pool is so small. A large pool does not make the database faster. A database has limited CPU cores and disk parallelism, and beyond a point more simultaneous queries just contend with each other. A frequently quoted rule of thumb is that a pool of roughly (2 × database cores) + effective disk spindles per database is a sensible starting point, to be tested.</p>
+
+<h3>9.2 The multiplication trap</h3>
+<p>The pool is per application instance, so the total demand on the database is <b>instances × pool size</b>. With 50 instances at 20 connections each, the database sees 1,000 connections, far more than it can use and possibly beyond its configured maximum (a typical default maximum is in the low hundreds). Autoscaling makes it worse: when load rises and the platform adds more instances, the connection count rises exactly when the database is already stressed, which can turn a slowdown into an outage. Defences:</p>
+<ul>
+  <li>Keep per-instance pools small, and compute the total against the database limit before choosing the instance cap.</li>
+  <li>Put a <b>connection pooler or proxy</b> between the apps and the database (PgBouncer, ProxySQL, RDS Proxy). Hundreds of app connections are multiplexed onto a few dozen real ones. In transaction pooling mode a server connection is held only for the duration of a transaction, but features that rely on session state (session variables, some prepared statements, advisory locks) can break.</li>
+  <li>Use read replicas with their own pools so reads do not compete with writes for the same connections.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 320" role="img" aria-label="Many app instances with pools, a pooler, and the database connection limit">
+  <rect class="box" x="20" y="40" width="130" height="40" rx="8"/><text class="t-c t-b" x="85" y="65">App 1: pool 20</text>
+  <rect class="box" x="20" y="95" width="130" height="40" rx="8"/><text class="t-c t-b" x="85" y="120">App 2: pool 20</text>
+  <rect class="box" x="20" y="150" width="130" height="40" rx="8"/><text class="t-c t-b" x="85" y="175">App 3: pool 20</text>
+  <text class="t-c t-sm" x="85" y="212">... 50 instances</text>
+  <path class="arrow" d="M150 60 L330 100"/><path class="arrow" d="M150 115 L330 115"/><path class="arrow" d="M150 170 L330 130"/>
+  <rect class="cache" x="330" y="70" width="150" height="90" rx="8"/><text class="t-c t-b" x="405" y="102">Pooler</text><text class="t-c t-sm" x="405" y="122">accepts 1,000 client</text><text class="t-c t-sm" x="405" y="138">connections</text>
+  <path class="arrow-g" d="M480 115 L600 115"/><text class="t-c t-sm" x="540" y="106">40 real</text>
+  <rect class="db" x="600" y="70" width="150" height="90" rx="8"/><text class="t-c t-b" x="675" y="102">Database</text><text class="t-c t-sm" x="675" y="122">8 cores, max 200</text><text class="t-c t-sm" x="675" y="138">connections</text>
+  <rect class="miss" x="20" y="240" width="420" height="60" rx="8"/>
+  <text class="t-sm" x="32" y="264">Without a pooler: 50 x 20 = 1,000 connections</text>
+  <text class="t-sm" x="32" y="284">exceeds the limit of 200, and autoscaling adds more.</text>
+  <rect class="hit" x="470" y="240" width="410" height="60" rx="8"/>
+  <text class="t-sm" x="482" y="264">With a pooler: the database sees about 40 busy</text>
+  <text class="t-sm" x="482" y="284">connections, sized to its cores, whatever the app count.</text>
+</svg>
+<figcaption>Per-instance pools multiply with the number of instances. A pooler in the middle decouples the number of application connections from the number of real database connections.</figcaption>
+</figure>
+
+<h3>9.3 Pool configuration that matters</h3>
+<ul>
+  <li><b>Maximum size</b>: the cap discussed above.</li>
+  <li><b>Acquire timeout</b>: how long a request waits for a free connection before failing. Keep it short (hundreds of milliseconds to a few seconds), so that a saturated pool turns into fast errors and not into a pile of threads hanging.</li>
+  <li><b>Query and statement timeouts</b>: a query that runs forever holds a connection forever. Set limits in both client and database.</li>
+  <li><b>Connection lifetime and validation</b>: recycle connections periodically and test them, because firewalls and load balancers silently drop idle connections, which otherwise show up as sudden errors.</li>
+  <li><b>Leak detection</b>: code that borrows a connection and forgets to return it (for example on an exception path) slowly drains the pool, a classic cause of "the service hangs after a few hours".</li>
+</ul>
+<p>The same ideas apply to HTTP client pools toward other services: bound the number of connections and requests per destination, set timeouts, and fail fast.</p>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="backpressure">10. Backpressure, bounded queues and load shedding</h2>
+
+<p>When work arrives faster than it can be processed, something has to give. A system with no plan lets the queue grow without bound until memory runs out or latency becomes useless. A system with a plan chooses where to push back.</p>
+
+<h3>10.1 Unbounded queues are a trap</h3>
+<p>An unbounded queue looks harmless because it never rejects work. But if the arrival rate stays above the service rate, the queue grows forever: memory fills, garbage collection thrashes, and the age of the oldest item rises until every response is too late to matter. Because requests at the back wait so long, by the time they are served the client has timed out and retried, so the server does work whose answer is thrown away, and the retries add yet more load. This feedback loop is why overload usually ends in a total outage, not a gentle slowdown.</p>
+
+<h3>10.2 Bounded queues and backpressure</h3>
+<p>The remedy is to <b>bound</b> every queue and decide what happens when it is full. <b>Backpressure</b> means the slowness of a downstream stage is felt by the upstream one, instead of being hidden in a growing buffer. Options when the bound is hit:</p>
+<ul>
+  <li><b>Block the producer</b> (a bounded blocking queue). This slows the producer to the consumer's speed. It works inside one process and in reactive streams, but over a network, blocking ties up the caller's resources.</li>
+  <li><b>Reject immediately</b> with an error such as HTTP 503 Service Unavailable or 429 Too Many Requests, optionally with a <code>Retry-After</code> header. The caller learns fast and can back off.</li>
+  <li><b>Drop</b> the oldest or the lowest-priority item. Dropping the oldest is often right for real-time data (stale data is worthless); dropping newest is right when order and fairness matter.</li>
+  <li><b>Signal upstream</b> in the protocol: TCP's receive window, HTTP/2 flow control, and reactive streams' "request(n)" all let a consumer say how much it can take.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Unbounded versus bounded queue under overload">
+  <text class="t-b" x="20" y="22">Unbounded queue</text>
+  <rect class="ext" x="20" y="40" width="100" height="40" rx="8"/><text class="t-c t-b" x="70" y="65">Clients</text>
+  <rect class="miss" x="170" y="40" width="260" height="40" rx="8"/><text class="t-c t-sm" x="300" y="65">queue grows without limit ...</text>
+  <rect class="box" x="480" y="40" width="100" height="40" rx="8"/><text class="t-c t-b" x="530" y="65">Workers</text>
+  <path class="arrow" d="M120 60 L168 60"/><path class="arrow" d="M430 60 L478 60"/>
+  <text class="t-sm" x="20" y="108">Result: memory fills, latency climbs to minutes, clients time out and retry, load doubles, total outage.</text>
+
+  <text class="t-b" x="20" y="152">Bounded queue with shedding</text>
+  <rect class="ext" x="20" y="170" width="100" height="40" rx="8"/><text class="t-c t-b" x="70" y="195">Clients</text>
+  <rect class="cache" x="170" y="170" width="130" height="40" rx="8"/><text class="t-c t-sm" x="235" y="195">queue, max 100</text>
+  <rect class="box" x="360" y="170" width="100" height="40" rx="8"/><text class="t-c t-b" x="410" y="195">Workers</text>
+  <path class="arrow" d="M120 190 L168 190"/><path class="arrow" d="M300 190 L358 190"/>
+  <path class="arrow-r" d="M235 170 L235 140 L560 140 L560 190"/>
+  <rect class="miss" x="500" y="190" width="150" height="40" rx="8"/><text class="t-c t-sm" x="575" y="215">fast 503 / 429</text>
+  <text class="t-sm" x="20" y="262">Result: accepted requests stay fast, rejected ones fail quickly and clients back off. The system degrades by a fraction instead of dying.</text>
+</svg>
+<figcaption>Top: an unbounded queue hides overload until everything fails. Bottom: a bound turns overload into quick, explicit rejection of the excess, protecting the requests that are accepted.</figcaption>
+</figure>
+
+<h3>10.3 Load shedding (preview)</h3>
+<p><b>Load shedding</b> is deliberate rejection of some requests to protect the rest. A server estimates its own health (queue depth, in-flight count, CPU, or the age of the oldest queued request) and refuses new work when over a threshold. Smart shedding also prioritizes: keep health checks, logins and payments, and drop prefetches, analytics and background refreshes first. Rate limiting (<a href="16-rate-limiting.html">Chapter 16</a>) is the sibling technique that limits <i>by caller</i> to keep one client from consuming everything; shedding limits <i>by total capacity</i>. Together with timeouts, retry budgets and circuit breakers (<a href="40-resilience.html">Chapter 40</a>) they make up the overload defences of a service.</p>
+
+<div class="callout tip"><b>Interview tip</b>
+When you add a queue anywhere in a design, say its bound and what happens when it is full. "A bounded queue of 1,000, and beyond that we return 503 and clients retry with jittered backoff" is a short sentence that signals senior thinking.
+</div>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="concurrency-bugs">11. Concurrency problems inside services</h2>
+
+<p>Once many requests run at the same time, they will sometimes touch the same data at the same instant. The resulting bugs are the hardest kind: rare, hard to reproduce, and invisible in a single-user test.</p>
+
+<h3>11.1 Race conditions and shared state</h3>
+<p>A <b>race condition</b> is a bug whose outcome depends on the unlucky timing of concurrent operations. The classic form is <b>check-then-act</b>: the code checks a condition and then acts on it, but the condition can change between the two steps. "If the username is free, create it" lets two requests both see it free, and both create it. "If stock is above zero, sell one" oversells the last item.</p>
+<p>Inside one process, shared mutable state is the source: a static field, a singleton holding a map, a cached object modified by request threads. Even <code>counter++</code> is three steps (read, add, write) and two threads can both read 5 and both write 6, losing one increment. The cures are to avoid sharing (make objects immutable, keep state per request), to use atomic operations or concurrent data structures, or to protect the state with a lock. But across <b>several app servers</b> in-process locks are useless, since each server has its own memory. The shared state that matters lives in the database or shared store, and the protection must live there too.</p>
+
+<h3>11.2 The lost update</h3>
+<p>The most common concurrency bug in web services is the <b>lost update</b>. Two requests read the same row, each computes a new value from what it read, and each writes. The second write overwrites the first, silently discarding it.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Lost update sequence and optimistic concurrency fix">
+  <text class="t-c t-b" x="230" y="20">Lost update (no protection)</text>
+  <rect class="box" x="30" y="32" width="100" height="30" rx="8"/><text class="t-c t-b" x="80" y="52">Request A</text>
+  <rect class="db" x="180" y="32" width="100" height="30" rx="8"/><text class="t-c t-b" x="230" y="52">Row: bal=100</text>
+  <rect class="box" x="330" y="32" width="100" height="30" rx="8"/><text class="t-c t-b" x="380" y="52">Request B</text>
+  <line class="life" x1="80" y1="62" x2="80" y2="340"/><line class="life" x1="230" y1="62" x2="230" y2="340"/><line class="life" x1="380" y1="62" x2="380" y2="340"/>
+  <path class="arrow" d="M80 92 L226 92"/><text class="t-sm" x="90" y="86">1. A reads 100</text>
+  <path class="arrow" d="M380 132 L234 132"/><text class="t-sm" x="248" y="126">2. B reads 100</text>
+  <path class="arrow" d="M80 172 L226 172"/><text class="t-sm" x="90" y="166">3. A writes 100+50=150</text>
+  <path class="arrow-r" d="M380 212 L234 212"/><text class="t-sm" x="240" y="206">4. B writes 100-30=70</text>
+  <rect class="miss" x="40" y="250" width="380" height="70" rx="8"/>
+  <text class="t-sm" x="52" y="274">Final balance 70. A's deposit of 50 is lost.</text>
+  <text class="t-sm" x="52" y="294">Correct result is 120. No error was raised.</text>
+
+  <text class="t-c t-b" x="680" y="20">Fix: version check (optimistic)</text>
+  <rect class="box" x="480" y="32" width="90" height="30" rx="8"/><text class="t-c t-b" x="525" y="52">Request A</text>
+  <rect class="db" x="620" y="32" width="120" height="30" rx="8"/><text class="t-c t-b" x="680" y="52">bal=100, v=7</text>
+  <rect class="box" x="790" y="32" width="90" height="30" rx="8"/><text class="t-c t-b" x="835" y="52">Request B</text>
+  <line class="life" x1="525" y1="62" x2="525" y2="340"/><line class="life" x1="680" y1="62" x2="680" y2="340"/><line class="life" x1="835" y1="62" x2="835" y2="340"/>
+  <path class="arrow" d="M525 92 L676 92"/><text class="t-sm" x="530" y="86">read v=7</text>
+  <path class="arrow" d="M835 122 L684 122"/><text class="t-sm" x="700" y="116">read v=7</text>
+  <path class="arrow-g" d="M525 162 L676 162"/><text class="t-sm" x="500" y="182">write if v=7 : ok, v=8</text>
+  <path class="arrow-r" d="M835 222 L684 222"/><text class="t-sm" x="690" y="216">write if v=7</text>
+  <text class="t-sm" x="690" y="242">0 rows: B retries</text>
+  <rect class="hit" x="480" y="262" width="400" height="58" rx="8"/>
+  <text class="t-sm" x="492" y="286">B re-reads (150, v=8), recomputes 120, writes.</text>
+  <text class="t-sm" x="492" y="306">Both updates survive.</text>
+</svg>
+<figcaption>Left: both requests read 100, so the later write erases the earlier one. Right: each write says "only if the version is still what I read". The loser notices, re-reads and retries.</figcaption>
+</figure>
+
+<h3>11.3 The toolbox of cures</h3>
+<ul>
+  <li><b>Make the update atomic in the database.</b> Instead of read-modify-write in the application, send <code>UPDATE accounts SET balance = balance + 50 WHERE id = 7</code>. The database applies it under its own row lock, so concurrent increments serialize correctly. This is the cheapest and best fix whenever the new value can be expressed as an operation on the old one. Conditional forms such as <code>UPDATE stock SET qty = qty - 1 WHERE id = 9 AND qty &gt; 0</code> also fix check-then-act: the check and the act are one statement.</li>
+  <li><b>Pessimistic locking.</b> Lock the row before reading it: <code>SELECT ... FOR UPDATE</code> inside a transaction. Others who try to lock the same row wait until you commit. This is correct and simple, but holds locks while your code runs (so keep the transaction short, never call remote services inside it), risks deadlocks if two transactions lock rows in different orders (always lock in a consistent order), and reduces concurrency.</li>
+  <li><b>Optimistic concurrency control.</b> Assume conflicts are rare. Read the row together with a <b>version number</b> (or timestamp, or a hash of the content), and write with <code>UPDATE ... SET ..., version = version + 1 WHERE id = ? AND version = ?</code>. If zero rows were updated, someone else changed it first, so re-read and retry or report a conflict to the user. No locks are held while the user or the code thinks, which makes it ideal for web forms and for conflict-rare data. Under heavy conflict on the same row, retries pile up and it performs worse than a lock. HTTP exposes the same idea with <code>ETag</code> and <code>If-Match</code> headers, returning 412 Precondition Failed on a mismatch (<a href="05-api-design.html">Chapter 5</a>).</li>
+  <li><b>Unique constraints and idempotency keys.</b> Let the database enforce "only one" with a unique index and treat a duplicate-key error as the signal that someone else won. The same device protects against retries creating duplicates (<a href="32-idempotency-ids.html">Chapter 32</a>).</li>
+  <li><b>Isolation levels.</b> Database transactions run at an isolation level that decides which anomalies can occur. Read committed (a common default) permits lost updates in read-modify-write code; repeatable read or snapshot isolation detects some of them; serializable prevents them all but may abort transactions that you must retry. See <a href="18-relational-internals.html">Chapter 18</a> and <a href="31-distributed-transactions.html">Chapter 31</a> for the details; the point here is not to assume the default protects you.</li>
+  <li><b>Distributed locks</b> when the resource is not a database row (for example "only one instance runs this report"). They are tricky because of expiry and clock pauses; use fencing tokens (<a href="30-coordination-locks.html">Chapter 30</a>).</li>
+  <li><b>Serialize by key.</b> Route all operations for one entity to one worker, using a partitioned queue (all events for user 42 go to the same partition) or one actor per entity. There is then no concurrent access to that entity at all.</li>
+</ul>
+
+<table>
+<tr><th>Technique</th><th>Best when</th><th>Cost</th></tr>
+<tr><td>Atomic SQL update</td><td>Change is an expression on the old value (counters, balances, stock)</td><td>Almost none</td></tr>
+<tr><td>Pessimistic lock (FOR UPDATE)</td><td>Conflicts are frequent, transaction is short</td><td>Waiting, deadlock risk, lower throughput</td></tr>
+<tr><td>Optimistic version check</td><td>Conflicts are rare, long think time (forms, documents)</td><td>Retries on conflict</td></tr>
+<tr><td>Unique constraint</td><td>"Only one" rules, duplicate suppression</td><td>Error handling for duplicates</td></tr>
+<tr><td>Serialize by key</td><td>Strict ordering per entity at high volume</td><td>Hot keys limit throughput</td></tr>
+</table>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="contention">12. Lock contention and hot rows</h2>
+
+<p>Locks protect correctness but they are also the serial section of Amdahl's law. Many requests wanting the same lock form a queue, and the throughput on that item is limited to one holder at a time. If a lock is held for 5 ms, the most one lock can sustain is 1 / 0.005 = 200 operations per second, no matter how many servers you add. This is the (a) term of the USL in practice.</p>
+
+<h3>12.1 Hot rows and hot keys</h3>
+<p>A <b>hot row</b> is a single database row that many transactions want to update: a global counter, the "total sales today" row, the balance of one very active account, the inventory of the one popular product during a flash sale. Each update takes a row lock, so all updates to that row run one after another. Even if each takes one millisecond, the row caps at about 1,000 updates per second, and with lock queues and transaction overhead often far less. Sharding does not help, since the row lives on one shard. The same pattern is a <b>hot key</b> in a cache or partitioned store, where one key receives disproportionate traffic and overloads the single node that owns it.</p>
+
+<h3>12.2 Ways to relieve contention</h3>
+<ul>
+  <li><b>Shorten the critical section.</b> Do computation, remote calls and logging outside the lock or transaction. Take locks late and release early.</li>
+  <li><b>Split the hot counter</b> into N sub-counters ("striping" or "sharded counters"). Each increment picks one at random; a read sums them. With 20 sub-rows, write capacity is about 20 times higher. The price is a more expensive read and an approximate view while updates are in flight.</li>
+  <li><b>Aggregate in memory and flush in batches.</b> Count in the app or a cache (such as Redis <code>INCR</code>) and write the total to the database every second.</li>
+  <li><b>Append instead of update.</b> Record each event as a new row in a log table and compute the total by summing (or periodically rolling up). Inserts do not contend on one row.</li>
+  <li><b>Reserve in chunks.</b> For flash-sale stock, give each app server or shard a block of units to sell locally, rebalancing occasionally, rather than every sale hitting one stock row.</li>
+  <li><b>Queue and serialize.</b> Funnel updates for the hot entity through a single consumer which applies them in order and batches them. Contention becomes a queue, which is bounded and observable.</li>
+  <li><b>Replicate hot read keys.</b> For a hot cache key, keep several copies under suffixed names (key#1 to key#8) or add a small local cache in each app server with a short TTL (<a href="14-caching-failures.html">Chapter 14</a> covers hot-key and stampede handling).</li>
+  <li><b>Lock-free structures.</b> Inside a process, use atomic variables and concurrent collections rather than one big mutex, and partition maps by key.</li>
+</ul>
+
+<div class="callout watch"><b>Watch out</b>
+Retries make contention worse. If a hundred requests fail with a conflict and all retry immediately, they collide again. Use exponential backoff with <b>jitter</b> (random delay) and a bounded number of attempts.
+</div>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="checklist">13. Scaling the application tier: a checklist</h2>
+
+<p>When the question is "make this service handle ten times the traffic", walk down this list. Each item is a thing a reviewer would look for.</p>
+<ol>
+  <li><b>Statelessness.</b> No local sessions, files or in-memory-only data. Sessions in a shared store or signed tokens (section 3).</li>
+  <li><b>Load balancing.</b> A load balancer in front with health checks and connection draining (<a href="09-load-balancing.html">Chapter 9</a>). Prefer least-connections or round robin to sticky routing.</li>
+  <li><b>Bounded everything.</b> Bounded thread pools, bounded queues, bounded connection pools, bounded request and payload sizes, explicit timeouts on every outgoing call (section 10).</li>
+  <li><b>Right concurrency model</b> for the workload: event loop or cheap threads for I/O-heavy fan-out, more cores for CPU-heavy work, separate pools for blocking calls (sections 6 to 8).</li>
+  <li><b>Database protection.</b> Cache hot reads, use replicas, index, batch, pool connections, and add a pooler before adding instances (section 9).</li>
+  <li><b>Idempotent, retry-safe operations</b> so that retries and duplicate deliveries are harmless (<a href="32-idempotency-ids.html">Chapter 32</a>).</li>
+  <li><b>Move slow work off the request path.</b> Emails, thumbnails, reports and webhooks go to a queue and workers (<a href="34-queues-kafka.html">Chapter 34</a>, <a href="35-messaging-patterns.html">Chapter 35</a>).</li>
+  <li><b>Concurrency-safe writes.</b> Atomic updates, versions, unique constraints; no in-process locks protecting shared data (section 11).</li>
+  <li><b>Graceful startup and shutdown.</b> A new instance must warm up (connections, caches) before taking traffic, and on shutdown must finish in-flight requests, which matters for autoscaling and rolling deploys.</li>
+  <li><b>Observability.</b> Per-instance metrics for request rate, latency percentiles, error rate, pool and queue depths, saturation (<a href="54-observability-slos.html">Chapter 54</a>), so that you know which of the above fails first.</li>
+  <li><b>Load testing</b> with realistic traffic against a production-like environment to find the real knee of the curve, not the one on the whiteboard.</li>
+</ol>
+
+<h3>13.1 Containers, instances and autoscaling (preview)</h3>
+<p>A stateless service packaged as a container image can be started many times from the same image. An orchestrator such as Kubernetes keeps a desired number of copies running, replaces failed ones and spreads them over machines. <b>Autoscaling</b> adjusts that number automatically from a metric: average CPU, requests per instance, queue depth, or a custom signal. It brings several traps that tie back to this chapter. New instances take time to start and warm up (tens of seconds to minutes), so autoscaling reacts to a spike late; scale-out multiplies database connections (section 9); and CPU is a poor trigger for I/O-bound services, whose CPU stays low while their threads or pools are saturated, so concurrency or queue depth is a better signal. Set a floor (minimum instances) for availability, a ceiling to protect dependencies, and prefer scheduled scaling for predictable peaks. <a href="43-deployment-autoscaling.html">Chapter 43</a> covers the mechanics.</p>
+
+<!-- ======================= 14 ======================= -->
+<h2 id="capacity">14. Capacity planning with headroom</h2>
+
+<p><b>Capacity planning</b> is deciding in advance how many resources you need. The steps are: forecast the load (including the peak, not just the average), measure the capacity of one unit (one instance, one database) at the target latency, divide, and add margin.</p>
+<ol>
+  <li><b>Peak, not average.</b> Daily traffic is not flat. A peak-to-average ratio of 2 to 5 is common, higher for events, so size for the peak (Chapter <a href="02-estimation.html">2</a>).</li>
+  <li><b>Capacity of one unit at the knee.</b> Load test one instance and find the request rate at which p99 still meets the target, say 400 requests per second. That is its usable capacity, not the rate at which it crashes (say 650).</li>
+  <li><b>Divide.</b> Peak load divided by usable capacity gives the instance count.</li>
+  <li><b>Add N+1 or N+2 redundancy.</b> Plan so that the service survives losing one instance, or one whole availability zone, at peak. With three zones and a requirement to survive the loss of one, each zone must carry 50 percent of peak, so total capacity must be 150 percent of peak, and each zone runs at 67 percent in normal operation (<a href="41-ha-dr.html">Chapter 41</a>).</li>
+  <li><b>Headroom for growth and surprises.</b> Keep normal peak utilization at 50 to 70 percent so that spikes, deploys, a failed zone and a slow dependency do not push you over the knee. Re-forecast regularly, because provisioning can take weeks for hardware and growth compounds: 10 percent a month is 3.1 times in a year.</li>
+</ol>
+<div class="callout key"><b>Key idea</b>
+Headroom is not waste. It buys you time to react: autoscaling lag, failures and traffic surprises all consume it. Cost optimization comes from reducing the work per request and from autoscaling down off-peak, not from running hot at the peak.
+</div>
+
+<!-- ======================= 15 ======================= -->
+<h2 id="stages">15. A walkthrough: scaling in stages</h2>
+
+<p>A concrete story shows how all of this fits together. Start with a small product and double the load again and again, each time doing the cheapest thing that works. In an interview you can narrate this ladder; the skill is knowing when to climb a rung.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 470" role="img" aria-label="Scaling stages from single box to multi-tier to sharded">
+  <text class="t-b" x="20" y="20">Stage 1: single box (up to a few hundred users / tens of req/s)</text>
+  <rect class="ext" x="20" y="34" width="90" height="34" rx="8"/><text class="t-c t-b" x="65" y="56">Users</text>
+  <rect class="box" x="180" y="30" width="230" height="44" rx="8"/><text class="t-c t-b" x="295" y="57">App + database on one VM</text>
+  <path class="arrow" d="M110 51 L178 51"/>
+  <text class="t-sm" x="440" y="57">Simple, cheap. Risk: one failure = outage, no headroom.</text>
+
+  <text class="t-b" x="20" y="108">Stage 2: separate tiers, stateless app, cache (hundreds to thousands req/s)</text>
+  <rect class="ext" x="20" y="122" width="70" height="34" rx="8"/><text class="t-c t-b" x="55" y="144">Users</text>
+  <rect class="box" x="120" y="122" width="60" height="34" rx="8"/><text class="t-c t-b" x="150" y="144">LB</text>
+  <rect class="box" x="215" y="106" width="80" height="30" rx="8"/><text class="t-c t-b" x="255" y="126">App 1</text>
+  <rect class="box" x="215" y="142" width="80" height="30" rx="8"/><text class="t-c t-b" x="255" y="162">App 2</text>
+  <rect class="cache" x="340" y="106" width="90" height="30" rx="8"/><text class="t-c t-b" x="385" y="126">Cache</text>
+  <rect class="db" x="340" y="142" width="90" height="30" rx="8"/><text class="t-c t-b" x="385" y="162">Primary DB</text>
+  <path class="arrow" d="M90 139 L118 139"/><path class="arrow" d="M180 132 L213 121"/><path class="arrow" d="M180 146 L213 157"/>
+  <path class="arrow" d="M295 121 L338 121"/><path class="arrow" d="M295 157 L338 157"/>
+  <text class="t-sm" x="460" y="126">Scale app horizontally. Sessions in a shared store.</text>
+  <text class="t-sm" x="460" y="146">Cache and indexes relieve the database.</text>
+  <text class="t-sm" x="460" y="166">Add a CDN for static content.</text>
+
+  <text class="t-b" x="20" y="204">Stage 3: replicas, queues, workers (thousands to tens of thousands req/s)</text>
+  <rect class="box" x="20" y="218" width="60" height="34" rx="8"/><text class="t-c t-b" x="50" y="240">LB</text>
+  <rect class="box" x="110" y="214" width="100" height="42" rx="8"/><text class="t-c t-b" x="160" y="240">App x 20</text>
+  <rect class="cache" x="250" y="214" width="80" height="42" rx="8"/><text class="t-c t-b" x="290" y="240">Redis</text>
+  <rect class="db" x="370" y="206" width="100" height="26" rx="8"/><text class="t-c t-b" x="420" y="224">Primary</text>
+  <rect class="db" x="370" y="238" width="100" height="26" rx="8"/><text class="t-c t-b" x="420" y="256">Read replicas</text>
+  <rect class="cache" x="510" y="214" width="80" height="42" rx="8"/><text class="t-c t-b" x="550" y="240">Queue</text>
+  <rect class="box" x="630" y="214" width="100" height="42" rx="8"/><text class="t-c t-b" x="680" y="240">Workers</text>
+  <path class="arrow" d="M80 235 L108 235"/><path class="arrow" d="M210 235 L248 235"/><path class="arrow" d="M330 235 L368 225"/><path class="arrow" d="M210 245 L368 250"/>
+  <path class="arrow" d="M210 228 L508 228"/><path class="arrow" d="M590 235 L628 235"/>
+  <text class="t-sm" x="20" y="286">Reads go to cache then replicas. Slow work goes through the queue. Pooler in front of the database. Writes still hit one primary.</text>
+
+  <text class="t-b" x="20" y="322">Stage 4: partitioned data, multiple zones or regions (beyond one primary's write limit)</text>
+  <rect class="box" x="20" y="338" width="80" height="34" rx="8"/><text class="t-c t-b" x="60" y="360">Gateway</text>
+  <rect class="box" x="130" y="334" width="100" height="42" rx="8"/><text class="t-c t-b" x="180" y="360">Services</text>
+  <rect class="cache" x="260" y="334" width="100" height="42" rx="8"/><text class="t-c t-b" x="310" y="353">Shard</text><text class="t-c t-sm" x="310" y="368">router</text>
+  <rect class="db" x="400" y="326" width="110" height="24" rx="8"/><text class="t-c t-sm" x="455" y="343">Shard 1 + replicas</text>
+  <rect class="db" x="400" y="356" width="110" height="24" rx="8"/><text class="t-c t-sm" x="455" y="373">Shard 2 + replicas</text>
+  <rect class="db" x="400" y="386" width="110" height="24" rx="8"/><text class="t-c t-sm" x="455" y="403">Shard N + replicas</text>
+  <path class="arrow" d="M100 355 L128 355"/><path class="arrow" d="M230 355 L258 355"/><path class="arrow" d="M360 350 L398 340"/><path class="arrow" d="M360 358 L398 368"/>
+  <text class="t-sm" x="540" y="346">Data split by key (user ID, tenant ID).</text>
+  <text class="t-sm" x="540" y="366">Cross-shard queries and transactions get hard.</text>
+  <text class="t-sm" x="540" y="386">Often with cells or regions (Chapters 25, 26, 42).</text>
+  <text class="t-sm" x="20" y="450">Each rung adds cost and complexity. Climb only when measurements show the previous rung is the bottleneck.</text>
+</svg>
+<figcaption>The ladder from one machine to a partitioned multi-tier system. Each stage removes the bottleneck of the previous one and introduces new operational burden.</figcaption>
+</figure>
+
+<h3>15.1 What triggers each move</h3>
+<table>
+<tr><th>Symptom</th><th>Move to</th><th>Why it works</th><th>New problem introduced</th></tr>
+<tr><td>CPU and database compete on one VM</td><td>Separate app and database; add a load balancer and a second app server</td><td>Independent scaling; removes single app point of failure</td><td>Sessions and local state must move out of the app</td></tr>
+<tr><td>Database read load high, many repeated reads</td><td>Cache, then read replicas</td><td>Removes most read work; replicas add read capacity</td><td>Cache invalidation, replica lag</td></tr>
+<tr><td>Slow request path (emails, images, reports)</td><td>Queue plus workers</td><td>Smooths spikes and shortens requests</td><td>Eventual results, retries, duplicates</td></tr>
+<tr><td>Primary database write rate or size at limit of the largest instance</td><td>Partition (shard) by key; possibly per-tenant cells</td><td>Splits writes and storage over machines</td><td>Cross-shard queries, rebalancing, hot shards</td></tr>
+<tr><td>Users worldwide, region outage risk</td><td>Multiple regions, CDN at the edge</td><td>Lower latency, survive region loss</td><td>Data replication across distance, conflict handling</td></tr>
+</table>
+
+<!-- ======================= 16 ======================= -->
+<h2 id="worked">16. Worked example with numbers</h2>
+
+<p>Problem: an order service must handle a peak of 6,000 requests per second. Each request does 4 ms of CPU work, then makes one database query that takes 10 ms, and one call to a payment-status service that takes 36 ms. The target is p99 under 300 ms. Size the app tier, thread pools, database pool and headroom.</p>
+
+<h3>16.1 Per-request time and concurrency</h3>
+<p>Service time per request is 4 + 10 + 36 = 50 ms, of which 4 ms is CPU and 46 ms is waiting. By Little's Law the number of requests in flight at the peak is L = λ × W = 6,000 × 0.050 = <b>300 concurrent requests</b>.</p>
+
+<h3>16.2 Threads per instance</h3>
+<p>Take instances with 4 cores. The sizing estimate is 1 + wait/compute = 1 + 46/4 = 12.5 threads per core, or about 50 threads per instance. Each instance can then hold roughly 50 requests in flight. To hold 300 concurrent requests we need 300 / 50 = 6 instances at 100 percent. Now check CPU: at 6,000 requests per second the whole fleet needs 6,000 × 4 ms = 24 CPU-seconds per second, which means 24 cores fully busy, and 6 instances × 4 cores = 24 cores, so they would be at 100 percent CPU. That is on the knee, so we need headroom.</p>
+
+<h3>16.3 Headroom and redundancy</h3>
+<p>Target 60 percent CPU at peak: 24 / 0.6 = 40 cores = 10 instances. Now require that we survive losing one of three zones. Spread across 3 zones, 12 instances (4 per zone) gives 8 remaining after a zone loss: 8 instances × 4 cores = 32 cores, CPU utilization 24 / 32 = 75 percent, still under the knee. Choose <b>12 instances</b>. Normal utilization is 24 / 48 = 50 percent, comfortable. The thread pool of 50 per instance gives 600 slots against 300 needed at peak, so the pool is also not the limit, even when a zone is lost (8 × 50 = 400 vs 300).</p>
+
+<h3>16.4 Database connections</h3>
+<p>Database work per request is 10 ms held, so connections in use = 6,000 × 0.010 = <b>60 connections</b> busy on average at the peak. If the pool is per instance with 12 instances, 60 / 12 = 5 busy per instance on average. A per-instance pool of 10 gives room for bursts, for a total of 120 possible connections. Suppose the database has 16 cores: the rule of thumb of about 2 × cores + a few suggests useful concurrency near 35 to 40, so 120 simultaneous connections is more than it can use and, if autoscaling later doubles the fleet, rises to 240. Put a pooler in front limiting real connections to about 40, with app-side acquire timeouts of 200 ms. Queries at 60 busy average on 16 cores means queries will queue at the database: that is a real concern that says the database, not the app tier, is the bottleneck. Remedies by cost: a cache for repeated reads (if 70 percent of queries are cacheable, load drops to about 18 busy connections), a read replica, or a faster query via an index.</p>
+
+<h3>16.5 Downstream dependency</h3>
+<p>The payment-status call takes 36 ms and we make 6,000 per second, so 216 concurrent calls into that service at the peak. If it slows to 360 ms (ten times), in-flight calls become 2,160 and our 600-slot pool fills in seconds. Unless protected, every request thread would hang and our whole service fails. Therefore: a timeout of about 150 ms on that call, a separate bulkhead pool of, say, 300 slots for it, a circuit breaker that opens when most calls fail, and a fallback (return "status pending") so that the order endpoint degrades gracefully. A bounded queue of 200 in front of the pool with a 503 beyond it caps the added delay: 200 / 6,000 = 33 ms.</p>
+
+<h3>16.6 Summary of the plan</h3>
+<table>
+<tr><th>Item</th><th>Value</th><th>Reason</th></tr>
+<tr><td>In-flight requests at peak</td><td>300</td><td>Little's Law: 6,000 × 0.05</td></tr>
+<tr><td>Instances</td><td>12 (4 cores each, 3 zones)</td><td>60% CPU target and survive one zone loss at 75%</td></tr>
+<tr><td>Worker threads per instance</td><td>50</td><td>1 + 46/4 per core × 4 cores</td></tr>
+<tr><td>Database busy connections</td><td>about 60</td><td>6,000 × 0.010, reduced by cache</td></tr>
+<tr><td>Real database connections</td><td>about 40 through a pooler</td><td>Matches database cores, independent of instance count</td></tr>
+<tr><td>Payment call guard</td><td>150 ms timeout, bulkhead, breaker, fallback</td><td>Slow dependency otherwise multiplies in-flight work by 10</td></tr>
+</table>
+
+<!-- ======================= 17 ======================= -->
+<h2 id="widget">17. Try it: pool and capacity calculator</h2>
+
+<div class="widget">
+<h4>Little's Law and headroom calculator</h4>
+<div class="row"><label>Peak requests per second <input type="number" id="w-rps" value="6000" min="1"></label></div>
+<div class="row"><label>Average time per request (ms) <input type="number" id="w-ms" value="50" min="1"></label></div>
+<div class="row"><label>Fraction of that time spent waiting (0 to 0.99) <input type="number" id="w-wait" value="0.92" min="0" max="0.99" step="0.01"></label></div>
+<div class="row"><label>Cores per instance <input type="number" id="w-cores" value="4" min="1"></label></div>
+<div class="row"><label>Target peak CPU utilization (0.1 to 0.9) <input type="number" id="w-util" value="0.6" min="0.1" max="0.9" step="0.05"></label></div>
+<div class="row"><button id="w-go">Compute</button></div>
+<div class="log" id="w-out" aria-live="polite"></div>
+</div>
+
+<!-- ======================= 18 ======================= -->
+<h2 id="qa">18. Interview Q&amp;A</h2>
+
+<details><summary>What does it mean for a system to be scalable, and how would you measure it?</summary>
+<p>A system is scalable if I can keep its latency and availability within target as load grows by adding resources, at a cost that grows roughly in proportion. I measure it by picking the load parameter that matters (requests per second, connections, data size), then running load tests at increasing levels while recording throughput and p50 and p99 latency. The result is a curve with a knee, the point where queueing makes latency bend upward. Capacity is the load at the knee, not at failure, and scalability is how well that knee moves right as I add instances. I also check for diminishing returns, since contention and coordination can make the second doubling worth much less than the first.</p></details>
+
+<details><summary>Why does adding servers not give linear speed-up? What do Amdahl's law and the USL say?</summary>
+<p>Some work is serial, such as a lock, a single leader or a single database writer. Amdahl's law shows that if a fraction s is serial, the speed-up can never exceed 1/s: with 5 percent serial it is capped at 20 times regardless of servers. The Universal Scalability Law adds coherency cost, the price of keeping workers consistent with each other, which grows with the square of the worker count and eventually makes throughput fall. So the practical work is to find the shared thing, shrink or partition it, and avoid designs where every node must talk to every other node.</p></details>
+
+<details><summary>How do you make a service stateless, and what do you do about sessions?</summary>
+<p>I move everything that must survive between requests out of the app process: durable data to the database, files to object storage, shared short-lived data to Redis, scheduled jobs to a single scheduler. For sessions there are three options. Sticky sessions pin a user to a server but lose sessions on failure and unbalance load. A shared store such as Redis keyed by a session ID lets any server serve any user and supports instant revocation at the price of an extra network call and a critical dependency. Signed short-lived tokens carry identity in the client and need no lookup, but cannot be revoked early without a deny list. I usually use signed tokens for identity, plus a shared store for anything revocable.</p></details>
+
+<details><summary>Explain thread-per-request versus an event loop. When would you choose each?</summary>
+<p>Thread per request gives each request an OS thread that blocks on I/O, which keeps code simple but costs memory and context switching, so a machine tops out at thousands of concurrent requests. An event loop uses a few threads and the operating system's readiness notification (epoll) to multiplex many connections, so waiting is cheap, but any blocking or CPU-heavy handler stalls everyone on that loop. I choose an event loop or cheap threads (goroutines, virtual threads) for I/O-heavy work with many idle or slow connections, such as gateways and chat. For CPU-heavy work I want parallelism across cores, with a pool sized near the core count, and I keep long computation off event loops.</p></details>
+
+<details><summary>How do you size a thread pool, and how does Little's Law help?</summary>
+<p>For CPU-bound tasks I use about one thread per core. For mixed tasks the estimate is threads per core of 1 plus wait time over compute time, so a request that computes 5 ms and waits 45 ms wants about 10 threads per core. Little's Law gives the total concurrency required: in-flight work equals arrival rate times time in the system, so 2,000 requests per second at 50 ms means 100 in flight. It also gives the throughput ceiling of a fixed pool, pool size divided by request time, which shows how a slow dependency cuts capacity without any code change. I confirm the numbers with a load test, since garbage collection and downstream limits shift them.</p></details>
+
+<details><summary>Why is a database connection pool usually small, and what goes wrong with many instances?</summary>
+<p>Connections in use equal query rate times the time each holds a connection, so 1,000 queries per second at 5 ms need only about 5 connections. A database has limited cores and disk parallelism, so more concurrent queries beyond a point just contend and slow each other down. The trap is that pools are per instance, so 50 instances with 20 connections each means 1,000 connections, and autoscaling adds more exactly when the database is stressed. I keep pools small, set short acquire and statement timeouts, and put a pooler such as PgBouncer between the app and the database so real connection count is independent of the number of instances.</p></details>
+
+<details><summary>What is backpressure and why should queues be bounded?</summary>
+<p>Backpressure means a slow downstream stage makes upstream stages slow down or refuse work, instead of hiding the overload in a growing buffer. An unbounded queue never rejects, so under sustained overload it grows until memory is exhausted, and the oldest items wait so long that clients have already timed out and retried, doubling the load while the server does useless work. A bounded queue gives a clear policy when full: block the producer, reject quickly with 503 or 429, or drop the least valuable item. I size the bound from the latency budget, since the maximum wait is queue length divided by throughput. Fast rejection keeps accepted requests fast and lets clients back off.</p></details>
+
+<details><summary>Two requests update the same account balance at the same time. How do you prevent a lost update?</summary>
+<p>The lost update happens when both read the old value, compute, and the second write overwrites the first. If the change can be expressed as an operation on the old value, the best fix is an atomic statement such as <code>UPDATE ... SET balance = balance + 50</code>, so the database serializes it under a row lock. If I must read, think and write, I use either pessimistic locking with SELECT FOR UPDATE inside a short transaction, or optimistic concurrency with a version column and a conditional update that affects zero rows on conflict, after which I re-read and retry with backoff. Optimistic suits rare conflicts and long think times, pessimistic suits frequent conflicts. I would also check the isolation level rather than assume the default prevents this.</p></details>
+
+<details><summary>What is a hot row and how would you fix it?</summary>
+<p>A hot row is a single row, such as a global counter or the stock of a flash-sale product, that many transactions update. Row locks serialize them, so throughput on that row is capped at roughly one over the lock hold time, and sharding does not help since the row lives on one shard. Fixes: shorten the transaction, split the counter into many sub-counters and sum on read, accumulate in memory or Redis and flush in batches, append events instead of updating, give each server a block of stock to sell locally, or funnel updates through one consumer through a queue. Which to choose depends on how exact the reads must be. I would also add jittered backoff to retries so conflicts do not synchronize.</p></details>
+
+<details><summary>How would you scale the app tier for 10 times the traffic, and what would you worry about?</summary>
+<p>I would confirm statelessness first, then put the instances behind a load balancer with health checks, and compute the instance count from peak load, per-instance capacity at the knee, and zone-failure redundancy, keeping peak utilization around 60 percent. Then I would look at what the extra instances do to dependencies: database connections multiply, so I add a pooler and cache hot reads; downstream services get ten times the calls, so I add timeouts, bulkheads and bounded queues. I move slow work to a queue, make writes idempotent and concurrency-safe, and set autoscaling on a signal that matches the workload, such as concurrency or queue depth for I/O-bound services. Finally I load test to find the real knee, since the bottleneck will have moved.</p></details>
+
+<details><summary>Autoscaling just added instances but latency got worse. What happened?</summary>
+<p>Several things can cause this. The new instances may be cold and slow to warm caches and connections, and a load balancer sending them full traffic at once can overload them. The extra instances multiply database connections or downstream calls, so the shared dependency, which was the real bottleneck, saturates further. The trigger metric may be wrong, such as CPU for an I/O-bound service, so scaling happened late or on noise. Finally, the problem may have been contention on a lock or hot row, where more instances only add more waiters, as Amdahl and the USL predict. I would look at saturation signals on the dependencies first, then use slow-start in the load balancer and a better scaling metric.</p></details>
+
+<!-- ======================= 19 ======================= -->
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">19. Recap</h2>
+<ul>
+  <li>Scalability is keeping latency and availability acceptable as load grows, at proportional cost. Name the load parameter, and measure throughput with percentile latency. Capacity is the knee of the curve, so keep headroom.</li>
+  <li>Scale up first because it is simple, scale out the stateless tiers, and partition data last. Amdahl's serial fraction and the USL's contention and coherency terms explain why more machines give diminishing, and eventually negative, returns.</li>
+  <li>Stateless services are interchangeable. Sessions go to a shared store or signed tokens, files to object storage, jobs to a single scheduler; state is moved, not removed.</li>
+  <li>Reads scale by copying (cache, replicas, CDN); writes scale by splitting (sharding) or smoothing (queues, batching).</li>
+  <li>Find the bottleneck by following the request path and comparing load to capacity per stage, checking utilization and saturation, and repeat as the bottleneck moves.</li>
+  <li>Thread per request is simple but costly; event loops with epoll and lightweight threads make waiting cheap but require non-blocking code. Size by wait-to-compute ratio and verify with Little's Law, L = λ × W.</li>
+  <li>Connection pools should be small and the total is instances times pool size; use a pooler, timeouts and leak detection. Bulkhead dependencies into separate pools.</li>
+  <li>Bound every queue, apply backpressure, shed load fast with 503 or 429, and use jittered backoff on retries.</li>
+  <li>Concurrent requests cause lost updates and check-then-act races. Prefer atomic SQL, then versions (optimistic) or row locks (pessimistic), unique constraints, and serialization by key. In-process locks do not work across servers.</li>
+  <li>Hot rows cap throughput at one over the lock hold time; split, batch, append or queue them.</li>
+  <li>Plan capacity from peak load, usable capacity at the knee, N+1 or zone redundancy and 50 to 70 percent utilization. Climb the scaling ladder only as measurements demand.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="02-estimation.html">Chapter 2</a> (estimation and Little's Law) and <a href="03-networking-essentials.html">Chapter 3</a> (connections and latency). Leads to <a href="09-load-balancing.html">Chapter 9</a> (spreading requests), <a href="13-caching-patterns.html">Chapter 13</a> (copying reads), <a href="16-rate-limiting.html">Chapter 16</a> (limiting and shedding), <a href="24-replication.html">Chapter 24</a> and <a href="25-sharding.html">Chapter 25</a> (scaling data), <a href="30-coordination-locks.html">Chapter 30</a> (distributed locks), <a href="40-resilience.html">Chapter 40</a> (timeouts, bulkheads, breakers) and <a href="43-deployment-autoscaling.html">Chapter 43</a> (autoscaling).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+<script>
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+function setParts(node, parts) { node.textContent = ''; parts.forEach(function (p) { if (typeof p === 'string') node.appendChild(document.createTextNode(p)); else node.appendChild(el('b', null, p.b)); }); }
+document.getElementById('w-go').addEventListener('click', function () {
+  var rps = parseFloat(document.getElementById('w-rps').value) || 0;
+  var ms = parseFloat(document.getElementById('w-ms').value) || 0;
+  var wf = Math.min(0.99, Math.max(0, parseFloat(document.getElementById('w-wait').value) || 0));
+  var cores = Math.max(1, parseFloat(document.getElementById('w-cores').value) || 1);
+  var util = Math.min(0.9, Math.max(0.1, parseFloat(document.getElementById('w-util').value) || 0.6));
+  var out = document.getElementById('w-out');
+  var inflight = rps * ms / 1000;
+  var cpuMs = ms * (1 - wf);
+  var waitMs = ms * wf;
+  var tpc = 1 + waitMs / Math.max(cpuMs, 0.001);
+  var threads = Math.ceil(tpc * cores);
+  var cpuCores = rps * cpuMs / 1000;
+  var instances = Math.ceil(cpuCores / util / cores);
+  var instancesZone = Math.ceil(instances * 1.5 / 3) * 3;
+  out.textContent = '';
+  var lines = [
+    ['In flight at peak (Little): ', { b: inflight.toFixed(0) }, ' requests'],
+    ['CPU time per request: ', { b: cpuMs.toFixed(1) }, ' ms, waiting: ', { b: waitMs.toFixed(1) }, ' ms'],
+    ['Threads per core: ', { b: tpc.toFixed(1) }, ', per instance: ', { b: String(threads) }],
+    ['CPU cores busy at peak: ', { b: cpuCores.toFixed(1) }],
+    ['Instances for ' + Math.round(util * 100) + '% CPU: ', { b: String(instances) }],
+    ['Instances if one of three zones may fail (about): ', { b: String(instancesZone) }]
+  ];
+  lines.forEach(function (parts) { var d = el('div'); setParts(d, parts); out.appendChild(d); });
+});
+</script>
+</body>
+</html>

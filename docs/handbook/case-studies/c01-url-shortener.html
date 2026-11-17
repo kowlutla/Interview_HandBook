@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 1: Design a URL Shortener | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="c01-url-shortener">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 1 · Worked solutions</div>
+<h1>Design a URL Shortener</h1>
+<p class="lead">A URL shortener turns a long web address into a short one and sends anyone who opens the short one to the long one. It looks trivial, which is exactly why interviewers like it: the interesting work is in generating unique short codes at scale, choosing the right redirect status code, serving a read-heavy hot path from cache, counting clicks without slowing redirects down, and surviving abuse. This page walks through a complete interview solution, with numbers.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is usually one sentence: "Design a service like bit.ly or TinyURL." A strong candidate spends the first few minutes turning that sentence into a precise problem, following the approach in <a href="../chapters/01-interview-framework.html">Chapter 1</a>. The service has two core actions. A user submits a long URL such as <code>https://example.com/products/2024/summer-sale?utm_source=mail&amp;utm_campaign=jul</code> and receives a short URL such as <code>https://sho.rt/aZ3k9Qb</code>. Later, anyone who requests the short URL is redirected to the original.</p>
+<p>Here are the questions worth asking, and the answers this solution assumes.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th><th>Why it matters</th></tr>
+<tr><td>How many new short URLs per month?</td><td>100 million</td><td>Drives write QPS, code length, and total storage.</td></tr>
+<tr><td>What is the read to write ratio?</td><td>100 redirects per creation</td><td>The system is read-dominated, so caching decides the design.</td></tr>
+<tr><td>How long should a link live?</td><td>Default: until deleted, optional expiry date. Storage horizon of 5 years.</td><td>Determines total rows and the number of codes needed.</td></tr>
+<tr><td>Can users choose a custom alias?</td><td>Yes, for registered users, e.g. <code>sho.rt/summer</code>.</td><td>Custom aliases collide with generated codes, so the namespace needs a rule.</td></tr>
+<tr><td>Is the same long URL always mapped to the same code?</td><td>No. Each creation request gets a new code, unless the user is the same and sets the dedupe option.</td><td>Deduplication needs a lookup index and breaks per-link analytics; see section 9.</td></tr>
+<tr><td>Do we need click analytics?</td><td>Yes: counts per link by day, country, referrer and device.</td><td>Adds an event pipeline off the hot path.</td></tr>
+<tr><td>Is a redirect allowed to be slightly stale?</td><td>A deleted or expired link may keep working for up to a minute.</td><td>Allows cache TTLs instead of synchronous invalidation everywhere.</td></tr>
+<tr><td>Availability and latency targets?</td><td>Redirect 99.99% available, p99 under 50 ms at the server. Creation 99.9%.</td><td>Reads are the product; writes can degrade a little.</td></tr>
+<tr><td>Are codes guessable?</td><td>Codes should not be trivially enumerable for private links, but this is not a security boundary.</td><td>Affects whether sequential IDs are acceptable; see section 7.</td></tr>
+</table>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li><b>Create:</b> given a long URL (and optionally a custom alias, an expiry time, and an owner), return a short URL.</li>
+<li><b>Redirect:</b> given a short code, respond with a redirect to the long URL, as fast as possible.</li>
+<li><b>Custom alias:</b> a registered user can request a specific code if it is free and passes validation.</li>
+<li><b>Expiry and deletion:</b> links can expire at a chosen time or be deleted by the owner; afterwards they return 404 or 410.</li>
+<li><b>Analytics:</b> owners can see total clicks and breakdowns by time, country, referrer, and device.</li>
+<li><b>Abuse handling:</b> block known malicious destinations, rate limit creation, and allow takedown.</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Latency:</b> redirect p99 below 50 ms inside the data center; the user should not feel an extra hop.</li>
+<li><b>Availability:</b> the redirect path is the product. Aim for 99.99%, which allows about 52 minutes of downtime a year. See <a href="../chapters/41-ha-dr.html">Chapter 41</a>.</li>
+<li><b>Durability:</b> once a short link is issued, it must never be lost or reassigned to a different destination. A lost mapping breaks every page that embedded the link.</li>
+<li><b>Scalability:</b> handle 10x growth by adding machines, not by redesign.</li>
+<li><b>Uniqueness:</b> no two long URLs may ever receive the same code at the same time.</li>
+<li><b>Eventual consistency for analytics:</b> counts may lag by a minute or so.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>We will not design the web front end, user accounts and billing, a link-in-bio product, A/B destination testing, QR code generation, or an enterprise custom-domain onboarding flow (beyond a brief mention). We also will not build a full anti-phishing classifier; we will integrate with one.</p>
+
+<h2 id="estimation">3. Estimation</h2>
+<p>Estimation, covered in <a href="../chapters/02-estimation.html">Chapter 2</a>, tells us which parts of the design are hard. We use round numbers and show the arithmetic.</p>
+<h3>3.1 Traffic</h3>
+<ul>
+<li>New links: 100 million per month. A month has about 2.6 million seconds (30 days x 86,400). So average writes = 100,000,000 / 2,600,000 ≈ <b>40 per second</b>. With a peak factor of 5 (campaigns, bursts), peak writes ≈ <b>200 per second</b>.</li>
+<li>Redirects: read to write 100:1, so 10 billion redirects per month. Average = 10,000,000,000 / 2,600,000 ≈ <b>3,850 per second</b>, call it 4,000. Peak with factor 5 ≈ <b>20,000 per second</b>. Viral links make it spikier, which is why the cache and CDN matter.</li>
+</ul>
+<p>Even 20,000 requests per second is modest for a single well-tuned cache cluster. The hard part is not raw throughput. It is keeping the hot path tiny and correct, and keeping tail latency low when one link suddenly takes 50,000 requests per second by itself.</p>
+<h3>3.2 Storage</h3>
+<ul>
+<li>Links over 5 years: 100 million x 12 x 5 = <b>6 billion</b> rows.</li>
+<li>Row size: code (7 bytes), long URL (average about 200 bytes, capped at 2,048), owner id (8), created and expiry timestamps (16), flags and metadata (about 50). Round to <b>500 bytes</b> including index overhead.</li>
+<li>Total: 6,000,000,000 x 500 bytes = 3 x 10^12 bytes = <b>3 TB</b> for the mapping table. Per year, about 600 GB. This fits comfortably on a modest sharded cluster, and it would even fit on one large machine, but we want the throughput, replication, and operational headroom of sharding.</li>
+</ul>
+<h3>3.3 Code length</h3>
+<p>Base62 uses the characters a-z, A-Z, 0-9, so 62 symbols. With length 6 there are 62^6 ≈ 56.8 billion codes. With length 7 there are 62^7 ≈ 3.52 trillion. We need 6 billion codes in five years, so six characters would technically suffice (a fill ratio of about 10%), but random generation at 10% fill suffers noticeable collision retries, and counters give us no benefit from the extra headroom. Seven characters gives fill of 0.17%, room for custom aliases to share the space without trouble, and 10x growth without lengthening anything. We choose <b>7 characters</b>.</p>
+<h3>3.4 Bandwidth</h3>
+<p>A redirect response is just a status line and headers, about 500 bytes. Peak 20,000 per second x 500 bytes = 10 MB/s = 80 Mbit/s outbound. Inbound requests are about 300 bytes. This is trivial network load.</p>
+<h3>3.5 Cache memory</h3>
+<p>Link popularity follows a heavy-tailed distribution: a small share of links gets most clicks. Suppose 20% of links account for 80% of the traffic. A daily working set of, say, 100 million distinct codes at about 200 bytes per cache entry (code, long URL, expiry, flags, Redis overhead) is 100,000,000 x 200 = <b>20 GB</b>. That fits in the memory of a small Redis cluster (three shards of 16 GB with replicas), as discussed in <a href="../chapters/15-redis.html">Chapter 15</a>. A hit ratio above 95% is realistic; with it, only 5% of 20,000 peak, about 1,000 reads per second, reach the database.</p>
+<h3>3.6 Click events</h3>
+<p>Every redirect emits one event of about 200 bytes (timestamp, code, country, user agent hash, referrer). At 4,000 events per second average: 800 KB/s ≈ <b>70 GB per day</b> raw, about 25 TB per year uncompressed. Compressed columnar storage cuts this by 5 to 10x. Raw events are kept for 30 to 90 days; hourly and daily aggregates are kept long term and are tiny.</p>
+<table>
+<tr><th>Quantity</th><th>Average</th><th>Peak</th></tr>
+<tr><td>Creations per second</td><td>40</td><td>200</td></tr>
+<tr><td>Redirects per second</td><td>4,000</td><td>20,000</td></tr>
+<tr><td>Rows after 5 years</td><td colspan="2">6 billion (about 3 TB)</td></tr>
+<tr><td>Cache working set</td><td colspan="2">about 20 GB</td></tr>
+<tr><td>Click events per day</td><td colspan="2">about 340 million (70 GB)</td></tr>
+</table>
+
+<h2 id="api">4. API design</h2>
+<p>The API is small. We expose a REST API for management (see <a href="../chapters/05-api-design.html">Chapter 5</a>) and a plain GET for redirects.</p>
+<pre><code>POST /v1/links
+Authorization: Bearer &lt;token&gt;
+Idempotency-Key: 7f3c-...            (optional but recommended)
+{
+  "long_url": "https://example.com/very/long/path?x=1",
+  "custom_alias": "summer",          (optional)
+  "expires_at": "2027-01-01T00:00:00Z", (optional)
+  "redirect_type": 302               (optional: 301 or 302)
+}
+201 Created
+{ "code": "aZ3k9Qb", "short_url": "https://sho.rt/aZ3k9Qb",
+  "long_url": "...", "expires_at": null }
+errors: 400 invalid URL, 409 alias taken, 422 blocked destination, 429 rate limited</code></pre>
+<pre><code>GET /{code}
+302 Found            (or 301 Moved Permanently, per link setting)
+Location: https://example.com/very/long/path?x=1
+Cache-Control: private, max-age=0     (for 302)
+404 Not Found  - unknown code
+410 Gone       - expired or deleted</code></pre>
+<pre><code>GET    /v1/links/{code}                 -> metadata
+DELETE /v1/links/{code}                 -> 204, link becomes 410
+GET    /v1/links/{code}/stats?from=&amp;to=&amp;granularity=day
+       -> { "total": 18234, "series": [...], "countries": [...], "referrers": [...] }</code></pre>
+<p>The <code>Idempotency-Key</code> header lets a client retry a creation after a timeout without producing two different codes; see <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>. The server stores the key with the resulting code for 24 hours and returns the same response on a repeat.</p>
+
+<h2 id="data-model">5. Data model and storage choice</h2>
+<h3>5.1 Tables</h3>
+<pre><code>links
+  code        VARCHAR(16)  PRIMARY KEY        -- the short code, or custom alias
+  long_url    VARCHAR(2048) NOT NULL
+  owner_id    BIGINT NULL
+  created_at  TIMESTAMP
+  expires_at  TIMESTAMP NULL
+  redirect    SMALLINT      -- 301 or 302
+  status      SMALLINT      -- active, disabled (abuse), deleted
+  url_hash    BINARY(16)    -- optional, only for the dedupe feature
+
+owner_links (secondary access path)
+  owner_id, created_at DESC, code           -- "my links" list
+
+click_events (analytics store, not the OLTP store)
+  ts, code, country, device, referrer_host, ip_hash
+
+click_agg_hourly
+  code, hour, country, device, referrer_host, clicks</code></pre>
+<h3>5.2 Why this storage</h3>
+<p>The mapping is a pure key-value lookup: given a code, return a row. There are no joins, no range scans on the hot path, and no multi-row transactions. That shape fits a distributed key-value or wide-column store such as DynamoDB or Cassandra (<a href="../chapters/20-nosql.html">Chapter 20</a>), and it also fits a sharded relational database such as MySQL or PostgreSQL (<a href="../chapters/18-relational-internals.html">Chapter 18</a>).</p>
+<table>
+<tr><th>Option</th><th>Strengths</th><th>Weaknesses</th></tr>
+<tr><td>Sharded MySQL/Postgres</td><td>Familiar; a unique primary key gives free collision detection; easy "my links" queries; strong consistency on the primary.</td><td>You operate sharding yourself (<a href="../chapters/25-sharding.html">Chapter 25</a>); resharding is work.</td></tr>
+<tr><td>DynamoDB or Cassandra</td><td>Horizontal scale built in; conditional write (insert if not exists) detects collisions; multi-region replication options.</td><td>Secondary indexes cost more; Cassandra's conditional writes are slower (lightweight transactions).</td></tr>
+<tr><td>Redis as the primary</td><td>Very fast.</td><td>Memory cost for 3 TB, and durability needs care. Use it as a cache only.</td></tr>
+</table>
+<p><b>Choice.</b> A horizontally sharded key-value store with a conditional "insert if absent" write for the <code>links</code> table, a Redis cache in front of it, and a separate column-oriented analytics store (ClickHouse, Druid, or a lake with Parquet files) for click events. The reasons: the mapping is accessed only by key, uniqueness must be enforced atomically per key, and the scale of 3 TB with 20,000 reads per second is easy for such a store. Analytics has a completely different access pattern (scan and aggregate millions of rows), so mixing it into the OLTP store would hurt both. The same service can be built on sharded SQL with equal correctness; the rest of the design does not depend on this choice.</p>
+
+<h2 id="first-design">6. A first, simple design</h2>
+<p>Start with the simplest thing that works, then find where it breaks. One application server and one database:</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 190" role="img" aria-label="Simple single-server design">
+  <rect class="ext" x="30" y="60" width="150" height="60" rx="10"/><text class="t-c t-b" x="105" y="86">Browser</text><text class="t-c t-sm" x="105" y="104">GET /aZ3k9Qb</text>
+  <rect class="box" x="330" y="60" width="200" height="60" rx="10"/><text class="t-c t-b" x="430" y="86">App server</text><text class="t-c t-sm" x="430" y="104">create + redirect</text>
+  <rect class="db" x="690" y="60" width="180" height="60" rx="10"/><text class="t-c t-b" x="780" y="86">SQL database</text><text class="t-c t-sm" x="780" y="104">links(code, long_url)</text>
+  <path class="arrow" d="M180 90 L326 90"/>
+  <path class="arrow" d="M530 90 L686 90"/>
+  <text class="t-sm" x="30" y="165">Create: pick a code, INSERT row. Redirect: SELECT by code, answer 302. Works for thousands of links.</text>
+</svg>
+<figcaption>The baseline. It is correct, and it shows the three things that will break: a single database for every read, a single code generator, and no analytics.</figcaption>
+</figure>
+<p>Where this breaks as traffic grows:</p>
+<ol>
+<li><b>Every redirect hits the database.</b> At 20,000 peak reads per second one database starts to struggle, and latency is dominated by disk or network. Cache fixes it.</li>
+<li><b>Code generation.</b> A single auto-increment column is a single point of failure and a bottleneck once there are many writers or shards.</li>
+<li><b>Single point of failure.</b> One app server and one database mean any failure is an outage.</li>
+<li><b>Analytics</b> cannot be an <code>UPDATE links SET clicks = clicks + 1</code> on the hot row. A viral link would serialize thousands of writers on one row.</li>
+</ol>
+
+<h2 id="architecture">7. The scaled architecture</h2>
+<figure class="diagram">
+<svg viewBox="0 0 960 470" role="img" aria-label="Scaled URL shortener architecture">
+  <rect class="ext" x="20" y="190" width="110" height="56" rx="10"/><text class="t-c t-b" x="75" y="215">Clients</text><text class="t-c t-sm" x="75" y="233">browsers, apps</text>
+  <rect class="cache" x="170" y="190" width="120" height="56" rx="10"/><text class="t-c t-b" x="230" y="215">CDN / edge</text><text class="t-c t-sm" x="230" y="233">optional cache</text>
+  <rect class="box" x="330" y="190" width="120" height="56" rx="10"/><text class="t-c t-b" x="390" y="215">Load balancer</text><text class="t-c t-sm" x="390" y="233">L7, TLS</text>
+  <rect class="box" x="500" y="100" width="150" height="56" rx="10"/><text class="t-c t-b" x="575" y="125">Redirect service</text><text class="t-c t-sm" x="575" y="143">stateless, read path</text>
+  <rect class="box" x="500" y="280" width="150" height="56" rx="10"/><text class="t-c t-b" x="575" y="305">Create service</text><text class="t-c t-sm" x="575" y="323">stateless, write path</text>
+  <rect class="cache" x="710" y="100" width="130" height="56" rx="10"/><text class="t-c t-b" x="775" y="125">Redis cache</text><text class="t-c t-sm" x="775" y="143">code to long URL</text>
+  <rect class="db" x="710" y="190" width="130" height="56" rx="10"/><text class="t-c t-b" x="775" y="215">Link store</text><text class="t-c t-sm" x="775" y="233">sharded by code</text>
+  <rect class="box" x="710" y="280" width="130" height="56" rx="10"/><text class="t-c t-b" x="775" y="305">ID allocator</text><text class="t-c t-sm" x="775" y="323">counter ranges</text>
+  <rect class="box" x="500" y="390" width="150" height="56" rx="10"/><text class="t-c t-b" x="575" y="415">Safety checker</text><text class="t-c t-sm" x="575" y="433">blocklist, scan</text>
+  <rect class="cache" x="290" y="390" width="150" height="56" rx="10"/><text class="t-c t-b" x="365" y="415">Kafka: clicks</text><text class="t-c t-sm" x="365" y="433">async events</text>
+  <rect class="db" x="60" y="390" width="170" height="56" rx="10"/><text class="t-c t-b" x="145" y="415">Analytics store</text><text class="t-c t-sm" x="145" y="433">columnar, aggregates</text>
+  <path class="arrow" d="M130 218 L166 218"/>
+  <path class="arrow" d="M290 218 L326 218"/>
+  <path class="arrow" d="M450 205 L496 135"/>
+  <path class="arrow" d="M450 232 L496 300"/>
+  <path class="arrow" d="M650 128 L706 128"/>
+  <path class="arrow dash" d="M775 156 L775 186"/>
+  <path class="arrow" d="M650 310 L706 310"/>
+  <path class="arrow" d="M650 320 L725 250"/>
+  <path class="arrow" d="M575 336 L575 386"/>
+  <path class="arrow dash" d="M540 156 L400 386"/>
+  <path class="arrow" d="M290 418 L234 418"/>
+</svg>
+<figcaption>Two stateless services share nothing but the stores. The redirect service reads cache first, then the link store, and emits click events to Kafka without waiting. The create service gets a code from the allocator, checks the destination, and writes with a conditional insert. The CDN layer is optional and only used for 301 links or very hot 302 links, as explained in section 9.</figcaption>
+</figure>
+<p>The reasoning behind the split is that the read path and the write path have wildly different load (100:1) and different failure tolerance. The redirect service has no dependency on the ID allocator, the safety checker, or the analytics store being healthy. If Kafka is down, redirects still work; if the allocator is down, existing links still resolve. Splitting them lets us scale and deploy each separately (see <a href="../chapters/09-load-balancing.html">Chapter 9</a> for balancing, and <a href="../chapters/40-resilience.html">Chapter 40</a> for isolating dependencies).</p>
+
+<h3>7.1 Request flow: create a short link</h3>
+<figure class="diagram">
+<svg viewBox="0 0 960 400" role="img" aria-label="Create link sequence diagram">
+  <rect class="ext" x="20" y="10" width="120" height="36" rx="8"/><text class="t-c t-b" x="80" y="33">Client</text>
+  <rect class="box" x="220" y="10" width="140" height="36" rx="8"/><text class="t-c t-b" x="290" y="33">Create service</text>
+  <rect class="box" x="450" y="10" width="140" height="36" rx="8"/><text class="t-c t-b" x="520" y="33">Safety checker</text>
+  <rect class="box" x="680" y="10" width="110" height="36" rx="8"/><text class="t-c t-b" x="735" y="33">Allocator</text>
+  <rect class="db" x="840" y="10" width="100" height="36" rx="8"/><text class="t-c t-b" x="890" y="33">Link store</text>
+  <line class="life" x1="80" y1="46" x2="80" y2="390"/><line class="life" x1="290" y1="46" x2="290" y2="390"/><line class="life" x1="520" y1="46" x2="520" y2="390"/><line class="life" x1="735" y1="46" x2="735" y2="390"/><line class="life" x1="890" y1="46" x2="890" y2="390"/>
+  <path class="arrow" d="M80 80 L286 80"/><text class="t-sm" x="95" y="72">1. POST /v1/links</text>
+  <path class="arrow" d="M290 120 L516 120"/><text class="t-sm" x="310" y="112">2. validate URL, check blocklist</text>
+  <path class="arrow-g dash" d="M516 150 L294 150"/><text class="t-sm" x="340" y="167">3. ok</text>
+  <path class="arrow" d="M290 200 L731 200"/><text class="t-sm" x="380" y="192">4. need a code (usually served from local range)</text>
+  <path class="arrow-g dash" d="M731 230 L294 230"/><text class="t-sm" x="400" y="247">5. id 1234567890, encode base62</text>
+  <path class="arrow" d="M290 280 L886 280"/><text class="t-sm" x="400" y="272">6. INSERT code IF NOT EXISTS</text>
+  <path class="arrow-g dash" d="M886 310 L294 310"/><text class="t-sm" x="560" y="327">7. committed</text>
+  <path class="arrow-g dash" d="M290 360 L84 360"/><text class="t-sm" x="110" y="352">8. 201 with short URL</text>
+</svg>
+<figcaption>The client is told success only after the conditional insert commits. Step 4 is rarely a network call: the create service holds a block of IDs in memory (section 8.2).</figcaption>
+</figure>
+<ol>
+<li>The create service authenticates the caller and rate limits it (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>).</li>
+<li>It validates the URL: well-formed, scheme http or https, length at most 2,048, not pointing at the shortener itself (to avoid redirect loops).</li>
+<li>It asks the safety checker whether the host is on a blocklist or flagged (section 12).</li>
+<li>If a custom alias was given, it skips the allocator and uses the alias as the code. Otherwise it takes the next ID from its local range and encodes it in base62.</li>
+<li>It performs a conditional insert, "insert if the code does not exist". If this fails (alias taken, or a hash collision), the API returns 409 for aliases or retries with a new code.</li>
+<li>It returns 201 with the short URL. It may prime the cache with the new entry so the first click is a hit.</li>
+</ol>
+<h3>7.2 Request flow: follow a short link</h3>
+<figure class="diagram">
+<svg viewBox="0 0 960 360" role="img" aria-label="Redirect sequence diagram with cache hit and miss">
+  <rect class="ext" x="20" y="10" width="120" height="36" rx="8"/><text class="t-c t-b" x="80" y="33">Browser</text>
+  <rect class="box" x="230" y="10" width="150" height="36" rx="8"/><text class="t-c t-b" x="305" y="33">Redirect service</text>
+  <rect class="cache" x="500" y="10" width="110" height="36" rx="8"/><text class="t-c t-b" x="555" y="33">Redis</text>
+  <rect class="db" x="680" y="10" width="110" height="36" rx="8"/><text class="t-c t-b" x="735" y="33">Link store</text>
+  <rect class="cache" x="840" y="10" width="100" height="36" rx="8"/><text class="t-c t-b" x="890" y="33">Kafka</text>
+  <line class="life" x1="80" y1="46" x2="80" y2="350"/><line class="life" x1="305" y1="46" x2="305" y2="350"/><line class="life" x1="555" y1="46" x2="555" y2="350"/><line class="life" x1="735" y1="46" x2="735" y2="350"/><line class="life" x1="890" y1="46" x2="890" y2="350"/>
+  <path class="arrow" d="M80 80 L301 80"/><text class="t-sm" x="100" y="72">1. GET /aZ3k9Qb</text>
+  <path class="arrow" d="M305 110 L551 110"/><text class="t-sm" x="340" y="102">2. GET code</text>
+  <path class="arrow-g dash" d="M551 135 L309 135"/><text class="t-sm" x="360" y="152">3a. hit: long URL</text>
+  <path class="arrow-r dash" d="M551 175 L309 175"/><text class="t-sm" x="360" y="192">3b. miss</text>
+  <path class="arrow" d="M305 215 L731 215"/><text class="t-sm" x="440" y="207">4. read row (miss only)</text>
+  <path class="arrow-g dash" d="M731 240 L309 240"/><text class="t-sm" x="440" y="257">5. row; then SET in Redis with TTL</text>
+  <path class="arrow dash" d="M305 285 L886 285"/><text class="t-sm" x="520" y="277">6. async: publish click event (fire and forget)</text>
+  <path class="arrow-g" d="M301 325 L84 325"/><text class="t-sm" x="110" y="317">7. 302 Location: long URL</text>
+</svg>
+<figcaption>The browser waits only for steps 1 to 3 (hit) or 1 to 5 (miss), then step 7. The Kafka publish is asynchronous and cannot fail the redirect.</figcaption>
+</figure>
+<p>Detailed behavior of the redirect service:</p>
+<ol>
+<li>Parse the code from the path. Reject anything not matching <code>[A-Za-z0-9_-]{1,16}</code> immediately without touching any store, which protects the database from garbage traffic.</li>
+<li>Look in a tiny in-process cache first (a few thousand of the very hottest codes, for a few seconds). This absorbs a viral link before it even reaches Redis.</li>
+<li>Look in Redis. A hit returns the long URL, status flags and expiry.</li>
+<li>On a miss, read the link store. If the row exists and is active and unexpired, write it to Redis with a TTL. If it does not exist, write a short-lived <b>negative cache entry</b> (a "not found" marker for 30 to 60 seconds) so that scanners guessing random codes do not hammer the database; see <a href="../chapters/14-caching-failures.html">Chapter 14</a>.</li>
+<li>Check expiry and status: expired or deleted gives 410; disabled for abuse gives a warning page or 451/404.</li>
+<li>Publish the click event (best effort, with a local buffer), then return the redirect.</li>
+</ol>
+
+<h2 id="id-generation">8. Deep dive 1: generating unique short codes</h2>
+<p>This is the part interviewers push on hardest. The requirement: produce codes that are short, unique across all machines and regions, cheap to generate, and (preferably) not trivially guessable. There are four standard approaches. All of them eventually produce a number or a hash and then encode it as a base62 string, so we start with the encoding.</p>
+<h3>8.1 Base62 encoding</h3>
+<p>Base62 is the same idea as writing a number in another base. Decimal uses 10 digits; base62 uses 62 symbols: <code>0-9</code> (values 0 to 9), <code>a-z</code> (10 to 35), <code>A-Z</code> (36 to 61). To encode a number, repeatedly divide by 62 and collect the remainders, then reverse them. Example: the number 125 is 2 x 62 + 1, so its digits are 2 and 1, written "21". The number 1,000,000,000 in base62 is "15ftgG" (6 characters). Any number below 62^7 ≈ 3.52 trillion fits in 7 characters, and we left-pad with the zero symbol to get fixed width if we want.</p>
+<p>Why base62 and not base64? Base64 adds <code>+</code> and <code>/</code>, which are awkward in URLs (they need escaping). The URL-safe variant uses <code>-</code> and <code>_</code> instead, which is acceptable but looks odd and is easier to break when someone copies a link in a document that wraps at hyphens. Base62 is plain letters and digits. Some systems also drop look-alike characters (0, O, 1, l, I) giving base58, which helps if codes are read aloud or typed from print, at the cost of slightly longer codes (58^7 ≈ 2.2 trillion, still plenty).</p>
+<h3>8.2 Option A: counter with ranges (our choice)</h3>
+<p>Keep a global counter. Each new link takes the next number, and the code is its base62 encoding. The danger is the counter itself: a single incrementing row is a serialization point and a single point of failure. The fix is <b>range allocation</b> (also called a ticket server with batching).</p>
+<figure class="diagram">
+<svg viewBox="0 0 920 330" role="img" aria-label="Counter range allocation">
+  <rect class="db" x="330" y="20" width="260" height="70" rx="10"/><text class="t-c t-b" x="460" y="45">Allocator (3-node consensus store)</text><text class="t-c t-sm" x="460" y="65">next_free = 3,000,000</text><text class="t-c t-sm" x="460" y="80">advances by 1,000 per request</text>
+  <rect class="box" x="40" y="200" width="220" height="80" rx="10"/><text class="t-c t-b" x="150" y="226">Create server A</text><text class="t-c t-sm" x="150" y="246">owns [2,998,000 - 2,998,999]</text><text class="t-c t-sm" x="150" y="262">cursor at 2,998,412</text>
+  <rect class="box" x="350" y="200" width="220" height="80" rx="10"/><text class="t-c t-b" x="460" y="226">Create server B</text><text class="t-c t-sm" x="460" y="246">owns [2,999,000 - 2,999,999]</text><text class="t-c t-sm" x="460" y="262">cursor at 2,999,951</text>
+  <rect class="box" x="660" y="200" width="220" height="80" rx="10"/><text class="t-c t-b" x="770" y="226">Create server C</text><text class="t-c t-sm" x="770" y="246">fetching a new range...</text><text class="t-c t-sm" x="770" y="262">previous range exhausted</text>
+  <path class="arrow dash" d="M150 200 L360 92"/>
+  <path class="arrow dash" d="M460 200 L460 94"/>
+  <path class="arrow" d="M770 200 L580 92"/>
+  <text class="t-sm" x="640" y="160">GET next range (1 call per 1,000 links)</text>
+</svg>
+<figcaption>Each server leases a block of 1,000 consecutive numbers and hands them out from memory with no network call. The allocator is touched once per 1,000 creations, so 200 creations per second across the fleet means only about one allocator call every 5 seconds.</figcaption>
+</figure>
+<p>How it works step by step. The allocator stores one number, <code>next_free</code>. When a create server starts or runs out, it asks for a block: the allocator atomically reads <code>next_free</code>, adds 1,000, stores it, and returns the old value as the start of the block. The allocator needs durability and atomicity, so it lives in a small replicated store with consensus (etcd, ZooKeeper, or a SQL row with a transaction; see <a href="../chapters/29-consensus.html">Chapter 29</a> and <a href="../chapters/30-coordination-locks.html">Chapter 30</a>). The server then increments a local counter and encodes each number. Because blocks never overlap, uniqueness is guaranteed with no collision checks at all.</p>
+<p>What happens on failure. If a server crashes with 600 unused numbers in its block, those numbers are simply lost. That is fine: 1,000 per crash out of 3.5 trillion is nothing, and gaps in a code space are invisible. If the allocator is briefly unavailable, servers keep serving from their current block (1,000 numbers at 200/s total fleet peak, so about 25 to 50 seconds per server of headroom even at peak; make the block 10,000 to ride out longer outages). If the allocator loses its state, a rollback of <code>next_free</code> would reissue numbers, so it must be replicated and the block size is added to the persisted value <i>before</i> the block is handed out.</p>
+<p><b>The guessability problem.</b> Sequential numbers give sequential codes: <code>aZ3k9Qb</code> is followed by <code>aZ3k9Qc</code>. Anyone can enumerate all links, which leaks private URLs and lets competitors estimate your volume. Two fixes. First, apply a reversible permutation to the number before encoding: for example multiply by a large constant coprime to 62^7 modulo 62^7, or run a small Feistel cipher keyed with a secret over the 42-bit space. Because the mapping is a bijection, uniqueness is preserved and the output looks random. Second, accept guessability and treat codes as unlisted-but-not-secret, and give private links a longer random token. We choose the permutation: it keeps collision-free uniqueness and removes enumeration.</p>
+<h3>8.3 Option B: hash the long URL and handle collisions</h3>
+<p>Compute a hash (MD5 or SHA-256) of the long URL, take the first 42 bits (the information in 7 base62 characters is 7 x log2(62) ≈ 41.7 bits), and encode it. Identical URLs give identical codes, which provides deduplication for free. But hashes collide: by the birthday bound, with n codes in a space of N, the collision probability reaches about 50% when n ≈ 1.2 x sqrt(N). With N = 3.5 x 10^12, sqrt(N) ≈ 1.9 million, so we expect collisions after only a couple of million links, long before our 6 billion. So every insert needs collision handling: on conflict, check whether the stored row has the same long URL (then it is a duplicate, reuse the code) or a different one (a true collision). For a true collision, append a salt or counter to the input and re-hash, then retry. At 6 billion rows in a 3.5 trillion space, the probability that any single new insert collides is about 6e9 / 3.5e12 ≈ 0.17%, so retries are rare but must be correct. The cost is a conditional write per attempt and a design that still must be careful with races between two creators inserting the same code simultaneously (the conditional insert handles it).</p>
+<h3>8.4 Option C: random codes</h3>
+<p>Draw 42 random bits from a cryptographic generator, encode, and insert with "if not exists". It is simple, unguessable, and needs no coordination. The collision chance per insert equals the fill ratio (0.17% at 6 billion links), and rises as the space fills, so you must retry on conflict. It is a fine choice for smaller services, and it is what many custom-alias and private-link flows use.</p>
+<h3>8.5 Option D: Snowflake-style 64-bit IDs</h3>
+<p>A Snowflake ID packs a timestamp (41 bits of milliseconds), a machine id (10 bits), and a per-millisecond sequence (12 bits) into 64 bits. Each machine generates IDs independently with no coordination beyond a unique machine id; see <a href="../chapters/32-idempotency-ids.html">Chapter 32</a> for how that works and the clock-skew risks. The catch for a URL shortener is size: 64 bits in base62 needs 11 characters (62^10 is about 8.4 x 10^17, which is less than 2^64 ≈ 1.8 x 10^19, so 11 characters). A code of 11 characters is not very "short". You can shrink it by using fewer timestamp bits or a custom epoch, but then you are building a different scheme.</p>
+<h3>8.6 Comparison and choice</h3>
+<table>
+<tr><th>Approach</th><th>Uniqueness</th><th>Coordination</th><th>Code length</th><th>Guessable?</th><th>Dedupe</th><th>Main risk</th></tr>
+<tr><td>A. Counter ranges + permutation</td><td>Guaranteed by construction</td><td>One allocator call per 1,000 links</td><td>7</td><td>No, after permutation</td><td>Needs extra index</td><td>Allocator state loss (mitigate: replicate, persist before handing out)</td></tr>
+<tr><td>B. Hash + collision handling</td><td>Probabilistic, resolved by check</td><td>None, but conditional writes</td><td>7</td><td>No</td><td>Natural</td><td>Retry logic, collisions after millions of links</td></tr>
+<tr><td>C. Random + retry</td><td>Probabilistic, resolved by check</td><td>None, but conditional writes</td><td>7</td><td>No</td><td>No</td><td>Retry rate grows as space fills</td></tr>
+<tr><td>D. Snowflake</td><td>Guaranteed (unique machine ids)</td><td>Machine id assignment only</td><td>11</td><td>Partly (time-ordered)</td><td>No</td><td>Clock skew; long codes</td></tr>
+</table>
+<p><b>Decision:</b> counter ranges with a keyed permutation. Uniqueness is structural, so the create path is one conditional write that can never legitimately fail on a generated code (the condition is a safety net, not the mechanism), and tail latency stays low. Hashing is kept as a secondary index only if the product wants "same URL, same user, same code" deduplication (section 9.4).</p>
+<h3>8.7 Custom aliases and the shared namespace</h3>
+<p>Custom aliases such as <code>summer</code> live in the same keyspace as generated codes, so a user could choose <code>aZ3k9Qb</code> and later collide with a generated code. Three rules prevent trouble. First, custom aliases must not look like generated codes: require length different from 7 or require at least one character outside the generated alphabet, such as a hyphen (<code>my-sale</code>). We pick: generated codes are exactly 7 base62 characters; aliases are 3 to 30 characters from <code>[a-z0-9-]</code> and must not be exactly 7 characters of pure base62. Second, reserve words (<code>api</code>, <code>admin</code>, <code>login</code>, <code>static</code>, and offensive terms) are rejected. Third, the insert is conditional, so two users racing for the same alias get exactly one winner and one 409 Conflict. Aliases are case-insensitive for the alias namespace (store lowercase) to avoid look-alike impersonation.</p>
+
+<h2 id="redirects">9. Deep dive 2: 301 versus 302, caching and analytics</h2>
+<h3>9.1 What the two codes mean</h3>
+<p>Both 301 and 302 tell the browser "the resource is at the URL in the <code>Location</code> header". The difference is permanence. <b>301 Moved Permanently</b> says the move is permanent, so browsers and intermediaries may cache it, often indefinitely, and search engines transfer ranking to the target. <b>302 Found</b> (a temporary redirect) says do not remember this; ask again next time. There are also 307 and 308 (the same as 302 and 301 but forbidding a method change from POST to GET); for simple GET redirects 301 and 302 behave the same in practice.</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 340" role="img" aria-label="301 versus 302 behavior over two visits">
+  <text class="t-b" x="20" y="24">301 Moved Permanently</text>
+  <rect class="ext" x="30" y="40" width="110" height="40" rx="8"/><text class="t-c t-b" x="85" y="65">Browser</text>
+  <rect class="box" x="380" y="40" width="140" height="40" rx="8"/><text class="t-c t-b" x="450" y="65">Shortener</text>
+  <rect class="ext" x="780" y="40" width="130" height="40" rx="8"/><text class="t-c t-b" x="845" y="65">Destination</text>
+  <path class="arrow" d="M140 52 L376 52"/><text class="t-sm" x="170" y="46">visit 1: GET short, 301 returned</text>
+  <path class="arrow-g dash" d="M85 82 L85 120 L776 120"/><text class="t-sm" x="300" y="113">visit 2: browser remembers, goes straight to destination (shortener never sees it)</text>
+  <text class="t-sm" x="30" y="150">Effect: fast and cheap, but clicks after the first are invisible to analytics, and you cannot change or disable the link for that browser.</text>
+  <text class="t-b" x="20" y="195">302 Found</text>
+  <rect class="ext" x="30" y="211" width="110" height="40" rx="8"/><text class="t-c t-b" x="85" y="236">Browser</text>
+  <rect class="box" x="380" y="211" width="140" height="40" rx="8"/><text class="t-c t-b" x="450" y="236">Shortener</text>
+  <rect class="ext" x="780" y="211" width="130" height="40" rx="8"/><text class="t-c t-b" x="845" y="236">Destination</text>
+  <path class="arrow" d="M140 223 L376 223"/><text class="t-sm" x="170" y="217">every visit hits the shortener first</text>
+  <path class="arrow-g" d="M524 233 L776 233"/><text class="t-sm" x="560" y="227">then onwards</text>
+  <text class="t-sm" x="30" y="285">Effect: one extra hop per click (tens of ms), but every click is counted, links can expire or change, and abuse takedown is immediate.</text>
+</svg>
+<figcaption>With 301 the browser skips the shortener after the first visit. With 302 the shortener is in the path of every click.</figcaption>
+</figure>
+<h3>9.2 Trade-offs</h3>
+<table>
+<tr><th>Concern</th><th>301</th><th>302</th></tr>
+<tr><td>Server load</td><td>Lower: repeat visitors by the same browser skip us.</td><td>Higher: every click arrives.</td></tr>
+<tr><td>Analytics</td><td>Undercounts; repeat clicks never reach us.</td><td>Accurate.</td></tr>
+<tr><td>Changing or disabling a link</td><td>Hard: browsers and CDNs may cache for months; cannot be revoked.</td><td>Easy: change takes effect on the next click.</td></tr>
+<tr><td>Expiry</td><td>Cached copies outlive the expiry.</td><td>Honored within cache TTL.</td></tr>
+<tr><td>SEO</td><td>Passes link equity to the destination; good for permanent vanity links.</td><td>Not treated as a permanent move.</td></tr>
+<tr><td>Abuse response</td><td>Poor: a malicious redirect lingers in browsers.</td><td>Good.</td></tr>
+</table>
+<p><b>Decision.</b> Default to 302 with <code>Cache-Control: private, max-age=0</code> (or a very short value) because analytics, expiry, and takedown are core requirements. Offer 301 as an opt-in for owners who explicitly accept the loss of analytics and revocability. This is a classic requirements-driven choice: if the product were a pure permanent-vanity-URL service with no analytics, 301 would be right and would cut traffic dramatically. When 301 is used, set a finite <code>max-age</code> (for example one day) instead of leaving the default heuristics, so mistakes can eventually heal.</p>
+<h3>9.3 Caching the hot read path, layer by layer</h3>
+<p>Redirects are the textbook cache-aside workload (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>): the data is small, read many times, written once, and the key is exact. We stack three layers.</p>
+<ol>
+<li><b>In-process cache (per redirect instance).</b> An LRU of about 10,000 entries with a 5 to 30 second TTL. It absorbs a link going viral: if one code receives 50,000 requests per second across 20 instances, each instance sees 2,500 per second, and the local cache turns it into one Redis read per TTL per instance. It also protects against a "hot key" melting a single Redis shard.</li>
+<li><b>Redis cluster.</b> Cache-aside with key <code>l:{code}</code> and value of the long URL plus flags and expiry. TTL 24 hours with random jitter of plus or minus 10%, so many entries created together do not expire together. Eviction policy allkeys-lru. Sizing is the 20 GB computed in section 3.5.</li>
+<li><b>CDN or edge (optional).</b> For 301 links and 302 links marked "cacheable for 60 seconds", the edge can answer without reaching the origin, and an edge worker can even compute the redirect itself. This makes global redirect latency tens of milliseconds, at the price of slightly stale revocation. See <a href="../chapters/12-cdn.html">Chapter 12</a>. Analytics must then be collected from edge logs rather than origin events.</li>
+</ol>
+<p>Failure patterns to defend against, from <a href="../chapters/14-caching-failures.html">Chapter 14</a>:</p>
+<ul>
+<li><b>Cache stampede.</b> A hot entry expires and 5,000 concurrent requests all miss together. Mitigation: request coalescing (only one in-flight database read per code per instance, others wait for it), jittered TTLs, and refresh-ahead for the very hottest keys.</li>
+<li><b>Cache penetration.</b> Scanners request random nonexistent codes, each a guaranteed miss. Mitigation: the strict pattern check, negative caching for 30 to 60 seconds, and optionally a Bloom filter of all existing codes in front of the database (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>) so "definitely does not exist" is answered from memory.</li>
+<li><b>Staleness after change.</b> On delete, disable, or edit, the create/admin service updates the database first, then deletes the Redis key and publishes an invalidation message to the instances' local caches. Worst case, a missed message is bounded by the local TTL (30 seconds), which fits the "one minute stale is acceptable" requirement. For abuse takedowns, a separate small "denylist" is checked on every redirect and pushed to instances immediately.</li>
+<li><b>Cache outage.</b> If Redis dies, the database would receive 100% of reads. The store is sized for the 5% miss rate, not 100%. Mitigation: local caches still absorb much of the load, connection limits and load shedding protect the database, and Redis is deployed with replicas and automatic failover.</li>
+</ul>
+<h3>9.4 Deduplication (same URL, same code?)</h3>
+<p>Should two requests for the same long URL return the same code? Per-user dedupe is a nice feature (clicking "shorten" twice does not create two links), but sharing a code between different users breaks per-user analytics and ownership, and a user deleting it would break the other's link. So we dedupe only within one owner and only when asked, by keeping a secondary index on <code>(owner_id, url_hash)</code>. Anonymous creation always makes a new code. The index is a small table separate from the hot mapping table, so it adds no cost to redirects.</p>
+<h3>9.5 Expiry</h3>
+<p>Expiry has two parts: enforcement and cleanup. Enforcement is done at read time: the redirect service compares <code>expires_at</code> with the current time, and the Redis TTL is set to the lesser of 24 hours and the time remaining, so a cached entry can never outlive the link. Cleanup is lazy plus a sweeper: a background job scans for rows expired more than 30 days ago and moves them to cold storage or deletes them. Codes of deleted links are <b>not</b> reused for a long grace period (and with a 3.5 trillion space we never need to reuse them), because recycling a code would make an old printed link silently open someone else's page, which is both a security and a trust failure.</p>
+
+<h2 id="analytics">10. Deep dive 3: click analytics without slowing redirects</h2>
+<p>The naive approach, incrementing a counter in the link row on every click, creates a write on the read path (100 times more writes than the whole creation workload) and a hot row for viral links. The right approach is to treat a click as an <b>event</b> and move aggregation off the hot path, which is the stream-processing pattern from <a href="../chapters/37-batch-stream.html">Chapter 37</a> and the log architecture from <a href="../chapters/34-queues-kafka.html">Chapter 34</a>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 300" role="img" aria-label="Click analytics pipeline">
+  <rect class="box" x="20" y="110" width="140" height="64" rx="10"/><text class="t-c t-b" x="90" y="136">Redirect service</text><text class="t-c t-sm" x="90" y="156">emit event, no wait</text>
+  <rect class="cache" x="210" y="110" width="140" height="64" rx="10"/><text class="t-c t-b" x="280" y="136">Kafka topic</text><text class="t-c t-sm" x="280" y="156">key = code, 32 parts</text>
+  <rect class="box" x="400" y="40" width="170" height="64" rx="10"/><text class="t-c t-b" x="485" y="66">Stream job</text><text class="t-c t-sm" x="485" y="86">enrich, dedupe, 1-min windows</text>
+  <rect class="box" x="400" y="190" width="170" height="64" rx="10"/><text class="t-c t-b" x="485" y="216">Raw sink</text><text class="t-c t-sm" x="485" y="236">Parquet files, 90 days</text>
+  <rect class="db" x="640" y="40" width="150" height="64" rx="10"/><text class="t-c t-b" x="715" y="66">Aggregates</text><text class="t-c t-sm" x="715" y="86">OLAP store, hourly</text>
+  <rect class="db" x="640" y="190" width="150" height="64" rx="10"/><text class="t-c t-b" x="715" y="216">Object storage</text><text class="t-c t-sm" x="715" y="236">cheap, replayable</text>
+  <rect class="ext" x="830" y="40" width="110" height="64" rx="10"/><text class="t-c t-b" x="885" y="66">Stats API</text><text class="t-c t-sm" x="885" y="86">dashboards</text>
+  <path class="arrow dash" d="M160 142 L206 142"/>
+  <path class="arrow" d="M350 130 L396 85"/>
+  <path class="arrow" d="M350 156 L396 210"/>
+  <path class="arrow" d="M570 72 L636 72"/>
+  <path class="arrow" d="M570 222 L636 222"/>
+  <path class="arrow" d="M790 72 L826 72"/>
+</svg>
+<figcaption>The redirect service only appends to Kafka. A stream job enriches events with country (from the IP address) and device (from the user agent), removes duplicates, and writes one-minute partial counts to the OLAP store; raw events go to object storage for reprocessing.</figcaption>
+</figure>
+<h3>10.1 The event</h3>
+<p>Each event carries a unique event id (a random 128-bit value, used for deduplication), the code, a timestamp, a hashed IP address (never store raw IPs longer than needed; see <a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>), the country resolved at the edge or by a GeoIP lookup, the user agent, and the referrer host. Bots are filtered later by user-agent rules and by suspicious patterns such as many hits from one IP within seconds.</p>
+<h3>10.2 Delivery guarantees and counting</h3>
+<p>Kafka delivers at least once, and the producer may retry, so duplicates occur. The stream job drops events whose id it has already seen in a time window (a state store or a Bloom filter with periodic rotation), producing effectively once counting. For a click counter exact precision is not critical: if the redirect service cannot reach Kafka, it buffers a bounded number of events in memory and on local disk and drops beyond that, preferring a few lost clicks over a failed redirect. Users should be told counts are approximate and eventually consistent, typically within a minute or two.</p>
+<h3>10.3 Hot keys and partitioning</h3>
+<p>If the Kafka key is the code, one viral link puts all its events in one partition, which becomes a hot partition. Mitigations: key by <code>code + random bucket (0 to 7)</code> so one link spreads over 8 partitions, and sum the buckets downstream; or let the stream job pre-aggregate in the redirect service itself (each instance counts clicks per code in memory and flushes a delta every second). Local pre-aggregation reduces 20,000 events per second to perhaps 1,000 deltas per second and is the cheapest fix, at the cost of losing per-event detail unless we also log raw events. A common compromise: send raw events to the log (for flexible analysis) and also maintain real-time approximate counters in Redis with <code>INCR</code> for the "total clicks" number shown immediately in the UI.</p>
+<h3>10.4 Options compared</h3>
+<table>
+<tr><th>Approach</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Increment a column on the link row</td><td>Trivial.</td><td>Write per click on the hot path, hot row, no breakdowns.</td></tr>
+<tr><td>Redis counters only</td><td>Fast, simple totals.</td><td>No breakdowns, data loss on failure, no history.</td></tr>
+<tr><td>Log events to Kafka, aggregate in a stream job</td><td>Off hot path; replayable; supports any breakdown; scales independently.</td><td>More components; eventual consistency; bots and duplicates to handle.</td></tr>
+<tr><td>Parse CDN or load balancer access logs in batch</td><td>Zero extra code in the service; works for edge-cached hits.</td><td>Hours of delay; less rich fields.</td></tr>
+</table>
+<p>We choose the Kafka pipeline plus Redis totals. Batch processing of raw files (a nightly job) is the safety net that corrects the streaming numbers and powers re-computation if a bug is found; this is the lambda-style pairing discussed in <a href="../chapters/37-batch-stream.html">Chapter 37</a>.</p>
+
+<h2 id="scaling">11. Scaling, sharding and hot spots</h2>
+<h3>11.1 Stateless tiers</h3>
+<p>The redirect and create services hold no durable state, so scaling them is a matter of adding instances behind the load balancer and letting an autoscaler react to CPU and request rate (<a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>). 20,000 requests per second at about 2,000 per instance gives 10 instances, plus a margin for failures and deploys: 20 to 30.</p>
+<h3>11.2 Sharding the link store</h3>
+<p>3 TB with 20,000 reads per second can technically live on a large replicated database, but we shard for operational reasons: faster backups, smaller failure domains, and room for 10x. The partitioning rules from <a href="../chapters/25-sharding.html">Chapter 25</a> apply.</p>
+<figure class="diagram">
+<svg viewBox="0 0 920 300" role="img" aria-label="Sharding by hash of code">
+  <rect class="box" x="30" y="110" width="170" height="60" rx="10"/><text class="t-c t-b" x="115" y="136">Service instance</text><text class="t-c t-sm" x="115" y="155">h = hash(code) mod 4096</text>
+  <rect class="cache" x="290" y="110" width="170" height="60" rx="10"/><text class="t-c t-b" x="375" y="136">Shard map</text><text class="t-c t-sm" x="375" y="155">4096 slots to 16 nodes</text>
+  <rect class="db" x="580" y="20" width="150" height="50" rx="10"/><text class="t-c t-b" x="655" y="41">Node 1</text><text class="t-c t-sm" x="655" y="58">slots 0-255</text>
+  <rect class="db" x="580" y="90" width="150" height="50" rx="10"/><text class="t-c t-b" x="655" y="111">Node 2</text><text class="t-c t-sm" x="655" y="128">slots 256-511</text>
+  <rect class="db" x="580" y="160" width="150" height="50" rx="10"/><text class="t-c t-b" x="655" y="181">Node ...</text><text class="t-c t-sm" x="655" y="198">more slots</text>
+  <rect class="db" x="580" y="230" width="150" height="50" rx="10"/><text class="t-c t-b" x="655" y="251">Node 16</text><text class="t-c t-sm" x="655" y="268">slots 3840-4095</text>
+  <rect class="hit" x="770" y="20" width="130" height="50" rx="10"/><text class="t-c t-sm" x="835" y="40">replica A, B</text><text class="t-c t-sm" x="835" y="56">per node</text>
+  <path class="arrow" d="M200 140 L286 140"/>
+  <path class="arrow" d="M460 130 L576 50"/>
+  <path class="arrow" d="M460 135 L576 115"/>
+  <path class="arrow" d="M460 145 L576 185"/>
+  <path class="arrow" d="M460 155 L576 255"/>
+  <path class="arrow dash" d="M730 45 L766 45"/>
+</svg>
+<figcaption>The partition key is the code itself. Because permuted codes look random, a hash of the code spreads rows evenly. A fixed number of slots (4,096) is mapped to nodes, so adding a node moves whole slots without rehashing every key.</figcaption>
+</figure>
+<p><b>Shard by the code.</b> The redirect lookup is always by code, so a single-shard read serves every redirect, with no scatter-gather. Hash partitioning of the code gives even data and load; range partitioning would funnel new sequential codes to one shard, which is why the permutation in section 8.2 helps even here. Use many more logical slots than machines (4,096 slots over 16 nodes), so moving a slot is a copy of a small piece; this is the virtual-node idea from consistent hashing (<a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>).</p>
+<p><b>The "my links" query</b> asks for all links by owner, which crosses shards because owners' links are scattered by code. Keep a separate index table partitioned by <code>owner_id</code> containing <code>(owner_id, created_at, code)</code>, updated on create (asynchronously through a queue, or in the same write as a transaction-less dual write with a repair job). Reads of the dashboard tolerate a second of lag.</p>
+<p>Each shard has one leader and two followers (<a href="../chapters/24-replication.html">Chapter 24</a>). Redirect misses can read from followers, since a row never changes after creation except status; the rare delete reads the leader for correctness when it matters (the abuse path).</p>
+<h3>11.3 Hot spots</h3>
+<p>A viral link is a hot key rather than a hot shard problem: one code gets, say, 100,000 reads per second. The in-process cache plus Redis replicas for hot keys plus the CDN make it harmless. Writes are never hot, since every link is written once. Creation bursts, such as a marketing system creating a million links in a minute, are handled by the rate limiter (per-owner quotas, token bucket) and by the fact that allocation is local.</p>
+<h3>11.4 Rate limits</h3>
+<p>Creation is limited per API key and per IP (for example 100 per hour anonymous, 10,000 per day free tier). Redirects have a generous per-IP limit that mostly exists to protect against floods, enforced at the edge or gateway (<a href="../chapters/11-api-gateway.html">Chapter 11</a>). Algorithm details live in <a href="../chapters/16-rate-limiting.html">Chapter 16</a>.</p>
+
+<h2 id="multi-region">12. Multi-region</h2>
+<p>Users are global, and a redirect crossing an ocean adds 150 ms. Since reads dominate and a link never changes after creation, the data is ideal to replicate everywhere (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>).</p>
+<figure class="diagram">
+<svg viewBox="0 0 960 330" role="img" aria-label="Multi-region deployment">
+  <text class="t-b" x="20" y="24">Region US (home for US-created links)</text>
+  <rect class="box" x="20" y="40" width="160" height="50" rx="10"/><text class="t-c t-b" x="100" y="62">Redirect + Create</text><text class="t-c t-sm" x="100" y="79">local range allocator</text>
+  <rect class="cache" x="210" y="40" width="120" height="50" rx="10"/><text class="t-c t-b" x="270" y="62">Redis</text><text class="t-c t-sm" x="270" y="79">local cache</text>
+  <rect class="db" x="20" y="110" width="310" height="56" rx="10"/><text class="t-c t-b" x="175" y="134">Link store (replica set, US)</text><text class="t-c t-sm" x="175" y="152">accepts writes for codes with prefix 0-2</text>
+  <text class="t-b" x="400" y="24">Region EU</text>
+  <rect class="box" x="400" y="40" width="160" height="50" rx="10"/><text class="t-c t-b" x="480" y="62">Redirect + Create</text><text class="t-c t-sm" x="480" y="79">local range allocator</text>
+  <rect class="cache" x="590" y="40" width="120" height="50" rx="10"/><text class="t-c t-b" x="650" y="62">Redis</text><text class="t-c t-sm" x="650" y="79">local cache</text>
+  <rect class="db" x="400" y="110" width="310" height="56" rx="10"/><text class="t-c t-b" x="555" y="134">Link store (replica set, EU)</text><text class="t-c t-sm" x="555" y="152">accepts writes for codes with prefix 3-5</text>
+  <text class="t-b" x="760" y="24">Region APAC</text>
+  <rect class="box" x="760" y="40" width="160" height="50" rx="10"/><text class="t-c t-b" x="840" y="62">Redirect + Create</text><text class="t-c t-sm" x="840" y="79">local range allocator</text>
+  <rect class="db" x="760" y="110" width="170" height="56" rx="10"/><text class="t-c t-b" x="845" y="134">Link store (APAC)</text><text class="t-c t-sm" x="845" y="152">prefix 6-8</text>
+  <path class="arrow dash" d="M330 138 L396 138"/><path class="arrow dash" d="M710 138 L756 138"/>
+  <text class="t-sm" x="20" y="200">Async replication copies every row to all regions (seconds). Each region's ID ranges come from disjoint blocks, so no two regions ever mint the same code.</text>
+  <text class="t-sm" x="20" y="224">Redirect: served by the nearest region (GeoDNS or anycast) from local cache, then local replica; a missing code falls back to the home region once.</text>
+  <text class="t-sm" x="20" y="248">Create: accepted in the nearest region with its own range; the conditional insert is local; the row then replicates out.</text>
+  <text class="t-sm" x="20" y="272">Custom alias: needs a global winner, so the write is routed to a single owning region for that alias (hash of alias), or uses a global store.</text>
+</svg>
+<figcaption>Each region serves reads from local data and can mint new generated codes independently, because the allocator hands out disjoint ranges per region.</figcaption>
+</figure>
+<p><b>Generated codes are conflict-free by construction.</b> Give each region its own pool of blocks (for example, the allocator assigns ranges from distinct segments of the number space, or the region index is part of the number before the permutation). Two regions cannot produce the same number, so asynchronous replication cannot create conflicts for generated codes.</p>
+<p><b>Custom aliases are the hard case.</b> Two users in different regions might claim <code>summer</code> in the same second. Asynchronous replication would accept both locally and discover the conflict later. Options: route all alias claims to one owner region chosen by hashing the alias (the creator pays a cross-region round trip, which is acceptable for a rare action), or use a globally consistent store such as Spanner or a quorum-based database for aliases only. Consistency choices follow <a href="../chapters/28-cap-consistency.html">Chapter 28</a>: for the alias namespace we choose consistency over latency; for redirects we choose availability and speed.</p>
+<p><b>Read-after-create.</b> A user creates a link in the US and a friend clicks it in Europe within 200 ms, before replication arrives. The friend's region gets a local miss. To avoid a false 404, the redirect service on a miss in the local replica asks the code's home region (the prefix identifies it) before giving up, and caches the result. This costs one cross-region call, only for fresh links. Alternatively, return the short URL only after replication to at least one other region (slower creation, stronger guarantee).</p>
+<p><b>Region failure.</b> If a region is lost, traffic shifts through DNS or anycast to another region, which already has every replicated row up to the replication lag. The few links created in the last seconds in the failed region might be missing until it recovers; for a service that treats the link as durable, wait for a second replica acknowledgment on creation (synchronous cross-region copy) at the cost of 50 to 150 ms added to creation latency. Since creation is not the latency-critical path, many designs choose that. Disaster recovery targets are discussed in <a href="../chapters/41-ha-dr.html">Chapter 41</a>.</p>
+
+<h2 id="failures">13. Failure modes and consistency</h2>
+<table>
+<tr><th>Component</th><th>If it fails</th><th>If it is slow</th><th>If it returns wrong data</th><th>Mitigation</th></tr>
+<tr><td>Redis cache</td><td>All reads fall to the store (5% to 100%). Local caches soften it.</td><td>Redirect latency rises.</td><td>Stale URL after update.</td><td>Replicas and failover, load shedding to protect the store, client timeouts of 20 ms then fall through to the store, short local TTLs, invalidation on edit.</td></tr>
+<tr><td>Link store shard</td><td>That shard's cache misses fail; cached links still work. Writes to the shard fail.</td><td>Misses slow.</td><td>Lost write if async replica promoted.</td><td>Leader plus two followers, automatic failover, serve stale cache entries beyond TTL when the store is down ("stale-if-error"), writes retried on a new range.</td></tr>
+<tr><td>ID allocator</td><td>Creates continue from local blocks, then fail with 503.</td><td>Block refill stalls.</td><td>Reissued range if state lost.</td><td>Three-node consensus store, large blocks, persist before hand-out, alert when allocator latency exceeds 1 s.</td></tr>
+<tr><td>Kafka</td><td>Redirects unaffected. Events buffered then dropped.</td><td>Producer buffer fills.</td><td>Duplicates.</td><td>Async, bounded buffer, drop-oldest, dedupe by event id, count lost events as a metric.</td></tr>
+<tr><td>Safety checker</td><td>Create requests could be blocked or unchecked.</td><td>Create latency.</td><td>False positive blocks good URL.</td><td>Fail open for trusted users and queue a re-scan, fail closed for anonymous users, appeal path.</td></tr>
+<tr><td>Redirect service instance</td><td>Load balancer health checks remove it.</td><td>Slow instance drags p99.</td><td>Bad deploy returns wrong URL.</td><td>Many instances, outlier ejection, canary deploys with automatic rollback.</td></tr>
+</table>
+<h3>13.1 Consistency decisions</h3>
+<ul>
+<li>The link row is <b>write-once</b> for the destination. A code maps to one long URL for life; edits (if a product allows them) create a new version and invalidate caches. This immutability is what makes aggressive caching and multi-region replication safe.</li>
+<li>Uniqueness is enforced by a single atomic conditional insert at the owning shard, not by a read-then-write. A read-check-then-insert has a race: two creators both see "free" and both insert.</li>
+<li>Status (active, disabled, deleted) is the only mutable field. Reads tolerate bounded staleness, 30 to 60 seconds, except for the abuse denylist, which is pushed.</li>
+<li>Idempotent creation: the client's <code>Idempotency-Key</code> maps to the resulting code in a small table with a 24 hour TTL, so a retry after a timeout returns the same code instead of a second one. A subtle point is that the key and the link must be written atomically (the same shard), or the key table must be written first with a pending state; see <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>.</li>
+</ul>
+
+<h2 id="security">14. Security, abuse, monitoring and cost</h2>
+<h3>14.1 Abuse and malware</h3>
+<p>Shorteners hide the destination, which makes them favorites for phishing and malware distribution. A responsible design assumes abuse from day one.</p>
+<ul>
+<li><b>At creation:</b> check the destination host and full URL against threat-intelligence lists (Google Safe Browsing style services, internal blocklists), reject URLs pointing at private IP ranges, localhost, or the shortener's own domain (to prevent loops and SSRF-style probing from any later preview feature), require CAPTCHA or an account after a threshold, and rate limit per account and per IP.</li>
+<li><b>After creation:</b> a re-scan job checks destinations periodically, because a benign page can be swapped for a malicious one later. On a hit the link status becomes disabled and a denylist update is pushed to all instances, so the redirect shows an interstitial warning page or a 451/404 within seconds.</li>
+<li><b>Interstitial and preview:</b> for new or low-reputation links, show a "you are about to visit..." page, which also defeats some phishing. A <code>+</code> suffix (<code>sho.rt/aZ3k9Qb+</code>) can show the destination without following it.</li>
+<li><b>Open redirect and header injection:</b> validate the URL and encode it properly when placing it in the <code>Location</code> header, rejecting control characters and newlines to prevent response splitting. Only allow http and https schemes; never <code>javascript:</code> or <code>data:</code>.</li>
+<li><b>Enumeration and privacy:</b> permuted codes plus 404 rate limiting prevent harvesting; for sensitive links offer longer, random codes (12 characters) and optional password protection.</li>
+<li><b>Abuse takedown tooling:</b> admins can disable by code, by domain (all links to evil.example), or by owner, with audit logs. General guidance is in <a href="../chapters/55-security.html">Chapter 55</a>.</li>
+</ul>
+<h3>14.2 Monitoring and SLOs</h3>
+<p>The service-level objectives follow from the requirements, and the approach is from <a href="../chapters/54-observability-slos.html">Chapter 54</a>.</p>
+<table>
+<tr><th>SLI</th><th>SLO</th><th>Alert when</th></tr>
+<tr><td>Redirect success (non-5xx, excluding valid 404/410) </td><td>99.99% over 30 days</td><td>Burn rate over 14x in 1 hour</td></tr>
+<tr><td>Redirect latency at the server</td><td>p99 under 50 ms, p50 under 5 ms</td><td>p99 above 100 ms for 5 minutes</td></tr>
+<tr><td>Create success</td><td>99.9%</td><td>Error rate above 1% for 5 minutes</td></tr>
+<tr><td>Cache hit ratio</td><td>above 95%</td><td>Below 90% (indicates penetration or eviction pressure)</td></tr>
+<tr><td>Analytics freshness</td><td>95% of clicks visible within 2 minutes</td><td>Consumer lag above 5 minutes</td></tr>
+<tr><td>Allocator remaining range</td><td>At least 10 minutes of headroom per instance</td><td>Refill failures</td></tr>
+</table>
+<p>Also track: 404 rate per source IP (scanners), creation rate per owner, malicious-block counts, and the Kafka drop counter.</p>
+<h3>14.3 Cost</h3>
+<p>Compute is small: about 30 redirect instances and 6 create instances. The link store at 3 TB with 3 replicas is about 9 TB of SSD. Redis at 20 GB with replicas is a few hundred dollars a month. The dominant cost in practice is analytics: 70 GB per day raw events, mostly storage and the stream cluster. Control it by sampling or aggregating early, keeping raw data for 30 to 90 days in compressed Parquet, and keeping only aggregates beyond that. A CDN reduces origin compute but adds per-request fees; at a few thousand requests per second the origin is usually cheaper than the CDN for 302s, so use the CDN selectively.</p>
+
+<h2 id="evolution">15. Evolution and phasing</h2>
+<h3>15.1 What to build first</h3>
+<ol>
+<li><b>Phase 1 (week 1):</b> one region, a SQL primary with replica, a single create/redirect service, random 7-character codes with a conditional insert, 302 redirects, Redis cache-aside. This handles hundreds of redirects per second and is correct.</li>
+<li><b>Phase 2:</b> separate the create and redirect services, introduce the counter-range allocator with the permutation, add the Kafka click pipeline and a stats API, add blocklist checks and rate limits.</li>
+<li><b>Phase 3:</b> shard the store, add the in-process cache and Bloom filter, add the CDN path for opt-in 301 links.</li>
+<li><b>Phase 4:</b> multi-region replication, custom-domain support, abuse scanning loops, full SLO dashboards.</li>
+</ol>
+<h3>15.2 At 10x scale</h3>
+<p>At 1 billion new links a month and 200,000 peak redirects per second: the cache grows to about 200 GB across more Redis shards, the link store to 30 TB across 64 or more nodes (the slot mapping makes this a rebalance rather than a redesign), 7 characters still suffice for five years (60 billion links in a 3.5 trillion space, 1.7% fill), and Kafka goes from tens to hundreds of partitions. The hot-key defenses and local pre-aggregation become mandatory rather than nice to have. Edge compute (running the redirect in a CDN worker with a replicated key-value store) becomes attractive to cut global latency further.</p>
+<h3>15.3 Alternatives not chosen</h3>
+<ul>
+<li><b>Pure hashing of the long URL</b> gives free dedupe but needs collision logic and weakens per-owner analytics.</li>
+<li><b>Auto-increment from one database</b> is simplest but a single point of failure, and sequential codes are enumerable.</li>
+<li><b>A fully serverless design</b> (edge function plus managed key-value store) minimizes operations; it is a good answer for a small team but gives less control over caching layers and analytics.</li>
+<li><b>Bigger alphabet (Unicode)</b> would shorten codes but breaks copy-paste and typing; not worth it.</li>
+</ul>
+
+<h2 id="qa">16. Interview Q&amp;A</h2>
+<details><summary>Why not use an auto-increment column and encode it? What goes wrong at scale?</summary>
+<p>A single auto-increment works until you have multiple writers or shards: it becomes a single point of failure and a serialization bottleneck, and it exposes sequential codes that anyone can enumerate. The fix is to keep the counter idea but lease ranges of numbers to each create server, so the central allocator is touched once per thousand links, and to apply a keyed bijective permutation before base62 encoding so codes look random. Uniqueness stays guaranteed by construction because ranges never overlap.</p></details>
+<details><summary>How many characters do you need, and how did you decide?</summary>
+<p>We expect 6 billion links in five years. Base62 with 6 characters gives about 56.8 billion codes, with 7 gives about 3.52 trillion. Six would fit but would be 10% full, causing noticeable collision retries for random schemes and leaving little room for growth or custom aliases. Seven characters keeps the fill under 0.2% and survives a 10x growth, at the cost of just one extra character in the URL.</p></details>
+<details><summary>What happens when two users submit the same long URL at the same time?</summary>
+<p>By default each request gets its own code, because per-link ownership and analytics matter, so there is no conflict at all. If the product offers per-owner dedupe, we look up <code>(owner_id, url_hash)</code> and return the existing code, and we guard the race between two concurrent first-time requests with a unique constraint on that pair, so one insert wins and the other re-reads and returns the winner's code. Different owners never share a code.</p></details>
+<details><summary>Why 302 instead of 301? When would you use 301?</summary>
+<p>A 301 can be cached permanently by browsers and intermediaries, so repeat clicks never reach us. That removes analytics for those clicks and prevents us from expiring, editing, or disabling a link for browsers that have already cached it. Because analytics, expiry and abuse takedown are requirements, 302 is the default. For a permanent vanity link with no analytics need, 301 reduces load and passes search ranking to the destination, so we allow it as an explicit opt-in with a finite max-age.</p></details>
+<details><summary>A single link goes viral with 100,000 requests per second. What breaks and how do you protect it?</summary>
+<p>The risk is one hot key: all those requests hit the same Redis shard and, on expiry, a stampede hits the database. We defend in layers. Each redirect instance has a small in-process cache with a short TTL, which turns the load into a handful of Redis reads. Redis keys have jittered TTLs and request coalescing so only one fetch per instance refills an expired entry. For known hot links we can replicate the key across several cache nodes, and a CDN can serve opted-in links entirely at the edge.</p></details>
+<details><summary>How do you count clicks without slowing down redirects or losing accuracy?</summary>
+<p>The redirect only appends an event to Kafka, asynchronously, and returns immediately. A stream job deduplicates events by event id, enriches them with country and device, and writes windowed aggregates to an OLAP store, while raw events go to object storage so a nightly batch can recompute and correct the numbers. If Kafka is unreachable, the service buffers a bounded number of events and then drops them, because losing some clicks is better than failing redirects. The dashboard shows eventually consistent counts, usually within a minute or two.</p></details>
+<details><summary>How do you handle custom aliases that might collide with generated codes or each other?</summary>
+<p>We separate the namespaces by format: generated codes are exactly seven base62 characters, while aliases are 3 to 30 characters from lowercase letters, digits and hyphens and may not be exactly seven pure-base62 characters. Reserved words are rejected. The insert is a conditional write, so when two people race for the same alias exactly one succeeds and the other gets 409 Conflict. In multi-region, alias claims are routed to a single owning region or a strongly consistent store, because asynchronous replication could otherwise accept both.</p></details>
+<details><summary>How do you shard the link store, and what about the "list my links" query?</summary>
+<p>We partition by a hash of the code into 4,096 logical slots mapped to physical nodes, because redirects look up by code and that gives single-shard reads and even distribution. Slots move between nodes when we add capacity, without rehashing everything. Listing links by owner would require scattering across all shards, so we maintain a second table partitioned by owner id holding the owner's codes, updated asynchronously on creation, with a repair job to fix any missed updates.</p></details>
+<details><summary>How do you stop the service being used for phishing and malware?</summary>
+<p>At creation we check the destination against threat-intelligence and blocklists, reject private addresses and loops, and rate limit by account and IP, with CAPTCHAs for anonymous users. After creation we rescan destinations periodically since a page can turn malicious later, and a disable action pushes to a denylist that every redirect instance checks, so takedown takes seconds. Using 302 rather than 301 matters here, since browsers do not cache the redirect and the block takes effect on the next click. We also offer a preview page for low-reputation links.</p></details>
+<details><summary>What does the system do if a region goes down, and how do you avoid false 404s for new links?</summary>
+<p>Traffic is steered to another region by DNS or anycast, and that region already holds every link replicated up to the replication lag, so redirects continue. A link created moments before the failure may not have replicated; to bound this we can require a second-region acknowledgment before returning success on creation, trading some creation latency. For links that are created in one region and clicked in another before replication arrives, a local miss falls back once to the code's home region, which is identifiable from the code, and the result is cached.</p></details>
+<details><summary>Hash the URL versus a counter: how would you defend each choice?</summary>
+<p>Hashing gives deduplication and needs no coordinator, but it has probabilistic collisions that appear after only millions of links (birthday bound) and needs retry logic and conditional writes on every insert. A counter with leased ranges makes uniqueness structural, needs one tiny coordinator touched rarely, and produces compact codes, but needs a permutation to stop enumeration and a secondary index if you want dedupe. I choose the counter because collisions are the kind of rare bug that is expensive to debug, and uniqueness by construction removes the whole class.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">17. Recap</h2>
+<ul>
+<li>Scale: 100 million links a month is only 40 creations per second, but 100:1 reads give 4,000 redirects per second on average and 20,000 at peak; 6 billion rows is about 3 TB; the cache working set is about 20 GB.</li>
+<li>Codes: 7 base62 characters (3.5 trillion codes), produced from leased counter ranges and a keyed permutation. Uniqueness is guaranteed by construction, and a conditional insert is the safety net. Hashing and random codes need collision handling; Snowflake IDs give 11-character codes.</li>
+<li>Redirects: 302 by default so every click is counted and links can be revoked; 301 is opt-in for permanent links without analytics.</li>
+<li>Hot path: in-process cache, then Redis cache-aside with jittered TTLs, request coalescing, negative caching and a Bloom filter; the link row is immutable so caching and replication are safe.</li>
+<li>Analytics: events to Kafka asynchronously, stream aggregation, raw files for recomputation, and eventually consistent counts.</li>
+<li>Data: sharded key-value store partitioned by a hash of the code with many logical slots; a separate owner index for "my links".</li>
+<li>Multi-region: replicate everywhere, per-region ID ranges avoid conflicts, aliases need a single owner, fresh-link misses fall back to the home region.</li>
+<li>Abuse: scan at creation and afterwards, rate limit, denylist pushed instantly, preview pages.</li>
+</ul></div>
+<p class="connects"><b>Connects to:</b> follows the <a href="../chapters/01-interview-framework.html">Chapter 1</a> framework and the <a href="../chapters/02-estimation.html">Chapter 2</a> arithmetic; API conventions in <a href="../chapters/05-api-design.html">Chapter 5</a>; balancing in <a href="../chapters/09-load-balancing.html">Chapter 9</a>; edge caching in <a href="../chapters/12-cdn.html">Chapter 12</a>; cache patterns and failures in <a href="../chapters/13-caching-patterns.html">Chapter 13</a> and <a href="../chapters/14-caching-failures.html">Chapter 14</a>; <a href="../chapters/15-redis.html">Chapter 15</a>; <a href="../chapters/16-rate-limiting.html">Chapter 16</a>; stores in <a href="../chapters/20-nosql.html">Chapter 20</a>; replication and sharding in <a href="../chapters/24-replication.html">Chapter 24</a> and <a href="../chapters/25-sharding.html">Chapter 25</a>; multi-region in <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>; consistency in <a href="../chapters/28-cap-consistency.html">Chapter 28</a>; unique IDs and idempotency in <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>; Kafka and stream processing in <a href="../chapters/34-queues-kafka.html">Chapter 34</a> and <a href="../chapters/37-batch-stream.html">Chapter 37</a>; observability in <a href="../chapters/54-observability-slos.html">Chapter 54</a>; security in <a href="../chapters/55-security.html">Chapter 55</a>; Bloom filters and consistent hashing in <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

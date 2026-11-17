@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 47: Service Communication and Contracts | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="47-service-communication">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Chapter 47 · Module 7 · Microservices</div>
+<h1>Service Communication and Contracts</h1>
+<p class="lead">Once a system is split into services (<a href="44-monolith-to-microservices.html">Chapter 44</a>, <a href="45-decomposition.html">Chapter 45</a>, <a href="46-microservice-data.html">Chapter 46</a>), everything those services do together happens over a network, and the agreement about what they say to each other becomes the most important thing you own. This chapter covers how to choose between synchronous calls and asynchronous messages, what chains of calls do to availability and latency, how to write contracts and evolve them without breaking anyone, and how to handle errors, retries, and deadlines across service boundaries.</p>
+
+<h2 id="why">1. Why communication is the hard part of microservices</h2>
+
+<p>In a monolith, one part of the code calls another by calling a function. That call takes nanoseconds, cannot be lost, cannot time out, and is checked by the compiler: if you rename a parameter, the build fails until every caller is fixed. When you split the monolith into services, each of those function calls may become a network call, and every one of those guarantees disappears. The call can be slow, can fail halfway, can be delivered twice, and the "compiler" that used to check both sides is now a separate team's deployment pipeline that you cannot see.</p>
+
+<p>Two questions therefore decide whether a microservice architecture works in practice:</p>
+<ol>
+  <li><b>How do services talk?</b> Do they call each other and wait (synchronous), or hand over a message and move on (asynchronous)? This choice determines how failures spread and how fast the system feels.</li>
+  <li><b>What exactly do they promise each other?</b> The shape of requests, responses, and events, plus the rules for changing that shape over time, is the <b>contract</b>. Teams deploy independently only if the contract is explicit and changes to it are safe.</li>
+</ol>
+
+<div class="callout key"><b>Key idea</b>
+A service boundary is a public API even if it is "internal". The moment a second team depends on it, you have customers, and the rules of public API design (stability, compatibility, deprecation, documentation) apply. Most painful microservice incidents are not caused by a service being down. They are caused by one service changing something another service silently relied on.</div>
+
+<p>This chapter owns the cross-service communication view. The details of REST, HTTP semantics, pagination and GraphQL syntax live in <a href="05-api-design.html">Chapter 5</a>; serialization formats and their encoding costs live in <a href="07-serialization.html">Chapter 7</a>; the internals of brokers and logs live in <a href="34-queues-kafka.html">Chapter 34</a>; and coordinating multi-service business transactions is the subject of <a href="48-sagas.html">Chapter 48</a>. Here we focus on the decisions and the contract discipline that sit between them.</p>
+
+<h2 id="sync-async">2. Synchronous versus asynchronous communication</h2>
+
+<h3>2.1 Synchronous request/response</h3>
+<p>In <b>synchronous</b> communication the caller sends a request and <b>waits</b> for the reply before continuing. The caller is blocked (or holds a connection and a thread or coroutine) for the duration. The two protocols you will meet most are:</p>
+<ul>
+  <li><b>REST over HTTP/JSON.</b> Resources identified by URLs, standard verbs (GET, POST, PUT, DELETE), standard status codes, human-readable bodies. It is universal, easy to debug with a browser or <code>curl</code>, cacheable by HTTP infrastructure, and works across organisation boundaries. The costs are verbose text payloads and no built-in schema enforcement unless you add one (OpenAPI, section 6). See <a href="05-api-design.html">Chapter 5</a>.</li>
+  <li><b>gRPC over HTTP/2 with Protocol Buffers.</b> You define services and messages in a <code>.proto</code> file and generate client and server code. Payloads are compact binary, one connection carries many concurrent calls, and the framework gives you deadlines, streaming, and typed stubs. The costs are poor browser support without a proxy, harder manual debugging, and some load-balancing traps (section 15).</li>
+</ul>
+<p>The defining property of both is that the answer comes back on the same connection while the caller waits. That makes the programming model simple (you write <code>total = pricing.quote(cart)</code> and use the result on the next line), but it also welds the caller's fate to the callee's, as the next sections show.</p>
+
+<h3>2.2 Asynchronous messaging and events</h3>
+<p>In <b>asynchronous</b> communication the sender hands a message to an intermediary (a queue or a log such as Kafka, <a href="34-queues-kafka.html">Chapter 34</a>) and continues without waiting for the receiver to process it. The receiver consumes the message whenever it is ready. There are two flavours worth separating:</p>
+<ul>
+  <li>A <b>command</b> (or task message) says "please do this": <code>ChargeCard(order 42, 30.00)</code>. There is one intended handler, and the sender cares that the work happens.</li>
+  <li>An <b>event</b> says "this happened": <code>OrderPlaced(order 42)</code>. The sender does not know or care who listens; zero, one, or twenty consumers can react. Events are facts in the past tense and are not requests.</li>
+</ul>
+<p>The sender and receiver are decoupled in time (the receiver may be down or slow and the message waits), and often in knowledge (the publisher does not know the consumers). The price is that the programming model is harder: there is no immediate answer, results arrive later (or via another message), delivery is typically at-least-once so consumers must tolerate duplicates (<a href="32-idempotency-ids.html">Chapter 32</a>), and tracing "what happened to order 42" means following messages through several systems.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Synchronous call versus asynchronous message flow">
+  <text class="t-b" x="20" y="22">Synchronous: caller waits for every step</text>
+  <rect class="ext" x="30" y="36" width="110" height="34" rx="8"/><text class="t-c t-b" x="85" y="58">Client</text>
+  <rect class="box" x="220" y="36" width="110" height="34" rx="8"/><text class="t-c t-b" x="275" y="58">Order</text>
+  <rect class="box" x="410" y="36" width="110" height="34" rx="8"/><text class="t-c t-b" x="465" y="58">Payment</text>
+  <rect class="box" x="600" y="36" width="110" height="34" rx="8"/><text class="t-c t-b" x="655" y="58">Email</text>
+  <line class="life" x1="85" y1="70" x2="85" y2="165"/><line class="life" x1="275" y1="70" x2="275" y2="165"/><line class="life" x1="465" y1="70" x2="465" y2="165"/><line class="life" x1="655" y1="70" x2="655" y2="165"/>
+  <path class="arrow" d="M85 90 L271 90"/><text class="t-sm" x="105" y="84">place order</text>
+  <path class="arrow" d="M275 108 L461 108"/><text class="t-sm" x="295" y="102">charge</text>
+  <path class="arrow" d="M465 126 L651 126"/><text class="t-sm" x="485" y="120">send receipt</text>
+  <path class="arrow dash" d="M651 144 L469 144"/><path class="arrow dash" d="M461 154 L279 154"/><path class="arrow dash" d="M271 162 L89 162"/>
+  <text class="t-sm" x="730" y="110">Total latency = sum of all</text>
+  <text class="t-sm" x="730" y="128">steps. If Email is down,</text>
+  <text class="t-sm" x="730" y="146">the whole order fails.</text>
+
+  <text class="t-b" x="20" y="205">Asynchronous: caller records the intent and moves on</text>
+  <rect class="ext" x="30" y="219" width="110" height="34" rx="8"/><text class="t-c t-b" x="85" y="241">Client</text>
+  <rect class="box" x="220" y="219" width="110" height="34" rx="8"/><text class="t-c t-b" x="275" y="241">Order</text>
+  <rect class="cache" x="410" y="219" width="110" height="34" rx="8"/><text class="t-c t-b" x="465" y="241">Broker</text>
+  <rect class="box" x="600" y="219" width="110" height="34" rx="8"/><text class="t-c t-b" x="655" y="241">Payment</text>
+  <rect class="box" x="760" y="219" width="110" height="34" rx="8"/><text class="t-c t-b" x="815" y="241">Email</text>
+  <line class="life" x1="85" y1="253" x2="85" y2="345"/><line class="life" x1="275" y1="253" x2="275" y2="345"/><line class="life" x1="465" y1="253" x2="465" y2="345"/><line class="life" x1="655" y1="253" x2="655" y2="345"/><line class="life" x1="815" y1="253" x2="815" y2="345"/>
+  <path class="arrow" d="M85 272 L271 272"/><text class="t-sm" x="105" y="266">place order</text>
+  <path class="arrow" d="M275 292 L461 292"/><text class="t-sm" x="290" y="286">publish OrderPlaced</text>
+  <path class="arrow-g dash" d="M271 312 L89 312"/><text class="t-sm" x="105" y="306">202 accepted (fast)</text>
+  <path class="arrow dash" d="M469 300 L651 300"/><text class="t-sm" x="500" y="296">later</text>
+  <path class="arrow dash" d="M469 330 L811 330"/><text class="t-sm" x="540" y="324">later (independent)</text>
+</svg>
+<figcaption>In the top flow the user waits for a chain of calls and any failure propagates back. In the bottom flow Order only has to write its own state and publish an event; Payment and Email consume it at their own pace, and a slow Email service cannot fail the order.</figcaption>
+</figure>
+
+<h3>2.3 A decision framework</h3>
+<p>Neither style is better in general. Use the questions below, in order, for each interaction between two services rather than choosing one style for the whole system.</p>
+<ol>
+  <li><b>Does the caller need the answer to continue?</b> A price quote while rendering a cart: yes, so synchronous. Sending a receipt email: no, so asynchronous.</li>
+  <li><b>Must the work succeed before you can tell the user "done"?</b> If the user-visible promise depends on it (the card was actually authorised), you need the result. If you can honestly say "we received your order and will confirm", asynchronous is fine.</li>
+  <li><b>Is it a query or a change?</b> Reads that need fresh data from the owner are naturally synchronous. State changes that other services want to react to are naturally events.</li>
+  <li><b>How many consumers, and do you know them?</b> One known callee suggests a call or a command. An open-ended set of reactors suggests publishing an event.</li>
+  <li><b>What if the callee is down for ten minutes?</b> If the business can tolerate delay, put a queue in between and the outage becomes a backlog. If it cannot, you need redundancy and a fallback instead (<a href="40-resilience.html">Chapter 40</a>).</li>
+  <li><b>What are the latency and load shapes?</b> Spiky load that the callee cannot absorb is a strong reason for a queue as a shock absorber. Strict end-to-end latency budgets argue for direct calls.</li>
+</ol>
+
+<table>
+  <tr><th>Dimension</th><th>Synchronous (REST / gRPC)</th><th>Asynchronous (queue / log / events)</th></tr>
+  <tr><td>Coupling in time</td><td>Both must be up at the same moment</td><td>Receiver can be down; messages wait</td></tr>
+  <tr><td>Result</td><td>Immediate, in the same call</td><td>Later, via callback, event, or polling</td></tr>
+  <tr><td>Failure spread</td><td>Callee failure becomes caller failure unless contained</td><td>Failure becomes backlog and delay</td></tr>
+  <tr><td>Load handling</td><td>Callee sees the caller's peaks directly</td><td>Broker buffers peaks; consumers drain at their rate</td></tr>
+  <tr><td>Debugging</td><td>Simple request trace</td><td>Needs correlation ids across messages</td></tr>
+  <tr><td>Consistency</td><td>Easier to reason about for a single request</td><td>Eventual; needs idempotent consumers and sagas</td></tr>
+  <tr><td>Best for</td><td>Queries, validation, "need it now" steps</td><td>Notifications, fan-out, workflows, integration across domains</td></tr>
+</table>
+
+<div class="callout tip"><b>Interview tip</b>
+Say out loud which steps in your design are on the synchronous critical path and which are off it. A strong answer looks like: "Placing the order synchronously calls inventory to reserve stock and payment to authorise, because the user needs those answers. Everything else (email, analytics, loyalty points, search indexing) hangs off an OrderPlaced event." Then justify each choice with the questions above.</div>
+
+<h2 id="availability">3. Temporal coupling and the availability of call chains</h2>
+
+<p><b>Temporal coupling</b> means two services must both be healthy at the same instant for a request to succeed. Every synchronous call adds one such requirement. The consequences can be calculated.</p>
+
+<h3>3.1 The multiplication rule</h3>
+<p>If a request needs services A, B, C in series, and each one is independently available with probability p, the request succeeds with probability p times p times p. Services that are each 99.9 percent available ("three nines") sound excellent, but:</p>
+<table>
+  <tr><th>Services in the synchronous chain</th><th>Each at 99.9%</th><th>Downtime per 30 days</th><th>Each at 99.99%</th></tr>
+  <tr><td>1</td><td>99.900%</td><td>about 43 minutes</td><td>99.990%</td></tr>
+  <tr><td>3</td><td>99.700%</td><td>about 2.2 hours</td><td>99.970%</td></tr>
+  <tr><td>5</td><td>99.501%</td><td>about 3.6 hours</td><td>99.950%</td></tr>
+  <tr><td>10</td><td>99.005%</td><td>about 7.2 hours</td><td>99.900%</td></tr>
+  <tr><td>20</td><td>98.019%</td><td>about 14.3 hours</td><td>99.800%</td></tr>
+</table>
+<p>The numbers are computed as 0.999 raised to the number of services; a month of 43,200 minutes at 99.005 percent leaves about 430 minutes (7.2 hours) of failed requests. The lesson is that <b>the availability of a request path is below the availability of its weakest member, and falls with every extra hop.</b> A checkout that depends synchronously on ten services each at 99.9 percent cannot promise even "two nines and a half".</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Availability of a synchronous chain compared with a decoupled design">
+  <text class="t-b" x="20" y="22">Chain of five: all must be up</text>
+  <rect class="box" x="20" y="40" width="120" height="44" rx="8"/><text class="t-c t-b" x="80" y="60">Gateway</text><text class="t-c t-sm" x="80" y="76">99.9%</text>
+  <rect class="box" x="190" y="40" width="120" height="44" rx="8"/><text class="t-c t-b" x="250" y="60">Order</text><text class="t-c t-sm" x="250" y="76">99.9%</text>
+  <rect class="box" x="360" y="40" width="120" height="44" rx="8"/><text class="t-c t-b" x="420" y="60">Pricing</text><text class="t-c t-sm" x="420" y="76">99.9%</text>
+  <rect class="box" x="530" y="40" width="120" height="44" rx="8"/><text class="t-c t-b" x="590" y="60">Inventory</text><text class="t-c t-sm" x="590" y="76">99.9%</text>
+  <rect class="box" x="700" y="40" width="120" height="44" rx="8"/><text class="t-c t-b" x="760" y="60">Payment</text><text class="t-c t-sm" x="760" y="76">99.9%</text>
+  <path class="arrow" d="M140 62 L186 62"/><path class="arrow" d="M310 62 L356 62"/><path class="arrow" d="M480 62 L526 62"/><path class="arrow" d="M650 62 L696 62"/>
+  <rect class="miss" x="20" y="100" width="800" height="36" rx="8"/><text class="t-c t-b" x="420" y="123">End-to-end: 0.999 to the 5th = 99.50% (about 3.6 hours of failure per month)</text>
+
+  <text class="t-b" x="20" y="175">Critical path of three, the rest off-path via events</text>
+  <rect class="box" x="20" y="193" width="120" height="44" rx="8"/><text class="t-c t-b" x="80" y="213">Gateway</text><text class="t-c t-sm" x="80" y="229">99.9%</text>
+  <rect class="box" x="190" y="193" width="120" height="44" rx="8"/><text class="t-c t-b" x="250" y="213">Order</text><text class="t-c t-sm" x="250" y="229">99.9%</text>
+  <rect class="cache" x="360" y="193" width="120" height="44" rx="8"/><text class="t-c t-b" x="420" y="213">Event log</text><text class="t-c t-sm" x="420" y="229">99.99%</text>
+  <rect class="box" x="560" y="170" width="120" height="34" rx="8"/><text class="t-c t-b" x="620" y="192">Payment</text>
+  <rect class="box" x="560" y="212" width="120" height="34" rx="8"/><text class="t-c t-b" x="620" y="234">Email</text>
+  <rect class="box" x="720" y="191" width="120" height="34" rx="8"/><text class="t-c t-b" x="780" y="213">Analytics</text>
+  <path class="arrow" d="M140 215 L186 215"/><path class="arrow" d="M310 215 L356 215"/>
+  <path class="arrow dash" d="M480 205 L556 190"/><path class="arrow dash" d="M480 225 L556 230"/><path class="arrow dash" d="M680 190 L716 205"/>
+  <rect class="hit" x="20" y="258" width="800" height="32" rx="8"/><text class="t-c t-b" x="420" y="279">Accept path: about 0.999 x 0.999 x 0.9999 = 99.8%; downstream outages become delay</text>
+</svg>
+<figcaption>Synchronous dependencies multiply. Moving non-essential work behind an event log shortens the critical path to the services that truly must answer now.</figcaption>
+</figure>
+
+<h3>3.2 Latency compounds too</h3>
+<p>Latency adds along a chain, but <b>tail latency</b> is worse than it looks. If each of five services has a 99th percentile of 100 ms, the chance that at least one of five calls lands in its slow 1 percent tail is about 1 minus 0.99 to the 5th, close to 5 percent. So roughly one in twenty end-to-end requests sees a "p99-slow" hop. With fan-out of 50 parallel calls the probability is about 40 percent. This is the tail-at-scale effect covered in <a href="40-resilience.html">Chapter 40</a>, and it is why call depth and fan-out are design variables, not details.</p>
+
+<h3>3.3 Ways to shorten and soften the chain</h3>
+<ul>
+  <li><b>Remove the dependency from the critical path</b> by turning "call B" into "publish an event B reacts to" when the user does not need B's answer.</li>
+  <li><b>Own the data you need</b> through a local read model or cache fed by events (<a href="46-microservice-data.html">Chapter 46</a>), so a query does not need the owner to be up.</li>
+  <li><b>Degrade gracefully:</b> if recommendations are down, render the page without them. Mark dependencies as <i>essential</i> or <i>optional</i> and handle optional ones with fallbacks.</li>
+  <li><b>Add redundancy and limits:</b> timeouts, circuit breakers and bulkheads so a slow callee does not exhaust the caller (<a href="40-resilience.html">Chapter 40</a>).</li>
+</ul>
+
+<h2 id="fanout">4. Fan-out, call depth, and cascading load</h2>
+
+<p><b>Fan-out</b> is how many downstream calls one incoming request triggers. <b>Call depth</b> is how many hops deep the longest chain goes. Both grow quietly as teams add features, and both hurt in specific ways.</p>
+
+<h3>4.1 What goes wrong</h3>
+<ul>
+  <li><b>Latency of the slowest.</b> A page that fans out to 20 services in parallel is as slow as the slowest of the 20, so tail latency dominates (section 3.2).</li>
+  <li><b>Amplification.</b> One user request at the edge may produce 30 internal calls. A 1,000 requests per second front door becomes 30,000 internal calls per second, and a small slowdown in one deep service multiplies into queued threads upstream.</li>
+  <li><b>Retry storms.</b> If each layer retries three times, a failing leaf at depth 4 sees up to 3 to the 4th, which is 81 times the original load, exactly when it is least able to cope. Retries belong at one layer, not all of them, plus retry budgets (<a href="40-resilience.html">Chapter 40</a>).</li>
+  <li><b>Distributed deadlock-like cycles.</b> Service A calls B which calls A back. Under load both pools are full of requests waiting for each other. Cycles in the call graph are a design bug; break them with events or by merging the services.</li>
+  <li><b>Unclear ownership of failures.</b> With depth 7, the on-call engineer for the front service is paged for a bug in a service they have never heard of.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Fan-out and call depth with retry amplification">
+  <text class="t-b" x="20" y="22">Wide fan-out (latency = slowest)</text>
+  <rect class="ext" x="20" y="150" width="90" height="40" rx="8"/><text class="t-c t-b" x="65" y="175">Request</text>
+  <rect class="box" x="180" y="150" width="110" height="40" rx="8"/><text class="t-c t-b" x="235" y="175">Aggregator</text>
+  <rect class="box" x="380" y="40" width="100" height="30" rx="6"/><text class="t-c t-sm" x="430" y="60">Profile 20ms</text>
+  <rect class="box" x="380" y="90" width="100" height="30" rx="6"/><text class="t-c t-sm" x="430" y="110">Orders 35ms</text>
+  <rect class="box" x="380" y="140" width="100" height="30" rx="6"/><text class="t-c t-sm" x="430" y="160">Recs 40ms</text>
+  <rect class="miss" x="380" y="190" width="100" height="30" rx="6"/><text class="t-c t-sm" x="430" y="210">Ads 900ms</text>
+  <rect class="box" x="380" y="240" width="100" height="30" rx="6"/><text class="t-c t-sm" x="430" y="260">Loyalty 25ms</text>
+  <path class="arrow" d="M110 170 L176 170"/>
+  <path class="arrow" d="M290 160 L376 58"/><path class="arrow" d="M290 165 L376 105"/><path class="arrow" d="M290 170 L376 155"/><path class="arrow-r" d="M290 175 L376 205"/><path class="arrow" d="M290 180 L376 255"/>
+  <text class="t-sm" x="190" y="300">Response time of the page = about 900 ms, set by the slowest branch.</text>
+
+  <text class="t-b" x="560" y="22">Deep chain with retries at every layer</text>
+  <rect class="box" x="560" y="40" width="90" height="34" rx="6"/><text class="t-c t-sm" x="605" y="62">A (3 tries)</text>
+  <rect class="box" x="560" y="100" width="90" height="34" rx="6"/><text class="t-c t-sm" x="605" y="122">B (3 tries)</text>
+  <rect class="box" x="560" y="160" width="90" height="34" rx="6"/><text class="t-c t-sm" x="605" y="182">C (3 tries)</text>
+  <rect class="miss" x="560" y="220" width="90" height="34" rx="6"/><text class="t-c t-sm" x="605" y="242">D failing</text>
+  <path class="arrow" d="M605 74 L605 96"/><path class="arrow" d="M605 134 L605 156"/><path class="arrow" d="M605 194 L605 216"/>
+  <text class="t-sm" x="670" y="62">1 request in</text>
+  <text class="t-sm" x="670" y="122">up to 3 calls</text>
+  <text class="t-sm" x="670" y="182">up to 9 calls</text>
+  <text class="t-sm" x="670" y="242">up to 27 calls on D</text>
+  <text class="t-sm" x="560" y="300">Retries multiply by depth: fix at one layer only.</text>
+</svg>
+<figcaption>Left: a parallel fan-out inherits the tail of its slowest member. Right: when every layer retries three times, a failing leaf receives 3 to the power of its depth in extra load at the worst moment.</figcaption>
+</figure>
+
+<h3>4.2 Rules of thumb</h3>
+<ul>
+  <li>Keep synchronous call depth small, often cited as 2 to 3 hops for user-facing paths. Beyond that, ask whether service boundaries are drawn badly (<a href="45-decomposition.html">Chapter 45</a>) or whether some of the calls can be asynchronous.</li>
+  <li>Parallelise independent calls and set a <b>per-call timeout and an overall deadline</b> (section 13), returning partial results where possible (section 12.3).</li>
+  <li>Budget fan-out: a front-door request should not trigger an unbounded number of internal calls. Paginate, batch, and cache.</li>
+  <li>Draw the call graph. If you cannot draw it on one page, nobody can reason about its failure modes. Distributed tracing (<a href="40-resilience.html">Chapter 40</a> and the observability chapters) makes the real graph visible.</li>
+</ul>
+
+<h2 id="contracts">5. API contracts: what they are and how to write them down</h2>
+
+<p>A <b>contract</b> is the full set of promises a provider makes to its consumers: the operations or topics it offers, the shape and meaning of the data, the error behaviour, the performance and availability expectations, and the rules for how all of that may change. Part of the contract can be machine-checked (the shapes), and part is only written down (semantics such as "amount is in minor units, so 1250 means 12.50").</p>
+
+<h3>5.1 Interface description languages</h3>
+<p>An <b>IDL</b> (interface definition language) describes an API in a neutral, machine-readable form, so that documentation, client code, server stubs, mocks, and compatibility checks can all be generated from one source of truth. The common ones:</p>
+<table>
+  <tr><th>Tool</th><th>Describes</th><th>Notes</th></tr>
+  <tr><td><b>OpenAPI</b> (formerly Swagger)</td><td>HTTP/JSON APIs: paths, methods, parameters, request and response schemas, status codes, auth schemes</td><td>YAML or JSON document. Generates docs, SDKs, validators, mocks. Schemas use a JSON Schema dialect.</td></tr>
+  <tr><td><b>Protocol Buffers</b> (<code>.proto</code>)</td><td>gRPC services and messages; also a common message encoding for Kafka</td><td>Fields are identified by numbers, not names, which is the key to safe evolution (section 6).</td></tr>
+  <tr><td><b>AsyncAPI</b></td><td>Event-driven APIs: channels (topics/queues), messages, payload schemas, bindings to Kafka, AMQP, MQTT</td><td>The OpenAPI equivalent for asynchronous systems; describes who publishes and who subscribes.</td></tr>
+  <tr><td><b>Avro / JSON Schema</b></td><td>Message payload shapes</td><td>Avro carries a writer schema and resolves against a reader schema, a strong fit for event logs (<a href="07-serialization.html">Chapter 7</a>).</td></tr>
+  <tr><td><b>GraphQL SDL</b></td><td>A typed graph of objects and queries</td><td>Used for client-facing aggregation (section 16).</td></tr>
+</table>
+
+<h3>5.2 Schema registries</h3>
+<p>For event streams the contract has to be available at runtime, not only at build time. A <b>schema registry</b> is a service that stores every version of every schema, assigns each an id, and enforces a <b>compatibility mode</b> when a producer tries to register a new version. A typical flow with Kafka:</p>
+<ol>
+  <li>The producer registers the schema for topic <code>orders</code>. The registry checks it against previous versions under the configured rule (for example "backward compatible") and rejects it if it would break consumers.</li>
+  <li>The registry returns a small numeric schema id. The producer writes each message as a few bytes of id plus the compact binary payload, instead of repeating field names.</li>
+  <li>The consumer reads the id, fetches (and caches) the schema from the registry, and decodes the payload, resolving it against the schema version it was built with.</li>
+</ol>
+<p>The registry turns "someone changed the message format and broke three consumers at 2 a.m." into a failed build for the person making the change. Pair it with a CI step so incompatible schemas never reach production. Details of the encodings and their evolution rules are in <a href="07-serialization.html">Chapter 7</a>.</p>
+
+<div class="callout watch"><b>Watch out</b>
+A schema describes shape, not meaning. If a producer starts sending <code>amount</code> in dollars instead of cents, every schema check still passes. Semantics need documentation, examples, and consumer-driven tests (section 8).</div>
+
+<h2 id="compat">6. Compatibility: the rules that make independent deployment possible</h2>
+
+<p>Services deploy on different schedules, so at any moment old and new versions of producers and consumers coexist. Compatibility rules define which combinations still work.</p>
+
+<h3>6.1 Backward and forward compatibility</h3>
+<ul>
+  <li><b>Backward compatible:</b> a <i>new</i> consumer can read data written by an <i>old</i> producer. Think "new code, old data".</li>
+  <li><b>Forward compatible:</b> an <i>old</i> consumer can read data written by a <i>new</i> producer. Think "old code, new data".</li>
+  <li><b>Full compatibility:</b> both hold. This is the target for anything with long-lived data (event logs, mobile clients you cannot force to upgrade).</li>
+</ul>
+<p>For request/response APIs, the usual framing is from the consumer's side: can an existing client keep working after the server changes (server changes must be backward compatible for old clients) and can a newer client talk to an older server during a rollout (forward compatibility)? For event logs, both directions matter because old events are replayed to new consumers and new events reach old consumers.</p>
+
+<h3>6.2 The practical rules</h3>
+<table>
+  <tr><th>Change</th><th>Safe?</th><th>Why</th></tr>
+  <tr><td>Add an optional field to a response or event</td><td>Yes</td><td>Old consumers ignore it (if they follow the tolerant reader rule).</td></tr>
+  <tr><td>Add an optional request field with a sensible default</td><td>Yes</td><td>Old clients do not send it; the server applies the default.</td></tr>
+  <tr><td>Add a required request field</td><td>No</td><td>Old clients do not send it and their calls start failing.</td></tr>
+  <tr><td>Remove a field consumers read</td><td>No</td><td>Old consumers break. Deprecate first, remove only when usage reaches zero.</td></tr>
+  <tr><td>Rename a field</td><td>No</td><td>Equals remove plus add. Add the new name, keep the old, migrate, then remove.</td></tr>
+  <tr><td>Change a field's type or unit</td><td>No</td><td>Silent corruption is the worst case, for example dollars changed to cents.</td></tr>
+  <tr><td>Reuse a field name or number for a new meaning</td><td>Never</td><td>Old data and old clients will misinterpret it.</td></tr>
+  <tr><td>Add a new operation or endpoint</td><td>Yes</td><td>Nobody calls it yet.</td></tr>
+  <tr><td>Tighten validation (reject values previously accepted)</td><td>No</td><td>Requests that used to work start failing. Relaxing validation is generally safe.</td></tr>
+  <tr><td>Add an enum value</td><td>Careful</td><td>Safe only if consumers handle unknown values (section 6.4).</td></tr>
+</table>
+
+<h3>6.3 Tolerant reader and the robustness principle</h3>
+<p>The <b>tolerant reader</b> pattern says a consumer should take only what it needs from a message and ignore everything else. It must not fail because of unknown extra fields, and must not depend on field order or on the absence of fields it does not use. Combined with a producer that only makes additive changes, this lets the producer evolve freely. Practical consequences:</p>
+<ul>
+  <li>Configure JSON deserializers to ignore unknown properties (many default to failing, which silently turns every additive change into a breaking one).</li>
+  <li>Do not validate a response against a strict full-schema in production code paths, only against the parts you use. (Strict validation in tests of your own provider is a different matter.)</li>
+  <li>Use sensible defaults when optional fields are absent.</li>
+  <li>The other half, sometimes called "be conservative in what you send", means providers should not emit surprising values: no new status strings in a field consumers switch on without warning.</li>
+</ul>
+
+<h3>6.4 Never repurpose fields; evolving enums</h3>
+<p>In Protocol Buffers each field has a permanent <b>field number</b> used on the wire. If you delete field 4 and later add a different field with number 4, old messages stored on disk or in a log will be decoded as the new field, producing garbage with no error. The rule: <b>never reuse a field number or name; mark removed ones as <code>reserved</code></b> so the compiler stops anyone from reusing them. In JSON the same applies to names: do not turn <code>status</code> from "order status" into "payment status".</p>
+<p><b>Enums</b> are the classic trap. A consumer written as <code>switch(status)</code> with cases PLACED, SHIPPED, DELIVERED works until the producer adds CANCELLED and the consumer hits an unhandled case, crashes, or worse, treats it as DELIVERED. Mitigations:</p>
+<ul>
+  <li>Consumers must have a defined default branch for unknown values ("show as Unknown", "skip", "route to dead-letter") and never assume the set is closed.</li>
+  <li>In Protocol Buffers, the first enum value should be a zero default such as <code>STATUS_UNSPECIFIED</code>; unknown numeric values decoded by older code are preserved as numbers in proto3 rather than failing.</li>
+  <li>Treat adding an enum value as a <i>documented, announced</i> change, and for enums consumers switch on, consider it as risky as adding a field consumers must handle.</li>
+  <li>Prefer representing open-ended categories as strings plus documentation, or as an enum plus an explicit "other" escape, when the set is likely to grow.</li>
+</ul>
+
+<h2 id="versioning">7. Versioning strategies and deprecation</h2>
+
+<p>Additive evolution handles most changes. When a change is genuinely breaking (a field's meaning changes, a resource is restructured), you need a way to run old and new behaviours side by side. That is <b>versioning</b>.</p>
+
+<table>
+  <tr><th>Strategy</th><th>Example</th><th>Good</th><th>Costs</th></tr>
+  <tr><td>URL path version</td><td><code>/v2/orders/42</code></td><td>Obvious, easy to route and to test in a browser, easy to run two versions in parallel at the gateway.</td><td>Whole API jumps versions at once; clients hardcode paths; the URL of a resource "changes".</td></tr>
+  <tr><td>Header version</td><td><code>X-API-Version: 2</code> or a date such as <code>2026-06-01</code></td><td>URLs stay stable; date-based versions let each client pin to a behaviour snapshot.</td><td>Less visible; caches must vary on the header; harder to explore by hand.</td></tr>
+  <tr><td>Media type (content negotiation)</td><td><code>Accept: application/vnd.shop.order.v2+json</code></td><td>Purist REST: the representation is versioned, not the resource. Can version per resource type.</td><td>Complex for clients and tooling; easy to misuse.</td></tr>
+  <tr><td>Field-level / no version</td><td>Add <code>totalMinor</code>, keep <code>total</code>, deprecate the old one</td><td>Smallest blast radius; most real changes can be done this way; matches protobuf's model.</td><td>Needs discipline and tooling; the payload carries old and new fields during migration.</td></tr>
+  <tr><td>Topic / schema version for events</td><td><code>orders.v2</code> topic, or schema evolution under one topic</td><td>Compatible changes stay on one topic; breaking changes get a new topic and a bridge.</td><td>Dual publishing during migration; consumers of the old topic must be tracked.</td></tr>
+</table>
+
+<div class="callout key"><b>Key idea</b>
+The best version strategy is to need versions rarely. Make additive, backward compatible changes by default (field-level evolution). Reserve a new major version for changes that cannot be made additively, and treat each major version as a product you must operate in parallel and eventually retire.</div>
+
+<h3>7.1 A deprecation process that actually works</h3>
+<ol>
+  <li><b>Announce</b> with the replacement and a date. Put it in the OpenAPI/proto (a <code>deprecated</code> flag), the changelog, and a direct message to known consumers.</li>
+  <li><b>Signal in-band:</b> return a <code>Deprecation</code> and <code>Sunset</code> header (these are standard HTTP header names) and log a warning-level metric each time a deprecated element is used, tagged by calling client.</li>
+  <li><b>Measure:</b> build a dashboard of which consumers still use the old element. You cannot remove what you cannot see; the gateway or service mesh (<a href="50-service-mesh.html">Chapter 50</a>) can attribute calls to callers.</li>
+  <li><b>Chase the stragglers:</b> contact owners, offer migration help, escalate near the date.</li>
+  <li><b>Brown-out:</b> shortly before removal, deliberately fail the old path for short windows to flush out forgotten callers.</li>
+  <li><b>Remove</b> only when usage is zero (or an agreed small residue is accepted by the business), then delete the code and the tests.</li>
+</ol>
+<p>Internal APIs deserve the same process on a shorter clock. "We own all the consumers" is rarely true for long.</p>
+
+<h2 id="cdc">8. Consumer-driven contract testing (Pact)</h2>
+
+<p>Schemas guarantee shape; they do not tell you which parts consumers actually use. End-to-end tests across many services are slow, flaky, and cannot run in one team's pipeline. <b>Consumer-driven contract testing</b> fills the gap: each <b>consumer</b> writes down exactly what it expects from the provider, and the <b>provider</b> verifies those expectations in its own build.</p>
+
+<h3>8.1 How Pact works</h3>
+<p><b>Pact</b> is the best-known framework (the idea is available for HTTP and for messages). The workflow:</p>
+<ol>
+  <li><b>Consumer test.</b> In the consumer's unit tests, the developer describes an interaction: "when I send <code>GET /orders/42</code> with this header, I expect status 200 and a JSON body containing <code>id</code> (a string) and <code>total</code> (a number)". The Pact library runs the consumer code against a <b>mock provider</b> that replies as specified, so the consumer is tested without a real provider.</li>
+  <li><b>Pact file.</b> A successful run writes a <b>pact</b>, a JSON document listing the interactions the consumer relied upon. Only the fields the consumer actually reads are included, which keeps the contract minimal and honours the tolerant reader idea.</li>
+  <li><b>Publish.</b> The consumer's CI publishes the pact to a broker (the Pact Broker or a hosted equivalent), tagged with the consumer version and branch.</li>
+  <li><b>Provider verification.</b> The provider's CI fetches all pacts from consumers that depend on it, replays each interaction against the real provider code (with test data prepared by "provider states", for example "an order 42 exists"), and checks the responses match.</li>
+  <li><b>Publish results and gate deploys.</b> Verification results go back to the broker. A "can I deploy?" check answers whether this version of this service is compatible with the versions of its partners currently in each environment, blocking an unsafe release.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Pact consumer-driven contract testing workflow">
+  <rect class="box" x="30" y="30" width="200" height="60" rx="10"/><text class="t-c t-b" x="130" y="55">Consumer code</text><text class="t-c t-sm" x="130" y="75">(Order service client)</text>
+  <rect class="ext" x="30" y="150" width="200" height="60" rx="10"/><text class="t-c t-b" x="130" y="175">Mock provider</text><text class="t-c t-sm" x="130" y="195">replies as the test says</text>
+  <rect class="cache" x="350" y="90" width="200" height="60" rx="10"/><text class="t-c t-b" x="450" y="115">Pact file (JSON)</text><text class="t-c t-sm" x="450" y="135">expected interactions</text>
+  <rect class="cache" x="350" y="230" width="200" height="60" rx="10"/><text class="t-c t-b" x="450" y="255">Pact Broker</text><text class="t-c t-sm" x="450" y="275">versions, tags, results</text>
+  <rect class="box" x="670" y="30" width="200" height="60" rx="10"/><text class="t-c t-b" x="770" y="55">Provider build (CI)</text><text class="t-c t-sm" x="770" y="75">fetch pacts, replay</text>
+  <rect class="db" x="670" y="150" width="200" height="60" rx="10"/><text class="t-c t-b" x="770" y="175">Real provider</text><text class="t-c t-sm" x="770" y="195">with provider states</text>
+  <rect class="hit" x="670" y="250" width="200" height="60" rx="10"/><text class="t-c t-b" x="770" y="275">can-i-deploy gate</text><text class="t-c t-sm" x="770" y="295">compatible, or block</text>
+  <path class="arrow" d="M130 90 L130 146"/><text class="t-sm" x="140" y="122">1. consumer test</text>
+  <path class="arrow" d="M230 170 L346 125"/><text class="t-sm" x="236" y="132">2. writes</text>
+  <path class="arrow" d="M450 150 L450 226"/><text class="t-sm" x="460" y="192">3. publish</text>
+  <path class="arrow" d="M550 250 L666 70"/><text class="t-sm" x="620" y="190">4. fetch</text>
+  <path class="arrow" d="M770 90 L770 146"/><text class="t-sm" x="780" y="122">5. replay</text>
+  <path class="arrow-g dash" d="M670 190 L554 262"/><text class="t-sm" x="580" y="240">6. results</text>
+  <path class="arrow dash" d="M770 210 L770 246"/>
+  <text class="t-sm" x="30" y="340">A provider change that breaks any consumer's pact fails the provider build before release.</text>
+</svg>
+<figcaption>The consumer defines expectations and records them in a pact. The provider replays those expectations against its real code in its own pipeline, and the broker's compatibility check gates deployment. No shared integration environment is required.</figcaption>
+</figure>
+
+<h3>8.2 What it gives you, and its limits</h3>
+<ul>
+  <li><b>Fast, isolated, per-service tests</b> that catch breaking changes at build time instead of in a shared staging environment.</li>
+  <li><b>A map of real usage:</b> the pacts show which consumers use which fields, so a provider knows what it can safely remove.</li>
+  <li><b>Not a substitute for functional testing:</b> pacts check that the provider can satisfy the consumer's expectations, not that business logic is right. They also do not cover performance or full end-to-end flows. Keep a thin layer of end-to-end smoke tests.</li>
+  <li><b>Needs a culture:</b> consumers must write and maintain pacts, and the provider must treat a failing pact as a stop sign, not a nuisance. Without that, the broker becomes shelfware.</li>
+</ul>
+<p>The same idea works for events: a consumer pact for a message states "I need an <code>OrderPlaced</code> event with <code>orderId</code> and <code>items[]</code>", and the producer verifies that its serialization can satisfy it. Schema registry compatibility checks (section 5.2) and message pacts complement each other: the registry stops structural breaks, pacts catch "this field you thought was optional is one I rely on".</p>
+
+<h2 id="contract-first">9. Contract-first design, ownership, and governance</h2>
+
+<h3>9.1 Contract-first versus code-first</h3>
+<p><b>Code-first</b> means you write the service and generate the API description from the code. It is fast to start, but the contract becomes whatever the code happens to do, and it changes accidentally when someone refactors a class. <b>Contract-first</b> means you write the OpenAPI, proto, or AsyncAPI document first, review it with consumers, then generate server stubs and client SDKs from it and implement behind them.</p>
+<p>Contract-first has real advantages: consumers can start building against a mock server before the provider exists (so teams work in parallel), the contract is reviewed as a deliberate artefact in a pull request, and breaking changes show up as diffs in the contract file, where a linter or compatibility checker (for example a tool that diffs two OpenAPI versions, or a proto breaking-change detector) can fail the build. Code-first remains reasonable for small internal APIs with one consumer; the important thing is that the published contract is <b>checked in, versioned, and diffed in CI</b> either way.</p>
+
+<h3>9.2 Ownership</h3>
+<ul>
+  <li><b>Every API and every event topic has exactly one owning team</b> that is listed in a catalog (for example a developer portal) with an on-call contact, a status (experimental, stable, deprecated), and its schemas.</li>
+  <li>The <b>producer owns the schema</b> and compatibility; consumers own how they interpret it. A consumer does not get to demand a change by threatening to break, but it does get to register its expectations through a pact.</li>
+  <li><b>Data ownership follows service ownership</b> (<a href="46-microservice-data.html">Chapter 46</a>): the service that owns the data owns the contract for it. Nobody reaches into another service's database as an informal API, which is the most common source of hidden coupling.</li>
+</ul>
+
+<h3>9.3 Governance without a bottleneck</h3>
+<p>Governance means keeping hundreds of APIs consistent and safe without making a central committee approve every change. The scalable approach is <b>automation plus lightweight review</b>:</p>
+<ul>
+  <li>A shared <b>style guide</b> (naming, pagination, error shape, idempotency headers, date formats) enforced by an API linter in CI.</li>
+  <li><b>Automatic breaking-change detection</b> in the pipeline: a pull request that makes an incompatible change to a published contract fails unless it carries an explicit, reviewed exception and a migration plan.</li>
+  <li>A <b>registry or catalog</b> as the single place to discover APIs, with ownership and deprecation status.</li>
+  <li>A small <b>API review group</b> consulted for new public or cross-domain APIs, not for every field.</li>
+  <li><b>Metrics:</b> per-API usage by consumer, error rates, and deprecated-field usage, which feed the deprecation process (section 7.1).</li>
+</ul>
+
+<h2 id="breaking">10. Handling breaking changes: expand and contract</h2>
+
+<p>Sometimes a breaking change is unavoidable (splitting a field, changing a type, moving to a new resource shape). The way to ship it with zero downtime and no coordinated big-bang deploy is the <b>expand and contract</b> pattern (also called parallel change). It breaks a breaking change into a sequence of individually safe, backward compatible steps:</p>
+<ol>
+  <li><b>Expand.</b> The provider adds the new representation <i>alongside</i> the old one. Both exist and carry the same information. Nothing breaks, because old consumers still read the old field.</li>
+  <li><b>Migrate.</b> Consumers move, one at a time and on their own schedule, to the new representation. The provider tracks which consumers still read the old one.</li>
+  <li><b>Contract.</b> When no consumer uses the old representation, the provider removes it.</li>
+</ol>
+<p>The same three phases apply to database columns, event schemas, and API versions. For writes, you may also need the provider to <b>accept both forms</b> and to <b>write both forms</b> during the migration so that old and new readers see consistent data.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Expand and contract timeline for renaming a field">
+  <text class="t-b" x="20" y="22">Example: replace total (decimal dollars) with totalMinor (integer cents)</text>
+  <line x1="40" y1="60" x2="860" y2="60" stroke="var(--muted)" stroke-width="2"/>
+  <rect class="box" x="40" y="80" width="230" height="80" rx="10"/>
+  <text class="t-c t-b" x="155" y="102">Phase 1: Expand</text>
+  <text class="t-c t-sm" x="155" y="122">Provider returns BOTH</text>
+  <text class="t-c t-sm" x="155" y="138">total and totalMinor</text>
+  <text class="t-c t-sm" x="155" y="154">All consumers still work</text>
+  <rect class="cache" x="335" y="80" width="230" height="80" rx="10"/>
+  <text class="t-c t-b" x="450" y="102">Phase 2: Migrate</text>
+  <text class="t-c t-sm" x="450" y="122">Consumers switch to</text>
+  <text class="t-c t-sm" x="450" y="138">totalMinor one by one</text>
+  <text class="t-c t-sm" x="450" y="154">Dashboard: who reads total?</text>
+  <rect class="hit" x="630" y="80" width="230" height="80" rx="10"/>
+  <text class="t-c t-b" x="745" y="102">Phase 3: Contract</text>
+  <text class="t-c t-sm" x="745" y="122">Usage of total is zero</text>
+  <text class="t-c t-sm" x="745" y="138">Provider removes total</text>
+  <text class="t-c t-sm" x="745" y="154">Only totalMinor remains</text>
+  <path class="arrow" d="M270 120 L331 120"/><path class="arrow" d="M565 120 L626 120"/>
+  <circle cx="155" cy="60" r="6" fill="var(--fg)"/><circle cx="450" cy="60" r="6" fill="var(--fg)"/><circle cx="745" cy="60" r="6" fill="var(--fg)"/>
+  <text class="t-sm" x="40" y="200">Each step is a normal, independently deployable, rollback-safe change. The long middle phase is where deprecation notices, usage metrics,</text>
+  <text class="t-sm" x="40" y="220">and brown-outs (section 7.1) do their work. Typical duration ranges from days for internal APIs to many months for public ones.</text>
+  <rect class="miss" x="40" y="240" width="820" height="40" rx="8"/><text class="t-c t-sm" x="450" y="265">Anti-pattern: renaming in one deploy forces every consumer to deploy at the same moment (a distributed monolith).</text>
+</svg>
+<figcaption>Expand and contract turns a flag-day rename into three safe steps separated by as long as consumers need.</figcaption>
+</figure>
+
+<p>When even that is not enough (for instance, a new resource model), run <b>two versions in parallel</b> behind the gateway (<a href="11-api-gateway.html">Chapter 11</a>) and translate in one place: either the new version is implemented on top of the old, or an adapter layer maps between them. The monolith migration technique in <a href="44-monolith-to-microservices.html">Chapter 44</a> (the strangler fig) uses the same idea.</p>
+
+<h2 id="formats">11. Data formats in messages</h2>
+
+<p>The wire format affects size, speed, evolvability, and debuggability. A fuller comparison is in <a href="07-serialization.html">Chapter 7</a>; here is how to choose for service-to-service traffic:</p>
+<table>
+  <tr><th>Format</th><th>Strengths</th><th>Weaknesses</th><th>Typical use</th></tr>
+  <tr><td>JSON</td><td>Human-readable, universal, schema-optional</td><td>Verbose, no native schema enforcement, ambiguous numbers (large integers lose precision in JavaScript), no binary type</td><td>Public REST APIs, low-volume internal APIs, debuggable events</td></tr>
+  <tr><td>Protocol Buffers</td><td>Compact, fast, strong typing, field numbers give safe evolution, code generation</td><td>Not human-readable without tools; needs the schema to decode</td><td>gRPC; high-volume internal calls; events with a registry</td></tr>
+  <tr><td>Avro</td><td>Compact, schema carried by id, rich reader/writer resolution, good with registries</td><td>Needs registry or embedded schema; less natural for RPC</td><td>Kafka event streams and data pipelines</td></tr>
+  <tr><td>Thrift, MessagePack, CBOR</td><td>Compact binary alternatives</td><td>Smaller ecosystems</td><td>Specific platforms</td></tr>
+</table>
+<p>Choices that matter more than the encoding itself:</p>
+<ul>
+  <li><b>Money:</b> send integer minor units plus an ISO 4217 currency code (<code>{"amount": 1250, "currency": "USD"}</code>), never floating point.</li>
+  <li><b>Time:</b> use UTC timestamps in ISO 8601 or epoch milliseconds, never local time without a zone. Make clear whether a field is an instant or a calendar date.</li>
+  <li><b>Identifiers:</b> opaque strings, not integers that consumers might do arithmetic on, and not exposing internal sequence numbers. See <a href="32-idempotency-ids.html">Chapter 32</a>.</li>
+  <li><b>Envelope:</b> events should carry metadata separate from the business payload: event id, type, schema version, timestamp, producer, correlation and causation ids for tracing.</li>
+  <li><b>Size:</b> keep messages small. For large payloads send a reference (object store URL) plus a checksum (the "claim check" pattern) rather than megabytes through the broker.</li>
+</ul>
+
+<h2 id="errors">12. Error contracts, status mapping, and partial failure</h2>
+
+<p>The error behaviour of an API is part of its contract, and it is the part most often left vague. Callers need to decide, from the error alone, whether to retry, to give up, or to show the user a message.</p>
+
+<h3>12.1 A consistent error shape</h3>
+<p>Use one error body across all services. A widely used standard for HTTP APIs is <b>Problem Details</b> (RFC 9457, formerly RFC 7807):</p>
+<pre><code>HTTP/1.1 409 Conflict
+Content-Type: application/problem+json
+
+{
+  "type": "https://api.example.com/errors/insufficient-stock",
+  "title": "Insufficient stock",
+  "status": 409,
+  "detail": "Only 2 units of SKU-123 remain.",
+  "instance": "/orders/42",
+  "traceId": "4bf92f3577b34da6",
+  "retryable": false
+}</code></pre>
+<p>The pieces: a stable machine-readable <b>type</b> or error code consumers can branch on (not the English message), a human <b>detail</b>, the trace id for support, and an explicit signal about retrying.</p>
+
+<h3>12.2 Mapping failures to status codes</h3>
+<table>
+  <tr><th>Situation</th><th>HTTP</th><th>gRPC status</th><th>Caller should</th></tr>
+  <tr><td>Malformed or invalid input</td><td>400 / 422</td><td>INVALID_ARGUMENT</td><td>Fix the request; never retry unchanged</td></tr>
+  <tr><td>Not authenticated</td><td>401</td><td>UNAUTHENTICATED</td><td>Refresh credentials, then retry once</td></tr>
+  <tr><td>Not permitted</td><td>403</td><td>PERMISSION_DENIED</td><td>Do not retry</td></tr>
+  <tr><td>Does not exist</td><td>404</td><td>NOT_FOUND</td><td>Do not retry (unless eventual consistency delay is plausible)</td></tr>
+  <tr><td>Conflict, version mismatch, business rule</td><td>409 / 412</td><td>ALREADY_EXISTS, FAILED_PRECONDITION, ABORTED</td><td>Re-read state; may retry after resolving</td></tr>
+  <tr><td>Rate limited</td><td>429 with Retry-After</td><td>RESOURCE_EXHAUSTED</td><td>Back off for the stated time</td></tr>
+  <tr><td>Server bug</td><td>500</td><td>INTERNAL</td><td>Retry cautiously; alert owners</td></tr>
+  <tr><td>Dependency down or overloaded</td><td>503 (and sometimes 502, 504)</td><td>UNAVAILABLE</td><td>Retry with backoff and jitter</td></tr>
+  <tr><td>Timeout</td><td>504 / client timeout</td><td>DEADLINE_EXCEEDED</td><td>Outcome unknown; retry only if idempotent</td></tr>
+</table>
+<p>Two rules prevent whole classes of outages. First, <b>do not flatten every downstream failure to a 500</b>: a validation error in a downstream service that surfaces as 500 invites retries that can never succeed. Second, <b>do not leak internals</b>: map a downstream's raw error to your own contract (a payments 402 does not become your 402 unless you mean it) and never return stack traces or internal hostnames.</p>
+
+<h3>12.3 Partial failure semantics</h3>
+<p>A call that spans several services, or a batch of items, can partly succeed. The contract must say what the caller can conclude:</p>
+<ul>
+  <li><b>Timeouts are ambiguous.</b> A <code>DEADLINE_EXCEEDED</code> does not mean "did not happen"; the callee may have completed the work and the reply was lost. This is why retried writes need idempotency (section 13).</li>
+  <li><b>Batch calls</b> should return per-item results (for example HTTP 207 style bodies or a list of statuses) so the caller can retry only the failed items, instead of an all-or-nothing response that hides what happened.</li>
+  <li><b>Aggregation calls</b> (an aggregator calling five services) must decide per dependency whether failure is fatal. A profile page can return <code>200</code> with <code>"recommendations": null</code> and a <code>"partial": ["recommendations"]</code> marker while a missing account record is a hard failure.</li>
+  <li><b>Multi-service writes</b> cannot rely on a distributed transaction. If payment succeeded and inventory then failed, you need compensation, which is the subject of <a href="48-sagas.html">Chapter 48</a> and of <a href="31-distributed-transactions.html">Chapter 31</a>.</li>
+</ul>
+
+<h2 id="retries">13. Idempotency, retries, timeouts, and deadline propagation</h2>
+
+<h3>13.1 Idempotency across services</h3>
+<p>Because networks lose replies, a client that times out does not know whether the operation ran. The safe response is to retry, which only works if the operation is <b>idempotent</b>: doing it twice has the same effect as doing it once. Reads and PUT-style "set to this value" operations are naturally idempotent. Creating an order or charging a card is not, so the contract adds an <b>idempotency key</b>:</p>
+<ol>
+  <li>The caller generates a unique key per logical operation (for example a UUID) and sends it as <code>Idempotency-Key: 7f3c...</code>, reusing the same key on every retry.</li>
+  <li>The provider stores the key with the result (or an "in progress" marker) in the same transaction as the work itself.</li>
+  <li>If the same key arrives again, the provider returns the stored result without redoing the work. If the key arrives with a different request body, it rejects it as a misuse.</li>
+</ol>
+<p>The same principle applies to message consumers: with at-least-once delivery, a consumer must deduplicate by message id or make its handler idempotent (the inbox pattern, <a href="48-sagas.html">Chapter 48</a>). Full treatment of keys, delivery semantics, and id generation is in <a href="32-idempotency-ids.html">Chapter 32</a>.</p>
+
+<h3>13.2 Retry policy</h3>
+<ul>
+  <li>Retry only errors that are plausibly transient (503, 504, connection reset, <code>UNAVAILABLE</code>), and only for idempotent operations.</li>
+  <li>Use <b>exponential backoff with jitter</b>, a cap on attempts, and a <b>retry budget</b> (for example, retries may add at most 10 percent to normal traffic) so retries cannot amplify an outage.</li>
+  <li><b>Retry at one layer.</b> If the gateway, the service, and the client library all retry, the multiplication from section 4 appears.</li>
+  <li>Honour <code>Retry-After</code> and stop on non-retryable codes.</li>
+</ul>
+
+<h3>13.3 Timeouts and deadline propagation</h3>
+<p>Every network call needs a timeout, because the default in many libraries is "wait forever", and a thread stuck forever is how one slow service takes down its callers (<a href="40-resilience.html">Chapter 40</a>). But a fixed per-hop timeout is not enough. If the user's request has a 2-second budget and service A spends 1.5 seconds before calling B with B's own 2-second timeout, B may keep working for 1.5 seconds after the user has already given up, wasting capacity on an answer nobody will read.</p>
+<p><b>Deadline propagation</b> fixes this: the entry point sets an absolute deadline (or remaining budget), and every service passes it downstream, so each hop uses <i>the time that is left</i>, not a fresh timeout. If the remaining budget is smaller than the minimum useful time, the service fails fast instead of starting hopeless work. gRPC does this natively; over HTTP you carry a header such as <code>X-Request-Deadline</code> or a remaining-milliseconds value.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Deadline propagation across three services">
+  <text class="t-b" x="20" y="22">Client sets a 1000 ms deadline; each hop sees what is left</text>
+  <line x1="40" y1="60" x2="860" y2="60" stroke="var(--muted)" stroke-width="1"/>
+  <text class="t-sm" x="34" y="52">0 ms</text><text class="t-sm" x="395" y="52">500 ms</text><text class="t-sm" x="800" y="52">1000 ms deadline</text>
+
+  <rect class="ext" x="40" y="80" width="820" height="32" rx="6"/><text class="t-sm" x="50" y="101">Client / Gateway: total budget 1000 ms</text>
+  <rect class="box" x="40" y="130" width="540" height="32" rx="6"/><text class="t-sm" x="50" y="151">Order service: works 120 ms, then calls Pricing with remaining 880 ms</text>
+  <rect class="box" x="160" y="180" width="330" height="32" rx="6"/><text class="t-sm" x="170" y="201">Pricing: 250 ms, calls Tax with remaining 630 ms</text>
+  <rect class="box" x="410" y="230" width="270" height="32" rx="6"/><text class="t-sm" x="420" y="251">Tax: slow, 380 ms</text>
+  <path class="arrow-g" d="M120 112 L120 126"/><path class="arrow-g" d="M300 162 L300 176"/><path class="arrow-g" d="M450 212 L450 226"/>
+  <rect class="miss" x="690" y="130" width="170" height="32" rx="6"/><text class="t-c t-sm" x="775" y="151">wasted if no deadline</text>
+  <text class="t-sm" x="40" y="295">With propagation, if Tax is still running at 1000 ms every hop cancels together and the caller gets DEADLINE_EXCEEDED at once.</text>
+  <text class="t-sm" x="40" y="315">Without it, Pricing and Tax keep computing results nobody will read, while new requests pile up behind them.</text>
+</svg>
+<figcaption>One absolute deadline travels with the request. Each service subtracts its own work and passes on the remainder, and downstream work is cancelled when the budget is gone.</figcaption>
+</figure>
+
+<p>Related rule: the timeout of a caller should be <b>longer than the callee's own timeouts plus its retries only if</b> you want the callee to finish; otherwise make caller timeouts shorter than the sum, and rely on the propagated deadline. Include p99 observed latencies when choosing numbers, not averages.</p>
+
+<h2 id="auth">14. Service-to-service authentication (preview)</h2>
+<p>Inside the network, "trusted because it is internal" does not hold: one compromised service must not be able to impersonate all the others. Two ideas, previewed here and developed elsewhere:</p>
+<ul>
+  <li><b>Mutual TLS (mTLS):</b> both sides present certificates, so each service proves its identity to the other and the traffic is encrypted. A service mesh sidecar can do this transparently for every call and rotate certificates automatically (<a href="50-service-mesh.html">Chapter 50</a>).</li>
+  <li><b>Token propagation:</b> the end user's identity and permissions must reach deep services, usually by passing a signed token (a JWT) issued at the edge, or by exchanging it for a narrowly scoped token per hop, so that downstream services can authorise on behalf of the user and not only on the identity of the caller (<a href="55-security.html">Chapter 55</a>).</li>
+</ul>
+<p>Contract implications: the API description should state required scopes per operation, and authorisation must be enforced by the owning service, not assumed from the gateway alone.</p>
+
+<h2 id="grpc">15. gRPC in depth</h2>
+
+<h3>15.1 Call types</h3>
+<ul>
+  <li><b>Unary:</b> one request, one response. The default and the closest to a REST call.</li>
+  <li><b>Server streaming:</b> one request, a stream of responses (a price feed, or paged results sent as they are ready).</li>
+  <li><b>Client streaming:</b> a stream of requests, one response (uploading chunks, then a summary).</li>
+  <li><b>Bidirectional streaming:</b> both sides send independent streams over the same call (chat, live sync).</li>
+</ul>
+<p>Streams ride on a single HTTP/2 connection with <b>multiplexing</b>: many concurrent calls share one TCP connection without head-of-line blocking at the HTTP level. Flow control prevents a fast sender from overwhelming a slow receiver. Streaming contracts need extra rules: what happens on mid-stream failure, how a stream is resumed (include a cursor or sequence number), and when each side half-closes.</p>
+
+<h3>15.2 Deadlines and cancellation</h3>
+<p>Every gRPC client call should set a <b>deadline</b>. The deadline travels in the call metadata, the server can read the time remaining, and when it passes both sides see the call end with <code>DEADLINE_EXCEEDED</code>. If a server makes further gRPC calls while handling a request, passing the incoming context carries the deadline and the cancellation to them automatically. Cancellation also propagates when the client disconnects, so downstream work stops.</p>
+
+<h3>15.3 The load-balancing pitfall with long-lived connections</h3>
+<p>A traditional layer-4 load balancer distributes <i>connections</i>. With HTTP/1.1 and short connections that spreads requests well. gRPC opens <b>one long-lived HTTP/2 connection</b> and multiplexes thousands of calls on it, so a layer-4 balancer sees only one connection and pins <i>all</i> the traffic from that client to one backend. Symptoms: one backend pod at 90 percent CPU, others idle; new pods added during scaling receive no traffic from existing clients; rolling deployments make load lopsided.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="gRPC load balancing pitfall with L4 versus L7 or client-side balancing">
+  <text class="t-b" x="20" y="22">Layer 4 balancer: balances connections, not calls</text>
+  <rect class="ext" x="20" y="50" width="100" height="40" rx="8"/><text class="t-c t-b" x="70" y="75">Client</text>
+  <rect class="cache" x="190" y="50" width="100" height="40" rx="8"/><text class="t-c t-b" x="240" y="75">L4 LB</text>
+  <rect class="miss" x="370" y="30" width="120" height="34" rx="8"/><text class="t-c t-sm" x="430" y="52">Pod 1 : 100%</text>
+  <rect class="box" x="370" y="76" width="120" height="34" rx="8"/><text class="t-c t-sm" x="430" y="98">Pod 2 : idle</text>
+  <rect class="box" x="370" y="122" width="120" height="34" rx="8"/><text class="t-c t-sm" x="430" y="144">Pod 3 : idle</text>
+  <path class="arrow" d="M120 70 L186 70"/><path class="arrow-r" d="M290 65 L366 47"/><path class="arrow dash" d="M290 75 L366 93"/><path class="arrow dash" d="M290 80 L366 139"/>
+  <text class="t-sm" x="520" y="60">One HTTP/2 connection carries</text><text class="t-sm" x="520" y="78">every call, so one pod gets all.</text>
+
+  <text class="t-b" x="20" y="195">Fixes: per-call (L7) balancing or client-side balancing</text>
+  <rect class="ext" x="20" y="223" width="100" height="40" rx="8"/><text class="t-c t-b" x="70" y="248">Client</text>
+  <rect class="cache" x="190" y="223" width="130" height="40" rx="8"/><text class="t-c t-b" x="255" y="248">L7 proxy / mesh</text>
+  <rect class="hit" x="400" y="203" width="120" height="34" rx="8"/><text class="t-c t-sm" x="460" y="225">Pod 1 : 33%</text>
+  <rect class="hit" x="400" y="249" width="120" height="34" rx="8"/><text class="t-c t-sm" x="460" y="271">Pod 2 : 33%</text>
+  <rect class="hit" x="400" y="295" width="120" height="34" rx="8"/><text class="t-c t-sm" x="460" y="317">Pod 3 : 33%</text>
+  <path class="arrow" d="M120 243 L186 243"/><path class="arrow-g" d="M320 235 L396 220"/><path class="arrow-g" d="M320 243 L396 266"/><path class="arrow-g" d="M320 250 L396 312"/>
+  <text class="t-sm" x="560" y="235">The proxy understands HTTP/2 streams</text><text class="t-sm" x="560" y="253">and spreads individual calls. Or the</text><text class="t-sm" x="560" y="271">client resolves all pod addresses and</text><text class="t-sm" x="560" y="289">round-robins across them itself.</text>
+</svg>
+<figcaption>A layer-4 balancer sees one connection and pins all calls to one backend. Per-call balancing in an L7 proxy or service mesh, or client-side balancing over a resolved endpoint list, restores an even spread.</figcaption>
+</figure>
+
+<p>Remedies, in rough order of operational simplicity: use an <b>L7 proxy or service mesh</b> (<a href="50-service-mesh.html">Chapter 50</a>) that balances per request; use <b>client-side load balancing</b> with a headless service or name resolver that returns all backend addresses; or set a <b>maximum connection age</b> on servers so connections are recycled and re-balanced (a cheap mitigation, with brief reconnect churn). Also remember health checking and graceful shutdown (send GOAWAY, drain in-flight calls) so deployments do not drop requests.</p>
+
+<h3>15.4 Other gRPC contract points</h3>
+<ul>
+  <li>Maximum message size defaults are small (commonly 4 MB); large payloads should be streamed or chunked.</li>
+  <li>Browsers cannot speak native gRPC; use gRPC-Web through a proxy, or expose REST at the edge and gRPC inside.</li>
+  <li>Use the status codes in section 12.2 and rich error details (structured error messages in the response trailer), and keep the proto package versioned (<code>shop.order.v1</code>) so a breaking redesign can be a new package.</li>
+  <li>Use a linter and breaking-change detector on <code>.proto</code> files in CI.</li>
+</ul>
+
+<h2 id="graphql-bff">16. GraphQL federation, BFF, and the internal gateway</h2>
+
+<h3>16.1 Backend for Frontend</h3>
+<p>A mobile app, a web app, and a partner integration need different data shapes and different payload sizes. A <b>Backend for Frontend (BFF)</b> is a thin service owned by the front-end team that composes calls to the underlying domain services into exactly what that client needs, so the domain services are not distorted by presentation concerns, and a client makes one request instead of ten. It is a place where the fan-out of section 4 is deliberately managed: parallel calls, timeouts, partial results, caching. The edge-facing gateway and BFF patterns are covered in <a href="11-api-gateway.html">Chapter 11</a>.</p>
+
+<h3>16.2 GraphQL and federation</h3>
+<p>With <b>GraphQL</b>, the client sends a query naming precisely the fields it wants, and the server returns that shape. This removes over-fetching and many round trips from clients. In a microservice world there is still the question of who answers: a single monolithic GraphQL server would reintroduce a central bottleneck. <b>Federation</b> splits the graph: each domain service publishes its own <b>subgraph</b> schema (the Order service defines <code>Order</code>, the Customer service defines <code>Customer</code>, and the Order subgraph can add a field <code>customer</code> that refers to a Customer by key). A <b>gateway or router</b> composes the subgraph schemas into one supergraph, plans each incoming query across subgraphs, calls them in parallel where it can, and stitches the results.</p>
+<ul>
+  <li><b>Good:</b> clients see one coherent schema; domain teams own their part; the router handles the join logic.</li>
+  <li><b>Costs:</b> the router is critical infrastructure; query planning and N+1 fetch patterns need batching (data loaders) to avoid chatty calls between router and subgraphs; expensive queries need depth, complexity, and cost limits; caching is harder than with plain HTTP GET; and the composed schema is itself a contract needing compatibility checks, since a subgraph change can break the supergraph.</li>
+</ul>
+
+<h3>16.3 Internal API gateway</h3>
+<p>An <b>internal gateway</b> (or the mesh's ingress/egress) in front of groups of internal services gives a uniform place for authentication, rate limits, routing between versions, request logging, and traffic shaping for east-west traffic, much as the external gateway does for north-south traffic. Use it where it adds clear value, such as exposing a domain's API to many internal teams, shifting traffic between versions (canary and blue/green), or enforcing quotas on a noisy consumer. Do not funnel every service-to-service call through one central gateway: it becomes a latency tax, a single point of failure, and a team bottleneck. Mesh sidecars give many of the same controls without a central hop.</p>
+
+<h2 id="events">17. Event contracts, choreography, and synchronous-over-asynchronous</h2>
+
+<h3>17.1 Designing event contracts</h3>
+<p>An event is a long-lived public contract because consumers appear over time, some replay history, and the producer often never learns who they are. Guidelines:</p>
+<ul>
+  <li><b>Name events as past-tense domain facts:</b> <code>OrderPlaced</code>, <code>PaymentCaptured</code>, not <code>UpdateInventory</code> (which is a command in disguise that couples the publisher to a specific consumer's needs).</li>
+  <li><b>Choose the amount of data deliberately.</b> An <i>event notification</i> carries just the id and type ("order 42 changed"), so consumers call back to fetch details; it is small but couples consumers back to the producer's API and load. An <i>event-carried state transfer</i> includes the data consumers typically need (items, total, address), so they act without calling back, at the cost of a larger and more binding payload. Many teams choose the second for core business events and keep sensitive fields out.</li>
+  <li><b>Include identity and ordering metadata:</b> a unique event id (for deduplication), aggregate id and version or sequence number (for ordering and gap detection), timestamps, and a correlation id. Partition by aggregate id so events for one order stay in order (<a href="34-queues-kafka.html">Chapter 34</a>).</li>
+  <li><b>Publish reliably.</b> Writing to your database and then publishing to the broker are two operations; a crash between them loses or duplicates events. The <b>transactional outbox</b> writes the event to a table in the same transaction and a relay publishes it (see <a href="48-sagas.html">Chapter 48</a> and <a href="36-event-driven.html">Chapter 36</a>).</li>
+  <li><b>Document it in AsyncAPI</b> with the schema in the registry and compatibility enforced (section 5).</li>
+</ul>
+
+<h3>17.2 Choreography</h3>
+<p>In <b>choreography</b> each service reacts to events from others and publishes its own, with no central coordinator: Order publishes <code>OrderPlaced</code>; Inventory reserves stock and publishes <code>StockReserved</code>; Payment charges and publishes <code>PaymentCaptured</code>; Shipping reacts. It is loosely coupled and easy to extend (add a consumer without touching the producer), but the business flow is spread across services, so it is hard to see, to monitor ("where is order 42?"), and to change; cyclic event dependencies creep in. For complex multi-step business flows with compensation, an orchestrator is often clearer. That trade-off, with compensation and timeouts, is the topic of <a href="48-sagas.html">Chapter 48</a>.</p>
+
+<h3>17.3 Synchronous-over-asynchronous</h3>
+<p>Sometimes the user-facing API must look synchronous while the work is asynchronous (slow, retried, or on a queue). Patterns:</p>
+<ul>
+  <li><b>Accept and poll.</b> The API returns <code>202 Accepted</code> with a <code>Location</code> header for a status resource. The client polls it (<code>PENDING</code>, <code>COMPLETED</code>, <code>FAILED</code>) with a suggested <code>Retry-After</code>. Simple and robust.</li>
+  <li><b>Accept and call back.</b> The client supplies a webhook URL; the service posts the result when done (needs signing, retries, and idempotency on the receiving side; see <a href="05-api-design.html">Chapter 5</a>).</li>
+  <li><b>Accept and push.</b> Results are delivered via server-sent events or WebSocket (<a href="06-realtime.html">Chapter 6</a>).</li>
+  <li><b>Request/reply over a queue.</b> The caller publishes a request with a <code>replyTo</code> queue and a correlation id, then blocks waiting for the matching reply with a timeout. It keeps a synchronous feel for the caller while still buffering through the broker, but reintroduces temporal coupling for the waiting caller and needs care for timeouts, orphaned replies, and duplicates, so use it sparingly.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Accept and poll pattern for synchronous-looking asynchronous work">
+  <rect class="ext" x="30" y="30" width="120" height="34" rx="8"/><text class="t-c t-b" x="90" y="52">Client</text>
+  <rect class="box" x="260" y="30" width="140" height="34" rx="8"/><text class="t-c t-b" x="330" y="52">Order API</text>
+  <rect class="cache" x="500" y="30" width="120" height="34" rx="8"/><text class="t-c t-b" x="560" y="52">Queue</text>
+  <rect class="box" x="720" y="30" width="140" height="34" rx="8"/><text class="t-c t-b" x="790" y="52">Worker</text>
+  <line class="life" x1="90" y1="64" x2="90" y2="315"/><line class="life" x1="330" y1="64" x2="330" y2="315"/><line class="life" x1="560" y1="64" x2="560" y2="315"/><line class="life" x1="790" y1="64" x2="790" y2="315"/>
+  <path class="arrow" d="M90 95 L326 95"/><text class="t-sm" x="100" y="89">POST /orders (Idempotency-Key)</text>
+  <path class="arrow" d="M330 125 L556 125"/><text class="t-sm" x="350" y="119">enqueue job + save PENDING</text>
+  <path class="arrow-g dash" d="M326 155 L94 155"/><text class="t-sm" x="100" y="149">202 Accepted, Location: /jobs/9</text>
+  <path class="arrow dash" d="M564 185 L786 185"/><text class="t-sm" x="600" y="179">deliver job</text>
+  <path class="arrow" d="M90 215 L326 215"/><text class="t-sm" x="100" y="209">GET /jobs/9</text>
+  <path class="arrow dash" d="M326 235 L94 235"/><text class="t-sm" x="110" y="229">200 PENDING, Retry-After 2</text>
+  <path class="arrow" d="M786 255 L334 255"/><text class="t-sm" x="520" y="249">update: COMPLETED</text>
+  <path class="arrow" d="M90 285 L326 285"/><text class="t-sm" x="100" y="279">GET /jobs/9</text>
+  <path class="arrow-g dash" d="M326 303 L94 303"/><text class="t-sm" x="110" y="298">200 COMPLETED + result</text>
+</svg>
+<figcaption>The client gets an immediate acknowledgement and a status URL, then polls until the worker finishes. The idempotency key makes a retried POST safe.</figcaption>
+</figure>
+
+<h2 id="chatty">18. Fixing chatty APIs</h2>
+<p>An API is <b>chatty</b> when a client must make many small calls to accomplish one logical task: fetching an order, then each line item, then each product, then each price. Over a network each call pays latency, serialization, authentication, and queueing costs, and the failures multiply (section 3). Fixes, in order of how often they are the right answer:</p>
+<ul>
+  <li><b>Coarse-grained operations.</b> Design endpoints around the client's use case, not around database tables: <code>GET /orders/42?include=items,shipping</code> or a dedicated <code>GET /order-summary/42</code> returns what the screen needs in one call. Beware of overdoing it into giant responses; allow field selection or expansion so clients take only what they need.</li>
+  <li><b>Batch endpoints.</b> <code>POST /products:batchGet</code> with 100 ids replaces 100 calls (and return per-item results; section 12.3). Cap batch sizes and define behaviour for partial failure.</li>
+  <li><b>Aggregation in a BFF or GraphQL router</b> (section 16), which calls the services in parallel close to them, where latency is a millisecond rather than a mobile network's 100 ms.</li>
+  <li><b>Data loader pattern.</b> Inside a service, collect the ids requested within one request and fetch them together, avoiding the N+1 query pattern.</li>
+  <li><b>Caching</b> at the client, gateway, or service (<a href="13-caching-patterns.html">Chapter 13</a>), with HTTP validators (ETag) for cheap revalidation.</li>
+  <li><b>Local read model.</b> If service A constantly asks service B for the same reference data, replicate it into A through events and read it locally (<a href="46-microservice-data.html">Chapter 46</a>). This also removes the runtime dependency.</li>
+  <li><b>Revisit boundaries.</b> If two services talk to each other constantly about the same data, they may belong together (<a href="45-decomposition.html">Chapter 45</a>).</li>
+  <li><b>Binary protocol and connection reuse</b> (gRPC, HTTP/2 keep-alive) reduce per-call overhead, but do not fix a fundamentally chatty design.</li>
+</ul>
+
+<h2 id="worked">19. Worked example: an Order API across three releases</h2>
+
+<p>We design the contract for an Order service used by a web checkout, a mobile app, a warehouse service, and an analytics pipeline, and evolve it through three releases without ever forcing a consumer to deploy in lockstep.</p>
+
+<h3>19.1 Release 1: the first contract</h3>
+<p>Contract-first, in OpenAPI for the synchronous API and AsyncAPI for events. The first version, published as <code>v1</code> in the URL, because it is a public product API that mobile apps hardcode:</p>
+<pre><code>POST /v1/orders                 (header: Idempotency-Key)
+{
+  "customerId": "c_81",
+  "items": [ {"sku": "SKU-123", "qty": 2} ],
+  "total": 25.00                  // decimal dollars, USD
+}
+201 Created
+{
+  "id": "o_42", "status": "PLACED",
+  "customerId": "c_81",
+  "items": [ {"sku": "SKU-123", "qty": 2} ],
+  "total": 25.00
+}
+GET /v1/orders/o_42
+Event on topic orders: OrderPlaced {eventId, orderId, customerId, items[], total}</code></pre>
+<p>Decisions and reasons: the idempotency key makes retried POSTs safe (section 13); ids are opaque strings; status is a documented string enum with a statement "clients must tolerate unknown values"; errors use Problem Details (section 12); the OpenAPI file is linted and checked in; the warehouse and analytics register pacts; the <code>OrderPlaced</code> schema is in the registry with <b>backward compatibility</b> enforced. Synchronous calls on the critical path are limited to inventory reserve and payment authorise; email, loyalty, and analytics hang off the event.</p>
+<p>Three mistakes are already visible in hindsight, and they are exactly the sort found in real systems: <code>total</code> is a floating-point decimal, there is no currency, and there is no way to express a discount. The rest of the example fixes them through compatible evolution.</p>
+
+<h3>19.2 Release 2: additive changes, no version bump</h3>
+<p>Business needs: multi-currency, line-level prices, and a discount. Using the rules in section 6:</p>
+<ul>
+  <li>Add <code>currency</code> (optional, default <code>USD</code> when absent from requests, always present in responses).</li>
+  <li>Add <code>totalMinor</code> (integer, minor units) <b>beside</b> <code>total</code>; mark <code>total</code> deprecated in the OpenAPI document. This is the <b>expand</b> step of section 10.</li>
+  <li>Add <code>items[].unitPriceMinor</code> and an optional <code>discount</code> object.</li>
+  <li>Add <code>status</code> value <code>CANCELLED</code>. Because the contract has always said "tolerate unknown statuses" and the pacts of the web and warehouse consumers show a default branch, this is acceptable. The analytics job's pact does not, so the team contacts them first; this is the governance process catching an enum risk (section 6.4).</li>
+  <li>Update the event with the same additive fields. The registry accepts it under backward compatibility, and consumers that ignore unknown fields keep working.</li>
+</ul>
+<p>Rollout: no consumer has to change in the same deploy. Pact verification runs in the Order service's pipeline against the three consumers' pacts and passes. A dashboard records which clients still read <code>total</code> (the migrate step). Old mobile app versions will take months to disappear, so the field stays.</p>
+
+<h3>19.3 Release 3: the breaking change, and the contract step</h3>
+<p>Two further needs arrive. The checkout flow must become asynchronous because payment authorisation with an external provider is slow, and the <code>items</code> structure must change to support bundles (an item that contains other items), which cannot be added compatibly to the old array.</p>
+<ul>
+  <li><b>Asynchronous placement:</b> a new <code>v2</code> endpoint, <code>POST /v2/orders</code>, returns <code>202 Accepted</code> with a <code>Location</code> header and a status resource (section 17.3), and the final outcome is delivered as <code>OrderConfirmed</code> or <code>OrderRejected</code> events and via the polled status. <code>v1</code> stays, implemented as an adapter that calls the same core and waits up to a few seconds, preserving its synchronous behaviour for old clients.</li>
+  <li><b>Bundles:</b> <code>v2</code> introduces <code>lines[]</code> with nested <code>components[]</code>. The event moves to a new topic <code>orders.v2</code> with a new schema; for a transition period the service <b>dual-publishes</b> to both topics (sections 7 and 10), with a translator for <code>orders</code>. Consumers move on their own schedules, tracked in the catalog.</li>
+  <li><b>Contract step for earlier debts:</b> usage of <code>total</code> has dropped to zero in <code>v2</code> clients, but <code>v1</code> still exposes it, because <code>v1</code> is a frozen contract. The sunset of <code>v1</code> is announced with a date six months out, <code>Deprecation</code> and <code>Sunset</code> headers are added, brown-out windows run two weeks before the date, and <code>v1</code> and the old topic are removed once the usage dashboard reads zero.</li>
+  <li><b>Reliability pieces added:</b> timeouts with a 1.5 second end-to-end deadline on the synchronous quote path; a retry budget at the gateway only; the outbox for event publishing; idempotent consumers with an inbox table; the multi-step order process moves to a saga (<a href="48-sagas.html">Chapter 48</a>).</li>
+</ul>
+
+<table>
+  <tr><th>Release</th><th>Change</th><th>Technique</th><th>Consumers must deploy together?</th></tr>
+  <tr><td>1</td><td>Initial API and event</td><td>Contract-first, registry, pacts, idempotency key</td><td>n/a</td></tr>
+  <tr><td>2</td><td>currency, totalMinor, discounts, CANCELLED</td><td>Additive fields, expand, tolerant reader, deprecate <code>total</code></td><td>No</td></tr>
+  <tr><td>3</td><td>Async placement, bundles</td><td>New major version in parallel, adapter, dual-publish, sunset process</td><td>No, but a migration deadline exists</td></tr>
+</table>
+
+<div class="callout good"><b>What the example shows</b>
+Release 2 absorbed most of the real-world change with no version bump. Release 3 needed a true new version, and even then the old version kept working through an adapter while consumers migrated. At no point did any team need another team to deploy on the same day.</div>
+
+<h2 id="failures">20. Failure modes and how to prevent them</h2>
+<table>
+  <tr><th>Failure mode</th><th>What happens</th><th>Prevention</th></tr>
+  <tr><td>Silent breaking change</td><td>A producer renames or retypes a field; consumers fail or misread data in production</td><td>Contract-first, breaking-change diff in CI, registry compatibility, Pact verification</td></tr>
+  <tr><td>Strict deserializer</td><td>Consumer fails on an unknown additive field</td><td>Tolerant reader; ignore-unknown configuration; consumer tests with extra fields</td></tr>
+  <tr><td>Enum surprise</td><td>New enum value crashes or mis-routes old consumers</td><td>Default branch; announce enum additions; open-ended categories</td></tr>
+  <tr><td>Repurposed field</td><td>Old data decoded as new meaning</td><td>Reserved field numbers/names; review rule</td></tr>
+  <tr><td>Cascading failure</td><td>One slow dependency exhausts threads upstream, spreads outward</td><td>Timeouts, circuit breakers, bulkheads, load shedding (<a href="40-resilience.html">Chapter 40</a>)</td></tr>
+  <tr><td>Retry storm</td><td>Layered retries multiply load on a struggling service</td><td>Retry at one layer, backoff and jitter, retry budgets</td></tr>
+  <tr><td>Duplicate side effects</td><td>Retried or redelivered requests charge twice</td><td>Idempotency keys; idempotent and deduplicating consumers</td></tr>
+  <tr><td>Lopsided gRPC load</td><td>L4 balancer pins long-lived connections to a few pods</td><td>L7/mesh balancing, client-side balancing, max connection age</td></tr>
+  <tr><td>Wasted work after timeout</td><td>Downstream keeps computing after the caller gave up</td><td>Deadline propagation and cancellation</td></tr>
+  <tr><td>Distributed monolith</td><td>Services must deploy together because of tight contracts or shared schemas</td><td>Additive evolution, expand and contract, avoid shared database and shared domain libraries (<a href="44-monolith-to-microservices.html">Chapter 44</a>)</td></tr>
+  <tr><td>Lost or duplicated event</td><td>Crash between database write and publish</td><td>Transactional outbox; idempotent consumers</td></tr>
+  <tr><td>Poison message</td><td>One undecodable event blocks a partition</td><td>Dead-letter queue, schema validation at producer, alerting</td></tr>
+  <tr><td>Stale contract docs</td><td>Documentation drifts from behaviour</td><td>Generate docs from the contract; verify the provider against it in CI</td></tr>
+  <tr><td>Zombie deprecation</td><td>Old versions never removed because nobody knows the consumers</td><td>Usage metrics by caller, sunset dates, brown-outs</td></tr>
+</table>
+
+<h2 id="qa">21. Interview Q&amp;A</h2>
+
+<details><summary>When would you choose asynchronous messaging over a synchronous call between two services?</summary>
+<p>I choose asynchronous when the caller does not need the result to continue, when the work can honestly be acknowledged and completed later, when many independent consumers may react to the same fact, or when the callee cannot absorb the caller's peaks and needs a buffer. Sending a receipt, updating search indexes, and awarding loyalty points are examples. I choose synchronous when the answer is needed to proceed, such as a price quote or stock check feeding a page the user is looking at. The deciding questions are: does the caller need the answer now, what should happen if the callee is down for ten minutes, and how many consumers exist. I also mention the cost of async: eventual consistency, duplicate delivery, and harder tracing.</p></details>
+
+<details><summary>Five services in a synchronous chain are each 99.9 percent available. What is the end-to-end availability and what can you do about it?</summary>
+<p>Availability multiplies for a serial chain, so it is about 0.999 to the fifth power, roughly 99.5 percent, which is around 3.6 hours of failure per month instead of 43 minutes. The options are to shorten the chain by moving non-essential work behind events, to give services local read models so queries do not require the owner to be up, to mark dependencies as optional and degrade gracefully, and to add redundancy plus timeouts, circuit breakers, and bulkheads so one failure does not spread. The point of the calculation is that call depth is a reliability decision, not only a latency one.</p></details>
+
+<details><summary>What makes a change backward compatible, and what are the rules for evolving a schema safely?</summary>
+<p>A change is backward compatible if existing consumers keep working without modification. Additive changes are safe: new optional response fields, new optional request fields with defaults, new endpoints. Removing or renaming fields, changing types or units, adding required request fields, and tightening validation are breaking. Fields must never be repurposed, and in protobuf their numbers are reserved after removal. Consumers must follow the tolerant reader pattern, ignoring unknown fields and handling unknown enum values, otherwise even additive changes break them. For event logs I also want forward compatibility because old consumers will see new events, and I enforce the rules mechanically with a schema registry and a breaking-change check in CI.</p></details>
+
+<details><summary>Explain consumer-driven contract testing and why it beats end-to-end tests for service boundaries.</summary>
+<p>Each consumer records, in its own tests against a mock provider, exactly which requests it makes and which parts of the response it needs, producing a pact file. The provider's pipeline replays all of its consumers' pacts against the real implementation, so a change that would break any consumer fails the provider's build before release, and a broker's can-I-deploy check blocks unsafe combinations. It beats end-to-end tests at boundaries because it runs fast in each team's pipeline, needs no shared environment, is not flaky, and tells the provider exactly which consumer depends on which field. It does not replace testing business logic or a few end-to-end smoke tests.</p></details>
+
+<details><summary>How do you ship a breaking change with zero downtime and without coordinating consumer deploys?</summary>
+<p>I use expand and contract. First expand: the provider adds the new field or version alongside the old, both populated, so nothing breaks. Then migrate: consumers move at their own pace while I track who still uses the old element through metrics, deprecation headers, and contact with owners. Finally contract: when usage is zero I remove the old form. For bigger changes I run a new major version in parallel behind the gateway with an adapter, and for events I dual-publish to the old and new topic. Each step is independently deployable and reversible, so no big-bang release is needed.</p></details>
+
+<details><summary>Why can a gRPC service get uneven load behind a standard load balancer, and how do you fix it?</summary>
+<p>gRPC runs over HTTP/2 and keeps one long-lived connection that multiplexes many calls. A layer-4 balancer distributes connections, so a client with one connection sends everything to one backend, while others stay idle and newly scaled pods get nothing. Fixes are to use a layer-7 proxy or service mesh that balances each call, to do client-side load balancing over the full list of backend addresses from a headless service or resolver, or to cap connection age so connections are recycled. I would also ensure health checks and graceful draining so deployments do not drop calls.</p></details>
+
+<details><summary>What is deadline propagation and why is a fixed per-hop timeout not enough?</summary>
+<p>With deadline propagation the entry point sets an absolute time by which the user-facing request must finish, and each service passes the remaining budget downstream. With only fixed per-hop timeouts, a downstream service can keep working long after the original caller gave up, because its own timeout is measured from when it received the call, and chains of such hops can exceed the user's patience many times over. Propagation lets each hop fail fast when little budget remains and cancel work when the budget is gone, saving capacity during incidents. gRPC supports it natively and over HTTP it is carried in a header.</p></details>
+
+<details><summary>How do you make a retried write across services safe?</summary>
+<p>A timeout means the outcome is unknown, so a retry may repeat a side effect. The caller sends a unique idempotency key with each logical operation and reuses it on every retry. The provider stores the key and result atomically with the work, and replays the stored result for duplicates, rejecting the same key with a different body. For message consumers, which usually see at-least-once delivery, I deduplicate on the message id with an inbox table or make the handler naturally idempotent. I also retry at only one layer, with backoff, jitter, and a retry budget, so retries cannot amplify an outage.</p></details>
+
+<details><summary>Compare choreography with orchestration for a multi-service business flow, and where do contracts matter?</summary>
+<p>In choreography services react to each other's events with no coordinator, which is loosely coupled and easy to extend but makes the overall flow implicit and hard to monitor or change. In orchestration a coordinator calls or commands each step and tracks state, giving a visible flow and clear compensation logic at the cost of a more central component. In both, event and command contracts are the interface: past-tense facts for events, explicit commands with idempotency for orchestrated steps, schemas in a registry, and compatibility rules enforced. Complex flows with compensations usually justify orchestration, covered in the sagas chapter.</p></details>
+
+<details><summary>How would you reduce chattiness between a mobile client and many backend services?</summary>
+<p>I would put a BFF or a GraphQL router between the client and the domain services so the client makes one request per screen and the aggregator fans out in parallel inside the data center, with timeouts and partial results for optional parts. I would add batch endpoints for lookups by many ids, design coarse-grained operations around use cases with field selection, and cache with validators. Internally I would use data loaders to avoid N+1 patterns and, if one service repeatedly needs another's reference data, replicate it through events into a local read model. If two services remain extremely chatty I would question the boundary itself.</p></details>
+
+<details><summary>What does good governance of internal APIs look like without creating a bottleneck?</summary>
+<p>Every API and topic has one owning team recorded in a catalog with status and contacts. A style guide is enforced by linters in CI, breaking-change detection fails any incompatible change to a published contract unless an explicit migration plan is attached, and the schema registry enforces compatibility for events. A small review group handles new cross-domain or public APIs, not every field. Usage metrics by consumer and by deprecated element feed a deprecation process with sunset dates. The principle is to automate the checks and reserve human review for design decisions.</p></details>
+
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">22. Recap</h2>
+<ul>
+  <li>Splitting into services turns function calls into network calls; the contract between services becomes the central engineering artefact.</li>
+  <li>Choose sync versus async per interaction: sync when the caller needs the answer now, async when work can be deferred, fan out to many consumers, or needs buffering.</li>
+  <li>Synchronous chains multiply unavailability and amplify tail latency; limit call depth, fan-out, and retries, and keep non-essential work off the critical path.</li>
+  <li>Write contracts first in OpenAPI, protobuf, and AsyncAPI, store event schemas in a registry with enforced compatibility, and diff contracts in CI.</li>
+  <li>Evolve additively: add optional fields, never repurpose or reuse, be a tolerant reader, treat enums as open, and prefer field-level evolution to new versions.</li>
+  <li>For real breaking changes use expand and contract, parallel versions, dual publishing, and a measured deprecation process ending in removal.</li>
+  <li>Consumer-driven contract tests (Pact) let providers verify real consumer expectations in their own pipeline.</li>
+  <li>Make errors part of the contract: stable codes, a consistent shape, correct status mapping, explicit retryability, and defined partial-failure behaviour.</li>
+  <li>Retries need idempotency keys, one retry layer, backoff, and budgets; timeouts need propagated deadlines.</li>
+  <li>gRPC needs per-call load balancing, deadlines, and size limits; BFFs, federation, and batching tame chatty clients; event contracts need identity, ordering, and reliable publication through an outbox.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="05-api-design.html">Chapter 5</a> (API styles), <a href="07-serialization.html">Chapter 7</a> (formats and schema evolution), <a href="11-api-gateway.html">Chapter 11</a> (gateways and BFF), <a href="32-idempotency-ids.html">Chapter 32</a> (idempotency), <a href="34-queues-kafka.html">Chapter 34</a> (queues and logs), <a href="40-resilience.html">Chapter 40</a> (timeouts, retries, circuit breakers) and the service-splitting chapters <a href="44-monolith-to-microservices.html">44</a>, <a href="45-decomposition.html">45</a>, and <a href="46-microservice-data.html">46</a>. Leads to <a href="48-sagas.html">Chapter 48</a> (sagas), <a href="50-service-mesh.html">Chapter 50</a> (service mesh and mTLS), and <a href="55-security.html">Chapter 55</a> (security).</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case study 23: Design a Ride-Sharing Service | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="c23-ride-sharing">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Case study 23 · Worked solutions</div>
+<h1>Design a Ride-Sharing Service</h1>
+<p class="lead">A ride-sharing service connects a rider who wants to go somewhere with a nearby driver who is willing to take them, in seconds, while both phones move through a city. The hard parts are that the data is a firehose of moving points, that "nearest driver" must be answered thousands of times per second, that a driver must never be promised to two riders, and that price and arrival time must be computed from a live, constantly changing picture of supply and demand. This page designs it for 20 million trips a day and works through location ingestion, geospatial indexing, matching, ETA, surge pricing and failure modes.</p>
+
+<h2 id="problem">1. Problem statement and clarifying questions</h2>
+<p>The prompt is one line: "Design Uber." A strong candidate does not start drawing cars on a map. Following the <a href="../chapters/01-interview-framework.html">interview framework in Chapter 1</a>, we first pin down what is being built. The questions below, with the answers we assume for the rest of the page, set the scope.</p>
+<table>
+<tr><th>Question</th><th>Assumed answer</th></tr>
+<tr><td>How big is the service?</td><td>100 million monthly active riders, 5 million registered drivers, 20 million completed trips per day, in about 500 cities across 50 countries.</td></tr>
+<tr><td>What does a rider do?</td><td>Opens the app, sees nearby cars on a map, enters a destination, sees a fare estimate and an arrival estimate, requests a ride, watches the driver approach in real time, rides, pays and rates.</td></tr>
+<tr><td>What does a driver do?</td><td>Goes online, streams location while online, receives a ride offer, has a short window (about 15 seconds) to accept, navigates to the rider, starts and ends the trip.</td></tr>
+<tr><td>Ride types?</td><td>Single-rider on-demand rides in several car classes. Pooled (shared) rides, scheduled rides and delivery are out of scope; we say where they would plug in.</td></tr>
+<tr><td>How fast must matching be?</td><td>From tapping "Request" to a driver being assigned: p50 under 5 seconds, p99 under 15 seconds, excluding the time a human driver takes to tap Accept.</td></tr>
+<tr><td>How fresh must locations be?</td><td>The driver app reports a position about every 4 seconds. The rider should see a moving car with under about 5 seconds of lag. A position older than 30 seconds means the driver is treated as unavailable.</td></tr>
+<tr><td>What accuracy is required for ETA?</td><td>The pickup ETA should be within about 20% of the true value for 80% of requests. Perfection is not expected; consistency and no wild outliers matter more.</td></tr>
+<tr><td>How is the price set?</td><td>Base fare formula (distance, time, fees) multiplied by a dynamic surge multiplier per small map area, shown to the rider before they confirm. Once shown and accepted, the price is locked.</td></tr>
+<tr><td>Consistency stance?</td><td>A driver must never be assigned two trips at once, and a trip must have exactly one state at any time. Everything else, such as the exact dots on the map, may be slightly stale.</td></tr>
+<tr><td>Global?</td><td>Yes. Cities are mostly independent of each other, which is the single most useful property of this problem (section 9).</td></tr>
+</table>
+<div class="callout tip"><b>Interview tip</b> Say early that this problem is really four problems with different shapes: an <b>ingestion firehose</b> (locations), a <b>geospatial query</b> (who is near here), a <b>small but critical transactional core</b> (the trip), and an <b>analytic feedback loop</b> (surge and ETA). Each gets a different storage and consistency choice, and naming that split earns most of the credit.</div>
+
+<h2 id="requirements">2. Requirements and scope</h2>
+<h3>2.1 Functional requirements</h3>
+<ul>
+<li>A driver can go online and offline, and while online continuously publishes location and availability.</li>
+<li>A rider can see nearby available drivers and get a fare estimate and pickup ETA for a pickup and destination pair.</li>
+<li>A rider can request a ride. The system finds a suitable driver, offers the trip, and on acceptance binds the two together.</li>
+<li>Both parties see each other's live location during the pickup and the trip.</li>
+<li>The trip moves through a defined set of states (requested, offered, accepted, arrived, in progress, completed, cancelled) and every state change is recorded.</li>
+<li>On completion the fare is computed from the actual route, time and the locked surge multiplier, and payment is triggered.</li>
+<li>Either party can cancel under defined rules (possibly with a fee).</li>
+</ul>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+<li><b>Low latency matching and real-time updates:</b> seconds, not minutes.</li>
+<li><b>High availability for the request path:</b> a rider who cannot request a ride goes to a competitor, so we favour availability for location and discovery data (<a href="../chapters/28-cap-consistency.html">Chapter 28</a>).</li>
+<li><b>Strong consistency for the assignment:</b> exactly one driver per trip and exactly one trip per driver at a time.</li>
+<li><b>Write-heavy ingestion:</b> hundreds of thousands of location writes per second that must not delay trip requests.</li>
+<li><b>Graceful degradation:</b> if surge, ETA ML or maps are down, fall back to simpler estimates rather than fail the request.</li>
+<li><b>Durable money and trip records:</b> a completed trip is never lost.</li>
+</ul>
+<h3>2.3 Out of scope</h3>
+<p>Pooling and route-sharing optimisation, scheduled rides, driver onboarding and background checks, the payment processor internals (see <a href="c14-payment-system.html">Case study 14</a>), turn-by-turn navigation rendering, fraud models beyond the hooks, and the internals of map tile serving.</p>
+
+<h2 id="estimation">3. Estimation with real arithmetic</h2>
+<p>Estimation (<a href="../chapters/02-estimation.html">Chapter 2</a>) must reveal which part is the expensive one. Here it is the location stream, not the trips. We round aggressively and keep the numbers consistent for the whole page.</p>
+<h3>3.1 Trips and demand</h3>
+<ul>
+<li>20 M trips per day = 20,000,000 / 86,400 s = about <b>230 trip requests per second</b> on average. Demand is spiky (commute hours, Friday night, events): peak is about 3x average, <b>about 700 per second</b> globally. A single city at a stadium exit can see 10x its own average for a few minutes, which is why we reason per city and per cell.</li>
+<li>Not every request ends in a completed trip. If 80% complete, requests are about 25 M per day, about 290 per second average and about 870 per second at peak. We use <b>about 900 requests per second</b> as the design peak.</li>
+<li>Average trip duration is 20 minutes. Concurrent trips on average = 20 M x 20 min / 1,440 min per day = <b>about 280,000</b>; peak about 3x = <b>about 830,000</b> concurrent trips.</li>
+</ul>
+<h3>3.2 Driver supply and the location firehose</h3>
+<ul>
+<li>5 M registered drivers; about 1 M are online on average and about 1.5 M at peak. Utilisation is trips-in-progress over online drivers = 280,000 / 1,000,000, about 28% (the rest are waiting or driving to a pickup).</li>
+<li>Each online driver reports a location every 4 seconds. Average rate = 1,000,000 / 4 = <b>250,000 updates per second</b>; peak = 1,500,000 / 4 = <b>375,000 per second</b>. This is 400 times larger than the trip request rate, and it dominates the system's write load.</li>
+<li>Payload per update: driver id (8 B), latitude and longitude (8 B), heading, speed, accuracy, timestamp, status and app overhead, about <b>100 bytes</b> encoded compactly (<a href="../chapters/07-serialization.html">Chapter 7</a>). Peak ingress = 375,000 x 100 B = about <b>37.5 MB/s</b>, about 300 Mbps. That is small for bandwidth but large in message count.</li>
+<li>Raw location history if we keep it all: 250,000 x 100 B x 86,400 s = about 2.2 TB per day, about 790 TB per year. We keep full detail for 7 days for disputes and ML (about 15 TB hot) and downsample after that.</li>
+</ul>
+<h3>3.3 Rider reads</h3>
+<ul>
+<li>Riders open the app and look at the map about 60 M times a day (about 3 per completed trip including window shopping). Each view fetches nearby drivers: about 700 per second average, about 2,100 per second peak.</li>
+<li>While watching the map or an approaching driver, the app receives pushed updates every 4 seconds. If 1 M riders are watching at peak, that is 1,000,000 / 4 = <b>250,000 pushes per second</b>, comparable to the inbound location rate. This is the real-time delivery problem in section 8.3.</li>
+</ul>
+<h3>3.4 Storage</h3>
+<table>
+<tr><th>Data</th><th>Arithmetic</th><th>Result</th></tr>
+<tr><td>Live driver state (latest position, status)</td><td>5 M drivers x about 200 B</td><td>about 1 GB (tiny, fits in memory many times over)</td></tr>
+<tr><td>Trip records</td><td>20 M per day x about 2 KB (states, fare, ids, timestamps)</td><td>40 GB per day, about 15 TB per year</td></tr>
+<tr><td>Trip breadcrumbs (route actually driven)</td><td>20 min / 4 s = 300 points x 32 B = about 10 KB per trip; x 20 M</td><td>about 200 GB per day, about 70 TB per year</td></tr>
+<tr><td>Raw location log</td><td>section 3.2</td><td>about 2.2 TB per day; 7-day hot window about 15 TB</td></tr>
+<tr><td>Road graph and speed profiles</td><td>global road network of a few hundred million edges x tens of bytes, plus time-of-day speed buckets</td><td>tens to low hundreds of GB; held in memory per region by the ETA service</td></tr>
+<tr><td>Surge state</td><td>cells per city (about 100 K worldwide at fine resolution) x a few counters</td><td>megabytes</td></tr>
+</table>
+<div class="callout key"><b>Key idea</b> The system has a tiny, hot, in-memory working set (about 1 GB of live driver positions) under a huge write rate (375 K per second), next to a small transactional core (900 requests per second) that needs correctness. The design is mostly about keeping those two worlds apart: ephemeral location data goes to fast, lossy, in-memory structures; trip state goes to a durable, strongly consistent store.</div>
+
+<h2 id="api">4. API design</h2>
+<p>Riders and drivers use REST for commands and a persistent connection (WebSocket or a push channel, <a href="../chapters/06-realtime.html">Chapter 6</a>) for live updates. User ids always come from the auth token, never from the body (<a href="../chapters/05-api-design.html">Chapter 5</a>).</p>
+<pre><code>POST /v1/drivers/me/status        { "state": "online" | "offline" }
+POST /v1/drivers/me/location      (also sent as a stream on the open connection)
+  body: { "lat": 37.7749, "lng": -122.4194, "heading": 90, "speed_mps": 8.2,
+          "accuracy_m": 6, "ts": 1731859200000, "seq": 48211 }
+  202:  {}                        (fire and forget; no response body needed)
+
+GET  /v1/rides/estimate?pickup=lat,lng&amp;dest=lat,lng
+  200: { "options": [ { "product": "economy", "fare_low": 1450, "fare_high": 1750,
+                         "currency": "USD", "surge": 1.4, "surge_token": "OPAQUE",
+                         "pickup_eta_s": 240 } ] }
+
+POST /v1/rides                    (request a ride)
+  body: { "pickup": {...}, "dest": {...}, "product": "economy",
+          "surge_token": "OPAQUE", "client_request_id": "uuid" }
+  201: { "ride_id": "r_91823", "state": "REQUESTED" }
+
+GET  /v1/rides/{id}               current state, driver, ETA, location
+POST /v1/rides/{id}/cancel
+
+# driver side
+POST /v1/offers/{offer_id}/accept     POST /v1/offers/{offer_id}/decline
+POST /v1/rides/{id}/arrived           POST /v1/rides/{id}/start    POST /v1/rides/{id}/complete
+
+# push channel (server to client)
+{ "type": "driver_location", "ride_id": "...", "lat": ..., "lng": ..., "eta_s": 180 }
+{ "type": "ride_state", "ride_id": "...", "state": "ACCEPTED" }
+{ "type": "offer", "offer_id": "...", "pickup": {...}, "expires_in_ms": 15000 }</code></pre>
+<p>Four details matter. First, <code>client_request_id</code> makes ride creation idempotent, so a rider on a flaky mobile network who taps twice does not order two cars (<a href="../chapters/32-idempotency-ids.html">Chapter 32</a>). Second, the <code>surge_token</code> is a signed, short-lived (a few minutes) opaque value that encodes the multiplier the rider was shown. It lets the server honour the displayed price without trusting a client-supplied number, and it expires so stale surge cannot be replayed. Third, the location endpoint returns <code>202</code> with no body: location is high-volume, loss-tolerant, and the next update supersedes the last, so the server does not wait on durability. Fourth, <code>seq</code> is a per-driver monotonically increasing counter so that out-of-order or duplicated updates can be discarded cheaply (<a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>).</p>
+
+<h2 id="data">5. Data model and storage choices</h2>
+<p>Different data have wildly different access patterns, so we use different stores. The reasoning for each is below; technology details live in the chapters linked.</p>
+<table>
+<tr><th>Data</th><th>Store</th><th>Why</th></tr>
+<tr><td>Live driver location and availability</td><td>In-memory geospatial index, partitioned by city and cell, with Redis (<a href="../chapters/15-redis.html">Chapter 15</a>) as the simple form and a custom in-process index owned by a location service in the large form</td><td>375 K writes per second, reads by area, working set about 1 GB. Durability is unnecessary: a lost position is replaced 4 seconds later. We need speed and cheap "who is in these cells" queries.</td></tr>
+<tr><td>Trip (ride) state and driver assignment</td><td>Sharded relational store or strongly consistent NoSQL, keyed by ride id with a secondary lookup by driver and by rider (<a href="../chapters/17-data-modeling.html">Chapter 17</a>, <a href="../chapters/20-nosql.html">Chapter 20</a>)</td><td>About 900 writes per second at peak, but each must be durable and transitions must be atomic and ordered. Conditional writes (compare-and-set on state or version) enforce the state machine.</td></tr>
+<tr><td>Location event log</td><td>Kafka topic (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>), partitioned by driver id or city, with archive to object storage (<a href="../chapters/21-object-storage.html">Chapter 21</a>)</td><td>Decouples ingestion from consumers (index updater, breadcrumb writer, ETA speed learner, analytics). Replayable. Absorbs bursts.</td></tr>
+<tr><td>Trip breadcrumbs</td><td>Wide-column or time-series store keyed by (ride id, sequence)</td><td>Append-only, read once at trip end for fare and for support disputes. About 200 GB per day.</td></tr>
+<tr><td>Road graph and speed profiles</td><td>Immutable snapshots loaded into memory by the routing service, refreshed on a schedule</td><td>Routing needs microsecond graph traversal, not database queries. Updated by batch jobs and by live speed deltas.</td></tr>
+<tr><td>Surge multipliers</td><td>Small replicated cache (Redis) keyed by cell id, written by the surge job</td><td>Read on every estimate; written every minute or so; tiny.</td></tr>
+<tr><td>Payments, ledgers</td><td>Dedicated payment service with its own ACID store (<a href="c14-payment-system.html">Case study 14</a>)</td><td>Money needs transactions, idempotency and audit; not shared with the location path.</td></tr>
+</table>
+<h3>5.1 Core schemas</h3>
+<pre><code>rides:     ride_id (PK) | rider_id | driver_id (nullable) | state | version
+           pickup_lat/lng | dest_lat/lng | product | surge_multiplier | fare_estimate
+           requested_at | accepted_at | started_at | completed_at | city_id
+driver_by_ride_active:  driver_id (unique while a ride is active) -> ride_id
+offers:    offer_id | ride_id | driver_id | sent_at | expires_at | outcome
+driver_live (in memory):   driver_id -> { lat, lng, heading, ts, seq, status, product, cell_id }
+cell_index (in memory):    cell_id -> set of driver_id (available drivers only)
+surge:     (city_id, cell_id) -> { multiplier, computed_at, demand, supply }</code></pre>
+<p>The unique entry <code>driver_by_ride_active</code> is how we enforce "one active trip per driver" in the database itself: assigning a driver is a conditional insert that fails if the driver already has an active ride. Section 7.2 uses this.</p>
+
+<h2 id="first-design">6. A first simple design, then the scaled architecture</h2>
+<h3>6.1 The simple version</h3>
+<p>Start with one app server and one database. Drivers post their latitude and longitude into a <code>drivers</code> table every 4 seconds. A ride request runs a query for the nearest available drivers, picks the first, and sets its status to busy.</p>
+<pre><code>SELECT driver_id FROM drivers
+WHERE status = 'available'
+  AND lat BETWEEN :lat - 0.02 AND :lat + 0.02
+  AND lng BETWEEN :lng - 0.02 AND :lng + 0.02
+ORDER BY (lat - :lat)^2 + (lng - :lng)^2 LIMIT 5;</code></pre>
+<p>This is correct and fine for a town. At our scale it fails in three ways. The table takes 375 K updates per second, which no single relational primary handles, and each update rewrites an index. A two-column range scan on latitude and longitude uses one B-tree index poorly: it can narrow on one axis and must filter the other, so it reads a long strip of the world. And "pick the first and mark it busy" has a race: two concurrent requests can both read the same driver as available. So we separate ingestion from the index, use a proper spatial partitioning (section 7.1), and make assignment an atomic conditional write (section 7.2).</p>
+<h3>6.2 The scaled architecture</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 430" role="img" aria-label="High level ride-sharing architecture">
+<rect class="ext" x="20" y="60" width="110" height="50" rx="8"/><text class="t-c t-b" x="75" y="90">Rider app</text>
+<rect class="ext" x="20" y="260" width="110" height="50" rx="8"/><text class="t-c t-b" x="75" y="290">Driver app</text>
+<rect class="box" x="170" y="150" width="120" height="60" rx="8"/><text class="t-c t-b" x="230" y="177">Gateway</text><text class="t-c t-sm" x="230" y="195">auth, limits, WS</text>
+<rect class="box" x="340" y="20" width="150" height="50" rx="8"/><text class="t-c t-b" x="415" y="42">Ride service</text><text class="t-c t-sm" x="415" y="59">trip state machine</text>
+<rect class="box" x="340" y="90" width="150" height="50" rx="8"/><text class="t-c t-b" x="415" y="112">Matching (dispatch)</text><text class="t-c t-sm" x="415" y="129">candidates, offers</text>
+<rect class="box" x="340" y="160" width="150" height="50" rx="8"/><text class="t-c t-b" x="415" y="182">Location service</text><text class="t-c t-sm" x="415" y="199">ingest, geo index</text>
+<rect class="box" x="340" y="230" width="150" height="50" rx="8"/><text class="t-c t-b" x="415" y="252">ETA / routing</text><text class="t-c t-sm" x="415" y="269">road graph, ML</text>
+<rect class="box" x="340" y="300" width="150" height="50" rx="8"/><text class="t-c t-b" x="415" y="322">Pricing and surge</text><text class="t-c t-sm" x="415" y="339">fare, multiplier</text>
+<rect class="box" x="340" y="370" width="150" height="50" rx="8"/><text class="t-c t-b" x="415" y="392">Push / real-time</text><text class="t-c t-sm" x="415" y="409">fan-out to apps</text>
+<rect class="db" x="560" y="20" width="140" height="50" rx="8"/><text class="t-c t-b" x="630" y="42">Trip DB</text><text class="t-c t-sm" x="630" y="59">sharded, durable</text>
+<rect class="cache" x="560" y="160" width="140" height="50" rx="8"/><text class="t-c t-b" x="630" y="182">Geo index</text><text class="t-c t-sm" x="630" y="199">memory, by cell</text>
+<rect class="box" x="560" y="90" width="140" height="50" rx="8"/><text class="t-c t-b" x="630" y="112">Kafka</text><text class="t-c t-sm" x="630" y="129">location + events</text>
+<rect class="cache" x="560" y="300" width="140" height="50" rx="8"/><text class="t-c t-b" x="630" y="322">Surge cache</text><text class="t-c t-sm" x="630" y="339">cell to multiplier</text>
+<rect class="box" x="750" y="90" width="130" height="50" rx="8"/><text class="t-c t-b" x="815" y="112">Stream jobs</text><text class="t-c t-sm" x="815" y="129">surge, speeds</text>
+<rect class="db" x="750" y="160" width="130" height="50" rx="8"/><text class="t-c t-b" x="815" y="182">Breadcrumb</text><text class="t-c t-sm" x="815" y="199">store + archive</text>
+<rect class="box" x="750" y="230" width="130" height="50" rx="8"/><text class="t-c t-b" x="815" y="252">Payment svc</text><text class="t-c t-sm" x="815" y="269">on completion</text>
+<path class="arrow" d="M130 85 L168 170"/><path class="arrow" d="M130 285 L168 195"/>
+<path class="arrow" d="M290 165 L338 50"/><path class="arrow" d="M290 175 L338 115"/><path class="arrow" d="M290 185 L338 185"/><path class="arrow dash" d="M290 195 L338 255"/><path class="arrow dash" d="M290 205 L338 325"/>
+<path class="arrow" d="M490 45 L558 45"/><path class="arrow" d="M490 185 L558 185"/><path class="arrow" d="M415 160 L415 142" style="display:none"/>
+<path class="arrow" d="M440 160 L560 125"/>
+<path class="arrow dash" d="M490 115 L558 175"/>
+<path class="arrow dash" d="M490 255 L520 255 L520 230 L580 212" style="display:none"/>
+<path class="arrow" d="M700 115 L748 115"/><path class="arrow dash" d="M700 125 L748 175" style="display:none"/>
+<path class="arrow dash" d="M700 325 L492 325"/><path class="arrow" d="M815 142 L815 158" style="display:none"/>
+<path class="arrow dash" d="M780 142 L700 322"/>
+<path class="arrow" d="M490 45 L520 45 L520 395 L492 395" style="display:none"/>
+<path class="arrow dash" d="M415 372 L415 352" style="display:none"/>
+<path class="arrow" d="M490 55 L748 245"/>
+<text class="t-sm" x="560" y="400">Solid: main flow. Dashed: lookups and side feeds.</text>
+<text class="t-sm" x="560" y="418">Location data never touches the Trip DB.</text>
+</svg>
+<figcaption>Gateway terminates apps and persistent connections. The Location service ingests driver positions into an in-memory geo index and a Kafka log; Matching queries the geo index, asks ETA for travel times and Pricing for fares, and writes the assignment through the Ride service into the durable Trip DB. Stream jobs read the Kafka log to compute surge and live road speeds. The Push service sends live updates to apps.</figcaption>
+</figure>
+<p>Responsibilities. The <b>Gateway</b> authenticates, rate-limits (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>) and holds the long-lived connections (<a href="../chapters/11-api-gateway.html">Chapter 11</a>). The <b>Location service</b> accepts the 375 K updates per second, validates and de-duplicates them, updates the in-memory index, and publishes to Kafka. The <b>Matching service</b> (often called dispatch) owns the "find and offer" logic. The <b>Ride service</b> owns the trip state machine and is the only writer of trip rows. <b>ETA and routing</b> answers "how long from A to B now". <b>Pricing</b> computes fares and applies the surge multiplier from the surge cache. The <b>Push service</b> forwards driver positions to the right riders and state changes to both apps. All of these are stateless except the Location service's index and the Matching service's per-city state, which are partitioned by geography (section 9).</p>
+
+<h3>6.3 Flow: a driver reports location</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Sequence of a driver location update">
+<text class="t-c t-b" x="80" y="22">Driver app</text><text class="t-c t-b" x="260" y="22">Gateway</text><text class="t-c t-b" x="440" y="22">Location svc</text><text class="t-c t-b" x="620" y="22">Geo index</text><text class="t-c t-b" x="810" y="22">Kafka</text>
+<line class="life" x1="80" y1="32" x2="80" y2="290"/><line class="life" x1="260" y1="32" x2="260" y2="290"/><line class="life" x1="440" y1="32" x2="440" y2="290"/><line class="life" x1="620" y1="32" x2="620" y2="290"/><line class="life" x1="810" y1="32" x2="810" y2="290"/>
+<path class="arrow" d="M80 62 L258 62"/><text class="t-sm" x="95" y="56">1 position (every 4 s)</text>
+<path class="arrow" d="M260 100 L438 100"/><text class="t-sm" x="275" y="94">2 route by city/cell</text>
+<path class="arrow" d="M440 140 L618 140"/><text class="t-sm" x="455" y="134">3 drop if seq old; update cell</text>
+<path class="arrow dash" d="M618 175 L442 175"/><text class="t-sm" x="480" y="169">4 ok</text>
+<path class="arrow" d="M440 215 L808 215"/><text class="t-sm" x="520" y="209">5 publish (async, batched)</text>
+<path class="arrow dash" d="M258 250 L82 250"/><text class="t-sm" x="110" y="244">6 202 (no body)</text>
+<text class="t-sm" x="480" y="275">Steps 3 and 5 do not block the 202.</text>
+</svg>
+<figcaption>The update is acknowledged as soon as it is accepted; the in-memory index update and the Kafka publish are fast, local and batched. If the geo index is momentarily unavailable the update is lost without harm, because the next one arrives in 4 seconds.</figcaption>
+</figure>
+<h3>6.4 Flow: requesting and matching a ride</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Sequence of requesting and matching a ride">
+<text class="t-c t-b" x="60" y="22">Rider</text><text class="t-c t-b" x="200" y="22">Ride svc</text><text class="t-c t-b" x="350" y="22">Matching</text><text class="t-c t-b" x="500" y="22">Geo index</text><text class="t-c t-b" x="640" y="22">ETA</text><text class="t-c t-b" x="780" y="22">Driver</text>
+<line class="life" x1="60" y1="32" x2="60" y2="390"/><line class="life" x1="200" y1="32" x2="200" y2="390"/><line class="life" x1="350" y1="32" x2="350" y2="390"/><line class="life" x1="500" y1="32" x2="500" y2="390"/><line class="life" x1="640" y1="32" x2="640" y2="390"/><line class="life" x1="780" y1="32" x2="780" y2="390"/>
+<path class="arrow" d="M60 55 L198 55"/><text class="t-sm" x="70" y="49">1 POST /rides</text>
+<path class="arrow" d="M200 80 L348 80"/><text class="t-sm" x="215" y="74">2 REQUESTED saved, match</text>
+<path class="arrow" d="M350 108 L498 108"/><text class="t-sm" x="365" y="102">3 drivers near pickup</text>
+<path class="arrow dash" d="M498 132 L352 132"/><text class="t-sm" x="395" y="148">4 30 candidates</text>
+<path class="arrow" d="M350 170 L638 170"/><text class="t-sm" x="400" y="164">5 batch ETA candidate to pickup</text>
+<path class="arrow dash" d="M638 195 L352 195"/><text class="t-sm" x="450" y="211">6 road ETAs</text>
+<path class="arrow" d="M350 235 L778 235"/><text class="t-sm" x="450" y="229">7 offer to best driver (15 s)</text>
+<path class="arrow dash" d="M778 262 L352 262"/><text class="t-sm" x="520" y="278">8 accept</text>
+<path class="arrow" d="M350 300 L202 300"/><text class="t-sm" x="215" y="294">9 assign (conditional write)</text>
+<path class="arrow dash" d="M200 330 L62 330"/><text class="t-sm" x="75" y="346">10 ACCEPTED + driver, ETA</text>
+<path class="arrow dash" d="M200 360 L778 360"/><text class="t-sm" x="420" y="376">11 push ACCEPTED to driver</text>
+</svg>
+<figcaption>Matching gathers nearby candidates from the geo index, re-ranks them by road-network ETA, offers to the best one, and only when the driver accepts does it ask the Ride service to bind them with a conditional write. If the driver declines or times out, the loop returns to step 7 with the next candidate.</figcaption>
+</figure>
+<p>Step by step. (1) The rider app sends the request with its idempotency key. (2) The Ride service writes the ride in state <code>REQUESTED</code> to the durable trip store before doing anything else; this is the point at which the request is safe. It then hands the ride to Matching. (3, 4) Matching asks the geo index for available drivers in the cell containing the pickup and in rings of neighbouring cells until it has enough candidates (a few dozen). (5, 6) Straight-line distance is a poor proxy for pickup time (rivers, one-way streets, highways), so Matching asks the ETA service for road travel times from all candidates to the pickup in one batched call and re-ranks. (7, 8) It sends an offer to the best driver with a 15-second expiry; the driver accepts or declines, or the offer times out. (9) On accept, Matching calls the Ride service, which performs the atomic assignment (section 7.2). (10, 11) Both apps are notified, and the driver's live location starts being relayed to the rider (section 8.3).</p>
+
+<h3>6.5 The trip state machine</h3>
+<figure class="diagram">
+<svg viewBox="0 0 900 220" role="img" aria-label="Trip state machine">
+<rect class="box" x="10" y="80" width="110" height="46" rx="8"/><text class="t-c t-b" x="65" y="108">REQUESTED</text>
+<rect class="box" x="160" y="80" width="110" height="46" rx="8"/><text class="t-c t-b" x="215" y="108">OFFERED</text>
+<rect class="box" x="310" y="80" width="110" height="46" rx="8"/><text class="t-c t-b" x="365" y="108">ACCEPTED</text>
+<rect class="box" x="460" y="80" width="110" height="46" rx="8"/><text class="t-c t-b" x="515" y="108">ARRIVED</text>
+<rect class="box" x="610" y="80" width="110" height="46" rx="8"/><text class="t-c t-b" x="665" y="108">IN_PROGRESS</text>
+<rect class="hit" x="760" y="80" width="120" height="46" rx="8"/><text class="t-c t-b" x="820" y="108">COMPLETED</text>
+<rect class="miss" x="160" y="165" width="130" height="40" rx="8"/><text class="t-c t-b" x="225" y="190">NO_DRIVERS</text>
+<rect class="miss" x="400" y="165" width="130" height="40" rx="8"/><text class="t-c t-b" x="465" y="190">CANCELLED</text>
+<path class="arrow" d="M120 103 L158 103"/><path class="arrow" d="M270 103 L308 103"/><path class="arrow" d="M420 103 L458 103"/><path class="arrow" d="M570 103 L608 103"/><path class="arrow arrow-g" d="M720 103 L758 103"/>
+<path class="arrow dash" d="M215 80 C215 40 215 40 215 40 L165 40 L90 40 L65 78" style="display:none"/>
+<path class="arrow arrow-r dash" d="M215 126 L225 163"/>
+<path class="arrow arrow-r dash" d="M365 126 L440 163"/><path class="arrow arrow-r dash" d="M515 126 L480 163"/>
+<text class="t-sm" x="165" y="65">decline or timeout: back to REQUESTED, next driver</text>
+<text class="t-sm" x="560" y="170">cancel by rider or driver</text>
+<text class="t-sm" x="560" y="188">(fee rules depend on state)</text>
+<text class="t-sm" x="620" y="60">Every arrow is a conditional write: allowed only from the expected state.</text>
+</svg>
+<figcaption>Each transition is a compare-and-set on the ride row (state and version). A late or duplicated message, such as an Accept arriving after the rider cancelled, simply fails the condition and is rejected; it cannot move the ride to an invalid state. IN_PROGRESS cannot be cancelled in the same way as earlier states (it ends through COMPLETED or an incident flow).</figcaption>
+</figure>
+<p>The state machine is the contract between rider, driver and billing. Writing it down makes concurrency tractable: every actor (rider cancel, driver accept, timeout timer, support agent) issues a transition request with the state it expects to see, and the database accepts at most one winner. This is optimistic concurrency, described in <a href="../chapters/08-scalability-concurrency.html">Chapter 8</a>.</p>
+
+<h2 id="deep-dives">7. Deep dives</h2>
+<p>Four parts are where an interviewer will push: how to find nearby drivers fast, how to assign a driver without double-booking, how to compute an ETA, and how surge pricing works. Each is treated with alternatives and a decision.</p>
+
+<h3>7.1 Deep dive: the geospatial index</h3>
+<p>The query is "give me available drivers within about 2 km of this point, sorted roughly by closeness", and it runs both for the rider's map view (about 2,100 per second at peak) and for every match attempt (about 900 per second, plus retries). Meanwhile 375,000 positions per second are changing the data. The index therefore has to be cheap to update and cheap to query by area. The general techniques are explained in <a href="../chapters/58-geospatial-text.html">Chapter 58</a> and the dedicated <a href="c13-nearby-search.html">Case study 13</a>; here we apply them to moving objects.</p>
+<h4>The idea of a cell</h4>
+<p>Instead of storing a raw latitude and longitude and searching numerically, we divide the world into cells and give each cell an id. A point maps to its cell id with a pure computation, with no lookup. To find drivers near a point we compute the point's cell and its neighbouring cells, and read the set of drivers stored under each cell id. A query becomes "union of a few small sets", which is a handful of hash lookups.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Grid cells with a rider and drivers, ring search">
+<g>
+<rect class="box" x="40" y="30" width="60" height="60" rx="2" style="fill-opacity:.15"/><rect class="box" x="100" y="30" width="60" height="60" rx="2" style="fill-opacity:.15"/><rect class="box" x="160" y="30" width="60" height="60" rx="2" style="fill-opacity:.15"/><rect class="box" x="220" y="30" width="60" height="60" rx="2" style="fill-opacity:.15"/><rect class="box" x="280" y="30" width="60" height="60" rx="2" style="fill-opacity:.15"/>
+<rect class="box" x="40" y="90" width="60" height="60" rx="2" style="fill-opacity:.15"/><rect class="hit" x="100" y="90" width="60" height="60" rx="2"/><rect class="hit" x="160" y="90" width="60" height="60" rx="2"/><rect class="hit" x="220" y="90" width="60" height="60" rx="2"/><rect class="box" x="280" y="90" width="60" height="60" rx="2" style="fill-opacity:.15"/>
+<rect class="box" x="40" y="150" width="60" height="60" rx="2" style="fill-opacity:.15"/><rect class="hit" x="100" y="150" width="60" height="60" rx="2"/><rect class="cache" x="160" y="150" width="60" height="60" rx="2"/><rect class="hit" x="220" y="150" width="60" height="60" rx="2"/><rect class="box" x="280" y="150" width="60" height="60" rx="2" style="fill-opacity:.15"/>
+<rect class="box" x="40" y="210" width="60" height="60" rx="2" style="fill-opacity:.15"/><rect class="hit" x="100" y="210" width="60" height="60" rx="2"/><rect class="hit" x="160" y="210" width="60" height="60" rx="2"/><rect class="hit" x="220" y="210" width="60" height="60" rx="2"/><rect class="box" x="280" y="210" width="60" height="60" rx="2" style="fill-opacity:.15"/>
+<rect class="box" x="40" y="270" width="60" height="30" rx="2" style="fill-opacity:.15"/><rect class="box" x="100" y="270" width="60" height="30" rx="2" style="fill-opacity:.15"/><rect class="box" x="160" y="270" width="60" height="30" rx="2" style="fill-opacity:.15"/><rect class="box" x="220" y="270" width="60" height="30" rx="2" style="fill-opacity:.15"/><rect class="box" x="280" y="270" width="60" height="30" rx="2" style="fill-opacity:.15"/>
+</g>
+<circle cx="190" cy="180" r="7" fill="var(--fg)"/>
+<circle cx="130" cy="120" r="5" fill="var(--good)"/><circle cx="250" cy="115" r="5" fill="var(--good)"/><circle cx="125" cy="235" r="5" fill="var(--good)"/><circle cx="305" cy="180" r="5" fill="var(--good)"/><circle cx="60" cy="55" r="5" fill="var(--good)"/><circle cx="232" cy="190" r="5" fill="var(--good)"/>
+<text class="t-sm" x="370" y="50">Dark dot: rider pickup point.</text>
+<text class="t-sm" x="370" y="72">Green dots: available drivers.</text>
+<text class="t-sm" x="370" y="94">Amber cell: the pickup cell (ring 0).</text>
+<text class="t-sm" x="370" y="116">Green cells: ring 1, the 8 neighbours.</text>
+<text class="t-b" x="370" y="150">Search procedure</text>
+<text class="t-sm" x="370" y="172">1 Read ring 0 and ring 1: 9 cell lookups.</text>
+<text class="t-sm" x="370" y="194">2 If fewer than K candidates, add ring 2 (16 more cells).</text>
+<text class="t-sm" x="370" y="216">3 Stop at a radius cap (for example 10 minutes of driving).</text>
+<text class="t-sm" x="370" y="238">4 Sort candidates by straight distance, keep top K (about 30).</text>
+<text class="t-sm" x="370" y="260">5 Re-rank those K by road ETA (section 7.3).</text>
+<text class="t-sm" x="370" y="282">The driver at the right edge is in ring 2, not ring 1.</text>
+</svg>
+<figcaption>A ring search expands outward from the pickup cell. The cost is bounded by the number of cells read (9, then 25, then 49) and not by the number of drivers in the city. The driver just outside ring 1 on the right shows why a result needs the next ring when the first is sparse.</figcaption>
+</figure>
+<h4>Choosing the cell system</h4>
+<table>
+<tr><th>Option</th><th>How it works</th><th>Strengths</th><th>Weaknesses</th></tr>
+<tr><td>Geohash</td><td>Interleave latitude and longitude bits into a base-32 string; a prefix names a rectangle.</td><td>Simple, works in any key-value store or Redis, prefix scans give containment.</td><td>Rectangles distort toward the poles. Two nearby points can have totally different prefixes across a cell boundary, so neighbours must be computed explicitly. Cell sizes jump by factors of 32 between levels.</td></tr>
+<tr><td>Quadtree</td><td>Recursively split a square into four children when a node holds too many points.</td><td>Adapts to density: dense downtown cells are small, deserts are huge. Good for static points.</td><td>With 375 K moves per second the tree needs constant rebalancing, hard locking and awkward distribution across machines.</td></tr>
+<tr><td>S2 (Google)</td><td>Map the sphere onto a cube, then a space-filling Hilbert curve; cell ids are 64-bit integers with a parent/child hierarchy.</td><td>Little distortion, a cell id is one integer, nearby cells have numerically close ids, library provides region covering and neighbour lookup.</td><td>Needs a library; square cells have uneven neighbour distances (corner versus edge neighbours).</td></tr>
+<tr><td>H3 (Uber)</td><td>Hexagonal hierarchical grid on the globe, about 16 resolutions; a few pentagons exist.</td><td>All six neighbours of a hexagon are the same distance away, which makes ring and radius reasoning and smoothing (for surge) clean. Open-source library.</td><td>Hierarchy is approximate (children do not nest perfectly), so parent-child aggregation is slightly lossy.</td></tr>
+</table>
+<p><b>Decision.</b> Use a hierarchical cell grid, S2 or H3, at one fixed resolution for the driver index (cells about 0.5 to 1 km across, so a city has thousands of cells), and the same system at a coarser resolution for the partitioning key and for surge. Hexagons give uniform neighbour distances, which helps both the ring search and surge smoothing, so we pick H3-style hexagons (the diagram draws squares for simplicity); an interviewer who prefers S2 is equally well served, because the structure of the solution is identical. Quadtrees are the right answer for static points of interest (<a href="c13-nearby-search.html">Case study 13</a>) but poor for points that move constantly. A fixed grid never needs rebalancing: a move is "remove driver id from the old cell's set, add to the new one", and most updates do not even cross a cell boundary (at 8 m/s, about 30 m per update, versus cells of hundreds of metres), so most updates only overwrite the driver's record.</p>
+<h4>How the index is stored and partitioned</h4>
+<p>Two structures: <code>driver_live: driver_id to record</code> and <code>cell_index: cell_id to set of available driver ids</code>. A driver in an ongoing trip is removed from <code>cell_index</code> (not available) but keeps a live record so the rider can see them. The simplest implementation is Redis: hash plus set commands, or its geospatial commands, per city shard, which works to a few hundred thousand operations per second per cluster. At full scale the index lives inside the Location service as an in-process structure, partitioned by city (or by a coarse cell, for megacities), with each partition owned by exactly one process at a time using consistent hashing (<a href="../chapters/25-sharding.html">Chapter 25</a>, <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>) and a replica receiving the same Kafka stream as a warm standby. The Redis form is fine to describe first because it is easy to explain; sorted-set ideas appear in <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>.</p>
+<div class="callout watch"><b>Watch out</b> Do not put the 375 K per second location writes into your trip database, and do not make them durable synchronously. They are a cache of "where the driver is right now". Also do not forget expiry: a driver whose phone lost signal must disappear from the index. Each record carries its timestamp, and the query ignores anything older than 30 seconds; a background sweeper removes stale entries from cell sets.</div>
+
+<h3>7.2 Deep dive: matching and exactly-one assignment</h3>
+<h4>Which driver to pick</h4>
+<table>
+<tr><th>Strategy</th><th>How it works</th><th>Tradeoffs</th></tr>
+<tr><td>Greedy nearest</td><td>On each request, offer to the closest available driver by ETA immediately.</td><td>Lowest latency, trivial to implement. Locally optimal only: a request may take a driver who was the only good option for the next request seconds later, so total wait across riders is worse at busy times.</td></tr>
+<tr><td>Batched matching</td><td>Collect requests and idle drivers in a city for a short window (about 2 seconds), build a cost matrix of ETAs, and solve a bipartite assignment (the Hungarian algorithm or a cheaper heuristic) to minimise total pickup time.</td><td>Better global outcome, especially under scarcity; adds up to the window length in latency; more complex; needs per-city sequencing.</td></tr>
+<tr><td>Broadcast to many</td><td>Offer to several drivers at once, first accept wins.</td><td>Fast when drivers are slow to accept, but wastes driver attention, trains drivers to ignore offers and creates many "too late" rejections.</td></tr>
+</table>
+<p><b>Decision.</b> Start with greedy nearest by road ETA, and add small-window batching in dense cities, where the benefit is real. The window is short (1 to 3 seconds) so the extra latency is hidden inside the 5-second target. Offers go to one driver at a time with a 15-second expiry, and the ranking also considers driver attributes such as car class and rating thresholds. The ranking is a scoring function, not a rule, so it can be tuned and tested through experiments.</p>
+<h4>Making assignment atomic</h4>
+<p>When a driver accepts, we must bind ride and driver so that this driver has no other active ride and this ride has no other driver. Two things can go wrong. The same driver can accept two offers from two matching workers (two dispatchers overlapping near a boundary, or a retry), and the same ride can be accepted twice (a timeout fires and offers it to driver B while driver A's accept is in flight).</p>
+<pre><code>-- one transaction, executed by the Ride service
+UPDATE rides SET state='ACCEPTED', driver_id=:d, version=version+1
+  WHERE ride_id=:r AND state IN ('REQUESTED','OFFERED') AND version=:v;     -- ride still open?
+INSERT INTO driver_by_ride_active(driver_id, ride_id) VALUES (:d, :r);      -- unique driver_id
+-- if either statement affects 0 rows or violates the unique key, roll back: "offer no longer valid"</code></pre>
+<p>The conditional update protects the ride; the unique key on <code>driver_id</code> protects the driver. Both fit in one transaction when the two rows are on the same shard. If the ride row and the driver's active record live on different shards, use a two-step approach: first claim the driver with a conditional write on a small per-driver record (compare-and-set from available to reserved, with an expiry), then update the ride, and release the driver claim if the second step fails. That is a tiny saga (<a href="../chapters/48-sagas.html">Chapter 48</a>, <a href="../chapters/31-distributed-transactions.html">Chapter 31</a>) with a compensation. A single-key lock with a lease (<a href="../chapters/30-coordination-locks.html">Chapter 30</a>) serves a similar purpose, but a lease can expire at the wrong moment, so the database's conditional write remains the source of truth: the lock only reduces contention, correctness never relies on it alone.</p>
+<h4>The offer timeline</h4>
+<p>The offer itself has state too. An offer row records the driver, the ride, an expiry and an outcome. The accept call carries the offer id; if the offer has expired or the ride has moved on, the accept is rejected and the driver app shows "this trip is no longer available". A timer (a delayed message on the queue, <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>) fires at the expiry and moves to the next candidate, and the transition from OFFERED back to REQUESTED is itself conditional so that a timer that fires just after an accept does nothing.</p>
+
+<h3>7.3 Deep dive: ETA</h3>
+<p>An ETA is needed in three places: pickup ETA for ranking and for the rider, trip duration for the fare estimate, and a continuously updated ETA during the ride. Accuracy matters because it shapes the rider's decision to wait, and it feeds pricing.</p>
+<h4>Layer 1: the road graph and shortest path</h4>
+<p>Represent the road network as a directed graph. Nodes are intersections, edges are road segments with length, speed limit, turn restrictions and a travel-time function that depends on the time of day. The textbook answer is Dijkstra's algorithm, and its A* variant with a straight-line heuristic. On a metropolitan graph of millions of nodes, plain Dijkstra typically takes tens to hundreds of milliseconds per query, too slow when matching needs 30 ETAs per request at 900 requests per second (27,000 route computations per second). The standard speed-up is preprocessing: <b>contraction hierarchies</b> add shortcut edges so a query visits only a few hundred nodes and answers in about a millisecond; the cost is rebuilding when edge weights change, which is why live traffic is usually applied as a correction rather than by rebuilding every minute. For many-to-one queries (30 drivers to one pickup), run one backward search from the pickup and read all driver ETAs from it, which is much cheaper than 30 separate searches.</p>
+<h4>Layer 2: traffic and history</h4>
+<p>Edge speeds come from two sources. Historical profiles: for each edge and each 15-minute bucket of the week, the median speed, computed offline from the breadcrumb archive by a batch job (<a href="../chapters/37-batch-stream.html">Chapter 37</a>). Live speeds: a stream job reads the Kafka location log, map-matches each noisy GPS point to the most likely road segment (GPS can be 5 to 20 m off, worse among tall buildings), computes segment speeds over the last few minutes, and publishes deltas that the routing service blends with the historical value, weighting live data more when many drivers contributed recent samples.</p>
+<h4>Layer 3: learned correction</h4>
+<p>Even good segment speeds miss effects: traffic-light waiting, parking at the pickup, driver behaviour, rain. A machine-learned model takes the routing ETA as an input feature plus context (time, weather, pickup type, city) and predicts the residual, that is the amount by which the route-based estimate is typically wrong. The graph answers the structural part exactly and the model handles the noisy remainder. If the model is down we serve the uncorrected route ETA, which is still within reasonable error.</p>
+<table>
+<tr><th>Approach</th><th>Latency</th><th>Accuracy</th><th>Comment</th></tr>
+<tr><td>Straight-line distance / fixed speed</td><td>microseconds</td><td>poor (misses rivers, one-way streets)</td><td>Fine only for first-pass candidate filtering.</td></tr>
+<tr><td>Dijkstra / A* on live-weighted graph</td><td>tens of ms</td><td>good</td><td>Too slow for bulk matching at scale.</td></tr>
+<tr><td>Contraction hierarchies + traffic blend</td><td>about 1 ms</td><td>good</td><td>The workhorse; needs periodic rebuilds.</td></tr>
+<tr><td>CH + ML residual</td><td>about 2 to 5 ms</td><td>best</td><td>Chosen. Falls back to the line above on model failure.</td></tr>
+</table>
+<p>The ETA service is stateless apart from its in-memory graph copy, so it scales by adding replicas and is partitioned by region (a city's graph is only a few GB). Results for popular origin and destination cells at a given time bucket are cached for a short TTL (<a href="../chapters/13-caching-patterns.html">Chapter 13</a>): fare estimates for the same cell pair within the same minute can safely be shared.</p>
+
+<h3>7.4 Deep dive: surge pricing</h3>
+<p>Surge (dynamic pricing) raises the price where demand exceeds supply. It has two jobs: reduce demand from riders who can wait or walk elsewhere, and attract more drivers to the area. The problem is to compute a multiplier per small area, quickly, without oscillation.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 340" role="img" aria-label="Surge pricing pipeline and cell multipliers">
+<rect class="box" x="20" y="30" width="150" height="56" rx="8"/><text class="t-c t-b" x="95" y="55">Ride requests</text><text class="t-c t-sm" x="95" y="73">demand events</text>
+<rect class="box" x="20" y="120" width="150" height="56" rx="8"/><text class="t-c t-b" x="95" y="145">Driver locations</text><text class="t-c t-sm" x="95" y="163">supply events</text>
+<rect class="box" x="220" y="75" width="170" height="70" rx="8"/><text class="t-c t-b" x="305" y="103">Stream job</text><text class="t-c t-sm" x="305" y="121">count per cell, per</text><text class="t-c t-sm" x="305" y="136">1 min, sliding 5 min</text>
+<rect class="box" x="440" y="75" width="170" height="70" rx="8"/><text class="t-c t-b" x="525" y="103">Multiplier calc</text><text class="t-c t-sm" x="525" y="121">ratio, smooth over</text><text class="t-c t-sm" x="525" y="136">neighbours, clamp, ramp</text>
+<rect class="cache" x="660" y="75" width="150" height="70" rx="8"/><text class="t-c t-b" x="735" y="103">Surge cache</text><text class="t-c t-sm" x="735" y="121">cell to multiplier,</text><text class="t-c t-sm" x="735" y="136">version, TTL</text>
+<path class="arrow" d="M170 58 L218 100"/><path class="arrow" d="M170 148 L218 122"/><path class="arrow" d="M390 110 L438 110"/><path class="arrow" d="M610 110 L658 110"/>
+<text class="t-b" x="20" y="225">Example cells (raw demand/supply ratio, final multiplier)</text>
+<rect class="hit" x="20" y="240" width="90" height="50" rx="4"/><text class="t-c t-sm" x="65" y="262">0.8</text><text class="t-c t-b" x="65" y="280">1.0x</text>
+<rect class="hit" x="110" y="240" width="90" height="50" rx="4"/><text class="t-c t-sm" x="155" y="262">1.1</text><text class="t-c t-b" x="155" y="280">1.0x</text>
+<rect class="cache" x="200" y="240" width="90" height="50" rx="4"/><text class="t-c t-sm" x="245" y="262">1.8</text><text class="t-c t-b" x="245" y="280">1.5x</text>
+<rect class="miss" x="290" y="240" width="90" height="50" rx="4"/><text class="t-c t-sm" x="335" y="262">3.2</text><text class="t-c t-b" x="335" y="280">2.4x</text>
+<rect class="cache" x="380" y="240" width="90" height="50" rx="4"/><text class="t-c t-sm" x="425" y="262">1.9</text><text class="t-c t-b" x="425" y="280">1.6x</text>
+<rect class="hit" x="470" y="240" width="90" height="50" rx="4"/><text class="t-c t-sm" x="515" y="262">1.2</text><text class="t-c t-b" x="515" y="280">1.0x</text>
+<text class="t-sm" x="600" y="250">Neighbour smoothing: the 3.2 cell is averaged with</text>
+<text class="t-sm" x="600" y="268">adjacent cells so price does not jump block by block.</text>
+<text class="t-sm" x="600" y="286">Multiplier is capped and rate-limited per step.</text>
+<text class="t-sm" x="600" y="304">Rider pays the multiplier shown, locked by token.</text>
+</svg>
+<figcaption>Demand and supply counts per cell flow through a stream job; the multiplier calculation smooths across neighbouring cells, clamps to a maximum, limits how fast the value can change, and writes the result to a small cache that the Pricing service reads on each estimate. The row of cells shows how a raw ratio becomes a final price multiplier (the numbers are illustrative).</figcaption>
+</figure>
+<p>The computation, step by step. For each cell and each minute, the stream job (<a href="../chapters/37-batch-stream.html">Chapter 37</a>) counts <b>demand</b> (ride requests, and optionally app opens with a destination entered in the cell) and <b>supply</b> (available drivers in the cell, from the geo index, plus drivers about to finish nearby). It compares them over a sliding window of about 5 minutes to avoid reacting to noise. The raw imbalance, say demand divided by supply, is smoothed with the neighbouring hexagons so adjacent blocks do not have wildly different prices, which would look arbitrary and encourage riders to walk across a line. The result is mapped to a multiplier through a curve (for example flat at 1.0 until the ratio exceeds about 1.2, then rising), clamped to a maximum (regulators and event rules sometimes impose caps; during emergencies many operators cap or disable surge), and ramped so that it can rise or fall by only a bounded step each interval. The ramp avoids <b>oscillation</b>: if a high price makes demand drop and drivers arrive, the ratio falls, the price drops, demand returns, and the cycle repeats. Slow, smoothed changes damp that loop.</p>
+<table>
+<tr><th>Approach</th><th>Description</th><th>Tradeoff</th></tr>
+<tr><td>Rule table by time and place</td><td>Fixed schedule: Friday 10 pm downtown is 1.5x.</td><td>Simple and predictable but blind to real conditions, so it misses events and weather.</td></tr>
+<tr><td>Reactive ratio per cell</td><td>The pipeline above.</td><td>Responds to real conditions; lags by the window; can oscillate without smoothing.</td></tr>
+<tr><td>Predictive (forecast demand)</td><td>An ML model predicts demand for the next 10 to 30 minutes per cell, and the multiplier is computed against predicted supply.</td><td>Lets price and driver incentives act before the shortage; needs good data and fallbacks.</td></tr>
+</table>
+<p><b>Decision.</b> Ship the reactive ratio with smoothing and caps first; it is explainable to riders, regulators and support. Add a forecast layer later as an input to the same curve, with the reactive value as the fallback.</p>
+<p><b>Pricing consistency.</b> A rider sees a price at estimate time and requests a ride up to a few minutes later. We do not recompute at request time. The estimate response carries a signed <code>surge_token</code> (multiplier, cell, product, expiry of about 2 to 5 minutes). The ride request presents the token, the Ride service verifies the signature and expiry, and stores the multiplier on the ride row. The fare at completion is then computed from the actual distance and time with that locked multiplier. If the token has expired and the multiplier has since gone up, the app must show the new price and ask the rider to confirm again. The surge value itself is eventually consistent across replicas, and that is fine because the token pins the specific value each rider was shown.</p>
+
+<h2 id="scaling">8. Scaling, bottlenecks, hot spots and caching</h2>
+<h3>8.1 Scaling the location ingestion</h3>
+<p>375 K updates per second is an easy number if the work per update is small and the data is partitioned. Partition by <b>city</b> (or by a coarse cell inside a big city): the gateway looks up the driver's current city from the last update and routes to that partition. Each partition receives its slice of the stream, so one city needs at most a few tens of thousands of updates per second, handled by a single process with an in-memory index. We batch writes (apply a hundred updates at a time), compress Kafka batches, and have drivers send updates adaptively: every 4 seconds while moving, every 15 to 30 seconds while stationary, and immediately on a status change. The mobile client also batches and delays sends on weak connections, with the server discarding out-of-order data by <code>seq</code>. Adaptive reporting can easily cut the rate substantially and also helps battery life (<a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>).</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Location ingestion and partitioning by city">
+<rect class="ext" x="20" y="90" width="120" height="60" rx="8"/><text class="t-c t-b" x="80" y="115">1.5 M drivers</text><text class="t-c t-sm" x="80" y="133">375 K msg/s peak</text>
+<rect class="box" x="190" y="90" width="120" height="60" rx="8"/><text class="t-c t-b" x="250" y="115">Gateways</text><text class="t-c t-sm" x="250" y="133">stateless, many</text>
+<rect class="box" x="360" y="20" width="160" height="50" rx="8"/><text class="t-c t-b" x="440" y="42">Partition: city A</text><text class="t-c t-sm" x="440" y="58">primary + replica</text>
+<rect class="box" x="360" y="90" width="160" height="50" rx="8"/><text class="t-c t-b" x="440" y="112">Partition: city B</text><text class="t-c t-sm" x="440" y="128">primary + replica</text>
+<rect class="box" x="360" y="160" width="160" height="50" rx="8"/><text class="t-c t-b" x="440" y="182">Megacity partitions</text><text class="t-c t-sm" x="440" y="198">split by coarse cell</text>
+<rect class="box" x="570" y="90" width="150" height="60" rx="8"/><text class="t-c t-b" x="645" y="115">Kafka</text><text class="t-c t-sm" x="645" y="133">keyed by city/driver</text>
+<rect class="db" x="770" y="30" width="110" height="46" rx="8"/><text class="t-c t-b" x="825" y="58">Archive</text>
+<rect class="box" x="770" y="100" width="110" height="46" rx="8"/><text class="t-c t-b" x="825" y="128">Speed job</text>
+<rect class="box" x="770" y="170" width="110" height="46" rx="8"/><text class="t-c t-b" x="825" y="198">Surge job</text>
+<path class="arrow" d="M140 120 L188 120"/><path class="arrow" d="M310 110 L358 50"/><path class="arrow" d="M310 120 L358 115"/><path class="arrow" d="M310 130 L358 185"/>
+<path class="arrow dash" d="M520 50 L568 110"/><path class="arrow dash" d="M520 115 L568 120"/><path class="arrow dash" d="M520 185 L568 135"/>
+<path class="arrow" d="M720 105 L768 55"/><path class="arrow" d="M720 120 L768 123"/><path class="arrow" d="M720 135 L768 190"/>
+<text class="t-sm" x="20" y="250">The hot path (gateway to partition) is memory-only; durability and analytics hang off Kafka.</text>
+</svg>
+<figcaption>Gateways route each update to the partition that owns the driver's city. A megacity is split further by coarse cell. Kafka is a side channel for consumers that need the stream (archive, road-speed learning, surge); the matching path never waits on it.</figcaption>
+</figure>
+<h3>8.2 Hot spots</h3>
+<ul>
+<li><b>Geographic hot spots.</b> An airport, a stadium or New Year's Eve concentrates both drivers and requests in a few cells. The cell index handles that (each cell lookup is a set read), but the matching worker for a busy cell can become the bottleneck, so matching is sharded by cell prefix inside a city, and batched matching naturally absorbs bursts because it processes a window at a time. Airports often use a separate queue or staging lot: drivers are admitted into a virtual FIFO and matched in order, which also resolves fairness complaints.</li>
+<li><b>Hot keys.</b> A single driver record is written every 4 seconds, which is no problem, but a single surge key read on every estimate is hot. Surge values are cached in process in each Pricing instance with a 10 to 30 second TTL.</li>
+<li><b>Skew across cities.</b> A few cities carry a large share of trips, so partitions are sized by load rather than count, and megacities have dedicated clusters.</li>
+</ul>
+<h3>8.3 Delivering live location to riders</h3>
+<p>During a ride, a rider's app displays the driver's car moving. That needs a push path from the geo index to the right phone about every 4 seconds. At 1 M watching riders that is 250,000 pushes per second (section 3.3). The mechanism: when a ride is accepted, the Push service records a subscription "rider R watches driver D" in the gateway that holds the rider's connection (<a href="../chapters/06-realtime.html">Chapter 6</a>). The Location service, on each update for D, checks its small in-memory map of "drivers with active subscribers" and forwards the position to the gateway, which writes it down the rider's WebSocket. Only drivers on a trip need this, so the lookup is cheap. The app smooths the 4-second updates with interpolation so the car glides rather than jumps. If the connection drops, the app falls back to polling <code>GET /rides/{id}</code> every few seconds and reconnects. For the "cars nearby" view before booking, we do not subscribe at all: the app polls every 5 seconds, since a slightly stale picture is fine and polling is simple and scalable (the response can even be cached for a second per cell).</p>
+<h3>8.4 Caching and read paths</h3>
+<ul>
+<li>Nearby-drivers responses: cached per cell for about 1 second inside the Location service; at 2,100 requests per second the saving is modest but removes duplicate scans on busy cells.</li>
+<li>Fare estimates: cached by (origin cell, destination cell, product, minute) for about a minute, then adjusted for the current surge multiplier.</li>
+<li>Geocoding and place search (typing an address) use a separate search service and cache heavily; autocomplete itself is <a href="c11-autocomplete.html">Case study 11</a>.</li>
+<li>Trip reads (<code>GET /rides/{id}</code>): primary key lookups on the trip store with a replica read for non-critical views; the apps also hold the state locally and reconcile on reconnect.</li>
+</ul>
+
+<h2 id="failures">9. Failure modes, consistency and multi-region</h2>
+<h3>9.1 Component failures</h3>
+<table>
+<tr><th>Component</th><th>If it fails, slows or is wrong</th><th>Mitigation</th></tr>
+<tr><td>Geo index partition</td><td>Primary crashes: new matches in that city find no drivers for seconds. A slow or stale index offers drivers who have moved away.</td><td>Warm replica consumes the same stream and takes over in seconds; the index rebuilds from the next round of driver updates within about 4 seconds even from empty. Matching always checks the live record age and the driver's current status before offering.</td></tr>
+<tr><td>Kafka</td><td>Ingestion consumers lag; surge and speed data go stale.</td><td>Matching does not depend on it. Surge falls back to the last known multiplier with a TTL that decays toward 1.0; ETA falls back to historical speeds. Replicated topics (<a href="../chapters/24-replication.html">Chapter 24</a>).</td></tr>
+<tr><td>Trip DB shard</td><td>Rides on that shard cannot be created or updated.</td><td>Synchronous replication and automatic failover; the app retries with its idempotency key. Active rides already assigned continue on the apps' local state; completion is retried (<a href="../chapters/41-ha-dr.html">Chapter 41</a>).</td></tr>
+<tr><td>Matching service</td><td>A worker dies mid-offer.</td><td>Offers and their expiry are persisted; another worker picks up requests whose state has stayed REQUESTED or OFFERED beyond its timeout. Offer handling is idempotent.</td></tr>
+<tr><td>ETA service or ML model</td><td>Slow or returns wrong estimates.</td><td>Timeouts and a circuit breaker (<a href="../chapters/40-resilience.html">Chapter 40</a>); fall back to the graph ETA, then to straight-line distance with an average speed. Sanity bounds reject a prediction far outside the graph estimate.</td></tr>
+<tr><td>Pricing and surge</td><td>Cache empty or stale.</td><td>Serve last value with TTL; if none, base fare with no surge. Never block the ride on pricing.</td></tr>
+<tr><td>Push channel</td><td>Driver or rider does not get the update.</td><td>Apps poll on reconnect and on foreground; the server is the source of truth. For the offer itself, a push notification is the backup to the open socket.</td></tr>
+<tr><td>Payment service</td><td>Cannot charge at trip end.</td><td>The trip completes regardless; payment is retried asynchronously with an idempotency key (<a href="c14-payment-system.html">Case study 14</a>); riders with failed payments are blocked from the next request.</td></tr>
+<tr><td>GPS and phone issues</td><td>Bad accuracy, jumps, spoofed positions, a phone in a tunnel.</td><td>Drop updates with poor accuracy or impossible speed; smooth with map matching; mark the driver unavailable if silent for 30 seconds; detect mock-location apps.</td></tr>
+</table>
+<h3>9.2 Consistency and idempotency decisions</h3>
+<ul>
+<li><b>Strongly consistent:</b> the ride row and the driver-active uniqueness. Every state transition is a conditional write. These are the only places where we pay for consensus or a synchronous replica write (<a href="../chapters/28-cap-consistency.html">Chapter 28</a>, <a href="../chapters/29-consensus.html">Chapter 29</a>).</li>
+<li><b>Eventually consistent, loss-tolerant:</b> driver locations, nearby-driver lists, surge values, ETA caches.</li>
+<li><b>Idempotent commands:</b> create ride (client request id), accept offer (offer id plus conditional update), complete ride (conditional on IN_PROGRESS), charge (payment idempotency key). Every retry is safe, which is what lets us use at-least-once messaging throughout (<a href="../chapters/35-messaging-patterns.html">Chapter 35</a>).</li>
+<li><b>Ordering:</b> location updates carry a driver-local <code>seq</code>; trip transitions carry a version. A late message loses by comparison rather than by wall clock time, because phone clocks are unreliable (<a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>).</li>
+<li><b>Dual views:</b> the rider and the driver may briefly disagree (the rider cancelled but the driver's app has not received it yet). The server's state wins; the driver's later "start trip" fails the state condition and the app corrects itself.</li>
+</ul>
+<h3>9.3 Multi-region</h3>
+<p>Cities are nearly independent: a rider in Mumbai never matches a driver in Chicago. We therefore make the <b>city (or a group of nearby cities) the unit of isolation</b>, in the spirit of cells (<a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>). Each city is homed in one region that holds its geo index, matching state, trip shard and surge job, so the whole hot path is single-region and low-latency, and an outage affects only the cities in that cell. Cross-region data is limited to the user and driver account directory (replicated, mostly read), the global pricing configuration, and analytics, shipped asynchronously through Kafka mirroring (<a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>). A traveller who lands in a new city simply uses that city's region, with their profile fetched from the account service. Trips near a region boundary are rare and handled by assigning border cells to one region. Disaster recovery is by replicating each city's trip data to a second region; on failover, drivers' apps reconnect and the live index rebuilds in a few seconds, and only the in-flight trips need reconciliation from the replicated trip state.</p>
+
+<h2 id="ops">10. Security, abuse, monitoring and cost</h2>
+<h3>10.1 Security and abuse</h3>
+<ul>
+<li><b>Authentication and authorisation:</b> short-lived tokens; a driver can only read their own offers and the rider's pickup and name for an assigned ride; a rider sees only the assigned driver's position, never other riders. Check authorisation on every push subscription (<a href="../chapters/55-security.html">Chapter 55</a>).</li>
+<li><b>Location privacy:</b> positions are personal data. Minimise retention (full detail 7 days, then aggregated), restrict internal access, and coarsen the positions of nearby drivers shown on the pre-booking map (round them, or hide the exact heading) so an observer cannot track an individual driver. Reveal the exact destination to the driver only as late as the product allows (<a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>).</li>
+<li><b>Fraud:</b> GPS spoofing to fake surge hot spots or fake trips; collusion between rider and driver to collect incentives; stolen payment cards. Controls include velocity checks, device attestation, anomaly detection on trips with no movement, and holds on suspicious payouts.</li>
+<li><b>Abuse of the API:</b> rate limits per user, device and IP at the gateway; limits on cancellation frequency (<a href="../chapters/16-rate-limiting.html">Chapter 16</a>).</li>
+<li><b>Safety:</b> trip sharing, an emergency button and audit trails are served from the same trip and location data, so retention and access rules must make room for them.</li>
+</ul>
+<h3>10.2 Monitoring and SLOs</h3>
+<table>
+<tr><th>SLI</th><th>Target (SLO)</th><th>Why it matters</th></tr>
+<tr><td>Match success rate: requests that end ACCEPTED within 60 s, where supply existed</td><td>at least 97%</td><td>The core business outcome.</td></tr>
+<tr><td>Time to match (request to ACCEPTED, excluding driver think time)</td><td>p50 under 5 s, p99 under 15 s</td><td>Rider patience.</td></tr>
+<tr><td>Location freshness: share of online drivers with an index entry under 10 s old</td><td>at least 99%</td><td>A stale index means bad offers.</td></tr>
+<tr><td>ETA error: median absolute percentage error of pickup ETA against actual</td><td>under 15% (tracked per city)</td><td>Rider trust and pricing.</td></tr>
+<tr><td>Double assignment incidents</td><td>0</td><td>A correctness invariant; alert on any.</td></tr>
+<tr><td>Request API availability</td><td>99.95%</td><td>Revenue.</td></tr>
+</table>
+<p>Track per-city dashboards (supply, demand, surge, match rate, cancel rate), the age distribution of driver locations, Kafka consumer lag, offer accept and decline rates (a sudden drop signals a bad ranking change or an app bug), and a synthetic probe that requests rides from fake riders to fake drivers in each region every minute. Alerts follow SLO burn rates (<a href="../chapters/54-observability-slos.html">Chapter 54</a>). Changes to ranking, surge curves and ETA models are shipped behind experiments and gradual rollouts (<a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>).</p>
+<h3>10.3 Cost notes</h3>
+<ul>
+<li>Compute for the location tier is modest: 375 K small messages per second across a few hundred cores. Most cost is in maps and ML (routing graph replicas per region, model serving) and in storage of the location archive (about 2.2 TB per day raw), so downsampling after 7 days is a major saving: keeping one point per 15 seconds after the first week is roughly a 4x reduction, and older data is dropped at the end of the retention period.</li>
+<li>Third-party map data and map matching (or the cost of building them) is often a large vendor line item; caching ETAs and geocoding is the lever.</li>
+<li>Push notifications and SMS for offers and status are billed per message; use persistent sockets first and fall back to push or SMS only if the socket is down.</li>
+<li>Driver incentives, not infrastructure, are typically the biggest spend; better matching (lower pickup time) can save more money than any cache.</li>
+</ul>
+
+<h2 id="evolution">11. Evolution: phasing, 10x scale and alternatives</h2>
+<h3>11.1 What to build first</h3>
+<ol>
+<li><b>Phase 1 (one city):</b> a relational database with a spatial extension or a Redis geo index, a single-region deploy, greedy nearest matching with straight-line distance, flat pricing, polling for live location. This validates the product.</li>
+<li><b>Phase 2 (a few cities):</b> separate the Location service and the trip store, add Kafka, move to the cell index, introduce the state machine with conditional writes, add push over WebSockets, and use a map provider's routing API for ETA.</li>
+<li><b>Phase 3 (many cities):</b> own the road graph and the ETA service, reactive surge, per-city partitioning and cells, batched matching in dense cities, an experimentation framework.</li>
+<li><b>Phase 4 (global):</b> ML ETA residuals and demand forecasting, multi-region cells with DR, pooling and scheduled rides, fraud systems.</li>
+</ol>
+<h3>11.2 At 10x scale</h3>
+<ul>
+<li>200 M trips per day, 3.75 M location updates per second at peak. The partitioned-by-city architecture scales roughly linearly; what changes is that the largest cities need sub-city partitions with their own matching workers, and Kafka needs more partitions (<a href="../chapters/34-queues-kafka.html">Chapter 34</a>).</li>
+<li>Edge aggregation: regional location collectors reduce wide-area traffic by batching and by dropping redundant updates from stationary drivers.</li>
+<li>Matching moves toward global optimisation per city per second, which increases ETA query volume substantially; precomputed ETA matrices between cells in the same city become attractive.</li>
+<li>The location archive grows to tens of petabytes per year, so the retention policy and columnar archive formats become a cost priority.</li>
+</ul>
+<h3>11.3 Alternatives not chosen</h3>
+<ul>
+<li><b>One global geo index.</b> Simple to reason about but gives up isolation and adds cross-region latency for no benefit, since matches are always local.</li>
+<li><b>Writing every location to the primary database.</b> Wastes durability on data that expires in seconds and would require a huge write-optimised cluster.</li>
+<li><b>Quadtree index.</b> Adapts to density, but rebalancing under constant movement is costly; a fixed grid with finer cells in dense areas (hierarchical resolution) gives most of the benefit.</li>
+<li><b>Broadcasting offers to all nearby drivers.</b> Increases noise for drivers and wasted offers; kept only as a fallback in supply-poor areas.</li>
+<li><b>A pure ML dispatcher with no explicit state machine.</b> Models can rank candidates but must never own the correctness of assignment.</li>
+</ul>
+
+<h2 id="qa">12. Interview Q&amp;A</h2>
+<details><summary>Why do you keep driver locations in memory and not in the main database?</summary><p>Location data is written 375,000 times per second at peak, and each value is only useful for a few seconds, because the next update replaces it. Making each write durable would need a huge write-optimised cluster to preserve data that has almost no value after 4 seconds. Instead the live position is held in an in-memory index, with a replica fed from the same stream, and the full history is appended to Kafka and archived for ML and disputes. If an index node dies, it refills from the next round of driver updates within seconds. The trip database, by contrast, holds the small amount of data whose loss would matter, such as who was assigned to which ride.</p></details>
+<details><summary>How do you find the closest drivers to a rider efficiently?</summary><p>I divide the map into hierarchical cells (S2 or H3), keep for each cell the set of available drivers, and compute the rider's cell id by pure arithmetic. A query reads the rider's cell and its eight neighbours, widening to the next ring if there are fewer than about 30 candidates. The cost is bounded by the number of cells read, not by the number of drivers in the city. I then rank by straight-line distance, keep the top 30, and re-rank by road ETA from the routing service, because straight lines ignore rivers, one-way streets and highways. A fixed grid is preferable to a quadtree here since drivers move constantly and a grid never needs rebalancing.</p></details>
+<details><summary>Two riders request at the same instant and the same driver is the best match for both. What happens?</summary><p>Both matching attempts may offer to that driver, but only one accept can win, because assignment is a conditional write. The Ride service updates the ride only if it is still open, and inserts into the active-driver table whose unique key on driver id rejects a second active ride for that driver. The loser gets "offer no longer valid" and the dispatcher moves to the next candidate for that rider. To reduce wasted offers, a driver with an outstanding offer is also marked reserved in the index for the offer duration, and batched matching in dense cities assigns the contested driver to whichever rider gives the lowest total cost. Correctness never depends on that reservation, only the database condition does.</p></details>
+<details><summary>How would you compute the ETA, and why not just use straight-line distance?</summary><p>Straight-line distance can be badly wrong: a driver across a river is 300 metres away and 20 minutes away. I use a road graph with time-of-day speeds, and a speed-up such as contraction hierarchies so a route query takes around a millisecond and one backward search from the pickup serves all candidate drivers at once. Live speeds, learned from the drivers' own GPS after map matching, are blended with historical profiles. Finally a machine-learned model predicts the residual error of the route estimate, adding effects such as traffic lights and pickup delay. If the model or live feed fails, the system falls back to the plain graph estimate, then to a distance-based guess, so ETAs always exist.</p></details>
+<details><summary>Explain how surge pricing is computed and how you stop it from oscillating.</summary><p>A stream job counts demand (requests) and supply (available drivers) per hexagonal cell over a sliding window of a few minutes. The ratio is smoothed across neighbouring cells, mapped through a curve to a multiplier, clamped at a maximum, and ramped so it changes by a bounded step per interval. Oscillation occurs because a price rise cuts demand and draws drivers, which pushes the ratio down, which drops the price, which brings demand back. The sliding window, spatial smoothing and bounded step size all slow that feedback loop. The rider is shown a signed token with the multiplier, so the price shown is the price charged even though the underlying value keeps changing.</p></details>
+<details><summary>What happens if a driver accepts a ride just as the rider cancels?</summary><p>Both events become conditional state transitions on the same ride row. The cancel moves REQUESTED or OFFERED to CANCELLED, the accept moves OFFERED to ACCEPTED, and the database applies whichever arrives first. The other fails its precondition. If the cancel wins, the driver's accept returns "trip no longer available" and the driver app clears the offer. If the accept wins, the rider's cancel is processed as a cancellation of an accepted ride, which may carry a fee under the cancellation rules. Neither actor can push the trip into an invalid state, and because the commands are idempotent, retries are harmless.</p></details>
+<details><summary>How do you deliver the driver's moving position to the rider's phone?</summary><p>When a ride is accepted, the rider's gateway connection is registered as a subscriber to that driver. Each time the Location service accepts a position update for a driver who has subscribers, it forwards the update to the gateway holding the rider's WebSocket. Only drivers on a trip are tracked, so the extra lookup is small even though the total push rate can reach 250,000 per second at peak. The app interpolates between updates so the car moves smoothly. If the socket drops, the app falls back to polling the ride endpoint and reconnects. Browsing the map before booking uses simple polling every few seconds, because slightly stale data is fine and polling scales trivially.</p></details>
+<details><summary>How would you scale this to multiple regions and what data crosses regions?</summary><p>I treat the city as the unit of isolation. Each city is homed in one region that has its geo index, matching service, trip shard and surge pipeline, so the latency-critical path never crosses a region boundary. Only slow-moving data crosses regions: the account directory, configuration, and analytics streams. A rider travelling abroad uses the new city's region, with the profile fetched on demand. For disaster recovery, a city's trip data is replicated to a second region, and on failover the location index is rebuilt from fresh driver updates in seconds. This also contains blast radius, since a bad deployment or a failure in one city cell does not affect the others.</p></details>
+<details><summary>How do you handle bad GPS data, such as a driver whose position jumps across the city?</summary><p>I filter at ingestion and again at consumption. Each update carries an accuracy value, so low-accuracy points are dropped. A speed check against the previous position rejects teleports, for example implied speeds above about 200 km/h. The sequence number discards out-of-order duplicates. For road-speed learning and fares, points are map-matched to the road network with a probabilistic model that considers the sequence of points, which smooths jitter in urban canyons. For fares we use the matched route and fall back to the estimated route if breadcrumbs have gaps. A driver who goes silent for 30 seconds is removed from the available set, so a dead phone cannot be offered rides.</p></details>
+<details><summary>How would you add pooled rides to this design?</summary><p>Pooling changes matching from a driver-per-rider problem to one where a new request can join a trip in progress. The Matching service would also query active trips whose route passes near the pickup, and evaluate the detour for existing riders using the ETA service, accepting only if every rider's added delay stays under a threshold. The trip entity becomes one vehicle trip with several rider legs, and the "driver has one active ride" constraint becomes a capacity constraint. The state machine gets per-leg states, and pricing splits the fare. The geo index, ETA and push layers do not change, which is a good sign that the original decomposition was right.</p></details>
+
+<h2 id="connects">13. Connects to and recap</h2>
+<p class="connects"><b>Connects to:</b> framework in <a href="../chapters/01-interview-framework.html">Chapter 1</a>, estimation in <a href="../chapters/02-estimation.html">Chapter 2</a>, API design in <a href="../chapters/05-api-design.html">Chapter 5</a>, real-time delivery in <a href="../chapters/06-realtime.html">Chapter 6</a>, serialization in <a href="../chapters/07-serialization.html">Chapter 7</a>, concurrency in <a href="../chapters/08-scalability-concurrency.html">Chapter 8</a>, gateways in <a href="../chapters/11-api-gateway.html">Chapter 11</a>, caching in <a href="../chapters/13-caching-patterns.html">Chapter 13</a>, Redis in <a href="../chapters/15-redis.html">Chapter 15</a>, rate limiting in <a href="../chapters/16-rate-limiting.html">Chapter 16</a>, data modeling in <a href="../chapters/17-data-modeling.html">Chapter 17</a>, NoSQL in <a href="../chapters/20-nosql.html">Chapter 20</a>, object storage in <a href="../chapters/21-object-storage.html">Chapter 21</a>, replication in <a href="../chapters/24-replication.html">Chapter 24</a>, sharding in <a href="../chapters/25-sharding.html">Chapter 25</a>, multi-region in <a href="../chapters/26-multi-region-migrations.html">Chapter 26</a>, time and ordering in <a href="../chapters/27-failure-time-ordering.html">Chapter 27</a>, CAP in <a href="../chapters/28-cap-consistency.html">Chapter 28</a>, consensus in <a href="../chapters/29-consensus.html">Chapter 29</a>, locks in <a href="../chapters/30-coordination-locks.html">Chapter 30</a>, transactions in <a href="../chapters/31-distributed-transactions.html">Chapter 31</a>, idempotency in <a href="../chapters/32-idempotency-ids.html">Chapter 32</a>, Kafka in <a href="../chapters/34-queues-kafka.html">Chapter 34</a>, messaging in <a href="../chapters/35-messaging-patterns.html">Chapter 35</a>, stream processing in <a href="../chapters/37-batch-stream.html">Chapter 37</a>, scheduling in <a href="../chapters/38-scheduling-workflows.html">Chapter 38</a>, resilience in <a href="../chapters/40-resilience.html">Chapter 40</a>, HA/DR in <a href="../chapters/41-ha-dr.html">Chapter 41</a>, cells in <a href="../chapters/42-multitenancy-cells.html">Chapter 42</a>, deployment in <a href="../chapters/43-deployment-autoscaling.html">Chapter 43</a>, sagas in <a href="../chapters/48-sagas.html">Chapter 48</a>, observability in <a href="../chapters/54-observability-slos.html">Chapter 54</a>, security in <a href="../chapters/55-security.html">Chapter 55</a>, privacy and cost in <a href="../chapters/56-privacy-cost-mobile.html">Chapter 56</a>, hashing in <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>, geospatial in <a href="../chapters/58-geospatial-text.html">Chapter 58</a>, sorted sets in <a href="../chapters/59-sorted-sets-crdt.html">Chapter 59</a>. Related case studies: <a href="c13-nearby-search.html">Case study 13</a>, <a href="c14-payment-system.html">Case study 14</a>, <a href="c07-chat.html">Case study 7</a>, <a href="c08-notification-system.html">Case study 8</a>.</p>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>The problem splits into four shapes: a location firehose (375 K updates per second), a geospatial query, a small transactional trip core (about 900 requests per second) and an analytic loop for surge and ETA.</li>
+<li>Live locations live in memory, partitioned by city and indexed by hexagonal or S2 cells; they are loss-tolerant and refilled every 4 seconds. Kafka carries the stream to side consumers.</li>
+<li>Nearby search is a ring search over cells, bounded by cells read, then re-ranked by road ETA from a contraction-hierarchy router with live speeds and an ML residual.</li>
+<li>Matching starts greedy and moves to small-window batched assignment in dense cities. Assignment correctness comes from conditional writes: a version check on the ride and a unique active-ride key per driver.</li>
+<li>The trip is an explicit state machine; every command is idempotent and every transition is a compare-and-set, so late, duplicated or racing messages are harmless.</li>
+<li>Surge is a smoothed, clamped, rate-limited multiplier per cell; the rider pays the value in the signed token they saw.</li>
+<li>Cities are the unit of isolation and multi-region homing, which keeps the hot path local and contains failures.</li>
+<li>Every dependency has a fallback: no surge means base fare, no ML means graph ETA, no Kafka means stale surge but working matching.</li>
+</ul></div>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

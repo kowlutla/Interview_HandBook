@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 48: Sagas in Depth | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="48-sagas">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+  <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+</defs></svg>
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+<main>
+<div class="kicker">Chapter 48 · Module 7 · Microservices in Depth</div>
+<h1>Sagas in Depth</h1>
+<p class="lead">A saga lets several services complete one business transaction without any distributed lock, by chaining local transactions and undoing them with compensating actions when something fails. This chapter goes far beyond the definition: both coordination styles with a full worked example, the saga state machine, how to design compensations that actually work, what happens when the compensation itself fails, the isolation problems sagas cause and how to contain them, and how to run, observe and test sagas in production.</p>
+
+<h2 id="recap">1. Short recap and what this chapter adds</h2>
+
+<p><a href="31-distributed-transactions.html">Chapter 31</a> explained why two-phase commit (2PC) is a poor fit for microservices: it holds locks across services while a coordinator decides, it blocks when the coordinator dies, and many modern stores and message brokers cannot take part in it at all. It introduced the saga as the usual alternative. In one paragraph: a <b>saga</b> is a business transaction split into a sequence of <b>local transactions</b>, each one an ordinary ACID transaction inside a single service's own database. When a local transaction commits, the saga moves to the next one. If a step fails, the saga runs <b>compensating transactions</b> for the steps that already committed, in reverse order, to semantically undo their effect.</p>
+
+<p>Chapter 31 stopped there. This chapter is about everything an interviewer asks next: <i>who</i> decides what step comes next (choreography or orchestration), <i>where</i> the saga's progress is stored, <i>what</i> a compensation really is when the original action was sending an email, <i>how</i> you survive a crashed coordinator or a failing compensation, <i>why</i> concurrent sagas corrupt each other's data in subtle ways, and <i>how</i> you debug a saga that is stuck at step 4 of 7 at three in the morning. The data model that makes sagas necessary is in <a href="46-microservice-data.html">Chapter 46</a> (one database per service), the transport between steps is in <a href="47-service-communication.html">Chapter 47</a>, and event design is in <a href="36-event-driven.html">Chapter 36</a>.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="A saga as a chain of local transactions with compensations in reverse order">
+  <text class="t-b" x="20" y="22">Forward path: each box is one local ACID transaction in one service</text>
+  <rect class="box" x="20"  y="36" width="150" height="50" rx="8"/><text class="t-c t-b" x="95" y="58">T1 Create order</text><text class="t-c t-sm" x="95" y="76">Order service</text>
+  <rect class="box" x="210" y="36" width="150" height="50" rx="8"/><text class="t-c t-b" x="285" y="58">T2 Charge card</text><text class="t-c t-sm" x="285" y="76">Payment service</text>
+  <rect class="box" x="400" y="36" width="150" height="50" rx="8"/><text class="t-c t-b" x="475" y="58">T3 Reserve stock</text><text class="t-c t-sm" x="475" y="76">Inventory service</text>
+  <rect class="miss" x="590" y="36" width="150" height="50" rx="8"/><text class="t-c t-b" x="665" y="58">T4 Book courier</text><text class="t-c t-sm" x="665" y="76">Shipping: FAILS</text>
+  <path class="arrow" d="M170 61 L206 61"/><path class="arrow" d="M360 61 L396 61"/><path class="arrow" d="M550 61 L586 61"/>
+  <text class="t-b" x="20" y="146">Backward path: compensations run in reverse for the steps that committed</text>
+  <rect class="hit" x="20"  y="160" width="150" height="50" rx="8"/><text class="t-c t-b" x="95" y="182">C1 Cancel order</text><text class="t-c t-sm" x="95" y="200">mark CANCELLED</text>
+  <rect class="hit" x="210" y="160" width="150" height="50" rx="8"/><text class="t-c t-b" x="285" y="182">C2 Refund card</text><text class="t-c t-sm" x="285" y="200">new refund record</text>
+  <rect class="hit" x="400" y="160" width="150" height="50" rx="8"/><text class="t-c t-b" x="475" y="182">C3 Release stock</text><text class="t-c t-sm" x="475" y="200">increase available</text>
+  <path class="arrow-r" d="M665 86 L665 125 L475 125 L475 156"/>
+  <path class="arrow-r" d="M396 185 L364 185"/><path class="arrow-r" d="M206 185 L174 185"/>
+</svg>
+<figcaption>T4 fails, so the saga runs C3, then C2, then C1. There is no C4 because T4 never committed. Each compensation is itself a new local transaction, not a rollback.</figcaption>
+</figure>
+
+<div class="callout key"><b>Key idea</b>
+A saga gives you <b>atomicity of outcome</b> (eventually either all steps took effect or all were compensated) but not <b>isolation</b>. Between T1 and the last step, other users and other sagas can see and act on the intermediate state. Almost every hard topic in this chapter is either a way to get the outcome guarantee reliably (retries, persistence, idempotency, outbox) or a way to live with the missing isolation (semantic locks, versions, commutative updates).
+</div>
+
+<h2 id="running-example">2. The running example: order, payment, inventory, shipping</h2>
+
+<p>We use one example through the first half of the chapter. An online shop has four services, each with its own database. The business transaction is <b>place order</b>:</p>
+<ol>
+  <li><b>Order service</b> records the order. It starts in state <code>PENDING</code>.</li>
+  <li><b>Payment service</b> authorizes and captures the customer's card for the order total.</li>
+  <li><b>Inventory service</b> reserves the purchased items so they cannot be sold twice.</li>
+  <li><b>Shipping service</b> books a courier pickup and creates a shipment.</li>
+  <li>The order moves to <code>CONFIRMED</code>.</li>
+</ol>
+<p>No single database transaction can cover these four databases. If payment succeeds and inventory then finds the item out of stock, the customer has been charged for something we cannot ship. We need either a full success or a clean undo. The compensations are: cancel the order, refund the payment, release the reserved stock, cancel the courier booking. The two ways to coordinate the steps follow.</p>
+
+<h2 id="choreography">3. Choreography: services react to each other's events</h2>
+
+<p>In <b>choreography</b> there is no central brain. Each service publishes an event when its local transaction commits, and other services subscribe to the events they care about and decide for themselves what to do. The saga exists only as an emergent chain of reactions, like dancers who each know their own steps and watch their neighbours. It rides on the event-driven machinery from <a href="36-event-driven.html">Chapter 36</a> and the messaging patterns from <a href="35-messaging-patterns.html">Chapter 35</a>.</p>
+
+<h3>3.1 The worked example, event by event</h3>
+<p>The event names matter, so here is the complete catalogue. Facts are past tense and describe something that already happened.</p>
+<table>
+<tr><th>Service</th><th>Listens to</th><th>Local transaction</th><th>Publishes on success</th><th>Publishes on failure</th></tr>
+<tr><td>Order</td><td>client request; <code>ShipmentBooked</code>; <code>PaymentFailed</code>; <code>StockRejected</code>; <code>ShipmentFailed</code></td><td>insert order PENDING; later set CONFIRMED or CANCELLED</td><td><code>OrderCreated</code>, <code>OrderConfirmed</code></td><td><code>OrderCancelled</code></td></tr>
+<tr><td>Payment</td><td><code>OrderCreated</code>; <code>StockRejected</code>; <code>ShipmentFailed</code></td><td>charge card, record payment; on those failure events, refund</td><td><code>PaymentCaptured</code></td><td><code>PaymentFailed</code>, and <code>PaymentRefunded</code> after compensation</td></tr>
+<tr><td>Inventory</td><td><code>PaymentCaptured</code>; <code>ShipmentFailed</code></td><td>decrement available, add reservation row; on failure event, delete reservation</td><td><code>StockReserved</code></td><td><code>StockRejected</code>, and <code>StockReleased</code> after compensation</td></tr>
+<tr><td>Shipping</td><td><code>StockReserved</code></td><td>create shipment, book courier</td><td><code>ShipmentBooked</code></td><td><code>ShipmentFailed</code></td></tr>
+</table>
+
+<p>Notice the structure: every service's successful event is the next service's trigger, and every service that has something to undo also subscribes to the failure events of later steps. That second part is the hidden cost of choreography, discussed in section 5.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 640" role="img" aria-label="Choreography sequence: happy path then failure with compensations">
+  <rect class="box" x="30"  y="10" width="120" height="30" rx="8"/><text class="t-c t-b" x="90"  y="30">Order</text>
+  <rect class="box" x="210" y="10" width="120" height="30" rx="8"/><text class="t-c t-b" x="270" y="30">Payment</text>
+  <rect class="cache" x="390" y="10" width="120" height="30" rx="8"/><text class="t-c t-b" x="450" y="30">Event bus</text>
+  <rect class="box" x="570" y="10" width="120" height="30" rx="8"/><text class="t-c t-b" x="630" y="30">Inventory</text>
+  <rect class="box" x="750" y="10" width="120" height="30" rx="8"/><text class="t-c t-b" x="810" y="30">Shipping</text>
+  <line class="life" x1="90" y1="40" x2="90" y2="630"/><line class="life" x1="270" y1="40" x2="270" y2="630"/><line class="life" x1="450" y1="40" x2="450" y2="630"/><line class="life" x1="630" y1="40" x2="630" y2="630"/><line class="life" x1="810" y1="40" x2="810" y2="630"/>
+
+  <text class="t-b" x="10" y="64">Happy path</text>
+  <path class="arrow" d="M90 80 L446 80"/><text class="t-sm" x="100" y="74">1 OrderCreated (order PENDING)</text>
+  <path class="arrow" d="M450 104 L274 104"/><text class="t-sm" x="290" y="98">2 delivered to Payment</text>
+  <path class="arrow" d="M270 128 L446 128"/><text class="t-sm" x="280" y="122">3 PaymentCaptured</text>
+  <path class="arrow" d="M450 152 L626 152"/><text class="t-sm" x="470" y="146">4 delivered to Inventory</text>
+  <path class="arrow" d="M630 176 L454 176"/><text class="t-sm" x="470" y="170">5 StockReserved</text>
+  <path class="arrow" d="M450 200 L806 200"/><text class="t-sm" x="560" y="194">6 delivered to Shipping</text>
+  <path class="arrow" d="M810 224 L454 224"/><text class="t-sm" x="540" y="218">7 ShipmentBooked</text>
+  <path class="arrow-g" d="M450 248 L94 248"/><text class="t-sm" x="110" y="242">8 Order sets CONFIRMED</text>
+
+  <line x1="10" y1="274" x2="890" y2="274" stroke="var(--muted)" stroke-dasharray="4 4"/>
+  <text class="t-b" x="10" y="298">Failure at the last step</text>
+  <path class="arrow-r" d="M810 322 L454 322"/><text class="t-sm" x="540" y="316">9 ShipmentFailed (no courier)</text>
+  <path class="arrow-r" d="M450 346 L626 346"/><text class="t-sm" x="470" y="340">10 Inventory hears it</text>
+  <rect class="hit" x="570" y="352" width="120" height="30" rx="6"/><text class="t-c t-sm" x="630" y="372">release reservation</text>
+  <path class="arrow-r" d="M630 406 L454 406"/><text class="t-sm" x="470" y="400">11 StockReleased</text>
+  <path class="arrow-r" d="M450 430 L274 430"/><text class="t-sm" x="290" y="424">12 Payment hears ShipmentFailed</text>
+  <rect class="hit" x="210" y="436" width="120" height="30" rx="6"/><text class="t-c t-sm" x="270" y="456">issue refund</text>
+  <path class="arrow-r" d="M270 490 L446 490"/><text class="t-sm" x="280" y="484">13 PaymentRefunded</text>
+  <path class="arrow-r" d="M450 514 L94 514"/><text class="t-sm" x="110" y="508">14 Order hears failure</text>
+  <rect class="hit" x="30" y="520" width="120" height="30" rx="6"/><text class="t-c t-sm" x="90" y="540">set CANCELLED</text>
+  <text class="t-sm" x="200" y="580">Inventory and Payment both react to step 9 independently and in parallel.</text>
+  <text class="t-sm" x="200" y="600">Nobody holds the whole picture: the saga is the sum of these reactions.</text>
+</svg>
+<figcaption>Read top to bottom. Every arrow into the bus is a service publishing a fact; every arrow out is the bus delivering it to a subscriber. In the failure half, both Inventory and Payment compensate in response to the same event, in no guaranteed order relative to each other.</figcaption>
+</figure>
+
+<h3>3.2 What choreography does well and badly</h3>
+<p>Choreography has real strengths. There is <b>no single point of failure</b> and no extra component to run: the broker you already have is the only infrastructure. Services stay <b>loosely coupled in time</b>, since the publisher does not know or wait for subscribers, and adding a new participant (say, a loyalty-points service that listens to <code>OrderConfirmed</code>) needs no change to existing services. For short sagas with two to four steps and a linear flow it is the simplest thing that works.</p>
+<p>Its weaknesses show as the flow grows. The business process is nowhere written down as one thing; to learn what "place order" does you must read four codebases and the subscription configuration. Services develop <b>hidden coupling</b> (each one must know the failure events of services further downstream, so Payment needs to know about <code>ShipmentFailed</code>). <b>Cyclic dependencies</b> appear easily: Order publishes to Payment, Payment listens to Order's cancellations, Inventory listens to both, and soon every service listens to every other. It is hard to answer "where is order 8841 right now?" without tracing across services, and hard to add a step in the middle without editing several subscribers.</p>
+
+<h2 id="orchestration">4. Orchestration: a coordinator tells each service what to do</h2>
+
+<p>In <b>orchestration</b> one component, the <b>orchestrator</b> (also called the saga coordinator or process manager), owns the saga's logic. It sends a <b>command</b> to a participant ("capture payment for order 8841"), waits for a <b>reply</b> (success or failure), records the outcome, and then decides the next command. Participants stay simple: each exposes its local transaction and its compensation and knows nothing about the other participants or the saga's overall shape. The orchestrator is, in effect, a state machine (section 6) whose transitions are triggered by replies.</p>
+
+<h3>4.1 The same example, orchestrated</h3>
+<p>Now a <b>PlaceOrderSaga</b> lives inside the Order service (or in a dedicated orchestration service). It sends four commands, in order: <code>CapturePayment</code> to Payment, <code>ReserveStock</code> to Inventory, <code>BookShipment</code> to Shipping, and finally it locally marks the order confirmed. If a reply says failure, it sends compensating commands in reverse order: for a failure at shipping that is <code>ReleaseStock</code> to Inventory, then <code>RefundPayment</code> to Payment, then it marks the order cancelled.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 600" role="img" aria-label="Orchestration sequence: happy path and failure with compensations driven by the orchestrator">
+  <rect class="ext" x="30"  y="10" width="140" height="30" rx="8"/><text class="t-c t-b" x="100" y="30">Orchestrator</text>
+  <rect class="box" x="250" y="10" width="140" height="30" rx="8"/><text class="t-c t-b" x="320" y="30">Payment</text>
+  <rect class="box" x="470" y="10" width="140" height="30" rx="8"/><text class="t-c t-b" x="540" y="30">Inventory</text>
+  <rect class="box" x="690" y="10" width="140" height="30" rx="8"/><text class="t-c t-b" x="760" y="30">Shipping</text>
+  <line class="life" x1="100" y1="40" x2="100" y2="590"/><line class="life" x1="320" y1="40" x2="320" y2="590"/><line class="life" x1="540" y1="40" x2="540" y2="590"/><line class="life" x1="760" y1="40" x2="760" y2="590"/>
+
+  <text class="t-b" x="10" y="64">Happy path</text>
+  <path class="arrow" d="M100 84 L316 84"/><text class="t-sm" x="120" y="78">CapturePayment</text>
+  <path class="arrow-g" d="M320 104 L104 104"/><text class="t-sm" x="190" y="118">ok</text>
+  <path class="arrow" d="M100 138 L536 138"/><text class="t-sm" x="240" y="132">ReserveStock</text>
+  <path class="arrow-g" d="M540 158 L104 158"/><text class="t-sm" x="400" y="172">ok</text>
+  <path class="arrow" d="M100 192 L756 192"/><text class="t-sm" x="330" y="186">BookShipment</text>
+  <path class="arrow-g" d="M760 212 L104 212"/><text class="t-sm" x="600" y="226">ok</text>
+  <rect class="hit" x="30" y="238" width="140" height="28" rx="6"/><text class="t-c t-sm" x="100" y="257">order CONFIRMED</text>
+
+  <line x1="10" y1="284" x2="890" y2="284" stroke="var(--muted)" stroke-dasharray="4 4"/>
+  <text class="t-b" x="10" y="308">Failure at shipping</text>
+  <path class="arrow" d="M100 330 L756 330"/><text class="t-sm" x="330" y="324">BookShipment</text>
+  <path class="arrow-r" d="M760 350 L104 350"/><text class="t-sm" x="560" y="364">FAILED (no courier)</text>
+  <rect class="miss" x="30" y="374" width="140" height="28" rx="6"/><text class="t-c t-sm" x="100" y="393">state: COMPENSATING</text>
+  <path class="arrow-r" d="M100 428 L536 428"/><text class="t-sm" x="240" y="422">ReleaseStock</text>
+  <path class="arrow-g" d="M540 448 L104 448"/><text class="t-sm" x="400" y="462">ok</text>
+  <path class="arrow-r" d="M100 484 L316 484"/><text class="t-sm" x="120" y="478">RefundPayment</text>
+  <path class="arrow-g" d="M320 504 L104 504"/><text class="t-sm" x="190" y="518">ok</text>
+  <rect class="hit" x="30" y="530" width="140" height="28" rx="6"/><text class="t-c t-sm" x="100" y="549">order CANCELLED</text>
+  <text class="t-sm" x="300" y="560">The orchestrator alone chooses the order of compensations.</text>
+</svg>
+<figcaption>The orchestrator on the left is the only participant that talks to everyone. Every command has a matching reply, so the orchestrator always knows exactly which step it is in. Compare the compensation half with the choreographed version: here it is sequential and deterministic.</figcaption>
+</figure>
+
+<h3>4.2 Strengths and costs</h3>
+<p>Orchestration puts the whole process in <b>one readable place</b>. Adding a step is an edit to one class. Status is trivial: the orchestrator's persisted state <i>is</i> the saga status. Compensation order is explicit. Participants have no cyclic dependency on each other; they depend only on the orchestrator's command contract. Testing the process means testing one component with stubbed participants.</p>
+<p>The costs are real. The orchestrator is a component you must run, scale and make highly available, and a poorly designed one becomes a <b>god service</b> that holds business rules belonging to the participants (section 21). Participants are called by command, so coupling in time is a bit tighter than in choreography. The coordinator must persist its state reliably, which is where most of the engineering effort goes.</p>
+
+<h2 id="decision">5. Choreography versus orchestration: how to choose</h2>
+
+<table>
+<tr><th>Dimension</th><th>Choreography</th><th>Orchestration</th></tr>
+<tr><td>Where the flow lives</td><td>Scattered across services' subscriptions</td><td>One saga definition in the orchestrator</td></tr>
+<tr><td>Coupling</td><td>Participants know the events of other services, including downstream failure events. Loose in time, tight in knowledge</td><td>Participants know only the orchestrator's commands. The orchestrator knows every participant's API</td></tr>
+<tr><td>Visibility and status</td><td>Poor; must reconstruct from events and traces</td><td>Excellent; read the saga record</td></tr>
+<tr><td>Cyclic dependencies</td><td>Common as the number of steps grows; services subscribe to each other</td><td>Avoided; arrows point from orchestrator to participants only</td></tr>
+<tr><td>Adding or reordering a step</td><td>Edit several subscribers; risk of missed handlers</td><td>Edit one definition</td></tr>
+<tr><td>Testing</td><td>Needs integration tests across services or contract tests per event</td><td>Unit test the state machine; participants test their own commands</td></tr>
+<tr><td>Ownership</td><td>Each team owns a slice; nobody owns the end-to-end flow</td><td>One team owns the saga end to end, which is a benefit and a bottleneck</td></tr>
+<tr><td>Failure of the coordinator</td><td>No single coordinator to fail; broker is the shared dependency</td><td>Orchestrator must be durable and highly available</td></tr>
+<tr><td>Best for</td><td>Two to four steps, simple linear flows, events that other consumers also want</td><td>Five or more steps, branching, timeouts, human steps, regulated processes needing an audit trail</td></tr>
+</table>
+
+<div class="callout tip"><b>Interview tip</b>
+A balanced answer: "I would start with choreography for a short, stable, linear flow, and move to orchestration once the saga has more than about four steps, branches, or needs timeouts and status reporting. For anything with money I want the audit trail and explicit compensation order that an orchestrator gives, usually via a workflow engine rather than hand-rolled code."
+</div>
+
+<h2 id="state-machine">6. The saga state machine and its persistence</h2>
+
+<p>An orchestrated saga is a state machine, and the most important engineering fact about it is that <b>its state must be durable</b>. The orchestrator process can crash after sending a command and before receiving the reply, or after receiving the reply and before sending the next command. When a new instance picks up, it must know exactly where the saga was. If the state lived only in memory, the saga would silently vanish, leaving a customer charged and no order.</p>
+
+<h3>6.1 The saga log</h3>
+<p>The standard design is a <b>saga instance table</b> plus a <b>saga log</b> (an append-only history). The instance row holds the saga's identity, type, overall state, a pointer to the current step, and its business payload. The log records every step transition with a timestamp. In a relational store it looks like this:</p>
+<pre><code>saga_instance
+  saga_id        uuid  primary key        -- correlation id used on every message
+  saga_type      text                     -- 'PlaceOrder'
+  state          text                     -- RUNNING | COMPENSATING | COMPLETED | COMPENSATED | FAILED_NEEDS_OPS
+  current_step   int
+  payload        jsonb                    -- order id, amount, items, payment id once known
+  version        bigint                   -- optimistic lock: only one worker advances it
+  deadline_at    timestamptz              -- when the current step times out
+  created_at, updated_at
+
+saga_step
+  saga_id, step_no, step_name, kind       -- kind: COMPENSATABLE | PIVOT | RETRIABLE
+  status         text                     -- PENDING | SENT | SUCCEEDED | FAILED | COMPENSATING | COMPENSATED | COMP_FAILED
+  attempts       int
+  last_error     text
+  updated_at</code></pre>
+<p>On every reply the orchestrator executes a single local transaction that (1) loads the saga with its version, (2) applies the transition (marks step SUCCEEDED, picks the next step), (3) writes the next outgoing command to an outbox table (section 13), and (4) bumps the version. Because transition and outgoing command commit atomically, a crash cannot lose a step or send a command whose state was not recorded. The version check means that if two workers wake up for the same saga (duplicate reply, timer racing a reply), only one wins.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Saga state machine with running, compensating, completed, compensated and needs-ops states">
+  <rect class="box" x="30" y="150" width="130" height="50" rx="10"/><text class="t-c t-b" x="95" y="172">STARTED</text><text class="t-c t-sm" x="95" y="190">order PENDING</text>
+  <rect class="box" x="250" y="150" width="150" height="50" rx="10"/><text class="t-c t-b" x="325" y="172">RUNNING</text><text class="t-c t-sm" x="325" y="190">step k of n</text>
+  <rect class="hit" x="560" y="40" width="150" height="50" rx="10"/><text class="t-c t-b" x="635" y="62">COMPLETED</text><text class="t-c t-sm" x="635" y="80">all steps ok</text>
+  <rect class="miss" x="500" y="150" width="170" height="50" rx="10"/><text class="t-c t-b" x="585" y="172">COMPENSATING</text><text class="t-c t-sm" x="585" y="190">undo steps k-1 .. 1</text>
+  <rect class="hit" x="740" y="150" width="130" height="50" rx="10"/><text class="t-c t-b" x="805" y="172">COMPENSATED</text><text class="t-c t-sm" x="805" y="190">clean abort</text>
+  <rect class="cache" x="500" y="270" width="200" height="56" rx="10"/><text class="t-c t-b" x="600" y="294">NEEDS_OPS</text><text class="t-c t-sm" x="600" y="313">compensation exhausted retries</text>
+  <path class="arrow" d="M160 175 L246 175"/><text class="t-sm" x="168" y="168">begin</text>
+  <path class="arrow" d="M400 165 C430 100 520 70 556 65"/><text class="t-sm" x="430" y="80">last step ok</text>
+  <path class="arrow-r" d="M400 180 L496 180"/><text class="t-sm" x="404" y="172">step fails</text>
+  <path class="arrow" d="M330 150 C330 110 400 110 400 150" /><text class="t-sm" x="270" y="108">next step ok (loop)</text>
+  <path class="arrow-g" d="M670 175 L736 175"/><text class="t-sm" x="672" y="168">all undone</text>
+  <path class="arrow-r" d="M585 200 L585 266"/><text class="t-sm" x="595" y="236">compensation stuck</text>
+  <path class="arrow dash" d="M325 200 C325 300 400 300 496 298"/><text class="t-sm" x="190" y="290">step timeout:</text><text class="t-sm" x="190" y="306">retry or compensate</text>
+</svg>
+<figcaption>Terminal states are COMPLETED, COMPENSATED and NEEDS_OPS. A saga that sits in RUNNING or COMPENSATING with an old deadline is a stuck saga, which monitoring must find (section 18).</figcaption>
+</figure>
+
+<h3>6.2 Recovery</h3>
+<p>A background <b>recovery job</b> scans for sagas that are not terminal and whose <code>deadline_at</code> has passed or whose last update is older than expected. For each it looks at the current step's status. If the step is SENT and the reply never came, it resends the command (safe only because participants are idempotent, section 12) or asks the participant for the step's status. This single mechanism is what turns "process crashed" and "message lost" from disasters into delays.</p>
+
+<h2 id="step-types">7. Step types: compensatable, pivot, retriable</h2>
+
+<p>Not all steps are alike, and a well-designed saga orders them by type. Chris Richardson's classification, widely used, has three kinds.</p>
+<ul>
+  <li><b>Compensatable transactions</b> can be undone by a compensating transaction. Create order (cancel it), reserve stock (release it), hold a hotel room (cancel the hold).</li>
+  <li>The <b>pivot transaction</b> is the go/no-go point. If it commits, the saga will run to the end and will not be compensated; if it fails, the saga compensates everything before it. It is typically the step that is hard or impossible to undo, such as capturing money that cannot be un-captured cleanly, or the point where the business has made an irrevocable commitment. There is at most one pivot.</li>
+  <li><b>Retriable transactions</b> come after the pivot. They are guaranteed to eventually succeed if retried (they are idempotent and have no business reason to fail), so the saga never needs to compensate past the pivot. Examples: send the confirmation email, emit an invoice, update a search index, publish a notification.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 230" role="img" aria-label="Saga ordering: compensatable steps, one pivot, then retriable steps">
+  <rect class="box" x="20" y="60" width="180" height="60" rx="8"/><text class="t-c t-b" x="110" y="86">Create order</text><text class="t-c t-sm" x="110" y="104">compensatable</text>
+  <rect class="box" x="230" y="60" width="180" height="60" rx="8"/><text class="t-c t-b" x="320" y="86">Reserve stock</text><text class="t-c t-sm" x="320" y="104">compensatable</text>
+  <rect class="cache" x="440" y="60" width="180" height="60" rx="8"/><text class="t-c t-b" x="530" y="86">Capture payment</text><text class="t-c t-sm" x="530" y="104">PIVOT (commit point)</text>
+  <rect class="hit" x="650" y="60" width="110" height="60" rx="8"/><text class="t-c t-b" x="705" y="86">Ship</text><text class="t-c t-sm" x="705" y="104">retriable</text>
+  <rect class="hit" x="780" y="60" width="100" height="60" rx="8"/><text class="t-c t-b" x="830" y="86">Email</text><text class="t-c t-sm" x="830" y="104">retriable</text>
+  <path class="arrow" d="M200 90 L226 90"/><path class="arrow" d="M410 90 L436 90"/><path class="arrow" d="M620 90 L646 90"/><path class="arrow" d="M760 90 L776 90"/>
+  <path class="arrow-r" d="M20 160 L620 160"/><text class="t-sm" x="30" y="184">Failure before or at the pivot: compensate backwards (undo earlier steps)</text>
+  <path class="arrow-g" d="M650 160 L880 160"/><text class="t-sm" x="650" y="184">After the pivot: never undo, retry forward until done</text>
+</svg>
+<figcaption>Before the pivot you can always back out. After it the saga is committed to finishing, so those steps must be retried forever rather than compensated.</figcaption>
+</figure>
+
+<p>This shapes the design rule: <b>put steps that can fail for business reasons (validation, stock check, fraud check, credit limit) before the pivot, and steps that must not fail after it.</b> If your saga has a step after the pivot that can legitimately fail (say, "customer's address is not deliverable"), you have misplaced the pivot or you need a business process to handle the exception, not a technical retry.</p>
+
+<h2 id="compensations">8. Designing compensations</h2>
+
+<h3>8.1 Semantic undo, not rollback</h3>
+<p>A database rollback erases changes that nobody else saw. A compensation cannot do that: the original local transaction has already committed, and other transactions may have read its effects. So a compensation is a <b>new forward transaction</b> that restores the business meaning. Cancelling an order sets <code>status = CANCELLED</code> and keeps the row. Refunding a payment inserts a refund record and keeps the original charge on the statement. This is "semantic undo". The system's history shows both events, which is also what auditors want.</p>
+<p>A compensation must be designed with the same care as the forward step: it needs its own idempotency, its own failure handling, and it must make sense in any state the forward step could have left things. For instance, "release stock" must be safe if the reservation was never created (the forward step failed halfway), safe if it was already released (duplicate message), and safe if the reservation has already been converted into a shipped item (in which case the saga design is wrong, see pivots).</p>
+
+<h3>8.2 Things that cannot be undone</h3>
+<table>
+<tr><th>Forward action</th><th>Why it is hard to undo</th><th>Practical approach</th></tr>
+<tr><td>Send an email or SMS</td><td>You cannot recall it</td><td>Send it only in a retriable step after the pivot, or send a follow-up "correction" message as the compensation, or delay sending until the saga is confirmed</td></tr>
+<tr><td>Capture a card payment</td><td>Money moved; undo means a refund that takes days, may incur fees, and shows on the customer's statement</td><td>Prefer authorize (hold) first and capture at the end; the compensation of an authorization is a void, which is cheap and instant</td></tr>
+<tr><td>Call a third-party API (book a courier, order from a supplier)</td><td>The other side may not support cancel, or only within a window</td><td>Check their cancel semantics; make the call the pivot or place it late; keep a cancellation fee as an accepted business cost</td></tr>
+<tr><td>Physical or irreversible action (ship a parcel, dispense cash, delete data)</td><td>Cannot be reversed by software</td><td>It must be the pivot or after it; everything risky happens before</td></tr>
+<tr><td>Publish an event others acted on</td><td>Consumers already changed their state</td><td>Publish a compensating event (<code>OrderCancelled</code>) and require consumers to handle it</td></tr>
+</table>
+
+<h3>8.3 Ordering steps: risky first, irreversible last</h3>
+<p>Because compensations are costly and sometimes imperfect, the cheapest way to improve a saga is to <b>reorder it</b> so that the steps most likely to fail run first and the steps hardest to undo run last. Checking stock (cheap to undo, fails often) belongs before capturing payment (expensive to undo, fails rarely). That is why section 7's pivot sits after stock reservation, and why many real designs use a pattern like "reserve, then authorize, then capture, then ship". Another technique is to use <b>tentative or pending states</b> as the forward step: instead of "charge the card" use "place a hold", with a later "confirm" step that is retriable and rarely fails. This is the TCC (Try-Confirm-Cancel) shape from <a href="31-distributed-transactions.html">Chapter 31</a>, and in effect every saga with reservations is a TCC-flavoured saga.</p>
+
+<div class="callout watch"><b>Watch out</b>
+In the choreography example earlier, payment was captured before stock was reserved. That order is acceptable for teaching, but in a real shop you would reserve stock first, because an out-of-stock rejection is common and a refund is expensive and slow. Reordering the steps changes which services must compensate and how often.
+</div>
+
+<h2 id="timeouts">9. Timeouts and deadlines per step</h2>
+
+<p>In a distributed system a missing reply is ambiguous: the participant may be slow, may have crashed before acting, or may have acted and the reply was lost. A saga therefore needs a <b>deadline per step</b>, stored with the saga (<code>deadline_at</code> above) and enforced by a timer or the recovery scan. The deadline for a step should reflect its business meaning, not a default HTTP timeout. A payment authorization may deserve 10 seconds. A "warehouse confirms picking" step may deserve 4 hours. A human approval may deserve 3 days.</p>
+<p>It is also worth a <b>saga-wide deadline</b>: "if the whole saga is not done in 15 minutes, abort and compensate". Without one, a saga stuck at step 3 can hold a semantic lock (section 15) on stock indefinitely. When a deadline fires, the orchestrator does not simply assume failure, because the late step may still complete. It either queries the participant ("what is the status of command X?") or, more commonly, sends the compensation. That is safe only if the compensation is idempotent and also handles the case of the forward step arriving <i>after</i> it (a "tombstone" or "cancelled" record so a late forward command is ignored).</p>
+
+<h2 id="retry-vs-compensate">10. Retries versus compensation</h2>
+
+<p>When a step does not succeed, there are three possible reactions, and the saga must choose correctly for each kind of failure.</p>
+<table>
+<tr><th>Failure kind</th><th>Examples</th><th>Right reaction</th></tr>
+<tr><td><b>Transient technical</b></td><td>Timeout, connection reset, 503, broker redelivery</td><td>Retry with exponential backoff and jitter, bounded in time. The step is idempotent so retry is safe</td></tr>
+<tr><td><b>Business rejection</b></td><td>Card declined, out of stock, credit limit exceeded, validation error</td><td>Do not retry. Start compensation; the answer will not change</td></tr>
+<tr><td><b>Unknown outcome</b></td><td>Timeout where the participant may have committed</td><td>Retry with the <i>same</i> idempotency key (so it is applied at most once), or query status first, then decide</td></tr>
+<tr><td><b>Persistent technical</b></td><td>Participant down for hours, bug in a participant</td><td>Retry up to a budget, then alert. For steps before the pivot compensate if the business tolerates it; after the pivot keep retrying and page a human</td></tr>
+</table>
+<p>The key discipline is classifying errors at the participant boundary. A participant should return a clear distinction between "I refused, and will always refuse this" and "I could not process this now". A generic "500 error" forces the orchestrator to guess. This is part of the contract design discussed in <a href="47-service-communication.html">Chapter 47</a>.</p>
+
+<h2 id="compensation-failure">11. When the compensation itself fails</h2>
+
+<p>This is the question that separates textbook answers from production ones. The forward path can fail, so the backward path can too. The principle is: <b>compensations must be designed so that they can be retried until they succeed</b>. A saga that has started compensating has no safe way back, so it can only go forward to "fully compensated". Practical handling, in escalating order:</p>
+<ol>
+  <li><b>Retry with backoff.</b> Most compensation failures are transient (the payment provider is briefly down). Keep retrying, with a long ceiling on the interval, potentially for days. This is why compensations must be idempotent.</li>
+  <li><b>Retry forever with alerting.</b> There is no sensible "give up" for a refund. Set a time-based alert (for example after 15 minutes of failure) while the retries continue.</li>
+  <li><b>Dead-letter and park.</b> If a compensation keeps failing with a non-transient error (invalid account, refund window expired), move the saga to <code>NEEDS_OPS</code> and put the command in a dead-letter queue with the full saga context. Dead-letter queues are covered in <a href="35-messaging-patterns.html">Chapter 35</a>.</li>
+  <li><b>Manual intervention with ops tooling.</b> Operators need a screen or CLI that shows the saga, its log, the failed step and the error, and lets them (a) retry the step, (b) mark a step as manually completed with a note ("refund issued through the bank console"), (c) skip it, or (d) force the saga to a terminal state. Every such action is audited. Without this tooling, the first stuck saga becomes an engineer running SQL against production.</li>
+  <li><b>Reconciliation.</b> A periodic job compares services' views (orders versus payments versus reservations) and flags drift that sagas missed. It is the safety net behind the whole design.</li>
+</ol>
+
+<div class="callout key"><b>Key idea</b>
+Treat compensation failure as an expected operational event with a runbook, not as an exception that "should never happen". The saga's design goal is that every inconsistency is eventually either resolved automatically or surfaced to a human with enough context to resolve it in minutes.
+</div>
+
+<h2 id="idempotency">12. Idempotent steps and compensations</h2>
+
+<p>Messaging systems give <b>at-least-once</b> delivery (see <a href="35-messaging-patterns.html">Chapter 35</a>), and orchestrators retry on timeout, so every command can arrive twice or more. An <b>idempotent</b> operation produces the same result when applied several times as when applied once. Without it, a duplicate <code>CapturePayment</code> charges the customer twice.</p>
+<p>The standard technique is an <b>idempotency key</b>: the orchestrator generates a stable identifier per step (for example <code>sagaId + ":" + stepNo</code>) and sends it with the command. The participant keeps a table of processed keys. On receiving a command it does, in one local transaction: check whether the key exists; if so, return the stored result without acting; if not, perform the business change and insert the key and the result. A unique constraint on the key makes the check race-free.</p>
+<pre><code>-- Payment service, handling CapturePayment(sagaId, stepNo, orderId, amount)
+BEGIN;
+  INSERT INTO processed_command(key, result) VALUES ('s42:2', NULL)
+    ON CONFLICT (key) DO NOTHING;
+  -- if 0 rows inserted: duplicate, fetch and return stored result, COMMIT, stop
+  INSERT INTO payment(order_id, amount, status) VALUES (:orderId, :amount, 'CAPTURED');
+  UPDATE processed_command SET result = 'OK:pay-991' WHERE key = 's42:2';
+COMMIT;</code></pre>
+<p>Compensations need the same treatment, plus one more subtlety: the <b>compensation may arrive before the forward action</b>, for example when a timeout fired and the orchestrator compensated while the original command was delayed in a queue. The participant must record "compensated for key X" so that when the late forward command arrives, it is rejected rather than executed. This is called a <b>tombstone</b> or "cancel-before-try" guard.</p>
+
+<h2 id="outbox">13. Reliable messaging: transactional outbox and inbox</h2>
+
+<p>A saga step has two actions that must happen together: update the local database, and send a message (an event or a command). Doing both naively creates the <b>dual write problem</b>. If the process commits the database change and then crashes before publishing, the next step never starts. If it publishes first and the database commit fails, the next step runs for a change that never happened. <a href="31-distributed-transactions.html">Chapter 31</a> introduced the fix; here is how it works in saga context.</p>
+<p>With the <b>transactional outbox</b>, the service writes the business change and a row in an <code>outbox</code> table in <i>one</i> local transaction. A separate <b>relay</b> (a poller or a change-data-capture reader, see <a href="36-event-driven.html">Chapter 36</a>) reads unsent outbox rows and publishes them to the broker, marking them sent. The message is therefore published at least once and only if the change committed. With the <b>inbox</b> on the receiving side, the consumer records each incoming message id in a table within the same transaction as its business change, so a redelivered message is detected and ignored. Outbox plus inbox yields <b>effectively-once</b> processing from at-least-once transport.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="Outbox on the sender and inbox on the receiver">
+  <rect class="box" x="20" y="40" width="300" height="190" rx="10"/><text class="t-b" x="34" y="62">Payment service (sender)</text>
+  <rect class="db" x="40" y="80" width="260" height="56" rx="8"/><text class="t-c t-b" x="170" y="102">one local transaction</text><text class="t-c t-sm" x="170" y="122">payment row + outbox row</text>
+  <rect class="cache" x="40" y="160" width="260" height="50" rx="8"/><text class="t-c t-b" x="170" y="182">Relay (poller or CDC)</text><text class="t-c t-sm" x="170" y="200">reads unsent rows, publishes</text>
+  <path class="arrow" d="M170 136 L170 156"/>
+  <rect class="cache" x="370" y="100" width="150" height="70" rx="10"/><text class="t-c t-b" x="445" y="130">Broker</text><text class="t-c t-sm" x="445" y="150">at-least-once</text>
+  <path class="arrow" d="M300 185 C340 185 340 140 366 140"/><path class="arrow" d="M520 135 L576 135"/>
+  <rect class="box" x="580" y="40" width="300" height="190" rx="10"/><text class="t-b" x="594" y="62">Inventory service (receiver)</text>
+  <rect class="db" x="600" y="80" width="260" height="76" rx="8"/><text class="t-c t-b" x="730" y="102">one local transaction</text><text class="t-c t-sm" x="730" y="122">insert message id into inbox</text><text class="t-c t-sm" x="730" y="140">(duplicate? skip) + reserve stock</text>
+  <rect class="hit" x="600" y="174" width="260" height="36" rx="8"/><text class="t-c t-sm" x="730" y="197">writes its own outbox row for the reply</text>
+</svg>
+<figcaption>The database commit is the single source of truth. Publishing happens after, driven by the outbox, and the inbox makes the redelivery that follows from "at least once" harmless.</figcaption>
+</figure>
+
+<h2 id="isolation">14. The isolation problem</h2>
+
+<p>ACID transactions give <b>isolation</b>: concurrent transactions behave as if they ran one after another. A saga gives up this property (the "I" in ACID) because each local transaction commits immediately and its effects are visible to everyone before the saga finishes. Sagas are therefore <b>ACD</b>: atomic in outcome, consistent, durable, but not isolated. Three classic anomalies result, all caused by the window between T1 committing and the saga finishing or compensating.</p>
+<ul>
+  <li><b>Lost update.</b> Saga A reads a value, saga B changes it and commits, and then A (or A's compensation) overwrites it without seeing B's change. Example: saga A reserved stock and later compensates by setting <code>available = 10</code> (the value it remembers), wiping out a sale that saga B made in between.</li>
+  <li><b>Dirty read.</b> Saga B reads data that saga A wrote, and A is later compensated. Example: A tentatively raises a customer's loyalty tier, B grants a discount because of the tier, then A fails and the tier is reverted. B acted on data that, in business terms, never really existed.</li>
+  <li><b>Non-repeatable (fuzzy) read.</b> A saga reads the same data twice at different steps and gets different answers because another saga changed it in between. Example: step 1 reads the item price as 50, step 4 reads 55; the invoice is inconsistent with the charge.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Dirty read anomaly between two concurrent sagas">
+  <rect class="ext" x="20" y="14" width="150" height="30" rx="8"/><text class="t-c t-b" x="95" y="34">Saga A (order 1)</text>
+  <rect class="ext" x="330" y="14" width="150" height="30" rx="8"/><text class="t-c t-b" x="405" y="34">Stock table</text>
+  <rect class="ext" x="690" y="14" width="150" height="30" rx="8"/><text class="t-c t-b" x="765" y="34">Saga B (order 2)</text>
+  <line class="life" x1="95" y1="44" x2="95" y2="290"/><line class="life" x1="405" y1="44" x2="405" y2="290"/><line class="life" x1="765" y1="44" x2="765" y2="290"/>
+  <path class="arrow" d="M95 70 L401 70"/><text class="t-sm" x="120" y="64">reserve last unit: available 1 to 0 (commits)</text>
+  <path class="arrow" d="M765 110 L409 110"/><text class="t-sm" x="520" y="104">B reads available = 0</text>
+  <rect class="miss" x="640" y="122" width="250" height="30" rx="6"/><text class="t-c t-sm" x="765" y="142">B rejects order 2: out of stock</text>
+  <path class="arrow-r" d="M95 190 L401 190"/><text class="t-sm" x="120" y="184">A fails later, compensates: available back to 1</text>
+  <rect class="miss" x="20" y="214" width="380" height="30" rx="6"/><text class="t-c t-sm" x="210" y="234">A never sold it, yet B turned away a real customer</text>
+</svg>
+<figcaption>B read a value that was only provisional. After A's compensation the stock is available again, but order 2 has already been rejected based on the dirty read.</figcaption>
+</figure>
+
+<h2 id="countermeasures">15. Countermeasures for the missing isolation</h2>
+
+<p>Since the database will not give isolation, the application must. The catalogue below comes from the saga literature; use the lightest one that is sufficient for the business risk.</p>
+<table>
+<tr><th>Countermeasure</th><th>How it works</th><th>Example</th><th>Cost</th></tr>
+<tr><td><b>Semantic lock</b></td><td>A step sets an application-level flag on the record (<code>PENDING</code>, <code>APPROVAL_PENDING</code>). Other sagas either fail, wait, or treat the flagged record specially. The saga's final step or compensation clears the flag</td><td>Order is <code>PENDING</code> until confirmed; edits to a pending order are rejected</td><td>Must handle blocked sagas and deadlocks (two sagas waiting on each other's flags) with timeouts</td></tr>
+<tr><td><b>Commutative updates</b></td><td>Design operations so order does not matter: increments and decrements rather than absolute assignment, so compensation is "add back N" not "set to M"</td><td><code>available = available - 1</code> then compensate with <code>+ 1</code></td><td>Cheap; the first thing to reach for, but cannot enforce invariants like "never below zero" alone</td></tr>
+<tr><td><b>Pessimistic view</b></td><td>Reorder steps so the dirty read has a harmless outcome: do the risky, decreasing step first</td><td>Reduce available balance immediately on reserve (the pessimistic view) so concurrent readers see the lower number and never over-sell</td><td>May reject a request that would have succeeded after compensation, which is the safer error</td></tr>
+<tr><td><b>Reread value</b></td><td>Before overwriting, reread the record and verify it is unchanged; if changed, abort and restart the saga. An optimistic-offline-lock pattern</td><td>Before refunding, reread the order status</td><td>Extra reads and retry paths</td></tr>
+<tr><td><b>Version file</b></td><td>Record the operations performed on a record so out-of-order arrival can be reordered. Turns non-commutative operations into commutative ones</td><td>Record "Cancel arrived before Authorize" so a late Authorize is dropped</td><td>Extra bookkeeping per record</td></tr>
+<tr><td><b>By value</b></td><td>Pick the concurrency mechanism by business risk: low-risk requests use sagas, high-risk or high-value ones use a stronger mechanism (a distributed transaction or a single-service lock)</td><td>Transfers above a threshold go through a reserved, serialized path</td><td>Two code paths to maintain</td></tr>
+</table>
+<p>In the order example, the order's <code>PENDING</code> state is a semantic lock for the order entity; stock reservation as a decrement is a commutative, pessimistic update; and payment authorization with later capture is both pessimistic (funds are held) and cheap to reverse.</p>
+
+<h2 id="concurrency">16. Concurrency of sagas, and sagas versus 2PC</h2>
+
+<p>Beyond data anomalies, there are concurrency issues in the saga machinery itself. Many sagas run at once, thousands per second, so the orchestrator's database must be sharded or partitioned by <code>saga_id</code>. Each saga instance must be advanced by <b>one worker at a time</b>, enforced by the version check of section 6 or by routing all messages for a saga to a single partition (partition key = saga id, as in <a href="35-messaging-patterns.html">Chapter 35</a>). Two sagas touching the same entity, for example two orders for the last unit, are serialized by the participant's own local transaction on that entity, which is the right place for the invariant ("available never negative") to be enforced. Two <i>different</i> sagas affecting one customer's credit limit are the kind of cross-saga conflict that needs a semantic lock or commutative updates.</p>
+
+<table>
+<tr><th>Aspect</th><th>Saga</th><th>Two-phase commit</th></tr>
+<tr><td>Isolation</td><td>None; anomalies must be handled by the app</td><td>Full, via locks held across all participants</td></tr>
+<tr><td>Locks held during protocol</td><td>Only short local locks per step</td><td>Locks held from prepare until global decision</td></tr>
+<tr><td>Availability</td><td>High; participants proceed independently</td><td>Lower; blocked if the coordinator fails at the wrong time</td></tr>
+<tr><td>Latency</td><td>Sum of steps, asynchronous allowed</td><td>Two coordinated round trips, synchronous</td></tr>
+<tr><td>Participant support</td><td>Any service with a local transaction and a compensation</td><td>Requires XA-style prepare support, rare in modern stores and brokers</td></tr>
+<tr><td>Undo</td><td>Explicit business compensation</td><td>Automatic rollback</td></tr>
+<tr><td>Complexity</td><td>On the application developer</td><td>On the infrastructure and operations</td></tr>
+<tr><td>Fits</td><td>Long-running, cross-organization, cross-store workflows</td><td>Few participants, short transactions, strict atomicity, same trust domain</td></tr>
+</table>
+<p>The honest summary for an interview: sagas trade isolation for availability and autonomy. If your business cannot tolerate any intermediate state (moving money between two ledgers that must always balance at every instant), keep both rows in one database or use a stricter protocol. If it can (placing orders, booking travel), a saga is almost always the right choice.</p>
+
+<h2 id="long-running">17. Long-running sagas and human steps</h2>
+
+<p>Sagas are not limited to millisecond API calls. A loan application saga might run for days: credit check, document upload, <b>manual underwriter approval</b>, contract signing. Such sagas introduce new requirements.</p>
+<ul>
+  <li><b>No thread or connection is held.</b> Between steps the saga is just a row in the database (or a workflow history in an engine). Waiting costs storage, not compute.</li>
+  <li><b>Human tasks</b> are modelled as a step that sends a command to a task system ("approve loan 551") and then waits for a callback or event. The deadline is large and has a business escalation: after 2 days remind the approver, after 5 days escalate to a manager, after 10 days auto-reject and compensate.</li>
+  <li><b>Timers</b> must be durable: a delayed message or a persisted deadline, not an in-process sleep (see <a href="38-scheduling-workflows.html">Chapter 38</a>).</li>
+  <li><b>Versioning.</b> A saga started under version 1 of the process may still be running when version 2 is deployed. The orchestrator must keep the old logic for in-flight instances, or migrate them deliberately.</li>
+  <li><b>Semantic locks become business reservations</b> with an expiry. A held seat or reserved credit must have a time-to-live, otherwise abandoned sagas lock resources forever.</li>
+  <li><b>Cancellation by the user</b> is a normal event, not an error: a "cancel" signal arriving mid-saga should move it into the compensating state at the next safe point.</li>
+</ul>
+
+<h2 id="observability">18. Saga observability</h2>
+
+<p>An orchestrated saga is easy to observe because its state is stored; a choreographed one is hard because it is spread over services. In both cases, good practice is the same. Full distributed tracing and log aggregation are covered in <a href="52-microservice-observability.html">Chapter 52</a>; here are the saga-specific pieces.</p>
+<ol>
+  <li><b>Correlation id.</b> The saga id is generated at the start and attached to <i>every</i> command, event, log line and trace span. A single search for <code>sagaId=s42</code> across the log system then returns the entire story. In choreography, where no component owns an id, the first service must mint one and every service must propagate it in the event envelope.</li>
+  <li><b>Status API.</b> Expose <code>GET /sagas/{id}</code> returning state, current step, per-step status and attempts, timestamps, and the last error. Customer support and product screens ("your order is being processed") use it. With choreography you build this by running a small <b>read model</b> that subscribes to all saga-related events and folds them into a per-saga status record, an application of the CQRS idea from <a href="36-event-driven.html">Chapter 36</a>.</li>
+  <li><b>Metrics.</b> Count sagas started, completed, compensated and needs-ops, per saga type. Histogram the end-to-end duration and the per-step duration. Gauge the number of sagas currently in each state and, critically, the <b>age of the oldest non-terminal saga</b>.</li>
+  <li><b>Dashboards and alerts.</b> A dashboard with success rate, compensation rate (a rising compensation rate means an upstream problem such as an inventory bug), step latency, retry counts and the stuck list. Alert on: any saga in NEEDS_OPS, any saga older than its deadline plus a margin, and a compensation rate above baseline.</li>
+  <li><b>Trace spans.</b> Wrap the whole saga in a parent span and each step in a child span so that the waterfall shows where time went, including waits between steps.</li>
+</ol>
+
+<h2 id="testing">19. Testing sagas</h2>
+
+<p>Sagas are bug-prone because most code paths run only when something goes wrong. A disciplined test pyramid:</p>
+<ul>
+  <li><b>Unit tests of the state machine.</b> With an orchestrator this is easy: feed in a sequence of replies and assert the next commands. Test <i>every failure position</i>: for an n-step saga, inject a failure at step k for each k and assert the correct compensations in the correct order.</li>
+  <li><b>Idempotency tests.</b> Deliver each command and each reply twice, and out of order, and assert the final state is unchanged. Deliver a compensation before its forward command.</li>
+  <li><b>Crash tests.</b> Kill the orchestrator between "command sent" and "reply processed", restart, and assert the saga completes. Property-based tests that randomly interleave messages, delays and crashes find the bugs humans do not imagine.</li>
+  <li><b>Contract tests.</b> Each participant publishes the commands, replies and events it supports and tests against them, so a change to <code>PaymentFailed</code> does not silently break the orchestrator or the choreographed subscribers (see <a href="47-service-communication.html">Chapter 47</a>).</li>
+  <li><b>End-to-end tests</b> with a few full-environment scenarios: happy path, one failure with compensation, one timeout. Keep them few because they are slow and flaky.</li>
+  <li><b>Chaos and game days</b> in a staging environment: drop messages, delay replies, take a participant down, and check that recovery and ops tooling behave.</li>
+</ul>
+
+<h2 id="engines">20. Workflow engines for orchestration</h2>
+
+<p>Hand-writing an orchestrator means reimplementing persistence, timers, retries, versioning and visibility. <b>Durable workflow engines</b> provide these. They are covered as general tools in <a href="38-scheduling-workflows.html">Chapter 38</a>; here is how they fit sagas.</p>
+<ul>
+  <li><b>Temporal</b> (and its ancestor Cadence) lets you write the saga as ordinary code in a general-purpose language. The engine records every step result in a durable event history; if the worker crashes, another worker replays the history to rebuild the exact state and continue. Activities (the calls to services) have configurable retry policies and timeouts. The common saga idiom is to push a compensation onto a list after each successful step and, in a catch block, run the list in reverse. Long sleeps and human-approval signals are first-class.</li>
+  <li><b>AWS Step Functions</b> expresses the saga as a state machine in a declarative JSON-based language (Amazon States Language). Each state can call a Lambda or an AWS service, has built-in <code>Retry</code> and <code>Catch</code> clauses with backoff, and a <code>Catch</code> can route to compensation states. Standard workflows can run for up to a year, and "wait for callback" tasks support human steps.</li>
+  <li>Others include Azure Durable Functions, Camunda and Zeebe (BPMN-based), Netflix Conductor, and in the Java world the Eventuate Tram Sagas and Axon libraries.</li>
+</ul>
+<p>The tradeoffs: an engine removes the hardest infrastructure work and gives a ready-made UI and history, but adds an operational dependency (a Temporal cluster, or vendor lock-in with Step Functions), a programming model with constraints (Temporal workflow code must be deterministic), and cost per state transition on managed offerings. For a small number of simple sagas a library or a hand-rolled table may be lighter; for many sagas, long timers or human tasks, an engine is usually the right call.</p>
+
+<h2 id="anti-patterns">21. Anti-patterns</h2>
+<ul>
+  <li><b>The distributed monolith via orchestrator.</b> The orchestrator grows to contain business rules (pricing, eligibility, discount logic) that belong to participants, and participants become thin CRUD wrappers. Every feature change touches the orchestrator, and teams can no longer deploy independently. Keep the orchestrator to sequencing and state; keep decisions in the owning service.</li>
+  <li><b>Chatty sagas.</b> A saga with fifteen steps and a round trip per field. Latency, failure probability and compensation count grow with step count. Redraw service boundaries so that one service can complete a coherent unit of work in one local transaction; the number of steps is a design smell indicating wrong boundaries (see <a href="46-microservice-data.html">Chapter 46</a>).</li>
+  <li><b>Hidden coupling in choreography.</b> Services quietly depend on each other's event ordering and failure events, with no document describing the saga. A change in one service breaks the flow somewhere else. Cure: document the flow, add a status read model, and consider moving to orchestration.</li>
+  <li><b>A saga for something that should be one transaction.</b> If two entities always change together and are owned by one team, put them in one service and database.</li>
+  <li><b>Compensations that are not tested or not idempotent.</b> The most common production failure.</li>
+  <li><b>Sharing a database to "simplify" the saga.</b> Defeats service autonomy and reintroduces the coupling the saga was meant to avoid.</li>
+  <li><b>Synchronous chains disguised as a saga.</b> Service A calls B, which calls C, with no persisted state. A crash in the middle leaves no record and no compensation. A saga needs persisted progress.</li>
+  <li><b>Using exceptions for business outcomes.</b> Treating "card declined" as an infrastructure failure retried 10 times.</li>
+</ul>
+
+<h2 id="travel">22. Second worked example: travel booking</h2>
+
+<p>A trip booking combines a <b>flight</b>, a <b>hotel</b> and a <b>rental car</b>, each with a different external provider. The customer wants all three or none. This example has a different shape from the order saga: the participants are third parties with their own cancellation rules, and the steps take seconds to minutes.</p>
+<table>
+<tr><th>Step</th><th>Service call</th><th>Type</th><th>Compensation</th><th>Notes</th></tr>
+<tr><td>1</td><td>Create trip record (PENDING)</td><td>Compensatable</td><td>Mark CANCELLED</td><td>Semantic lock on the trip</td></tr>
+<tr><td>2</td><td>Hold flight seat (ticket hold, 15 min)</td><td>Compensatable</td><td>Release hold</td><td>Riskiest: sells out fast, so it goes first</td></tr>
+<tr><td>3</td><td>Book hotel (free-cancellation rate)</td><td>Compensatable</td><td>Cancel booking</td><td>Choose a refundable rate while the saga is open</td></tr>
+<tr><td>4</td><td>Book car</td><td>Compensatable</td><td>Cancel reservation</td><td>Often free to cancel</td></tr>
+<tr><td>5</td><td>Charge customer (the pivot)</td><td>Pivot</td><td>None after this point</td><td>Authorization earlier, capture here</td></tr>
+<tr><td>6</td><td>Ticket the flight (issue ticket number)</td><td>Retriable</td><td>None; retry</td><td>Irreversible or costly, so after payment</td></tr>
+<tr><td>7</td><td>Send itinerary email</td><td>Retriable</td><td>None</td><td>Sent only at the end</td></tr>
+</table>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Travel booking saga where the car booking fails and hotel and flight holds are released">
+  <rect class="box" x="20"  y="40" width="150" height="56" rx="8"/><text class="t-c t-b" x="95" y="64">1 Trip PENDING</text><text class="t-c t-sm" x="95" y="82">succeeded</text>
+  <rect class="box" x="200" y="40" width="150" height="56" rx="8"/><text class="t-c t-b" x="275" y="64">2 Flight hold</text><text class="t-c t-sm" x="275" y="82">succeeded</text>
+  <rect class="box" x="380" y="40" width="150" height="56" rx="8"/><text class="t-c t-b" x="455" y="64">3 Hotel booked</text><text class="t-c t-sm" x="455" y="82">succeeded</text>
+  <rect class="miss" x="560" y="40" width="150" height="56" rx="8"/><text class="t-c t-b" x="635" y="64">4 Car booking</text><text class="t-c t-sm" x="635" y="82">FAILED: none left</text>
+  <rect class="cache" x="740" y="40" width="140" height="56" rx="8"/><text class="t-c t-b" x="810" y="64">5 Pivot: charge</text><text class="t-c t-sm" x="810" y="82">not reached</text>
+  <path class="arrow" d="M170 68 L196 68"/><path class="arrow" d="M350 68 L376 68"/><path class="arrow" d="M530 68 L556 68"/><path class="arrow dash" d="M710 68 L736 68"/>
+  <path class="arrow-r" d="M635 96 L635 150 L455 150 L455 196"/>
+  <rect class="hit" x="380" y="200" width="150" height="50" rx="8"/><text class="t-c t-b" x="455" y="222">Cancel hotel</text><text class="t-c t-sm" x="455" y="240">free cancel</text>
+  <rect class="hit" x="200" y="200" width="150" height="50" rx="8"/><text class="t-c t-b" x="275" y="222">Release flight</text><text class="t-c t-sm" x="275" y="240">drop hold</text>
+  <rect class="hit" x="20" y="200" width="150" height="50" rx="8"/><text class="t-c t-b" x="95" y="222">Trip CANCELLED</text><text class="t-c t-sm" x="95" y="240">tell customer</text>
+  <path class="arrow-r" d="M380 225 L354 225"/><path class="arrow-r" d="M200 225 L174 225"/>
+</svg>
+<figcaption>The car provider has no availability. Because payment (the pivot) comes after all bookings, nothing needs to be refunded; the compensations are free cancellations. Booking the car earlier than the flight would have been wrong since a failed flight hold would waste a car booking.</figcaption>
+</figure>
+
+<p>Design details that make this realistic. The flight hold has a provider-side expiry, so the saga deadline must be shorter than the hold (for example 10 minutes of a 15-minute hold), or the hold must be extended. Hotel and car providers differ in cancellation rules, so the saga picks refundable rates while the saga is open and converts to a non-refundable discount rate only after the pivot, if desired. The ticketing step is retriable: if the airline API is down, the saga keeps retrying and the customer sees "booking confirmed, tickets being issued". If ticketing fails permanently (fare no longer valid), the saga cannot compensate past the pivot, so it opens a <b>manual exception case</b> and a customer-service agent resolves it, which is the honest final answer for post-pivot failure. Idempotency keys are passed to each provider where supported (<code>sagaId:step</code>); for providers that do not accept keys, the saga first queries "booking by our reference" before retrying.</p>
+
+<h2 id="qa">23. Interview Q&amp;A</h2>
+
+<details><summary>What is a saga, and why not just use 2PC?</summary>
+<p>A saga splits a business transaction into local transactions, one per service, each committing independently, with a compensating transaction for each step so that a later failure can semantically undo the earlier work. 2PC would need every service to support a prepare phase and to hold locks until a coordinator decides, which hurts availability, is blocked by a coordinator crash and is unsupported by many brokers and NoSQL stores. The price of choosing a saga is the loss of isolation, which I must handle in the application with semantic locks and similar techniques.</p></details>
+
+<details><summary>Choreography or orchestration: how do you decide?</summary>
+<p>For short, linear flows of up to about four steps where other services also want the events, choreography is simple and needs no extra component. As the flow grows, branches, needs timeouts or must be audited, the logic scattered across subscribers becomes unmanageable and cyclic dependencies appear, so I move to orchestration where one component owns the sequence and the compensation order and the saga status is just its state. I would also factor in team ownership: orchestration needs one team to own the end-to-end flow.</p></details>
+
+<details><summary>What do you do if a compensating transaction fails?</summary>
+<p>Compensations must be designed to be retried until they succeed, so first they are idempotent and retried with backoff, potentially for days, with alerting. If the failure is non-transient (for example an expired refund window), the saga moves to a needs-ops state, the command goes to a dead-letter queue with full context, and an operator uses an admin tool to retry, mark manually completed or skip with an audit trail. A reconciliation job behind it detects any drift that slipped through.</p></details>
+
+<details><summary>How do you make saga steps idempotent?</summary>
+<p>The orchestrator generates a deterministic idempotency key per step, such as saga id plus step number, and sends it with every attempt. The participant, in the same local transaction as its business change, inserts the key into a processed-commands table with a unique constraint, and on a duplicate it returns the stored result without acting. Compensations use the same mechanism, plus a tombstone so a compensation that arrives before its forward command makes the late forward command a no-op.</p></details>
+
+<details><summary>What is the dual write problem and how does the outbox solve it?</summary>
+<p>A step must update its database and publish a message, but a database and a broker cannot be committed atomically, so a crash between the two either loses the message or publishes one for a change that did not commit. With the transactional outbox, the service writes the business change and the outgoing message to an outbox table in one local transaction, and a relay or change-data-capture process publishes it afterwards at least once. The receiver's inbox table deduplicates, which gives effectively-once processing.</p></details>
+
+<details><summary>What isolation anomalies do sagas have and how do you mitigate them?</summary>
+<p>Because each local transaction commits early, other sagas can see intermediate data, producing lost updates, dirty reads and non-repeatable reads. Mitigations include semantic locks (a PENDING flag that others respect), commutative updates (increment and decrement instead of assigning absolute values), a pessimistic view (reduce available stock first so readers never over-sell), rereading the value before overwriting, version records to order operations, and choosing a stronger mechanism by business value for high-risk cases. The choice depends on how bad the anomaly is for the business.</p></details>
+
+<details><summary>What is the pivot transaction?</summary>
+<p>The pivot is the step that marks the point of no return: before it, failures lead to compensation; after it, the saga must finish, so the remaining steps are retriable and are retried until they succeed. It usually is the step that is hardest to undo, such as capturing payment or issuing a ticket. Good design places failure-prone, cheap-to-undo steps before the pivot and only steps that cannot legitimately fail after it.</p></details>
+
+<details><summary>How would you observe and debug a saga stuck in production?</summary>
+<p>Every message and log line carries the saga id, so I search for it across services and the tracing system. An orchestrated saga also has a persisted record, exposed through a status API, showing the current step, attempts and last error. A dashboard shows the count of sagas by state and the age of the oldest non-terminal saga, with alerts on needs-ops and past-deadline sagas, and the ops tool can retry or force the step. For choreography I would build a read model from the events to get the same view.</p></details>
+
+<details><summary>When would you use a workflow engine such as Temporal or Step Functions?</summary>
+<p>When there are many sagas, long timers, human approval steps, or strong audit needs, because the engine supplies durable state, retries, timeouts, versioning and a visibility UI that are expensive to build correctly. Temporal runs ordinary code with replay from a stored history, while Step Functions uses a declarative state machine with Retry and Catch for compensation. The costs are an operational dependency or vendor lock-in and a constrained programming model, so for a tiny saga a simple table-driven orchestrator may be better.</p></details>
+
+<details><summary>You must send a confirmation email in a saga. Where does it go and what is its compensation?</summary>
+<p>An email cannot be recalled, so it should not be a compensatable step at all. I make it a retriable step after the pivot so it is sent only when the saga is guaranteed to succeed, and I do not compensate it. If the saga can still fail afterwards, I would send a separate cancellation email as the compensating action rather than trying to unsend the first. Delaying the email until the end is the cheapest design.</p></details>
+
+<h2 id="recap-section">24. Recap</h2>
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">Recap</h2><ul>
+<li>A saga is a chain of local transactions with compensations in reverse order; it provides atomic outcome but no isolation.</li>
+<li>Choreography uses events only: simple and decoupled for short flows, but the process is implicit, status is hard and cyclic dependencies grow. Orchestration uses a coordinator state machine: explicit flow, easy status and testing, at the cost of running a durable coordinator and avoiding a god service.</li>
+<li>Persist saga state and a step log in a transaction with the next outgoing command; recover stuck sagas with deadlines and a recovery scan.</li>
+<li>Classify steps as compensatable, pivot or retriable; put risky steps first and irreversible ones after the pivot.</li>
+<li>Compensations are semantic undo as new transactions; some things (email, physical actions) cannot be undone and must be placed after the pivot.</li>
+<li>Give every step a deadline; retry transient failures, compensate on business rejection, use idempotency keys when the outcome is unknown.</li>
+<li>Compensation must be retried until it succeeds; escalate to dead-letter, ops tooling and reconciliation.</li>
+<li>Use outbox and inbox plus idempotent handlers for effectively-once messaging (<a href="31-distributed-transactions.html">Chapter 31</a>, <a href="35-messaging-patterns.html">Chapter 35</a>).</li>
+<li>Handle missing isolation with semantic locks, commutative updates, pessimistic view, reread, version records and by-value choice.</li>
+<li>Observe with saga ids, a status API, state counts and oldest-age alerts (<a href="52-microservice-observability.html">Chapter 52</a>); test every failure position, duplicates and crashes; consider Temporal or Step Functions (<a href="38-scheduling-workflows.html">Chapter 38</a>).</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="31-distributed-transactions.html">Chapter 31</a> (2PC limits, saga overview, outbox), <a href="35-messaging-patterns.html">Chapter 35</a> (at-least-once, DLQ), <a href="36-event-driven.html">Chapter 36</a> (events, CDC), <a href="46-microservice-data.html">Chapter 46</a> (database per service) and <a href="47-service-communication.html">Chapter 47</a> (contracts and messaging). Leads to <a href="52-microservice-observability.html">Chapter 52</a> and the workflow engines in <a href="38-scheduling-workflows.html">Chapter 38</a>.</p>
+</main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

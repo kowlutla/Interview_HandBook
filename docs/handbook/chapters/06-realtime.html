@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 6: Real-Time Communication | HLD Handbook</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body data-page="06-realtime">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--fg)"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+  </defs>
+</svg>
+
+<div class="layout">
+<nav class="toc" id="toc"></nav>
+
+<main>
+<div class="kicker">Chapter 6 · Module 1 · Networking and Communication</div>
+<h1>Real-Time Communication</h1>
+<p class="lead">Ordinary web traffic is the client asking and the server answering. Chat, live scores, collaborative editing, and notifications need the server to speak first. This chapter explains every common technique for that (polling, long polling, Server-Sent Events, WebSockets, WebRTC, MQTT, push notifications), and then the hard part: running millions of long-lived connections, routing messages to the right one, surviving deploys and reconnect storms, and sizing the fleet.</p>
+
+<!-- ======================= 1 ======================= -->
+<h2 id="problem">1. Why real-time is hard over request/response HTTP</h2>
+
+<p>HTTP, as most people use it, is a <b>request/response</b> protocol. The client opens a connection (or reuses one), sends a request, and the server sends back exactly one response. The server never sends anything unless the client asked for it first. That model is wonderful for loading web pages and calling APIs, because it keeps servers simple: each request is independent, so any server behind a load balancer can answer it (this is the <b>stateless</b> design from <a href="09-load-balancing.html">Chapter 9</a>).</p>
+
+<p>Now consider a chat message. Alice sends "hello" to Bob. Alice's client can send it with a normal POST. But Bob's phone is sitting idle. Bob did not ask for anything, so under pure request/response the server has no way to deliver the message. The server needs some way to <b>push</b> data to a client at the moment the data exists. The same need appears in many products:</p>
+<ul>
+  <li>Chat and messaging (a message arrives from someone else).</li>
+  <li>Live dashboards, stock tickers, sports scores (the data changes on the server's schedule, not the client's).</li>
+  <li>Collaborative editing and multiplayer games (many clients must see each other's actions within tens of milliseconds).</li>
+  <li>Notifications, order and ride status, delivery tracking.</li>
+  <li>Progress of a long job (export, build, video encode).</li>
+</ul>
+
+<p>There are two ways to bridge the gap. Either the client <b>asks very often</b> (polling and its variants), or the connection is <b>kept open</b> so the server can write to it whenever it likes (SSE, WebSockets). Each approach moves cost around. Frequent asking wastes requests and adds delay. Keeping connections open makes the server <b>stateful</b>: a connection is a piece of memory on one specific machine, and that machine now matters. A load balancer can no longer treat servers as interchangeable, deployments disconnect users, and a message for Bob must be delivered by the one server that happens to hold Bob's connection. Most of this chapter is about the consequences of that single fact.</p>
+
+<div class="callout key"><b>Key idea</b>
+Real-time delivery means the server must be able to reach a specific client at an arbitrary moment. The cheap way is to make the client ask often. The responsive way is to keep a connection open, which turns your servers from stateless workers into stateful holders of millions of sockets. Almost every real-time design question is about managing that state.
+</div>
+
+<h3>1.1 What "real-time" means here</h3>
+<p>In interviews, "real-time" is soft. It rarely means hard real-time (guaranteed deadlines as in a pacemaker). It usually means <b>low latency delivery</b>: a chat message in under a few hundred milliseconds, a live score within a second or two, a game state update within 50 ms. Always ask the interviewer what delay is acceptable, because it decides the technique. A dashboard that refreshes every 10 seconds does not need WebSockets; a multiplayer shooter cannot live without something faster than TCP-based protocols.</p>
+
+<!-- ======================= 2 ======================= -->
+<h2 id="polling">2. Short polling and long polling</h2>
+
+<h3>2.1 Short polling</h3>
+<p>In <b>short polling</b>, the client sends a normal request on a timer, for example every 5 seconds: "anything new for me?" The server replies immediately with new data or with an empty result. Nothing about the server changes. It is the simplest technique and works through every proxy, firewall, and CDN ever built.</p>
+<p>Its costs are easy to compute. Suppose 1 million users have the app open and poll every 5 seconds. That is 200,000 requests per second, and if new data arrives for each user once every few minutes, the vast majority (often over 95 percent) of those responses are empty. You pay for the TLS, the headers (hundreds of bytes to a few KB per request), the authentication check, and a database or cache lookup, all to say "nothing". Worse, the average delay before a user sees an update is half the polling interval (2.5 seconds here), and shortening the interval to cut delay multiplies the cost. Short polling is acceptable when freshness requirements are loose (say 30 seconds or more), when the user count is small, or as a fallback.</p>
+
+<h3>2.2 Long polling</h3>
+<p><b>Long polling</b> keeps the same request/response shape but changes the server's behavior. The client sends a request "anything new since event 105?" If there is nothing, the server <b>does not answer yet</b>. It holds the request open (for typically 20 to 60 seconds). The moment an event appears, the server completes the held request with that data. The client processes it and immediately sends a new request. If the hold time expires with nothing to say, the server returns an empty response, and the client simply re-polls.</p>
+<p>This delivers events with near-zero delay, since the response is waiting on the server side when the event happens. It still works over plain HTTP and was the workhorse of early chat and Gmail-style apps (often called Comet). But it has costs:</p>
+<ul>
+  <li><b>Each event costs a full request cycle.</b> After every delivered event the client must re-issue a request, so under heavy event rates it degrades into frequent polling with headers on each message. Between the response and the next request there is a small window where the server cannot push; events in that window must be buffered and returned when the new request arrives, which is why the client sends a cursor ("since event 105").</li>
+  <li><b>The server holds one open request per client.</b> That is already the stateful-connection problem, just using HTTP machinery. Thread-per-request servers cannot afford it; you need an event-driven server (Chapter 8).</li>
+  <li><b>Intermediaries time out.</b> Load balancers and proxies close idle connections after 30 to 120 seconds, so the hold time must be shorter than the shortest idle timeout on the path.</li>
+  <li><b>Ordering and duplicates.</b> If a response is lost after the server considers it delivered, the event is lost unless the client's cursor semantics make the server resend. Use cursors, not "delete after sending".</li>
+</ul>
+
+<h3>2.3 Server-Sent Events (SSE)</h3>
+<p><b>Server-Sent Events</b> standardize the "hold a response open" idea. The client makes one ordinary HTTP GET with <code>Accept: text/event-stream</code>. The server replies with status 200 and <code>Content-Type: text/event-stream</code> and then never finishes the response: it keeps writing small text records as events occur. In browsers the <code>EventSource</code> object handles it. The wire format is plain text, one field per line, with a blank line ending each event:</p>
+<pre>HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+
+id: 105
+event: price
+data: {"sym":"ACME","px":41.07}
+
+: heartbeat comment (ignored by the client, keeps the connection alive)
+
+id: 106
+retry: 5000
+data: {"sym":"ACME","px":41.09}
+</pre>
+<p>Three features make SSE more than a trick. First, the <code>id:</code> field: the browser remembers the last id it received, and when the connection breaks it <b>reconnects automatically</b> and sends the header <code>Last-Event-ID: 106</code>, so the server can resume from the right place (section 9.3). Second, <code>retry:</code> lets the server tell the client how long to wait before reconnecting. Third, lines starting with a colon are comments, a convenient place for a keep-alive ping every 15 to 30 seconds so proxies do not close the idle stream.</p>
+<p>Limits to know. SSE is <b>one-directional</b>: server to client only. The client sends data with ordinary POST requests on separate connections. It carries <b>text</b> only (binary must be encoded, such as base64). The browser <code>EventSource</code> cannot set custom request headers, so authentication usually relies on cookies, or on a token in the URL (which leaks into logs), or on using a fetch-based SSE client instead. Over HTTP/1.1 browsers allow only about six connections per host, so several tabs can exhaust the allowance; over HTTP/2 many streams share one connection and the problem disappears. Finally, some proxies buffer responses; the server should disable buffering (for example <code>X-Accel-Buffering: no</code> for nginx) and send <code>Cache-Control: no-cache</code>.</p>
+<p>SSE is an excellent default for server-to-client streams: notifications, live feeds, dashboards, and the token-by-token streaming of AI model responses. It rides on plain HTTP, so load balancers, authentication, compression, and observability all work as usual.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="Timeline comparing short polling, long polling, SSE and WebSocket">
+  <text class="t-b" x="20" y="22">Client (left side of each lane) and server (right side). One server event happens at the red marker.</text>
+
+  <text class="t-b" x="20" y="62">Short polling</text>
+  <line class="life" x1="170" y1="52" x2="880" y2="52"/>
+  <path class="arrow" d="M180 52 L220 52"/><path class="arrow" d="M300 52 L340 52"/><path class="arrow" d="M420 52 L460 52"/><path class="arrow" d="M540 52 L580 52"/><path class="arrow" d="M660 52 L700 52"/><path class="arrow" d="M780 52 L820 52"/>
+  <circle cx="500" cy="52" r="6" fill="var(--bad)"/>
+  <text class="t-sm" x="170" y="82">Many empty requests; the event waits until the next tick (up to one interval of delay).</text>
+
+  <text class="t-b" x="20" y="132">Long polling</text>
+  <line class="life" x1="170" y1="122" x2="880" y2="122"/>
+  <rect class="cache" x="180" y="112" width="320" height="20" rx="6"/><text class="t-sm" x="190" y="126">request held open, server waits</text>
+  <circle cx="500" cy="122" r="6" fill="var(--bad)"/>
+  <rect class="hit" x="510" y="112" width="40" height="20" rx="6"/><text class="t-sm" x="520" y="126">reply</text>
+  <rect class="cache" x="560" y="112" width="300" height="20" rx="6"/><text class="t-sm" x="570" y="126">next request held open</text>
+  <text class="t-sm" x="170" y="152">Event delivered at once, but each event ends the request; the client must re-ask.</text>
+
+  <text class="t-b" x="20" y="212">Server-Sent Events</text>
+  <line class="life" x1="170" y1="202" x2="880" y2="202"/>
+  <rect class="cache" x="180" y="192" width="680" height="20" rx="6"/><text class="t-sm" x="190" y="206">one long HTTP response; events written as they happen</text>
+  <circle cx="380" cy="202" r="6" fill="var(--bad)"/><circle cx="500" cy="202" r="6" fill="var(--bad)"/><circle cx="700" cy="202" r="6" fill="var(--bad)"/>
+  <text class="t-sm" x="170" y="232">Server to client only. Auto-reconnect with Last-Event-ID.</text>
+
+  <text class="t-b" x="20" y="292">WebSocket</text>
+  <line class="life" x1="170" y1="282" x2="880" y2="282"/>
+  <rect class="box" x="180" y="272" width="60" height="20" rx="6"/><text class="t-sm" x="188" y="286">upgrade</text>
+  <rect class="hit" x="250" y="272" width="610" height="20" rx="6"/><text class="t-sm" x="260" y="286">full-duplex socket: both sides send frames any time</text>
+  <circle cx="500" cy="282" r="6" fill="var(--bad)"/><circle cx="600" cy="282" r="6" fill="var(--good)"/><circle cx="780" cy="282" r="6" fill="var(--good)"/>
+  <text class="t-sm" x="170" y="312">Red = server push, green = client send on the same connection.</text>
+  <text class="t-sm" x="170" y="352">Cost per idle user: polling = repeated requests; others = one open connection (memory) per user.</text>
+</svg>
+<figcaption>Read each lane left to right as time. Short polling pays many requests and still adds delay. Long polling and SSE hold the connection so the server can answer instantly. A WebSocket additionally lets the client send on the same connection.</figcaption>
+</figure>
+
+<!-- ======================= 3 ======================= -->
+<h2 id="websockets">3. WebSockets in depth</h2>
+
+<p>A <b>WebSocket</b> (RFC 6455) is a persistent, <b>full-duplex</b> (both directions at once) message channel between a browser or app and a server, running over a single TCP connection (and TLS, when the URL starts with <code>wss://</code>). Unlike SSE it carries both text and binary messages and the client can send as freely as the server. Unlike HTTP there is no per-message request line or header block: after setup, a message costs only a 2 to 14 byte frame header.</p>
+
+<h3>3.1 The upgrade handshake</h3>
+<p>A WebSocket does not use a new port. It begins life as an HTTP/1.1 request on port 80 or 443 and asks to <b>upgrade</b> the connection. That is clever because it passes through the same firewalls and the same load balancers as web traffic. The client sends:</p>
+<pre>GET /chat HTTP/1.1
+Host: chat.example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+Origin: https://app.example.com
+Authorization or Cookie: ...   (credentials, see section 14)
+</pre>
+<p>If the server agrees, it answers with status <b>101 Switching Protocols</b>:</p>
+<pre>HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+</pre>
+<p>The <code>Sec-WebSocket-Key</code> is a random 16-byte value, base64 encoded. The server must prove it understood the WebSocket protocol by computing <code>Sec-WebSocket-Accept</code> as the base64 of the SHA-1 hash of the key concatenated with a fixed GUID string from the RFC. This is not security against attackers; it prevents a confused HTTP server or cache from accidentally treating a non-WebSocket exchange as a success. After the 101 response, the same TCP connection stops speaking HTTP and speaks the WebSocket frame protocol. The handshake is also where you do authentication and origin checks (section 14), because it is the last moment the connection is still an ordinary, inspectable HTTP request.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 400" role="img" aria-label="WebSocket upgrade handshake, message exchange, ping pong and close sequence">
+  <rect class="ext" x="120" y="14" width="140" height="34" rx="8"/><text class="t-c t-b" x="190" y="36">Client</text>
+  <rect class="box" x="640" y="14" width="140" height="34" rx="8"/><text class="t-c t-b" x="710" y="36">Server</text>
+  <line class="life" x1="190" y1="48" x2="190" y2="390"/><line class="life" x1="710" y1="48" x2="710" y2="390"/>
+
+  <path class="arrow" d="M190 76 L706 76"/><text class="t-c t-sm" x="450" y="70">GET /chat  Upgrade: websocket, Sec-WebSocket-Key, Origin, credentials</text>
+  <path class="arrow-g" d="M710 112 L194 112"/><text class="t-c t-sm" x="450" y="106">101 Switching Protocols, Sec-WebSocket-Accept</text>
+  <rect class="hit" x="260" y="124" width="380" height="24" rx="6"/><text class="t-c t-sm" x="450" y="141">TCP connection now carries WebSocket frames, not HTTP</text>
+
+  <path class="arrow" d="M190 180 L706 180"/><text class="t-c t-sm" x="450" y="174">text frame: {"type":"send","to":"bob","body":"hi"}  (masked)</text>
+  <path class="arrow-g" d="M710 214 L194 214"/><text class="t-c t-sm" x="450" y="208">text frame: {"type":"msg","from":"carol","body":"yo"}  (not masked)</text>
+
+  <path class="arrow dash" d="M710 250 L194 250"/><text class="t-c t-sm" x="450" y="244">Ping (opcode 0x9) every 25 s</text>
+  <path class="arrow dash" d="M190 278 L706 278"/><text class="t-c t-sm" x="450" y="272">Pong (opcode 0xA) echoes the payload</text>
+
+  <path class="arrow-r" d="M190 316 L706 316"/><text class="t-c t-sm" x="450" y="310">Close frame (0x8), code 1000 normal closure</text>
+  <path class="arrow-r" d="M710 350 L194 350"/><text class="t-c t-sm" x="450" y="344">Close frame echoed, then TCP is closed</text>
+</svg>
+<figcaption>One HTTP request upgrades the connection. After that both sides send frames. Pings and pongs check that the peer is alive. A close is a two-frame handshake before TCP shuts down.</figcaption>
+</figure>
+
+<h3>3.2 Framing</h3>
+<p>TCP is a byte stream with no message boundaries. WebSocket adds <b>frames</b> so that messages have boundaries. Each frame starts with a small header:</p>
+<ul>
+  <li><b>FIN bit and opcode.</b> The opcode says what the frame is: <code>0x1</code> text (UTF-8), <code>0x2</code> binary, <code>0x0</code> continuation (a later piece of a fragmented message), <code>0x8</code> close, <code>0x9</code> ping, <code>0xA</code> pong. The FIN bit marks the final fragment of a message, so a large message can be split into several frames and interleaved with control frames.</li>
+  <li><b>Mask bit and payload length.</b> The length is stored in 7 bits for payloads up to 125 bytes; the value 126 means a 16-bit length follows; 127 means a 64-bit length follows. So the header is 2 bytes for small messages, up to 14 bytes in the worst case with masking.</li>
+  <li><b>Masking key.</b> Every frame sent <b>from the client to the server must be masked</b> with a random 4-byte key (each payload byte is XORed with the key). This is not encryption. It exists to stop a malicious page from crafting bytes that a buggy intermediate proxy might mistake for an HTTP request, poisoning its cache. Server-to-client frames are not masked.</li>
+</ul>
+<p>Control frames (close, ping, pong) are limited to 125 bytes of payload and cannot be fragmented, so they can always be sent between pieces of a large data message.</p>
+
+<h3>3.3 Ping, pong and why you still need your own heartbeat</h3>
+<p>TCP will happily sit forever on a connection whose other side has silently vanished (a phone that moved out of range, a NAT table entry that expired, a crashed laptop). Neither side is told, because no packet announces it. A <b>ping</b> frame asks "are you there?" and the peer must answer with a <b>pong</b> carrying the same payload. If no pong arrives within a deadline, the connection is considered dead and closed, freeing its memory. Pings serve a second purpose: they keep the connection from looking idle to load balancers and carrier NATs that drop quiet connections after one to a few minutes.</p>
+<p>Browsers answer pings automatically but their JavaScript <code>WebSocket</code> API cannot send or observe ping frames. So applications commonly add their own <b>application-level heartbeat</b>: a tiny JSON or binary message every 20 to 30 seconds, which also lets the application measure round-trip time and detect a "half-open" connection from the browser side. Section 9 treats heartbeats and their tuning in detail.</p>
+
+<h3>3.4 Closing</h3>
+<p>Either side can start a clean close by sending a <b>close frame</b> with a 2-byte status code and an optional short reason. The receiver replies with its own close frame, and then the TCP connection is closed (typically by the server). Useful codes: <code>1000</code> normal closure, <code>1001</code> going away (a server shutting down or a page navigating away), <code>1008</code> policy violation (for example failed authorization), <code>1009</code> message too big, <code>1011</code> unexpected internal server error. Code <code>1006</code> is special: it is never sent on the wire, but reported locally when the connection dropped without a close frame, which means a network failure or crash. Client logic should treat 1001 and 1006 as "reconnect" and 1008 as "do not blindly retry; refresh credentials".</p>
+
+<h3>3.5 What WebSockets do not give you</h3>
+<p>The protocol gives you a pipe and nothing else. It defines no message acknowledgments, no ordering across reconnects, no replay of missed messages, no routing by topic, no authentication scheme, and no automatic reconnect. All of that is application design, which is why Socket.IO, SignalR, and similar libraries exist, and why most of this chapter is about what to build around the pipe. WebSockets over HTTP/2 (RFC 8441) let many sockets share one TCP connection but are less widely deployed than the HTTP/1.1 upgrade, and typical designs assume one TCP connection per WebSocket.</p>
+
+<!-- ======================= 4 ======================= -->
+<h2 id="others">4. WebRTC, MQTT, and push notifications</h2>
+
+<h3>4.1 WebRTC overview</h3>
+<p><b>WebRTC</b> (Web Real-Time Communication) lets browsers and apps exchange audio, video, and arbitrary data <b>directly peer to peer</b> with very low latency. Video calls are its main use, and it is also used for game data and file transfer. Several mechanisms combine:</p>
+<ul>
+  <li><b>Signaling.</b> The peers must first exchange descriptions of what they can do (codecs, network addresses). WebRTC deliberately does not define how; applications use their own WebSocket or HTTP channel to relay these offer/answer messages through a server.</li>
+  <li><b>NAT traversal with ICE.</b> Most devices sit behind NAT (<a href="03-networking-essentials.html">Chapter 3</a>) and cannot be reached directly. ICE gathers candidate addresses. A <b>STUN</b> server tells a peer its public address as seen from the internet, which works for many NAT types. When direct paths fail (symmetric NATs, strict firewalls), a <b>TURN</b> server relays all media, which costs the operator real bandwidth; typically a minority of calls (often quoted as 10 to 20 percent) need it.</li>
+  <li><b>Transport.</b> Media flows over UDP, encrypted (DTLS key exchange, SRTP for media), preferring timeliness to reliability: a late audio packet is useless, so it is not retransmitted. <b>Data channels</b> run over SCTP on top of DTLS and can be configured reliable or unreliable, ordered or unordered.</li>
+</ul>
+<p>Pure peer-to-peer does not scale to group calls (each participant would upload N-1 streams). Production systems put a media server in the middle: an <b>SFU</b> (selective forwarding unit) receives each participant's stream once and forwards it to the others without decoding, or an <b>MCU</b> mixes streams into one. In an interview, mention WebRTC for audio/video and ultra-low-latency data, with WebSockets used only for signaling. Do not use it for ordinary chat.</p>
+
+<h3>4.2 MQTT overview</h3>
+<p><b>MQTT</b> is a lightweight publish/subscribe protocol over TCP (with TLS) built for constrained devices and unreliable networks: sensors, vehicles, smart home gear, and also some mobile messaging systems. Clients connect to a central <b>broker</b>. Messages are published to hierarchical <b>topics</b> such as <code>home/livingroom/temperature</code>, and subscribers use wildcards (<code>home/+/temperature</code>, <code>home/#</code>). The broker routes; clients never address each other. Features that matter:</p>
+<ul>
+  <li><b>Three QoS levels</b> per message: QoS 0 at most once (fire and forget), QoS 1 at least once (acknowledged, duplicates possible), QoS 2 exactly once between client and broker (a four-step handshake, costly). QoS applies per hop, not end to end.</li>
+  <li><b>Retained messages.</b> The broker stores the last message on a topic and gives it to new subscribers immediately, so a new dashboard sees the current value without waiting for the next reading.</li>
+  <li><b>Last will and testament.</b> A client registers a message the broker publishes if the client disconnects abnormally; this is a built-in presence signal.</li>
+  <li><b>Keep-alive and persistent sessions.</b> The client states a keep-alive interval; the broker drops the session if silent for about 1.5 times that. A persistent session lets the broker queue QoS 1 and 2 messages for an offline client and deliver them on reconnect.</li>
+</ul>
+<p>MQTT's small header (as little as 2 bytes) and its built-in delivery guarantees make it attractive for IoT. For a general web product, WebSockets plus your own backplane is more common; brokers such as EMQX and HiveMQ scale to millions of connections with the same fleet ideas as section 6.</p>
+
+<h3>4.3 Push notifications (APNs and FCM)</h3>
+<p>A WebSocket only works while the app is running and the connection is up. A phone with the app closed has no connection to you. Mobile operating systems solve this with <b>one shared, OS-managed connection</b> per device: Apple's <b>APNs</b> (Apple Push Notification service) for iOS and Google's <b>FCM</b> (Firebase Cloud Messaging) for Android (and web push through browsers). The OS keeps a single efficient persistent connection to the vendor, which is far kinder to battery than every app holding its own.</p>
+<p>The flow: the app asks the OS for a <b>device token</b> and sends it to your backend, which stores it against the user. To notify, your server calls the vendor API (HTTP/2 for APNs, HTTPS for FCM) with the token and a small payload (roughly 4 KB maximum). The vendor delivers it to the device, which displays a notification or wakes the app. Key properties:</p>
+<ul>
+  <li><b>Best effort.</b> There is no guaranteed delivery or delivery receipt to you in the general case. Vendors keep one or a few messages for an offline device with a time-to-live you set, then drop them. Options like APNs collapse identifiers and FCM collapse keys replace older undelivered messages ("3 new messages" instead of three).</li>
+  <li><b>Tokens change and expire.</b> The vendor returns errors for invalid or unregistered tokens; you must delete those.</li>
+  <li><b>Priority and rate.</b> High priority wakes the device but is throttled by the OS if abused. Silent data pushes are rate limited.</li>
+  <li><b>Privacy.</b> Payloads pass through the vendor; send identifiers and fetch the sensitive content from your API after the app wakes.</li>
+</ul>
+<p>The typical hybrid for messaging apps: use a WebSocket while the app is in the foreground and a push notification when it is not (the server checks presence: no live connection means send a push). Chapter 56 covers push notifications and offline sync on mobile in more depth (<a href="56-privacy-cost-mobile.html">Chapter 56</a>).</p>
+
+<!-- ======================= 5 ======================= -->
+<h2 id="compare">5. Comparison and decision guide</h2>
+
+<table>
+<tr><th>Technique</th><th>Direction</th><th>Latency to deliver</th><th>Cost per idle client</th><th>Strengths</th><th>Weaknesses</th></tr>
+<tr><td>Short polling</td><td>Client pulls</td><td>Up to one poll interval</td><td>Repeated requests (high)</td><td>Trivial, works everywhere, stateless, cacheable</td><td>Wasteful, delayed, load scales with users times frequency</td></tr>
+<tr><td>Long polling</td><td>Client pulls, server holds</td><td>Near-instant</td><td>One held request, plus re-request after each event</td><td>Plain HTTP, works through hostile proxies</td><td>Request overhead per event, timeouts, stateful holding</td></tr>
+<tr><td>SSE</td><td>Server to client</td><td>Near-instant</td><td>One open HTTP stream</td><td>Simple, auto-reconnect and resume, HTTP/2 friendly, standard auth and LB</td><td>One-way, text only, limited custom headers in browsers</td></tr>
+<tr><td>WebSocket</td><td>Both ways</td><td>Near-instant, small frames</td><td>One open TCP connection</td><td>Bidirectional, binary, low overhead</td><td>No built-in resume, ack or routing; stateful; proxy and LB care needed</td></tr>
+<tr><td>WebRTC</td><td>Both ways, peer to peer</td><td>Lowest (UDP)</td><td>Media session</td><td>Audio/video, tolerates loss, direct paths</td><td>Complex (ICE, TURN, SFU); needs signaling</td></tr>
+<tr><td>MQTT</td><td>Pub/sub via broker</td><td>Low</td><td>One small TCP connection</td><td>QoS levels, retained, last will, tiny header</td><td>Broker is central; per-hop guarantees; less browser-native</td></tr>
+<tr><td>APNs/FCM push</td><td>Server to device</td><td>Seconds, best effort</td><td>None for you (OS holds it)</td><td>Reaches closed apps, battery efficient</td><td>No delivery guarantee, small payload, vendor dependency</td></tr>
+</table>
+
+<h3>5.1 Decision guide</h3>
+<ol>
+  <li><b>Does the data need to arrive faster than every 15 to 30 seconds?</b> If not, short polling is the cheapest correct answer. Do not over-engineer.</li>
+  <li><b>Is traffic mostly server to client</b> (notifications, tickers, feed updates, streamed AI output)? Choose <b>SSE</b>. Add ordinary POSTs for the occasional client action.</li>
+  <li><b>Is the client also sending frequently and interactively</b> (chat, collaborative editing, games, trading UIs)? Choose <b>WebSockets</b>.</li>
+  <li><b>Audio, video, or sub-100 ms game state with loss tolerance?</b> Use <b>WebRTC</b> (or a custom UDP/QUIC protocol).</li>
+  <li><b>Fleets of devices with tiny payloads and flaky links?</b> Use <b>MQTT</b>.</li>
+  <li><b>User may have the app closed?</b> Add <b>APNs/FCM</b>. This is always a complement, never a replacement.</li>
+  <li><b>Hostile network where only plain HTTP works?</b> Fall back to long polling. Many libraries negotiate this automatically.</li>
+</ol>
+
+<div class="callout tip"><b>Interview tip</b>
+Say which two or three you considered and why you picked one. "I would use SSE for the notification feed because it is one-directional and keeps standard HTTP infrastructure; for chat I would use WebSockets because the client sends constantly; for offline users I add push." That demonstrates tradeoff reasoning, not memorization.
+</div>
+
+<!-- ======================= 6 ======================= -->
+<h2 id="scaling">6. Scaling stateful connections</h2>
+
+<p>The moment you hold connections open, your capacity planning changes. Stateless HTTP capacity is measured in requests per second. A real-time tier is measured in <b>concurrent connections</b> and in the <b>messages per second</b> flowing through them. Let us see what limits a single server.</p>
+
+<h3>6.1 Connections per server</h3>
+<p>Modern event-driven servers (Netty, Go, Node.js, Erlang/Elixir, Nginx, Envoy) use the operating system's scalable I/O notification (epoll on Linux) so that one thread can watch tens of thousands of sockets, waking only when one has data. The old model of one thread per connection collapses around a few thousand connections because of per-thread stack memory and context-switch cost. With the event-driven model, a tuned commodity server (say 8 to 16 cores, 16 to 64 GB of memory) can hold <b>hundreds of thousands</b> of mostly idle connections; the famous "C10K" and "C1M" benchmarks showed one million on a single box. In practice, production gateways run at <b>50,000 to 200,000</b> connections each, deliberately far below the maximum, for three reasons: when a server dies all its connections reconnect at once (a smaller blast radius means a gentler storm), a busy connection costs far more CPU than an idle one, and headroom is needed for deploys and spikes.</p>
+
+<h3>6.2 Memory per connection</h3>
+<p>An idle connection is not free. Rough accounting for one TLS WebSocket:</p>
+<table>
+<tr><th>Component</th><th>Typical cost</th><th>Notes</th></tr>
+<tr><td>Kernel TCP socket state and buffers</td><td>about 3 to 10 KB idle</td><td>Send and receive buffers grow under load (tens to hundreds of KB for a busy socket). Tuning buffer limits matters at scale.</td></tr>
+<tr><td>TLS session state</td><td>about 5 to 20 KB</td><td>Cipher state, buffers. Libraries differ widely.</td></tr>
+<tr><td>Application object</td><td>1 to 10 KB</td><td>User id, subscriptions, outbound queue, timers. A big per-connection outbound queue can dominate.</td></tr>
+<tr><td>Total planning figure</td><td>about 20 to 50 KB</td><td>Use 30 KB for estimates unless told otherwise.</td></tr>
+</table>
+<p>So 100,000 connections cost about 3 GB of memory. That is manageable, which is why real-time gateways are usually limited by CPU (TLS handshakes, message encoding, fan-out) or by bandwidth, not memory.</p>
+
+<h3>6.3 File descriptors and other limits</h3>
+<p>On Unix, each socket is a <b>file descriptor</b>. A process has a limit (<code>ulimit -n</code>), often defaulting to 1,024, and the system has a global cap (<code>fs.file-max</code>). A gateway must raise both well above the target connection count (for example 200,000 to 1,000,000). Other limits to tune: the size of the accept backlog, kernel connection tracking tables (conntrack) in NATs and firewalls that can fill up and silently drop new connections, and the ephemeral port range. The last is a trap on the <b>load balancer to gateway</b> hop: a single source IP can have only about 64,000 connections to one destination IP and port, because the connection is identified by the tuple of source IP, source port, destination IP, destination port. A reverse proxy opening 200,000 connections to one backend address needs multiple source IPs or multiple backend ports. Clients reaching the gateway directly do not hit this, because they come from many different IPs.</p>
+
+<h3>6.4 Load balancing long-lived connections</h3>
+<p>Load balancing (<a href="09-load-balancing.html">Chapter 9</a>) works at connection granularity here, not request granularity, and that changes the tradeoffs:</p>
+<ul>
+  <li><b>Round robin spreads new connections, not load.</b> Connections last hours. After a deploy or a scale-out, old servers keep their old connections while new servers sit empty. The fleet becomes imbalanced and stays so. Prefer <b>least connections</b> for new connections, and expect to occasionally shed connections from heavy servers (ask clients to reconnect gradually).</li>
+  <li><b>Stickiness is needed only for the lifetime of the connection,</b> and a TCP connection is naturally sticky: once established, all its frames flow to the same backend. You do not need cookie stickiness for the WebSocket itself. But if you use long polling or fallback transports, consecutive requests of one session can land on different servers, so sticky sessions or a shared session store is required. Many libraries (Socket.IO) require sticky routing for their HTTP fallback.</li>
+  <li><b>L4 or L7.</b> An L4 (TCP) balancer passes bytes through, supports enormous connection counts cheaply, and is the usual choice in front of gateways that terminate TLS themselves. An L7 (HTTP) balancer can route by path or header and terminate TLS, but it holds two sockets per client connection (client side and backend side), roughly doubling memory and descriptor use. At 10 million connections that doubling is real money.</li>
+  <li><b>Idle timeouts.</b> Set the balancer's idle timeout longer than your heartbeat interval (for example 120 seconds against 30-second pings), or it will cut healthy connections.</li>
+  <li><b>Connection draining.</b> Balancers must support removing a backend from rotation for new connections while existing ones continue, which section 13 relies on.</li>
+</ul>
+
+<h3>6.5 A connection gateway tier, separate from business logic</h3>
+<p>The most important architectural move is to <b>separate the machines that hold connections from the machines that implement the product</b>. A <b>connection gateway</b> (also called an edge or realtime server) does only a few things: terminates TLS, authenticates the handshake, keeps the socket alive with heartbeats, registers "user U is connected to me", decodes and forwards inbound messages to backend services, and writes outbound messages to the right socket. It contains <b>no business logic</b> about chat rooms, billing, or search.</p>
+<p>Why split? First, <b>deployment cadence</b>: business logic changes daily, but every restart of a connection holder disconnects users. A thin gateway changes rarely, so connections survive most releases. Second, <b>independent scaling</b>: gateways scale with connection count and message volume; business services scale with CPU work. Third, <b>blast radius and simplicity</b>: a bug in message ranking cannot drop 100,000 sockets. Fourth, <b>language and runtime fit</b>: gateways are written in runtimes good at massive concurrency; business services use whatever suits the team.</p>
+<p>Inbound traffic flows from gateway to business services over normal RPC or a queue. Outbound traffic (a service wants to send something to a user) is the harder direction, because the service does not know which gateway holds the user. That is the subject of the next section.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 430" role="img" aria-label="Real-time architecture: clients, load balancer, gateway tier, backplane, registry, services">
+  <rect class="ext" x="20" y="150" width="120" height="120" rx="10"/><text class="t-c t-b" x="80" y="200">Clients</text><text class="t-c t-sm" x="80" y="220">phones,</text><text class="t-c t-sm" x="80" y="236">browsers</text>
+  <rect class="box" x="190" y="170" width="110" height="80" rx="10"/><text class="t-c t-b" x="245" y="205">L4 load</text><text class="t-c t-b" x="245" y="223">balancer</text>
+  <path class="arrow" d="M140 210 L186 210"/>
+
+  <rect class="cache" x="350" y="40"  width="150" height="60" rx="10"/><text class="t-c t-b" x="425" y="66">Gateway G1</text><text class="t-c t-sm" x="425" y="84">100k sockets</text>
+  <rect class="cache" x="350" y="180" width="150" height="60" rx="10"/><text class="t-c t-b" x="425" y="206">Gateway G2</text><text class="t-c t-sm" x="425" y="224">100k sockets</text>
+  <rect class="cache" x="350" y="320" width="150" height="60" rx="10"/><text class="t-c t-b" x="425" y="346">Gateway G3</text><text class="t-c t-sm" x="425" y="364">100k sockets</text>
+  <path class="arrow" d="M300 195 L346 75"/><path class="arrow" d="M300 210 L346 210"/><path class="arrow" d="M300 225 L346 345"/>
+
+  <rect class="miss" x="570" y="40" width="150" height="70" rx="10"/><text class="t-c t-b" x="645" y="68">Backplane</text><text class="t-c t-sm" x="645" y="86">pub/sub: Redis / Kafka</text><text class="t-c t-sm" x="645" y="100">topic per gateway</text>
+  <rect class="db" x="570" y="190" width="150" height="70" rx="10"/><text class="t-c t-b" x="645" y="218">Registry</text><text class="t-c t-sm" x="645" y="236">user -> gateway</text><text class="t-c t-sm" x="645" y="250">(TTL entries)</text>
+  <rect class="box" x="570" y="320" width="150" height="70" rx="10"/><text class="t-c t-b" x="645" y="348">Services</text><text class="t-c t-sm" x="645" y="366">chat, presence,</text><text class="t-c t-sm" x="645" y="380">notifications</text>
+
+  <path class="arrow dash" d="M500 70 L566 70"/><path class="arrow dash" d="M500 210 L566 225"/><path class="arrow dash" d="M500 350 L566 355"/>
+  <path class="arrow dash" d="M500 200 L566 90"/>
+  <path class="arrow" d="M645 320 L645 264"/><path class="arrow" d="M680 320 L680 114"/>
+  <text class="t-sm" x="700" y="296">lookup</text>
+  <text class="t-sm" x="735" y="170">publish to G's topic</text>
+  <text class="t-sm" x="350" y="415">Gateways register users, subscribe to their own topic, and forward inbound messages to services.</text>
+</svg>
+<figcaption>Clients connect through a load balancer to a thin gateway tier. A registry says which gateway holds each user. Services look up the user, publish to that gateway's topic on the backplane, and the gateway writes the message to the socket.</figcaption>
+</figure>
+
+<!-- ======================= 7 ======================= -->
+<h2 id="routing">7. Routing a message to the server that holds the connection</h2>
+
+<p>Alice is on gateway G1. Bob is on gateway G3. Alice's message arrives at G1, passes to the chat service, and now somebody must write it to Bob's socket on G3. Gateways cannot talk to every other gateway directly (that is a fully connected mesh). Two components solve this together.</p>
+
+<h3>7.1 The connection registry</h3>
+<p>A <b>connection registry</b> is a fast key-value map from <code>user id</code> (or device id, or session id) to <code>gateway id</code> (and perhaps a connection id). Usually it lives in Redis (<a href="15-redis.html">Chapter 15</a>) or a similar store. When a connection is established and authenticated, the gateway writes <code>user:bob -> G3</code> with a <b>TTL</b> (say 60 to 120 seconds) and refreshes it on every heartbeat. When the connection closes cleanly the gateway deletes the entry. If the gateway crashes, nobody deletes anything, but the TTL expires and the entry disappears on its own. That self-healing property is why you use TTLs and refresh, rather than relying on delete-on-disconnect.</p>
+<p>One user may have several devices (phone, laptop, tablet), so the registry often maps a user to a <b>set</b> of device connections, for example a Redis hash <code>conns:bob</code> with fields per device. Registry entries can be stale: Bob may have reconnected to G5 a second ago while the old G3 entry lingers. Delivery code must treat the registry as a <b>hint</b>: the gateway that receives a message for a user it no longer holds must drop it or report "not here", and the sender falls back to the offline path (store and push, section 10).</p>
+
+<h3>7.2 The pub/sub backplane</h3>
+<p>The <b>backplane</b> is a message bus that every gateway is connected to. The simplest scheme: each gateway subscribes to its own channel, such as <code>gw.G3</code>. To deliver to Bob, a service reads <code>user:bob -> G3</code> from the registry and publishes <code>{to: bob, payload}</code> on <code>gw.G3</code>. Only G3 receives it; G3 finds Bob's socket in an in-memory hash map and writes the frame. Each message costs one registry read and one publish, regardless of the number of gateways.</p>
+<p>The alternative <b>broadcast scheme</b> skips the registry: publish every message on a channel all gateways subscribe to, and each gateway discards messages for users it does not hold. That is simple but multiplies traffic by the number of gateways, so it only suits small fleets or topic-based fan-out where most gateways have subscribers anyway.</p>
+<p>A middle path for group messaging: gateways subscribe to <b>topics for rooms</b> that have at least one local member (<code>room:42</code>). The service publishes once to <code>room:42</code>, and every gateway with a member of that room receives one copy and fans it out to its local sockets. This reduces cross-gateway traffic from one message per member to one message per gateway holding members, which is critical for big rooms and live-event audiences.</p>
+
+<h3>7.3 Redis pub/sub versus Kafka as the backplane</h3>
+<table>
+<tr><th>Property</th><th>Redis pub/sub</th><th>Kafka (or similar log)</th></tr>
+<tr><td>Delivery model</td><td>Fire and forget; if a subscriber is disconnected for a moment, messages are lost</td><td>Durable log with offsets; consumers can replay</td></tr>
+<tr><td>Latency</td><td>Sub-millisecond to a few ms</td><td>Typically several ms to tens of ms</td></tr>
+<tr><td>Subscription churn</td><td>Cheap: subscribe and unsubscribe to many channels dynamically</td><td>Topics and partitions are heavy; a topic per user or per room does not scale; use a few topics partitioned by gateway or by key</td></tr>
+<tr><td>Ordering</td><td>In order per publisher connection</td><td>In order per partition</td></tr>
+<tr><td>Best use</td><td>Ephemeral, latency-critical routing: delivery to online users, presence, typing</td><td>Durable event stream between services: the message of record, analytics, audit, replays</td></tr>
+</table>
+<p>A common and sound design uses both. The <b>chat service writes the message durably first</b> (to its database or a Kafka topic), so no accepted message can be lost. Then it uses Redis pub/sub (or a lightweight per-gateway queue) purely as a <b>delivery hint</b> to push it to online recipients. If the push is lost, the recipient picks the message up on reconnect from the durable store using its last sequence number (section 10). Thus the backplane may be lossy without compromising correctness. Redis Cluster pub/sub broadcasts messages across all nodes in classic mode, which limits scaling; sharded pub/sub (available in newer Redis versions) pins channels to shards. Say "I'd verify the throughput limits" rather than inventing numbers.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 420" role="img" aria-label="Sequence diagram of delivering a chat message from Alice on gateway 1 to Bob on gateway 3">
+  <rect class="ext" x="10" y="12" width="90" height="34" rx="8"/><text class="t-c t-b" x="55" y="34">Alice</text>
+  <rect class="cache" x="170" y="12" width="90" height="34" rx="8"/><text class="t-c t-b" x="215" y="34">Gateway 1</text>
+  <rect class="box" x="330" y="12" width="100" height="34" rx="8"/><text class="t-c t-b" x="380" y="34">Chat service</text>
+  <rect class="db" x="500" y="12" width="90" height="34" rx="8"/><text class="t-c t-b" x="545" y="34">Registry</text>
+  <rect class="miss" x="650" y="12" width="90" height="34" rx="8"/><text class="t-c t-b" x="695" y="34">Backplane</text>
+  <rect class="cache" x="790" y="12" width="100" height="34" rx="8"/><text class="t-c t-b" x="840" y="34">Gateway 3</text>
+  <line class="life" x1="55" y1="46" x2="55" y2="410"/><line class="life" x1="215" y1="46" x2="215" y2="410"/><line class="life" x1="380" y1="46" x2="380" y2="410"/><line class="life" x1="545" y1="46" x2="545" y2="410"/><line class="life" x1="695" y1="46" x2="695" y2="410"/><line class="life" x1="840" y1="46" x2="840" y2="410"/>
+
+  <path class="arrow" d="M55 80 L211 80"/><text class="t-sm" x="60" y="74">1. send to Bob</text>
+  <path class="arrow" d="M215 112 L376 112"/><text class="t-sm" x="222" y="106">2. forward (RPC)</text>
+  <path class="arrow" d="M380 144 L380 144"/><rect class="db" x="300" y="130" width="160" height="26" rx="6"/><text class="t-c t-sm" x="380" y="148">3. persist, assign seq 4012</text>
+  <path class="arrow" d="M380 184 L541 184"/><text class="t-sm" x="386" y="178">4. where is Bob?</text>
+  <path class="arrow-g" d="M545 214 L384 214"/><text class="t-sm" x="392" y="208">5. gateway 3</text>
+  <path class="arrow" d="M380 246 L691 246"/><text class="t-sm" x="400" y="240">6. publish on gw.3</text>
+  <path class="arrow" d="M695 278 L836 278"/><text class="t-sm" x="712" y="272">7. deliver</text>
+  <path class="arrow-g" d="M840 312 L840 312"/><rect class="hit" x="745" y="298" width="140" height="26" rx="6"/><text class="t-c t-sm" x="815" y="316">8. write to Bob's socket</text>
+  <path class="arrow dash" d="M836 352 L384 352"/><text class="t-sm" x="520" y="346">9. client ack (seq 4012)</text>
+  <path class="arrow-g" d="M376 384 L59 384"/><text class="t-sm" x="110" y="378">10. ack to Alice: stored</text>
+</svg>
+<figcaption>The message is persisted and sequenced before any delivery attempt. The registry says which gateway holds Bob, the backplane carries the message there, and Bob's client acknowledges it. If step 5 finds no entry, the service skips steps 6 to 9 and sends a push notification instead.</figcaption>
+</figure>
+
+<!-- ======================= 8 ======================= -->
+<h2 id="messaging-semantics">8. Delivery guarantees and ordering</h2>
+
+<p>Because a connection can break at any moment, a design must say precisely what it promises. Three guarantees are possible, discussed in detail in Chapter 32 (<a href="32-idempotency-ids.html">Chapter 32</a>):</p>
+<ul>
+  <li><b>At most once:</b> send and forget. Messages can be lost, never duplicated. Fine for typing indicators, cursor positions, and ephemeral presence.</li>
+  <li><b>At least once:</b> the sender retries until acknowledged. Messages are never lost but can arrive twice. This is the standard for chat and notifications.</li>
+  <li><b>Exactly once (effect):</b> you cannot get exactly-once delivery over an unreliable network, but you get exactly-once <i>effect</i> by combining at-least-once delivery with <b>deduplication</b> on the receiver.</li>
+</ul>
+
+<h3>8.1 Acknowledgments and sequence numbers</h3>
+<p>The mechanism is the same as TCP's idea lifted to the application. The server assigns each message in a conversation (or each user's inbox) a monotonically increasing <b>sequence number</b>. The sender attaches a client-generated <b>message id</b> so that retries of the same send can be recognized and de-duplicated by the server (an idempotency key). The recipient acknowledges the highest contiguous sequence number it has processed. The server keeps unacknowledged messages and re-sends them on timeout or on reconnect.</p>
+<p>TCP guarantees ordered delivery within one connection, but not across reconnects, devices, or gateways. So ordering must be rebuilt: the client keeps the last sequence number it applied, ignores anything at or below it (duplicate), and if it sees a gap (receives 4015 after 4012) it knows it missed 4013 and 4014 and asks the server to resend from 4013. Sequences are assigned per conversation (or per inbox) by a single writer, for instance the database partition that owns that conversation, because a global counter would be a bottleneck, and ordering across unrelated conversations is not needed.</p>
+
+<h3>8.2 Reasons for out-of-order or duplicate delivery</h3>
+<p>Real systems produce disorder in several ways: two paths to the same client (live push on the socket versus a catch-up fetch after reconnect, racing each other), the backplane delivering concurrently from different publishers, and client retries after a timeout when the first attempt had in fact succeeded. The cure is always the same: let the <b>sequence number be the source of truth</b>, apply messages by sequence, and treat each message as idempotent so that seeing it twice is harmless.</p>
+
+<div class="callout watch"><b>Watch out</b>
+A socket write succeeding does not mean the user received the message. The bytes may sit in a kernel buffer of a connection that is already dead. Only an application-level acknowledgment proves receipt. Mark messages "delivered" on ack, not on write.
+</div>
+
+<!-- ======================= 9 ======================= -->
+<h2 id="heartbeats">9. Heartbeats, reconnects, and resume</h2>
+
+<h3>9.1 Heartbeats and dead-connection detection</h3>
+<p>A heartbeat is a small periodic message. It has three jobs: keep intermediaries from closing the idle connection, let each side detect a dead peer, and (in the registry) refresh a TTL. Common settings: ping every 20 to 30 seconds, declare dead after missing two or three. The tradeoffs are straightforward. A <b>shorter interval</b> detects failures sooner and keeps NAT mappings alive, but costs battery on phones (each ping wakes the radio) and bandwidth and CPU at scale. A <b>longer interval</b> is cheaper but leaves dead connections, and "ghost" presence, around longer. Mobile carrier NATs often drop idle TCP mappings after about 5 minutes or sometimes less, so intervals longer than a few minutes are unsafe. Many mobile apps adapt: frequent heartbeats in the foreground, none in the background (relying on push notifications instead).</p>
+<p>At 10 million connections with a 30-second heartbeat, the fleet receives 10,000,000 / 30 = about 333,000 pings per second, and the same number of pongs. Individually trivial, but it is real load and shows why the interval is a cost lever (the sizing example in section 16 uses this).</p>
+
+<h3>9.2 Reconnect with exponential backoff and jitter</h3>
+<p>Clients will lose connections constantly: tunnels, Wi-Fi to cellular handover, server deploys, load balancer resets. The client must reconnect automatically, but <b>how</b> it reconnects decides whether a small incident becomes a large one. The standard recipe:</p>
+<ol>
+  <li>On unexpected close, wait a short base delay (for example 500 ms to 1 second), then try.</li>
+  <li>On each consecutive failure, <b>double</b> the delay (exponential backoff) up to a cap (for example 30 to 60 seconds).</li>
+  <li>Apply <b>jitter</b>: choose the actual wait randomly, for example uniformly between 0 and the current delay ("full jitter"). Without jitter, every client that lost its connection at the same instant retries at the same instants (1 s, 2 s, 4 s...), producing synchronized waves.</li>
+  <li>Reset the delay only after a connection has stayed healthy for a while, not merely after the handshake succeeded, so a flapping server does not trigger a tight loop.</li>
+  <li>Honor server hints: a <code>Retry-After</code> value, an SSE <code>retry:</code> field, or a close reason that says "do not reconnect for 60 s".</li>
+</ol>
+
+<h3>9.3 Resume: last event id and sequence numbers</h3>
+<p>After reconnecting, the client must not lose what happened in the gap, and the server must not resend everything. The client therefore tells the server where it left off. In SSE this is built in: the browser sends <code>Last-Event-ID</code>. In WebSockets you design it: the first message after the handshake is a <code>resume</code> request carrying the last sequence number per stream, for example <code>{"type":"resume","since":4012}</code>. The server replays from its durable store or a bounded replay buffer (for example the last N minutes of events kept in Redis streams or Kafka). If the gap is too large for the buffer, the server replies "gap too large", and the client does a full resync by fetching current state from a normal API (the snapshot), then continues live from the snapshot's sequence number. The combination of <b>snapshot plus incremental stream</b> is the robust pattern, because it handles both short blips and long absences with the same machinery.</p>
+<p>One subtle point is to avoid the "lost update in the handoff" race: subscribe to live events <b>first</b> (buffering them), then fetch the snapshot, then apply buffered events whose sequence is higher than the snapshot's. Doing it in the other order risks missing an event that happens between the snapshot and the subscription.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 360" role="img" aria-label="Reconnect and resume timeline with backoff, jitter and last sequence number">
+  <rect class="ext" x="130" y="14" width="140" height="34" rx="8"/><text class="t-c t-b" x="200" y="36">Client</text>
+  <rect class="cache" x="630" y="14" width="140" height="34" rx="8"/><text class="t-c t-b" x="700" y="36">Gateway</text>
+  <line class="life" x1="200" y1="48" x2="200" y2="350"/><line class="life" x1="700" y1="48" x2="700" y2="350"/>
+
+  <path class="arrow-g" d="M700 74 L204 74"/><text class="t-c t-sm" x="450" y="68">seq 4010, 4011, 4012 delivered and applied</text>
+  <rect class="miss" x="320" y="90" width="260" height="26" rx="6"/><text class="t-c t-sm" x="450" y="108">network drops, no close frame (code 1006)</text>
+  <path class="arrow-r dash" d="M700 140 L560 140"/><text class="t-sm" x="570" y="134">4013, 4014 generated; stored only</text>
+  <rect class="cache" x="130" y="156" width="140" height="26" rx="6"/><text class="t-c t-sm" x="200" y="174">wait 0.7 s (jittered)</text>
+  <path class="arrow-r" d="M200 200 L400 200"/><text class="t-sm" x="410" y="204">connect fails</text>
+  <rect class="cache" x="130" y="214" width="140" height="26" rx="6"/><text class="t-c t-sm" x="200" y="232">wait 1.6 s (jittered)</text>
+  <path class="arrow" d="M200 258 L696 258"/><text class="t-c t-sm" x="450" y="252">reconnect, auth, resume since=4012</text>
+  <path class="arrow-g" d="M700 292 L204 292"/><text class="t-c t-sm" x="450" y="286">replay 4013, 4014, then live 4015...</text>
+  <rect class="hit" x="260" y="312" width="380" height="26" rx="6"/><text class="t-c t-sm" x="450" y="330">client ignores any seq at or below its last applied value</text>
+</svg>
+<figcaption>The client remembers the last sequence it applied. After a drop it retries with growing, randomized delays, then asks for everything after that number. The server replays the gap and continues live without duplicates.</figcaption>
+</figure>
+
+<!-- ======================= 10 ======================= -->
+<h2 id="offline">10. Offline users and the durable path</h2>
+<p>A real-time channel is an optimization on top of durable storage, never the system of record. Every accepted message is stored first. If the recipient is online, push it; if the registry has no entry, <b>do not wait</b>: leave it in their inbox and send a mobile push notification (APNs/FCM) so the app can wake and sync. When the user opens the app, the client connects, sends its last sequence number, and pulls everything missed. This one rule, "durable write first, live push as best effort, resume from sequence on connect", makes the lossy parts of the pipeline (backplane, sockets, push vendors) safe, and is the core of chat designs (see the chat case study).</p>
+
+<!-- ======================= 11 ======================= -->
+<h2 id="presence">11. Presence and typing indicators</h2>
+
+<h3>11.1 Presence</h3>
+<p><b>Presence</b> is the "online / last seen" status next to a user's name. It sounds trivial and is surprisingly expensive, for two reasons: it must be detected reliably (a user who closes the laptop lid does not announce departure) and it must be <b>fanned out</b> to everyone who is watching that user.</p>
+<p><b>Detection with heartbeat TTLs.</b> Each live connection's heartbeat refreshes a key such as <code>presence:bob</code> with a TTL slightly longer than the heartbeat interval (for example heartbeat every 20 s, TTL 45 s). While Bob's client is alive the key keeps renewing. If the client vanishes, no refresh arrives, the key expires on its own, and Bob is now "offline" about 45 seconds after the last heartbeat. Explicit sign-off (a clean close) can delete the key immediately for a faster, more accurate result. The delay is a deliberate tradeoff: a short TTL tracks reality closely but flaps on transient network blips (users appearing to go offline and back online repeatedly); a longer TTL is steadier but shows ghosts. Many products add a <b>grace period</b>: on disconnect, wait 10 to 30 seconds for a reconnect before announcing "offline", which absorbs refreshes, page reloads, and tunnels.</p>
+<p>With multiple devices, a user is online if <b>any</b> device is, so presence is computed from a set of per-device entries.</p>
+
+<h3>11.2 The fan-out cost</h3>
+<p>Detection is cheap. Distribution is not. If Bob has 500 friends and each is watching, every Bob status change must be sent to 500 clients. With 10 million users who each flap online/offline a few times per day, and an average of 200 watchers, the totals reach billions of presence events per day. Strategies to contain this:</p>
+<ul>
+  <li><b>Pull rather than push for most views.</b> Show presence only for the people currently on screen (the open conversation or the visible part of the contact list). The client subscribes to presence of a few dozen users, not all friends, and fetches status in bulk when it opens a view.</li>
+  <li><b>Limit by audience.</b> Do not broadcast presence for huge groups or public channels; show "n online" as an approximate count instead.</li>
+  <li><b>Coalesce and debounce.</b> Collapse flapping within a short window; send at most one change per user per few seconds.</li>
+  <li><b>Lazy "last seen".</b> Store last-seen time coarsely (minutes granularity) and update only when it changes meaningfully, to avoid writing the database on every heartbeat. Heartbeats go to Redis with a TTL, not to the primary database.</li>
+  <li><b>Subscribe via the backplane.</b> A gateway subscribes to presence channels only for users that at least one of its local clients is watching, so presence events travel gateway-to-gateway only where needed.</li>
+</ul>
+<p>Presence is explicitly <b>best effort and eventually consistent</b>. An approximate answer a few seconds stale is acceptable, which is why a cache with TTLs, not a transactional database, is the right store.</p>
+
+<h3>11.3 Typing indicators</h3>
+<p>"Alice is typing..." is the cleanest example of ephemeral data. It needs low latency, it is worthless a few seconds later, and losing one is harmless. So: send it over the existing socket with <b>at-most-once</b> semantics (no persistence, no acknowledgment, no replay on reconnect); throttle the sender (one "typing" event per 3 seconds while keys are pressed, not one per keystroke); and make the <b>receiver expire it</b> automatically after a few seconds, so a lost "stopped typing" does not leave a stuck indicator. Send it only within the active conversation, directly to the other participants (a one-to-one fan-out of a tiny message), and skip it entirely for large groups.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 310" role="img" aria-label="Presence heartbeat with TTL expiry and fan-out to watchers">
+  <text class="t-b" x="20" y="22">Presence key in Redis for Bob (TTL 45 s, heartbeat every 20 s)</text>
+  <line class="arrow" x1="40" y1="90" x2="860" y2="90"/>
+  <text class="t-sm" x="800" y="110">time</text>
+  <circle cx="100" cy="90" r="7" fill="var(--good)"/><text class="t-c t-sm" x="100" y="70">connect</text>
+  <circle cx="220" cy="90" r="7" fill="var(--good)"/><text class="t-c t-sm" x="220" y="70">hb</text>
+  <circle cx="340" cy="90" r="7" fill="var(--good)"/><text class="t-c t-sm" x="340" y="70">hb</text>
+  <circle cx="460" cy="90" r="7" fill="var(--bad)"/><text class="t-c t-sm" x="460" y="70">last hb, then lid closed</text>
+  <rect class="cache" x="460" y="116" width="270" height="22" rx="6"/><text class="t-c t-sm" x="595" y="132">key still alive; TTL counting down (45 s)</text>
+  <circle cx="730" cy="90" r="7" fill="var(--bad)"/><text class="t-c t-sm" x="730" y="70">key expires: offline</text>
+
+  <rect class="hit" x="40" y="170" width="260" height="104" rx="8"/>
+  <text class="t-b" x="54" y="192">Cheap: detection</text>
+  <text class="t-sm" x="54" y="214">One in-memory write per heartbeat.</text>
+  <text class="t-sm" x="54" y="232">Expiry needs no explicit sign-off.</text>
+  <text class="t-sm" x="54" y="250">Grace period absorbs short blips.</text>
+  <rect class="miss" x="340" y="170" width="520" height="104" rx="8"/>
+  <text class="t-b" x="354" y="192">Expensive: distribution</text>
+  <text class="t-sm" x="354" y="214">10M users x ~5 status changes/day x ~200 watchers = 10 billion events/day</text>
+  <text class="t-sm" x="354" y="232">(about 115,000 per second on average) if every change is pushed to all watchers.</text>
+  <text class="t-sm" x="354" y="250">Fix: subscribe only for users on screen, debounce flaps, skip big groups.</text>
+</svg>
+<figcaption>A heartbeat refreshes a key whose expiry is the offline signal. Writing is cheap; the cost lies in telling every watcher, so push presence only to those currently viewing it.</figcaption>
+</figure>
+
+<!-- ======================= 12 ======================= -->
+<h2 id="backpressure">12. Backpressure and slow consumers</h2>
+<p>A gateway writes to thousands of sockets, and not all clients read at the same speed. A phone on a bad network may accept only a few KB per second. If the server keeps producing messages for that client faster than they drain, the data accumulates in the connection's outbound queue and in kernel buffers. This is the <b>slow consumer</b> problem. Left unchecked, a few slow clients consume gigabytes of memory, trigger garbage collection storms, and take the entire gateway down, harming healthy users. In event-driven servers, "write" typically means "copy into an application buffer and return", so nothing automatically pushes back on the producer.</p>
+<p>Principles for handling it:</p>
+<ul>
+  <li><b>Bound every per-connection queue</b> in both bytes and message count (for example 1 MB or 500 messages).</li>
+  <li><b>Choose a policy when the bound is hit.</b> For state-like data (presence, a stock price, a game position), <b>drop old messages or coalesce</b>: only the latest value matters, so keep one slot per key and overwrite. For must-deliver data (chat), do not buffer without limit on the gateway; <b>stop pushing and disconnect</b> the slow client with a close code, trusting that the durable store and resume will repair the gap when it reconnects on a better network. Conflating "reliable" with "unbounded memory" is a common mistake.</li>
+  <li><b>Use the transport's signals.</b> Check whether the socket is writable and the size of the pending write buffer before enqueueing; in Node.js this is <code>bufferedAmount</code>/backpressure on the stream, in Netty the channel's writability flag, in Go a bounded channel with a non-blocking send.</li>
+  <li><b>Isolate slow consumers from fast ones.</b> Never let one blocked socket write stall a loop that serves others. Use per-connection queues and per-connection write timeouts.</li>
+  <li><b>Apply backpressure upstream too.</b> If a topic or room produces more than recipients can absorb (a viral live event), batch or sample updates, lower the update rate (send a snapshot every 200 ms instead of every event), or shed low-priority traffic.</li>
+  <li><b>Limit inbound too.</b> A malicious or buggy client can flood the gateway; enforce per-connection rate limits and maximum message size (see <a href="16-rate-limiting.html">Chapter 16</a>).</li>
+</ul>
+
+<!-- ======================= 13 ======================= -->
+<h2 id="deploys">13. Deployment and draining of WebSocket servers</h2>
+<p>For stateless services, a deploy replaces servers one by one and nobody notices. For a gateway, restarting a server <b>severs all of its connections</b>. If you restart 100,000-connection servers carelessly, you create 100,000 simultaneous reconnects per server, which is the first step toward a reconnect storm (section 15). The goal is to move users off a server <b>gradually and politely</b>.</p>
+<ol>
+  <li><b>Remove from rotation.</b> Tell the load balancer to stop sending new connections to the old server (connection draining, "deregistration delay"). Existing connections stay.</li>
+  <li><b>Announce.</b> The server sends each client a "reconnect soon" message or close frame with code 1001 (going away), preferably with a hint of a random delay.</li>
+  <li><b>Drain slowly.</b> Close connections in batches over several minutes (for example 1 to 5 percent per second), not all at once. Each client reconnects, with jitter, to a different healthy server through the load balancer.</li>
+  <li><b>Clean up.</b> Delete this gateway's registry entries (or let TTLs expire) and unsubscribe from the backplane. Messages in flight are protected by the durable store plus resume.</li>
+  <li><b>Hard deadline.</b> After a maximum drain time (say 10 to 15 minutes), terminate the stragglers.</li>
+</ol>
+<p>For a rolling deploy, replace only a small fraction of the fleet at once so that surviving servers have capacity for the connections moving over (with 10 percent of the fleet draining, the other 90 percent needs at least 11 percent headroom). In Kubernetes, this means a generous <code>terminationGracePeriodSeconds</code>, a <code>preStop</code> hook that starts the drain, readiness probes that fail early, and a <code>maxUnavailable</code> setting that is small. <b>Blue/green</b> is also viable: bring up a full new gateway fleet, direct all new connections to it, and let the old fleet drain on its own as clients churn, which takes longer but is the gentlest. Because gateways are thin (section 6.5), most releases touch business services and never need this procedure at all.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Draining a gateway: connection counts falling on the old server and rising on new servers over time">
+  <line class="arrow" x1="60" y1="260" x2="860" y2="260"/><text class="t-sm" x="830" y="282">time</text>
+  <line class="arrow" x1="60" y1="260" x2="60" y2="30"/><text class="t-sm" x="68" y="38">connections</text>
+
+  <path d="M60 60 L220 60 L260 60 L420 160 L560 235 L720 255" fill="none" stroke="var(--bad)" stroke-width="3"/>
+  <text class="t-sm" x="70" y="52" style="fill:var(--bad)">old gateway: 100k</text>
+  <path d="M60 255 L220 255 L260 250 L420 190 L560 140 L720 100 L860 100" fill="none" stroke="var(--good)" stroke-width="3"/>
+  <text class="t-sm" x="700" y="92" style="fill:var(--good)">new gateways absorb</text>
+
+  <line class="life" x1="240" y1="40" x2="240" y2="260"/><text class="t-c t-sm" x="240" y="28">1. out of LB rotation</text>
+  <line class="life" x1="420" y1="40" x2="420" y2="260"/><text class="t-c t-sm" x="420" y="28">2. close 1001 in batches</text>
+  <line class="life" x1="720" y1="40" x2="720" y2="260"/><text class="t-c t-sm" x="720" y="28">3. deadline, then stop</text>
+  <text class="t-sm" x="260" y="150">Connections move at a controlled rate (for example 2 percent per second).</text>
+</svg>
+<figcaption>The old gateway keeps its connections until it is out of rotation, then sheds them in controlled batches. New gateways gain them at the same rate, so no server sees a sudden spike of handshakes.</figcaption>
+</figure>
+
+<!-- ======================= 14 ======================= -->
+<h2 id="security">14. Security</h2>
+<p>Long-lived connections introduce security problems that short requests do not have. General treatment is in <a href="55-security.html">Chapter 55</a>; these are the real-time specifics.</p>
+<ul>
+  <li><b>Check the Origin header on the upgrade.</b> Browsers allow a page on any website to open a WebSocket to any host, and they automatically attach the user's cookies to the handshake for that host. That enables <b>cross-site WebSocket hijacking</b>: a malicious page makes a victim's browser open an authenticated socket to your service and read or send data as the victim. The same-origin policy does not protect WebSockets. The server must verify that <code>Origin</code> matches an allow-list, and use CSRF-style protections where cookies are the credential. Non-browser clients can forge Origin, so it is only a protection against browser-borne attacks, not a replacement for authentication.</li>
+  <li><b>Authenticate during the handshake, not after.</b> Reject unauthenticated upgrades with 401 before allocating a long-lived connection. Browsers' WebSocket API cannot set an <code>Authorization</code> header, so options are: a session cookie (with Origin check and SameSite settings), a short-lived <b>one-time ticket</b> obtained from an authenticated HTTP endpoint and passed in the URL query once (it is single-use and expires in seconds, so leaking into logs is harmless), or a first-message authentication where the server drops the connection if no valid auth message arrives within a few seconds. Avoid putting long-lived bearer tokens in the URL.</li>
+  <li><b>Authorize every message and subscription,</b> not only the connection. Being connected as Alice does not entitle you to subscribe to <code>room:secret</code>. Check membership on each subscribe and publish, server-side.</li>
+  <li><b>Token refresh on a long connection.</b> Access tokens are short lived (minutes) but sockets last hours. Choices: validate once at connect and let the socket live on (simple, but a revoked or fired user stays connected); have the client send a fresh token over the socket periodically (for example every 10 minutes) and close the connection with an auth error if it lapses; or have the server track the token expiry and ask the client to refresh before it runs out. For revocation, the server needs a way to close specific users' connections quickly: publish a "kick user" event on the backplane that gateways act on.</li>
+  <li><b>Use TLS everywhere (wss://).</b> Plain ws:// can be tampered with by intermediaries, and many networks block it.</li>
+  <li><b>Defend resources.</b> Cap message size, per-connection message rate, connections per user and per IP, subscriptions per connection, and time allowed for the handshake and for authentication (to resist slowloris-style attacks that open many half-finished connections). Put DDoS protection (<a href="55-security.html">Chapter 55</a>) in front, since each connection costs memory.</li>
+  <li><b>Validate and bound payloads</b>: treat all frames as untrusted input; escape output to avoid injecting script into other users' pages.</li>
+</ul>
+
+<!-- ======================= 15 ======================= -->
+<h2 id="failures">15. Failure modes: reconnect storms and friends</h2>
+
+<h3>15.1 Reconnect storms (thundering herd)</h3>
+<p>The signature failure of real-time systems. A gateway, a zone, or the load balancer fails and drops many connections at once. Every client reconnects. A reconnect is much more expensive than an idle connection: a TCP and TLS handshake (CPU-heavy public-key math), an authentication call to the identity service, a registry write, subscriptions, and a catch-up read of missed messages from the database. If thousands of clients do this simultaneously, the surviving gateways run out of CPU, the auth service and database overload, timeouts occur, clients that failed retry, and the retries add to the overload. The system can <b>stay down even after the original fault is fixed</b>, because the retry load alone exceeds capacity (a <b>metastable failure</b>).</p>
+<p>Defenses, layered:</p>
+<ul>
+  <li><b>Client jitter and backoff</b> (section 9.2), the most important single defense.</li>
+  <li><b>Admission control at the gateway:</b> limit new handshakes per second (a token bucket); excess get a fast rejection with a Retry-After hint rather than queuing. Fast failure is cheaper than slow failure.</li>
+  <li><b>Cheap reconnect path:</b> cache authentication results briefly or use signed tokens validated locally (no auth service call), serve resume from a replay buffer, and avoid per-connect database writes. Use TLS session resumption (tickets) so repeat clients skip the expensive full handshake.</li>
+  <li><b>Smaller blast radius:</b> many gateways with moderate connection counts and spread across zones, so one failure displaces 1 to 2 percent of users, not 30 percent. Consider cell-based design (<a href="42-multitenancy-cells.html">Chapter 42</a>).</li>
+  <li><b>Load shedding and degradation:</b> under storm, prioritize reconnects of active users, defer catch-up fetches, and temporarily disable non-essential features such as presence.</li>
+  <li><b>Server-directed spreading:</b> when the server initiates the close (deploys), it includes a random delay for each client.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Reconnect storm without jitter versus with jitter, showing handshakes per second over time">
+  <text class="t-c t-b" x="230" y="20">No jitter: retries synchronize</text>
+  <text class="t-c t-b" x="670" y="20">Jitter: retries spread out</text>
+  <line class="arrow" x1="30" y1="250" x2="440" y2="250"/><line class="arrow" x1="30" y1="250" x2="30" y2="34"/>
+  <line class="arrow" x1="470" y1="250" x2="880" y2="250"/><line class="arrow" x1="470" y1="250" x2="470" y2="34"/>
+  <line class="life" x1="30" y1="90" x2="440" y2="90"/><text class="t-sm" x="34" y="84">capacity</text>
+  <line class="life" x1="470" y1="90" x2="880" y2="90"/><text class="t-sm" x="474" y="84">capacity</text>
+
+  <rect x="70" y="50" width="26" height="200" fill="var(--bad)" opacity="0.7"/>
+  <rect x="150" y="70" width="26" height="180" fill="var(--bad)" opacity="0.7"/>
+  <rect x="270" y="100" width="26" height="150" fill="var(--bad)" opacity="0.7"/>
+  <rect x="430" y="170" width="2" height="80" fill="var(--bad)" opacity="0.7"/>
+  <text class="t-sm" x="50" y="272">spikes at 0 s, 1 s, 3 s, 7 s... overload, more failures, more retries</text>
+
+  <rect x="500" y="200" width="30" height="50" fill="var(--good)" opacity="0.7"/>
+  <rect x="540" y="170" width="30" height="80" fill="var(--good)" opacity="0.7"/>
+  <rect x="580" y="160" width="30" height="90" fill="var(--good)" opacity="0.7"/>
+  <rect x="620" y="170" width="30" height="80" fill="var(--good)" opacity="0.7"/>
+  <rect x="660" y="190" width="30" height="60" fill="var(--good)" opacity="0.7"/>
+  <rect x="700" y="210" width="30" height="40" fill="var(--good)" opacity="0.7"/>
+  <rect x="740" y="225" width="30" height="25" fill="var(--good)" opacity="0.7"/>
+  <rect x="780" y="235" width="30" height="15" fill="var(--good)" opacity="0.7"/>
+  <text class="t-sm" x="490" y="272">same total, always below capacity, recovery completes</text>
+</svg>
+<figcaption>Both sides lose the same number of connections. Without jitter the clients retry in lockstep, so the load arrives in spikes above capacity. With jitter the same load is a low plateau the fleet can absorb.</figcaption>
+</figure>
+
+<h3>15.2 Other failure modes</h3>
+<ul>
+  <li><b>Half-open connections:</b> the peer died but your side never learned. Heartbeat deadlines clean these up; without them memory leaks until the file descriptor limit is hit.</li>
+  <li><b>Stale registry:</b> entry points to a gateway the user left. Messages vanish into a gateway that no longer has the socket. Mitigate with TTLs, the gateway refusing unknown users and reporting back, and the durable store plus push as the backup path.</li>
+  <li><b>Registry or backplane outage:</b> real-time delivery stops, but because messages are stored durably, clients that poll or reconnect still receive them. Degrade to slower catch-up (clients fall back to periodic fetch) rather than failing sends.</li>
+  <li><b>Hot rooms:</b> one conversation with a million viewers makes one backplane channel and a few gateways do all the work. Shard the room's audience across gateways with per-gateway sub-channels and batch updates; send snapshots at a fixed rate instead of every event.</li>
+  <li><b>Gateway memory leak or GC pause:</b> a pause longer than the heartbeat deadline makes every client think the server is dead. Watch pause times, and set the deadline above worst-case pauses.</li>
+  <li><b>Clock and ordering:</b> never order messages by client timestamps; use server-assigned sequences (<a href="27-failure-time-ordering.html">Chapter 27</a>).</li>
+  <li><b>Proxy and middlebox interference:</b> corporate proxies that strip Upgrade headers or buffer responses. Keep a fallback transport (long polling or SSE over plain HTTP) in the client library.</li>
+</ul>
+
+<!-- ======================= 16 ======================= -->
+<h2 id="sizing">16. Worked sizing: 10 million concurrent connections</h2>
+<p>Suppose a chat-like product has <b>10 million</b> users connected at peak. Assumptions (state them out loud in an interview): average user receives 1 message per 2 minutes (the average payload 1 KB); heartbeat every 30 seconds; average session lasts 30 minutes; 30 KB of memory per connection; target 100,000 connections per gateway at about 60 percent of a gateway's CPU capacity; deploy and zone-failure headroom required.</p>
+
+<h3>16.1 Gateway fleet</h3>
+<table>
+<tr><th>Quantity</th><th>Calculation</th><th>Result</th></tr>
+<tr><td>Memory for connections</td><td>10,000,000 x 30 KB</td><td>300 GB total, about 3 GB per 100k-connection gateway</td></tr>
+<tr><td>Base gateway count</td><td>10,000,000 / 100,000</td><td>100 gateways</td></tr>
+<tr><td>Headroom for losing one of three zones</td><td>surviving two zones must hold everything: 100 x 3/2</td><td>150 gateways (about 67,000 connections each normally)</td></tr>
+<tr><td>Machine size</td><td>16 cores, 32 GB RAM, 10 Gbps NIC</td><td>3 GB used for sockets; the rest for TLS, buffers, runtime</td></tr>
+<tr><td>File descriptors</td><td>about 100k to 150k when a zone is lost, plus margin</td><td>Set <code>ulimit -n</code> to at least 500,000</td></tr>
+</table>
+
+<h3>16.2 Message traffic</h3>
+<table>
+<tr><th>Quantity</th><th>Calculation</th><th>Result</th></tr>
+<tr><td>Outbound deliveries</td><td>10,000,000 / 120 s</td><td>about 83,000 messages per second fleet-wide</td></tr>
+<tr><td>Per gateway</td><td>83,000 / 150</td><td>about 550 per second (very light)</td></tr>
+<tr><td>Outbound bandwidth</td><td>83,000 x 1 KB</td><td>about 83 MB/s = roughly 0.7 Gbps total, 5 Mbps per gateway</td></tr>
+<tr><td>Inbound sends</td><td>assume similar, 1 per user per 2 min</td><td>about 83,000 per second to services</td></tr>
+<tr><td>Heartbeats</td><td>10,000,000 / 30 s</td><td>about 333,000 pings per second fleet-wide, about 2,200 per gateway</td></tr>
+</table>
+<p>Observation: bandwidth and message CPU are modest. The fleet size is set by <b>connection count, memory, and failure headroom</b>, and by the cost of handshakes during churn, which we compute next. Group chats multiply deliveries: a message to a 100-member group is 100 deliveries, so the real figure depends on the product (the chat case study explores it).</p>
+
+<h3>16.3 Connection churn, registry, and backplane</h3>
+<table>
+<tr><th>Quantity</th><th>Calculation</th><th>Result</th></tr>
+<tr><td>Steady-state connects</td><td>10,000,000 / 1,800 s sessions</td><td>about 5,600 new connections per second fleet-wide, 37 per gateway</td></tr>
+<tr><td>Registry refresh writes</td><td>one per heartbeat if refreshed every 30 s</td><td>about 333,000 writes per second; reduce by refreshing every 60 s with a 150 s TTL (about 167,000 per second), and batching in pipelines</td></tr>
+<tr><td>Registry size</td><td>10M entries x about 100 bytes (key, gateway id, overhead)</td><td>about 1 GB, plus replication; trivially fits in memory</td></tr>
+<tr><td>Registry shards</td><td>167,000 writes/s plus 83,000 reads/s at roughly 50,000 to 100,000 ops/s per shard comfortably</td><td>about 6 to 10 shards with replicas (verify against your own benchmark)</td></tr>
+<tr><td>Backplane publishes</td><td>83,000 per second, one per delivery to online users</td><td>If each gateway subscribes to its own channel: only 150 channels. Easily handled by a small sharded pub/sub cluster.</td></tr>
+</table>
+
+<h3>16.4 Failure scenario: lose a zone</h3>
+<p>One of three zones fails, taking 3.3 million connections with it. Without jitter: all 3.3 million clients reconnect within a couple of seconds, which is more than 1.5 million handshakes per second against about 100 surviving gateways. With full jitter spread over 60 seconds: 3,300,000 / 60 = <b>55,000 reconnects per second</b>, or about 550 per surviving gateway. A TLS 1.3 handshake with elliptic-curve keys costs on the order of 1 ms of CPU (assume 2 ms with the surrounding work), so 550 per second consumes about 1.1 cores of a 16-core machine: very manageable. The real bottlenecks are elsewhere: the authentication service must handle 55,000 token validations per second (so use locally validated signed tokens), and catch-up reads of 55,000 users per second hit the message store (so rate-limit resume, bound the replay window, and prefer cached recent messages). The gateways must be sized to absorb the extra 3.3 million connections (150 gateways at 67,000 each with all three zones, 100 at 100,000 each in two zones, exactly what the headroom rule provided).</p>
+
+<div class="callout good"><b>Result</b>
+10 million concurrent connections needs roughly 150 gateways (spread over three zones, 100,000 sockets each when one zone is down), about 300 GB of socket memory in total, a registry of about 1 GB across several shards, and a small pub/sub backplane. The cost drivers are connection state and failure headroom rather than raw message throughput.
+</div>
+
+<!-- ======================= 17 ======================= -->
+<h2 id="qa">17. Interview Q&amp;A</h2>
+
+<details><summary>Why can't I just use normal HTTP requests for a chat application?</summary>
+<p>HTTP request/response only lets the client initiate, so the server cannot deliver Bob's incoming message until Bob's client asks. You could make Bob's client ask every few seconds (short polling), but that wastes enormous request volume (most polls return nothing) and still adds delay equal to half the interval. Holding a connection open lets the server send instantly. That is why chat uses WebSockets, or long polling or SSE for receiving, with normal POSTs for sending if you want simpler infrastructure.</p></details>
+
+<details><summary>When would you choose SSE over WebSockets?</summary>
+<p>Choose SSE when data flows mainly from server to client: notifications, live feeds, dashboards, progress updates, streamed text. It runs over plain HTTP, so authentication, compression, logging, and load balancers work normally, and it gives automatic reconnect with a Last-Event-ID resume mechanism for free. WebSockets are better when the client also sends frequently and interactively (chat, games, collaborative editing), when you need binary data, or when you want one connection for both directions. If most of the traffic is downstream, SSE plus occasional POSTs is simpler to operate and has fewer ways to fail.</p></details>
+
+<details><summary>Explain how the WebSocket handshake works and why it starts as HTTP.</summary>
+<p>The client sends an HTTP/1.1 GET with Upgrade: websocket and Connection: Upgrade headers, a random Sec-WebSocket-Key, the protocol version, and the Origin. The server replies 101 Switching Protocols with Sec-WebSocket-Accept, which is a base64 SHA-1 of the key plus a fixed GUID, proving it understands WebSocket. After that the same TCP connection carries WebSocket frames. Starting as HTTP lets it use ports 80 and 443, pass through the existing firewalls and load balancers, and reuse cookie and header based authentication. It also gives the server a final chance to inspect the request, check Origin, and authenticate before committing resources.</p></details>
+
+<details><summary>You have 10 million connected users across many gateway servers. How does a message from one user reach another?</summary>
+<p>The sender's gateway forwards the message to a chat service, which first persists it and assigns a sequence number. The service then looks up the recipient in a connection registry (a fast key-value store, with TTL entries refreshed by heartbeats) to find which gateway holds the recipient's socket. It publishes the message to that gateway's channel on a pub/sub backplane such as Redis. The gateway looks up the socket in memory and writes the frame, and the client acknowledges it. If the registry shows no entry, the user is offline, the message stays in their inbox, and a push notification via APNs or FCM is sent. The durable write comes first, so a lost live delivery is repaired when the client reconnects and resumes from its last sequence number.</p></details>
+
+<details><summary>Why separate a connection gateway from the business logic services?</summary>
+<p>Connection holders are stateful: restarting one disconnects every user on it. Business logic changes often and needs frequent deploys, so mixing them would turn every release into a mass disconnect. A thin gateway that only terminates TLS, authenticates, tracks heartbeats, and moves messages changes rarely, so connections survive most deploys. It also lets you scale the two tiers independently (sockets and fan-out for gateways, CPU and data work for services), limits the blast radius of bugs, and lets each tier use the best technology for its job.</p></details>
+
+<details><summary>What happens when a client's network drops and it reconnects? How do you avoid losing or duplicating messages?</summary>
+<p>The server assigns each message a monotonically increasing sequence number per conversation or inbox, and the client remembers the last one it applied. On reconnect the client sends a resume request with that number (SSE does this with Last-Event-ID). The server replays everything after it from the durable store or a replay buffer, then continues live. The client ignores any sequence at or below what it has already applied, which handles duplicates, and detects gaps when numbers jump so it can request missing ones. For sends, the client attaches a unique message id so a retried send is deduplicated by the server. If the gap is too large to replay, the client fetches a fresh snapshot and continues from its sequence.</p></details>
+
+<details><summary>What is a reconnect storm and how do you prevent it?</summary>
+<p>It is the overload caused when many clients lose their connections at once (a gateway crash, a zone failure, a deploy) and all reconnect simultaneously. Reconnecting is expensive because of TLS handshakes, authentication calls, registry writes, and catch-up reads, so the surge overloads the survivors and the dependencies, causes failures, and the failures cause more retries, so the system can remain down after the original fault ends. Prevention starts with clients using exponential backoff with full jitter, then adds server-side admission control that rejects excess handshakes quickly, cheap reconnect paths (locally validated tokens, TLS session resumption, bounded replay), spreading disconnects during deploys, and a small blast radius via many gateways across zones.</p></details>
+
+<details><summary>How do you implement presence for millions of users without melting the system?</summary>
+<p>Detection is done by having each connection's heartbeat refresh a key with a TTL slightly above the heartbeat interval, in a fast in-memory store such as Redis. When heartbeats stop, the key expires and the user is offline, and a short grace period avoids flapping on brief disconnects. The expensive part is fan-out to watchers, which is multiplied by friends count and status-change frequency. To contain it, subscribe to presence only for users currently on screen, fetch statuses in bulk when a view opens, debounce rapid changes, skip presence in large groups in favor of approximate counts, and treat the data as best-effort and slightly stale instead of strongly consistent.</p></details>
+
+<details><summary>What is a slow consumer and what do you do about it?</summary>
+<p>A slow consumer is a client that reads from its socket more slowly than the server produces data for it, so outbound data piles up in memory on the gateway. Since a gateway serves many clients, a few of these can exhaust memory or stall loops and hurt everyone. The fix is to bound the per-connection outbound queue, and when it fills, apply a policy suited to the data: for state-like updates drop or coalesce old values and keep only the latest; for must-deliver messages stop pushing and disconnect the client, relying on durable storage and resume to deliver the rest when it reconnects. Also use per-connection write timeouts and keep one connection's blocking from stalling others.</p></details>
+
+<details><summary>How do you deploy new code to a WebSocket gateway fleet without dropping everyone?</summary>
+<p>You cannot avoid disconnects on the instances being replaced, but you can control the rate. First remove the instance from load balancer rotation so no new connections arrive, then tell clients to reconnect (a close frame with code 1001 or an application message), closing connections gradually in batches over minutes, each client reconnecting with jitter to healthy servers. Replace only a small fraction of the fleet at a time so the rest has headroom, and set a hard deadline for stragglers. Make gateways thin so they rarely need deploys, and use blue/green when you want the gentlest transition. The durable store plus resume means no messages are lost during the move.</p></details>
+
+<details><summary>What security issues are specific to WebSockets?</summary>
+<p>Browsers do not apply the same-origin policy to WebSocket connections and automatically send cookies in the handshake, so a malicious site can open an authenticated socket to your service on a victim's behalf (cross-site WebSocket hijacking). The server must validate the Origin header against an allow-list and use CSRF protections when cookies authenticate the user. Authentication belongs in the handshake, using a cookie or a short-lived single-use ticket rather than a long-lived token in the URL. Because connections outlive access tokens, you need a refresh strategy and a way to kick revoked users. You should also authorize every subscription and message, enforce size and rate limits, and use TLS.</p></details>
+
+<details><summary>Why use Redis pub/sub for routing but not as the system of record?</summary>
+<p>Redis pub/sub is fast and cheap for dynamic subscriptions, but it has no persistence or delivery guarantee: if a subscriber is briefly disconnected or the server restarts, messages published in that moment are gone. That is fine for a delivery hint on top of a durable store, since a missed push is recovered by resume from the sequence number. For the record of messages you use a database or a durable log such as Kafka, which supports replay and retention. Putting the durable write first and the pub/sub hint second gives low latency without risking correctness.</p></details>
+
+<!-- ======================= 18 ======================= -->
+<div class="recap" id="recap"><h2 style="border:none;margin-top:14px">18. Recap</h2>
+<ul>
+  <li>Request/response HTTP cannot push. The options are to ask often (short polling), hold the request (long polling), stream a response (SSE), or upgrade to a full-duplex socket (WebSocket). Choose the simplest one that meets the latency requirement.</li>
+  <li>SSE is one-way, text, plain HTTP, with built-in reconnect and Last-Event-ID. WebSockets are two-way and binary, started by a 101 upgrade, with frames, masking from client to server, ping/pong, and a close handshake, but with no built-in acknowledgments, ordering across reconnects, or routing.</li>
+  <li>WebRTC is for audio, video, and peer data over UDP with ICE, STUN, TURN, and SFUs. MQTT is lightweight pub/sub with QoS levels for devices. APNs and FCM reach apps that are closed, on a best-effort basis, and complement live connections.</li>
+  <li>Stateful connections change capacity planning: tens to hundreds of thousands per server, about 30 KB each, file descriptor and port limits, least-connections balancing, and heartbeat settings that outlast idle timeouts.</li>
+  <li>Split thin connection gateways from business services. Route with a TTL-based registry (user to gateway) and a pub/sub backplane (Redis for ephemeral hints, Kafka or a database for the durable record).</li>
+  <li>Persist first, then push. Use sequence numbers, acknowledgments, client message ids, and resume (snapshot plus incremental) to get at-least-once delivery with effectively-once results.</li>
+  <li>Reconnect with exponential backoff and jitter; protect the fleet with admission control, cheap reconnect paths, and a small blast radius to survive reconnect storms.</li>
+  <li>Presence is cheap to detect (heartbeat TTL) and expensive to fan out; typing indicators are ephemeral at-most-once messages. Bound outbound queues to handle slow consumers; drain gateways gradually on deploy.</li>
+  <li>Secure the handshake: Origin checks, authentication on upgrade, per-message authorization, token refresh, and limits. 10 million connections needs about 150 gateways, 300 GB of socket memory, and a modest registry and backplane.</li>
+</ul></div>
+
+<p class="connects"><b>Connects to:</b> builds on <a href="03-networking-essentials.html">Chapter 3</a> (TCP, TLS, HTTP), <a href="09-load-balancing.html">Chapter 9</a> (load balancing and sticky connections), and <a href="15-redis.html">Chapter 15</a> (Redis for the registry and pub/sub). Leads to <a href="32-idempotency-ids.html">Chapter 32</a> (delivery semantics), <a href="34-queues-kafka.html">Chapter 34</a> (Kafka as a backplane), <a href="55-security.html">Chapter 55</a> (security), <a href="56-privacy-cost-mobile.html">Chapter 56</a> (push notifications and offline sync), and the <a href="../case-studies/c07-chat.html">chat system case study</a>.</p>
+</main>
+</div>
+
+<script src="../assets/chapters.js"></script>
+<script src="../assets/nav.js"></script>
+</body>
+</html>
