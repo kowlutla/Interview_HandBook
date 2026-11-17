@@ -136,7 +136,7 @@
     flat.forEach(function (r, idx) {
       if (r.mod !== m) return;
       var done = !!r.it.done;
-      var a = el(done ? 'a' : 'span', 'ch' + (done ? '' : ' soon') + (idx === current ? ' current' : '') + (visited[r.it.id] ? ' visited' : ''));
+      var a = el(done ? 'a' : 'span', 'ch' + (done ? '' : ' soon') + (idx === current ? ' current' : ''));
       if (done) a.href = r.href;
       a.appendChild(el('span', 'num', r.label));
       a.appendChild(el('span', null, r.it.t));
