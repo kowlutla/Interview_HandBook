@@ -5,10 +5,18 @@
   if (!layout || !nav) return;
   function el(t, c, x) { var e = document.createElement(t); if (c) e.className = c; if (x !== undefined) e.textContent = x; return e; }
 
+  // accessibility: skip link, labelled landmark, main target
+  (function () {
+    var mm = document.querySelector('main'); if (mm && !mm.id) mm.id = 'main';
+    var sk = document.createElement('a'); sk.className = 'skip'; sk.href = '#main'; sk.textContent = 'Skip to content';
+    document.body.insertBefore(sk, document.body.firstChild);
+  })();
+  nav.setAttribute('aria-label', 'Site contents');
+
   // mobile top bar
   var bar = el('div', 'topbar');
-  var btn = el('button', null, '☰ Contents'); btn.type = 'button';
-  btn.addEventListener('click', function () { document.body.classList.toggle('nav-open'); });
+  var btn = el('button', null, '☰ Contents'); btn.type = 'button'; btn.setAttribute('aria-expanded', 'false');
+  btn.addEventListener('click', function () { var o = document.body.classList.toggle('nav-open'); btn.setAttribute('aria-expanded', o ? 'true' : 'false'); });
   var h = document.querySelector('h1');
   bar.appendChild(btn); bar.appendChild(el('span', null, h ? h.textContent : 'HLD Quick Notes'));
   layout.parentNode.insertBefore(bar, layout);

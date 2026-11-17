@@ -21,6 +21,67 @@
 <h1>Design Ad Click Aggregation</h1>
 <p class="lead">Every time someone clicks an ad, an advertiser may owe money and a dashboard must change. This worked solution builds a pipeline that ingests a billion clicks a day, throws away duplicates and bots, counts clicks per ad per minute with correct handling of late events, stores the counts so advertisers can query them in under a second, and proves the numbers are billing-grade by reconciling the stream against a slower batch job.</p>
 
+<h2 id="approach">How to approach this problem (read this first)</h2>
+
+<p><b>What the interviewer is really testing.</b> Counting clicks sounds easy, so the interview is about the three things that make it hard. First, correctness with money involved: no click lost, none counted twice, even when machines crash and messages are retried. Second, time: clicks arrive late and out of order, so you must count by when the click happened, not when you saw it, and say when a minute is "done". Third, skew: one popular ad can swamp one worker. If you handle these three calmly, the rest (Kafka, a store, a query API) is routine.</p>
+
+<h3>The thinking order</h3>
+<ol>
+<li><b>Ask what the number is used for.</b> Say: "Is this count billed, or only shown on a dashboard?" Ask this first because "billed" changes everything: it forces exactness, an audit trail and a slow, correct recount next to the fast path.</li>
+<li><b>Pin down volume and lateness.</b> Say: "How many clicks per day, and how late can a click arrive?" Volume sizes the system. Lateness decides the watermark and the allowed lateness. Also ask about duplicates and bots, since they decide whether a filter stage exists.</li>
+<li><b>Estimate the write rate first.</b> Say: "One billion a day is about 11.6k per second on average, and I design for 50k per second at peak." Write rate comes first because this system is write-heavy. Then show that the bandwidth (about 10 MB per second) is small, which tells you partitions are about parallelism, not bandwidth.</li>
+<li><b>Draft the write API and the event, not the read API.</b> Say: "The click URL carries a click id and a signature, and the endpoint logs the event and redirects." The click id is the key that makes dedup and idempotency possible, so introduce it early.</li>
+<li><b>State the first simple design and break it.</b> Say: "The naive version does one UPDATE per click on one database. That fails on hot rows, coupling, retries and no history." Four named failures give you a reason for each later box.</li>
+<li><b>Evolve it: log first, then stream, then store.</b> Say: "I write the raw event to a durable log, aggregate in a stream job, and upsert full counts into an OLAP store." Each move answers one of the four failures.</li>
+<li><b>Go deep on time and late data.</b> Say: "I aggregate by event time with tumbling minute windows, a watermark, and a late path." This is the part you will be pressed on, so do it before the nice-to-haves.</li>
+<li><b>Make the effect exactly once, then handle the hot ad.</b> Say: "At-least-once delivery plus idempotent writes of full counts gives an exactly-once effect. For a hot ad I salt the key and sum in a second stage."</li>
+<li><b>Close with reconciliation and failures.</b> Say: "An hourly batch recount from the raw archive produces the final billed numbers, and the gap between stream and batch is my alarm." It ends the story with the answer to "how do you know the number is right".</li>
+</ol>
+
+<h3>Decision points</h3>
+<ul>
+<li><b>Count by event time or processing time?</b> Ask: "Which clock does the contract use?" The contract says the minute the user clicked, so event time, which then needs a watermark.</li>
+<li><b>Stream only, or stream plus batch?</b> Ask: "Can the stream see everything it needs to decide?" It cannot see very late clicks, old duplicates or later fraud findings, and the number is billed, so add the batch recount.</li>
+<li><b>Where does dedup state live?</b> Ask: "Can the check be atomic with the write?" Keyed state in the stream job, snapshotted with the offsets, can. An external cache cannot.</li>
+<li><b>Which store?</b> Ask: "What queries are there?" Per-ad ranges and per-advertiser group-bys point to a columnar OLAP engine, not a pure key-value store.</li>
+<li><b>Salt every key or only hot ones?</b> Ask: "Does the long tail pay for a fix it does not need?" Salt only detected heavy hitters.</li>
+</ul>
+
+<h3>Suggested 45 minute plan</h3>
+<table>
+<tr><th>Minutes</th><th>Cover</th><th>Skip if short on time</th></tr>
+<tr><td>0 to 5</td><td>Clarifying questions, billing or not, lateness, scope</td><td>Attribution talk</td></tr>
+<tr><td>5 to 10</td><td>Requirements and estimation (write rate, peak, dedup state)</td><td>Query side sizing</td></tr>
+<tr><td>10 to 15</td><td>Click API, event schema, naive design and why it breaks</td><td>Read API details</td></tr>
+<tr><td>15 to 20</td><td>Scaled architecture and the flow of one click</td><td>Multi-region</td></tr>
+<tr><td>20 to 35</td><td>Deep dives: event time and watermarks, dedup, exactly once, hot keys</td><td>Top-K, fraud layers beyond the first two</td></tr>
+<tr><td>35 to 42</td><td>Batch reconciliation, failures, monitoring</td><td>Cost and security</td></tr>
+<tr><td>42 to 45</td><td>Scale to 10x, recap, questions</td><td>Alternatives not chosen</td></tr>
+</table>
+
+<h3>Common mistakes on this problem</h3>
+<ul>
+<li><b>Incrementing a counter per click.</b> It is not idempotent and keeps no history. Fix: write events to a log, and write full revisioned counts.</li>
+<li><b>Counting by processing time.</b> Outages create fake spikes. Fix: use event time with a watermark.</li>
+<li><b>Saying "exactly once" without saying how.</b> Fix: name the three boundaries (producer, job, sink) and the fix for each.</li>
+<li><b>Using a Bloom filter alone for dedup.</b> A false positive drops a paid click. Fix: let a "maybe" fall through to an exact check.</li>
+<li><b>Partitioning by ad id.</b> Popular ads make hot partitions. Fix: key the raw topic by click id and salt hot keys.</li>
+<li><b>Forgetting the batch path.</b> Late clicks and later fraud findings never reach the bill. Fix: recount hourly from the archive.</li>
+</ul>
+
+<div class="callout tip"><b>Interview tip</b> Open by asking whether the number is billed. Every later choice (exactness, the audit trail, the batch recount, idempotent upserts) follows from that one answer, and it shows you think about the business, not only the pipeline.</div>
+
+<h3>Sections of this page that match each step</h3>
+<ul>
+<li>Steps 1 and 2: <a href="#problem">problem and questions</a>, <a href="#requirements">requirements</a></li>
+<li>Step 3: <a href="#estimation">estimation</a></li>
+<li>Step 4: <a href="#api">API</a>, <a href="#data-model">data model and storage</a></li>
+<li>Steps 5 and 6: <a href="#first-design">first simple design</a>, <a href="#architecture">scaled architecture</a></li>
+<li>Step 7: <a href="#deep-dive-time">event time and late data</a>, <a href="#deep-dive-dedup">dedup and fraud</a></li>
+<li>Step 8: <a href="#deep-dive-exactly-once">exactly once</a>, <a href="#deep-dive-hot">hot ads</a>, <a href="#deep-dive-topk">top-K</a>, <a href="#query">queries</a></li>
+<li>Step 9: <a href="#deep-dive-lambda">reconciliation</a>, <a href="#failures">failures</a>, <a href="#ops">monitoring</a>, <a href="#scaling">scaling</a>, <a href="#evolution">evolution</a></li>
+</ul>
+
 <h2 id="problem">1. Problem statement and clarifying questions</h2>
 
 <p>An advertising platform shows ads on websites and apps. When a user clicks an ad, the browser or app is redirected through a click-tracking endpoint run by the platform, which records the click and then forwards the user to the advertiser's landing page. Advertisers pay per click (cost per click, CPC), so the number of clicks is literally money. Advertisers also want to watch campaigns live: "how many clicks did ad 4711 get in each of the last 60 minutes?" The task is to design the system that collects click events, aggregates them by ad and by minute, and serves the results.</p>
@@ -187,6 +248,7 @@ GET /v1/advertisers/{id}/top-ads?window=15m&amp;k=10
 </svg>
 <figcaption>Clicks flow left to right through a log, a filter job, an aggregate job and into the OLAP store. The dashed lower path is the batch lane: raw events are archived, a batch job recomputes finalized numbers, overwrites the provisional rows in the store (green dashed) and feeds the billing ledger.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> Read the picture left to right along the middle row, then look at the bottom row. 1. Users click and reach the Click tier, which verifies the signature, appends to Kafka clicks.raw and sends the 302. 2. The Filter job (top) reads clicks.raw, drops duplicates and bad clicks, and writes the survivors to the second Kafka box, clicks.valid. 3. The Aggregate job (below) reads clicks.valid, counts per ad per minute, and writes to two places: the OLAP store for history and Redis top-K for the live leaderboard. 4. The Query API on the right reads both. The bottom row is the slow lane drawn with dashed arrows: the raw archive in the object store, the hourly Batch job, and the Billing ledger. The green dashed arrow is the batch job overwriting provisional rows with final ones. The log sits between the click tier and everything else so that a slow counter never slows a user. On a whiteboard, draw the log first and put the two jobs after it. If you remove the archive and batch lane, the system still runs but nothing can correct late clicks or fraud found later, so you could not bill from it.</div>
 
 <p>The components, in the order a click meets them:</p>
 <ol>
@@ -220,6 +282,7 @@ GET /v1/advertisers/{id}/top-ads?window=15m&amp;k=10
 </svg>
 <figcaption>Steps 1 to 4 are the synchronous user-facing path and finish in a few milliseconds. Steps 5 to 9 happen asynchronously, seconds later. The user never waits for counting.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> This is a sequence diagram: each vertical line belongs to one actor, and time runs downward. Black arrows are requests, green arrows are replies. 1. The browser sends GET /c with the ad id, click id and signature to the Click tier. 2. The Click tier appends the event to Kafka and waits for the in-sync replicas (acks=all). 3. Kafka acknowledges. 4. Only now does the Click tier send the 302 redirect. Everything above the gap is the user's path, and the only slow part is the append. 5. Later, the Filter job polls a batch from Kafka. 6. It does the dedup check and fraud scoring on its own box. 7. It writes the survivors to clicks.valid, which the Aggregate job reads. 8. The Aggregate job adds each click to a window counter. 9. When a window closes (or an early trigger fires) it upserts the count into the OLAP store. The design choice is to acknowledge after the durable append and not after counting, so a slow store cannot hurt users. If you wait for the OLAP write before replying, the redirect gets slower and clicks are lost when the store is down. Point at the gap between step 4 and step 5 when you draw it.</div>
 
 <h2 id="deep-dive-time">8. Deep dive: event time, windows and late data</h2>
 
@@ -245,6 +308,7 @@ GET /v1/advertisers/{id}/top-ads?window=15m&amp;k=10
 </svg>
 <figcaption>The grey dashed line is the ideal where processing time equals event time. Real events lie below it because they arrive after they happened. The green watermark line says "no events older than this are expected". A dot below the line (red) is late data.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> This is a chart, not a flow, so read the two axes first. Along the bottom is processing time, when our job sees an event. Up the side is event time, when the click really happened. 1. Each black dot is one click. A click cannot be seen before it happens, so every dot sits on or below the grey dashed ideal line. 2. The distance below that line is the delay from network, retries or an offline phone. 3. The green line is the watermark. It trails the newest event time seen by 2 minutes, which is the tolerance we chose for out-of-order arrival. 4. The red dot is a click whose event time is older than the watermark at the moment it arrives. That click is late, and the window it belongs to may already have been emitted. The number to remember is the 2 minute gap between the grey and green lines: a bigger gap waits longer and is less often wrong, a smaller gap is fresher and drops more clicks into the late path. On a whiteboard, draw the axes and the two lines, then put one dot below the green line and say what happens to it. Without a watermark the job would never know when to close a minute.</div>
 
 <h3>8.2 Tumbling, hopping and sliding windows</h3>
 <p>A <b>tumbling window</b> is a fixed, non-overlapping interval: [10:00, 10:01), [10:01, 10:02), and so on. Each click belongs to exactly one. This is what the per-minute table needs, and it is the cheapest: one counter per (ad, minute). A <b>hopping (sliding) window</b> has a length and a smaller step, for example length 5 minutes and step 1 minute, so each click belongs to five windows. It answers "clicks in the last 5 minutes, refreshed every minute", used by the top-K board. Computing hopping windows by keeping a counter per window multiplies work by 5. The standard trick is to <b>never aggregate hopping windows from raw events</b>: keep the tumbling minute counts and compute the 5-minute sum by adding the last five minute counters at read time (or by a second, tiny, stage). The raw stream is touched once.</p>
@@ -265,6 +329,7 @@ GET /v1/advertisers/{id}/top-ads?window=15m&amp;k=10
 </svg>
 <figcaption>Only the tumbling buckets are persisted. A sliding window is a sum over the last N buckets, so its cost is N small additions, not N times the raw event volume.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> The picture has two rows that share one timeline. The top row is the stored data: six blue boxes, one per minute, from 10:00 to 10:06. Each click is counted in exactly one of them. The lower rows are views, not stored data. 1. The first bar spans five boxes, 10:00 to 10:05, and is labelled as the window ending 10:05. Its value is the sum of those five counters. 2. The second bar is the same idea shifted right by one box: minutes 10:01 to 10:05, the window ending 10:06. 3. Moving the window by one minute only drops the oldest box and adds the newest. The choice shown is to keep the cheap tumbling buckets and add them at read time. The alternative is to assign each click to five overlapping windows, which multiplies the work by five for the same answer. When drawing it, draw the boxes first, then lay the long bars over them. If you removed the top row and kept only sliding windows, you would lose the base counts that the table, the rollups and the top-K board all depend on.</div>
 
 <h3>8.3 Watermarks and allowed lateness</h3>
 <p>A <b>watermark</b> is the job's running claim: "I do not expect any more events with event time earlier than W". A common heuristic is <code>W = (largest event time seen) - D</code>, where D is a bound on out-of-orderness, here 2 minutes. When W passes the end of a window, the window is <i>closed</i> and its result is emitted. With D = 2 minutes, the 10:00 to 10:01 window emits when the job sees an event stamped 10:03 or later, so freshness is about one minute of window plus 2 minutes of wait, which meets the "30 seconds after the minute closes" target only if we emit early, so we also emit <b>early provisional results</b>: a trigger fires every 10 seconds for the open window and upserts the running count with status <code>provisional</code>. The dashboard therefore shows a live number that is slightly low, then the final-for-stream value at window close.</p>
@@ -334,6 +399,7 @@ GET /v1/advertisers/{id}/top-ads?window=15m&amp;k=10
 </svg>
 <figcaption>A barrier marker travels with the data. When a task sees it, it saves its state; the snapshot of all tasks plus the source offsets is a consistent cut. Recovery restores that cut and replays only events after it.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> The top row is the job: Kafka source, Dedup task, Window task and the OLAP upsert, joined by arrows. The red box labelled barrier N is a marker inserted into the stream, not a real click. 1. The source records its offset (1,204,500) and sends the barrier downstream along with the data. 2. When the Dedup task sees the barrier, it saves its seen-id set. 3. When the Window task sees it, it saves its minute counters. 4. The dashed arrows show each part writing into the object store box, which holds snapshot N: offsets plus dedup state plus window state. The writes are asynchronous so processing does not stop. 5. The bottom band shows the crash case: restore the snapshot, rewind the source to offset 1,204,500, and reprocess. Some events are processed twice, but the final upsert writes the same full value, so the count does not change. The point to say aloud is that state and offsets are saved as one consistent cut. If they were saved separately, a restore could count some clicks twice or skip some. Remove the barrier idea and you have no way to know the saved pieces belong together.</div>
 
 <p>Why store the full count rather than a delta? Suppose the sink received "ad 4711, 10:03, +3" twice. A delta applied twice yields +6. A message "ad 4711, 10:03, count = 11, revision 7" applied twice yields 11. Making the unit of write a <i>complete, revisioned value</i> is the single most useful idempotency habit in this design. The revision number (the window's emission count) also protects against out-of-order writes: the store keeps the row with the highest revision, so a delayed write from a zombie task that survived a network partition cannot overwrite a newer value.</p>
 
@@ -367,6 +433,7 @@ GET /v1/advertisers/{id}/top-ads?window=15m&amp;k=10
 </svg>
 <figcaption>Salting splits one hot key into S sub-keys for the expensive step, then a cheap second stage merges. Counts are additive, so the merge is exact; this does not work for non-additive metrics such as distinct users, which would need mergeable sketches.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> On the left is the input, clicks.valid, where ad 4711 is hot at 2,500 clicks per second. In the middle are four of the partial boxes (the picture shows salts 0, 1, 2 and 7, standing for all S = 8). On the right is one Final sum box and then the OLAP store. 1. Each click arrives with its click id. The job computes the salt as hash of the click id modulo 8, so the clicks of one ad spread evenly across the eight partial boxes. The caption under the stage 1 label gives the result: about 310 per second each (2,500 divided by 8). 2. Each partial box counts its share per minute. 3. Every partial sends its small total to the Final sum box, which is keyed by ad id only. 4. The Final sum adds eight numbers per minute and upserts one row. The choice shown avoids one task taking all 2,500 clicks per second, and it works because addition can be split and merged. On a whiteboard, draw the fan-out and the fan-in as a bow tie. If you remove stage 2 you would have eight partial counts and no single answer for the ad.</div>
 
 <p>The salt count S does not have to be the same for every ad. Applying 8 salts to every key multiplies state and output for the long tail of ads (millions of ads with a few clicks per minute) for no benefit. The better design detects hot keys dynamically: a lightweight heavy-hitter counter (Count-Min Sketch or a Space-Saving counter, see <a href="../chapters/57-hashing-probabilistic.html">Chapter 57</a>) in front of stage 1 flags ads above a threshold, say 500 per second, and only those get salted (S = 8, rising to 64 for an attack). Cold ads use S = 1. Correctness is not affected by the choice of S because the second stage always sums.</p>
 
@@ -406,6 +473,7 @@ GET /v1/advertisers/{id}/top-ads?window=15m&amp;k=10
 </svg>
 <figcaption>Both paths read the same raw events. The batch path writes a higher revision flagged final for each closed hour, replacing the stream's provisional rows. A diff monitor compares the two and alerts when they diverge more than expected, which is the earliest signal of a stream bug.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> Two lanes run left to right from the same source. The top lane is fast, the bottom lane is slow and exact. 1. On the left, Kafka clicks.raw holds recent events (7 days). A downward arrow copies every event to the Raw archive, the hourly Parquet files. 2. The Stream path box reads Kafka and writes provisional rows to the OLAP store in the middle. 3. The Batch path box (hourly) reads the archive, deduplicates everything, applies the full fraud rules and recounts exactly. 4. Its green arrow writes a higher revision flagged final into the OLAP store, replacing the provisional row. 5. The OLAP store feeds Billing on the right, and billing reads only the final rows. 6. The red Diff monitor below the store compares the two answers and alerts when the gap grows above 0.5%. The design choice is two independent counts of the same input, so one can check the other. The alternative, a single stream pipeline, has no outside check. When drawing, mark the green arrow clearly, since it is the step that makes the number billable. Without the diff monitor, a stream bug would be found only when an advertiser complains.</div>
 
 <p>The flow for hour H, starting after H plus 30 minutes (to cover the 15-minute lateness window with margin):</p>
 <ol>

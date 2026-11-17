@@ -34,10 +34,9 @@ for d, _, fs in os.walk(ROOT):
             head = clean(hm.group(2))
             if idm: hid = idm.group(1)
             else:
-                hid = re.sub(r'[^a-z0-9]+', '-', head.lower()).strip('-') or 'section'
-                while hid in used: hid += '-x'
-            used[hid] = 1
-            recs.append(dict(u=rel + '#' + hid, p=title, g=part, h=head, x=clean(pc[hm.end():])[:500]))
+                hid = None  # no stable id in the source: link to the page, not an invented anchor
+            if hid: used[hid] = 1
+            recs.append(dict(u=rel + ('#' + hid if hid else ''), p=title, g=part, h=head, x=clean(pc[hm.end():])[:500]))
 out = 'window.HLD_SEARCH=' + json.dumps(recs, ensure_ascii=False, separators=(',', ':')) + ';\n'
 open(os.path.join(ROOT, 'search-index.js'), 'w', encoding='utf-8', newline='\n').write(out)
 print('indexed %d sections, %d KB' % (len(recs), len(out) // 1024))

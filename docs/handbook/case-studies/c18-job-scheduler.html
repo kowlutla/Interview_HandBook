@@ -21,6 +21,60 @@
 <h1>Design a Job Scheduler</h1>
 <p class="lead">A job scheduler runs your code at the right time, exactly when a cron expression, a delay, or a dependency says it should, even when machines crash and clocks disagree. This worked solution designs one that holds 10 million job definitions: how due jobs are found, how two schedulers are stopped from firing the same job, how workers run it safely, and how retries, priorities, and catch-up behave.</p>
 
+<h2 id="approach">How to approach this problem (read this first)</h2>
+<p><b>What the interviewer is really testing.</b> A scheduler sounds easy, because "run a job at a time" is one line of cron. The hard parts are hidden underneath. First, finding due jobs among millions without scanning everything. Second, making sure two machines never both fire the same job, even when one of them freezes for a while. Third, not losing a job when a worker or scheduler dies half way, and being honest that this leads to at-least-once delivery and idempotent jobs. Fairness between tenants and the awkward details of time (zones, daylight saving, missed runs) are the extras that separate strong answers.</p>
+<h3>The thinking order, step by step</h3>
+<ol>
+<li><b>Ask what kinds of jobs and how many.</b> Cron, one-off and delayed; how many definitions; how many runs a day; how accurate the start time must be. Say: "Is this cron-style recurring work, one-off timers, or both, and how late is too late?" The answers set the size and the timing target, so they come before any design.</li>
+<li><b>Ask what "run" means and what guarantee is wanted.</b> Does the scheduler call a URL or run code? Is a duplicate worse than a miss? Say: "I assume a lost job is worse than a repeated one, so I will aim for at-least-once and make jobs idempotent." Naming this early saves a long argument later.</li>
+<li><b>Estimate runs per second, then the spike.</b> Divide runs per day by 86,400 for the average, then note that humans pick round times, so the top of the hour is far above average. Say: "About 1,157 runs a second on average, but the top of the hour is the real peak, so I design for roughly ten times that." This comes first because the spike, not the average, decides the queue and worker sizing.</li>
+<li><b>Draft the create-job API and name the entity.</b> The job definition and its next run time are the entities that drive everything. Say: "The core row is a job with a next_run_at, and I need to find rows where next_run_at is due." This leads straight to the time-sorted index.</li>
+<li><b>Start with one process and one table.</b> Say: "The simplest design polls a table every second and runs what is due." Then break it out loud: single point of failure, two copies double-fire, slow jobs block scheduling. These failures name the later features.</li>
+<li><b>Separate finding from running.</b> Scheduler tier finds and claims due rows, a queue carries them, workers run them. Say: "The scheduler never runs tenant code; it only hands out run ids." This is the first scaling move.</li>
+<li><b>Partition ownership and the atomic claim.</b> Split the schedule into shards, give each shard one owner with a lease and a fencing number, and make the claim a conditional database write. This is where the interviewer pushes hardest, so spend time here.</li>
+<li><b>Workers: leases, heartbeats, retries.</b> Explain how a dead worker is noticed and how a run is retried with backoff. Say: "I cannot get exactly-once, so I send an idempotency key on every attempt."</li>
+<li><b>Fairness, time rules, failures, evolution.</b> Close with tenant fairness, daylight saving and catch-up policy, the failure table, and what changes at ten times the scale.</li>
+</ol>
+<h3>The decision points</h3>
+<ul>
+<li><b>Poll a table, use a timer wheel, or use a delay queue?</b> Ask: can I cancel and edit a pending job, and does it survive a crash? A table says yes to both, so it is the truth, with a small in-memory wheel for precision (section 7).</li>
+<li><b>One global leader or an owner per shard?</b> Ask: where is the bottleneck? A single leader caps throughput and is a big failure domain, so own shards separately.</li>
+<li><b>At-most-once or at-least-once?</b> Ask: which is worse, a skipped run or a repeated run? Skipping is usually worse, so at-least-once with idempotency.</li>
+<li><b>Database or queue as the source of truth?</b> Ask: which one can be rebuilt? The queue can be rebuilt from the database, not the reverse, so the database decides.</li>
+<li><b>Shard by job id or by tenant?</b> Ask: is there a whale tenant? Hashing the job id spreads a whale evenly; tenant views come from a secondary index.</li>
+</ul>
+<div class="callout tip"><b>Interview tip</b> Give the duplicate-firing answer in two layers: "each shard has one lease-holding owner with a fencing epoch, and the claim itself is a conditional write with a deterministic run id, so even a frozen old owner cannot cause a second run." Two independent layers sound far stronger than one lock.</div>
+<h3>A suggested time plan (45 minutes)</h3>
+<table>
+<tr><th>Minutes</th><th>What you cover</th><th>Skip if short on time</th></tr>
+<tr><td>0 to 6</td><td>Clarifying questions, requirements, scope</td><td>Multi-region discussion</td></tr>
+<tr><td>6 to 11</td><td>Estimation: runs per second, spike, workers, shard count</td><td>Heartbeat batching arithmetic</td></tr>
+<tr><td>11 to 16</td><td>API and data model (job_def, schedule, execution)</td><td>Dependency table</td></tr>
+<tr><td>16 to 22</td><td>One-box design, why it fails, scaled architecture, run flow</td><td>Cancel flow</td></tr>
+<tr><td>22 to 32</td><td>Deep dive: finding due jobs, shard leases, atomic claim, then worker leases and retries</td><td>DAG details</td></tr>
+<tr><td>32 to 39</td><td>Fairness, time semantics, failure table</td><td>Caching, security</td></tr>
+<tr><td>39 to 45</td><td>Scale-up, alternatives, questions</td><td>Cost notes</td></tr>
+</table>
+<h3>Common mistakes on this problem</h3>
+<ul>
+<li><b>Scanning all jobs every second.</b> Fix: keep a time-sorted index and read only due rows.</li>
+<li><b>Using one distributed lock per job.</b> Fix: lock per shard, not per job, to keep coordination traffic small.</li>
+<li><b>Promising exactly-once.</b> Fix: promise at-least-once and show how idempotency keys give exactly-once effects.</li>
+<li><b>Trusting each machine's clock.</b> Fix: let the database decide what is due, and use fencing numbers for ordering.</li>
+<li><b>Ignoring the top-of-the-hour spike.</b> Fix: buffer in a queue, add jitter, autoscale workers.</li>
+<li><b>Forgetting a noisy tenant.</b> Fix: per-tenant queues with weighted round robin and running caps.</li>
+</ul>
+<h3>Sections of this page that match each step</h3>
+<ul>
+<li>Steps 1 and 2: <a href="#problem">1. Problem and clarifying questions</a>, <a href="#requirements">2. Requirements</a></li>
+<li>Step 3: <a href="#estimation">3. Estimation</a></li>
+<li>Step 4: <a href="#api">4. API design</a>, <a href="#model">5. Data model</a></li>
+<li>Steps 5 and 6: <a href="#first">6. First design and scaled architecture</a></li>
+<li>Step 7: <a href="#finding">7. Finding due jobs and not double-scheduling</a></li>
+<li>Step 8: <a href="#workers">8. Workers, leases, retries, dependencies</a></li>
+<li>Step 9: <a href="#fairness">9. Priorities, fairness, time</a>, <a href="#scale">10. Scaling</a>, <a href="#failures">11. Failures</a>, <a href="#ops">12. Operations</a>, <a href="#evolution">13. Evolution</a></li>
+</ul>
+
 <h2 id="problem">1. Problem statement and clarifying questions</h2>
 <p>The prompt is short: "Design a distributed job scheduler." Like most interview prompts, it hides several different products. A scheduler that runs a nightly report for one company is a very different thing from a platform where thousands of teams register millions of jobs. So the first job of the candidate is to ask questions and write down the answers that will be assumed for the rest of the design (this is the opening step of the framework in <a href="../chapters/01-interview-framework.html">Chapter 1</a>).</p>
 <table>
@@ -164,6 +218,7 @@ The database row is the truth about a job's schedule and the execution state. Th
 </svg>
 <figcaption>The API writes definitions and the first schedule row. Scheduler instances, each owning a subset of shards under a lease, find due rows and push them to priority queues. Workers pull, run, heartbeat, and write the result back. A reaper handles expired leases.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> Boxes are services, with colour showing the kind: purple is outside the system (tenants, the tenant's target), blue is our stateless services, green is a database, amber is a queue or coordination store. Solid arrows are the main path and dashed arrows are control or feedback. 1. A tenant calls the API service. 2. The API writes the definition and first schedule row into the sharded job store. 3. The scheduler tier scans and claims due rows from the store, but only for shards it owns, which it knows from leases in the coordination box. 4. It pushes run ids into the dispatch queues, split by priority. 5. Workers pull from the queues, run the job against the tenant's target, and send heartbeats and results back to the store (the long dashed arrow). 6. The reaper on the left watches for expired leases and requeues. The shape separates finding work, carrying work and doing work, so each can scale alone. On a whiteboard, draw the middle column first, then the sides. Remove the queue and spikes hit workers directly. Remove the reaper and a dead worker's run is stuck forever.</div>
 <p>Separation of duties is the main idea. The <b>scheduler</b> is small and fast: it never runs tenant code. The <b>queue</b> absorbs spikes. The <b>workers</b> are the only place work runs, and they can be scaled and sandboxed separately. The <b>reaper</b> is the repair loop that makes failures non-fatal.</p>
 
 <h3>6.2 Request flows</h3>
@@ -196,6 +251,7 @@ The database row is the truth about a job's schedule and the execution state. Th
 </svg>
 <figcaption>Steps 1 to 4 are the scheduler's job and happen in one short transaction plus an enqueue. Steps 5 to 10 belong to the worker. The lease token in steps 6 and 10 stops a slow worker from overwriting a newer owner's result.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> This is a sequence diagram with five lifelines: scheduler, job store, queue, worker and target. Time runs downward, and solid arrows are calls while dashed arrows are replies or periodic signals. 1. The scheduler asks the store to claim rows whose next_run_at is due. 2. The store returns the rows and the new execution records in the same transaction. 3. The scheduler enqueues the run id. 4. It moves next_run_at to the next cron time, so the job is not picked again. 5. A worker receives the run id from the queue. 6. It asks the store for a lease with token n and sets the state to running. 7. It calls the tenant's target with an idempotency key. 8. While waiting it sends a heartbeat every 10 seconds. 9. The target answers. 10. The worker completes the run, and the store accepts the write only if token n is still current. The picture is split so that steps 1 to 4 are short and the scheduler is free again at once. Remove step 6 and two workers could run the same message. Remove the token in step 10 and a stale worker could overwrite a newer result.</div>
 <h4>Flow C: cancel</h4>
 <p>For a not-yet-due run, the API deletes or marks the schedule row cancelled in one transaction; the scheduler's claim query ignores cancelled rows. For a queued run, the execution state becomes <code>cancelled</code> and the worker checks state when it takes the lease and drops the run. For a running run, the API sets a <code>cancel_requested</code> flag; the next heartbeat response tells the worker, which sends a cancel to the target or kills the process, then reports <code>cancelled</code>. Cancellation of running work is always best effort, because the tenant's code may already have produced external effects.</p>
 
@@ -230,6 +286,7 @@ The database row is the truth about a job's schedule and the execution state. Th
 </svg>
 <figcaption>Polling is simple and durable but coarse; a timer wheel is precise and cheap in memory but volatile; a delay queue pushes the whole problem onto a broker with limits on how far in the future it can hold messages.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> Three small pictures show three ways to answer "what is due now", and the green bar at the bottom says which one we pick. Panel A is the green table: rows sorted by next_run_at, and one query reads only the rows up to now plus one second. Panel B is a circle with slots: a hand moves one slot per tick and fires every job stored in that slot. Panel C is the amber box: each message has a visible_at time, and consumers see only the ones already ready. Read it left to right as a progression. 1. Panel A is durable and easy to edit but only as precise as the poll interval. 2. Panel B is precise and cheap but lives in memory, so a crash loses it. 3. Panel C hands the problem to a broker, which is hard to cancel or edit and has delay limits. The choice combines A and B: poll the table in short windows, load the next few seconds into a wheel, fire from the wheel. On a whiteboard, draw A as the foundation and B as a small box in front of it. If you drop A you lose durability. If you drop B you accept coarse timing.</div>
 <h4>A. Polling an indexed table (time buckets)</h4>
 <p>Each shard has a B-tree index on <code>(shard, next_run_at)</code>. The scheduler asks "give me up to 500 rows with <code>next_run_at</code> at or before now plus a short look-ahead window, ordered by time". Because the index is sorted by time, this reads only the due rows, not 156,000. A <b>time bucket</b> is a coarse slice of time (say one second, or ten) used as the leading key, so rows due in the same bucket are physically close and the scan is a single contiguous range. The price is timing granularity: with a poll every 500 ms, the median lateness is about 250 ms, and the database sees 64 shards × 2 polls per second = 128 queries per second. That is trivial. It is also fully durable: a restart loses nothing, because the table is the truth.</p>
 <h4>B. Timer wheel</h4>
@@ -263,6 +320,7 @@ The database row is the truth about a job's schedule and the execution state. Th
 </svg>
 <figcaption>Leases give failover; fencing epochs make a paused or partitioned old owner harmless, because the database rejects its writes. A lease alone is not enough, since the old owner may not know it expired.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> The top half shows the normal state. Blue boxes S1 and S2 are scheduler instances, the amber box is the coordination store holding shard 1's owner and epoch 7, and the green box is the job store shard that checks epochs on writes. 1. S1 renews its lease on a timer (dashed arrow to the coordination store). 2. Every write S1 makes to the job store carries epoch 7 (long arrow). The bottom half is the failure story. The red box says S1 paused for longer than its lease, for example a long garbage collection. 3. The lease expires, S2 takes shard 1 and gets epoch 8. 4. S1 wakes, still believing it owns the shard, and writes with epoch 7. 5. The green box on the right shows the store refusing it because 8 is current. 6. S1 learns it lost the lease, stops, and throws away its in-memory wheel. This is drawn with two checks (lease, then fencing) because a lease alone cannot reach a frozen process. Remove the epoch on writes and S1 can still double-dispatch. Remove the lease and nobody ever takes over a dead owner's shard.</div>
 <h4>Layer 2: an atomic claim in the database</h4>
 <p>Even with one owner per shard, bugs and ownership overlaps during failover must not cause duplicates. So the claim itself is a conditional update. Pseudocode in the owner's loop:</p>
 <pre><code>BEGIN;
@@ -304,6 +362,7 @@ then enqueue run_ids.</code></pre>
 </svg>
 <figcaption>A run moves forward only. Failure with attempts left goes to a backoff wait and back to queued. After the last attempt the run is dead and visible for manual re-run.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> Each box is a state of one execution, and each arrow is an allowed move. Blue is the active path, amber is waiting, green is success, red is failure, and purple is cancelled. Follow the happy path first. 1. A run starts as SCHEDULED. 2. It becomes QUEUED when the scheduler claims it and puts it on the queue. 3. A worker takes the lease and it is RUNNING. 4. The green arrow leads to SUCCEEDED. Now the unhappy paths. 5. The red arrow from RUNNING leads to FAILED or LOST (the worker reported an error, or its lease expired). 6. If attempts are left, the dashed arrow goes to RETRY, which waits out the backoff. 7. When the timer fires, the dashed arrow goes back to QUEUED. 8. If attempts are out, the red arrow leads to DEAD, which the tenant can see and re-run by hand. 9. A cancel moves a run to CANCELLED from any live state. It is drawn as a state machine so the rule is visible: runs only move forward through allowed edges, which is what the lease token check enforces. On a whiteboard, draw the happy path first and add the loop afterwards. Remove RETRY and a transient error becomes a permanent failure.</div>
 <h3>8.2 Retries and backoff</h3>
 <p>Retrying immediately after a failure usually makes things worse: if a downstream service is overloaded, a thousand instantly retried jobs deepen the overload. The standard policy is <b>exponential backoff with jitter</b> (<a href="../chapters/40-resilience.html">Chapter 40</a>). The wait before attempt <code>n</code> is a random value between 0 and <code>min(max, base × 2^n)</code>. With base 2 seconds and cap 10 minutes, waits are drawn from about 0-4 s, 0-8 s, 0-16 s and so on, up to 600 s. The random part ("full jitter") spreads retries so they do not arrive together. Not every failure is retried: a 4xx response such as "bad request" is permanent, so the policy distinguishes retryable (timeouts, 5xx, connection errors, lost lease) from non-retryable errors. After <code>max_attempts</code> the run becomes <code>DEAD</code> and an alert goes to the tenant. A dead-letter listing allows manual re-run.</p>
 <h3>8.3 Delivery semantics and exactly-once effects</h3>
@@ -349,6 +408,7 @@ A lease and fencing token protect the scheduler's own records, but they cannot s
 </svg>
 <figcaption>The dispatcher, not the queue order, decides who goes next. Heavy tenant A progresses at its fair share and its running cap; B and C are barely delayed.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> On the left are three tenants. The red box is tenant A with 5,000,000 runs queued, and the green boxes are tenants B and C with 40 and 300. In the middle the amber box is the fair dispatcher. On the right are the three priority queues, and the purple box at the far right is the worker pool. 1. All three tenants offer work to the dispatcher. 2. The dispatcher visits tenants in weighted round robin, so each tenant gets its turn however large its backlog. 3. It also checks the running cap and the dispatch rate for the tenant before sending. 4. Allowed runs go to the high, normal or low queue by their priority class. 5. Workers drain the three queues with a 6:3:1 share, so low priority still moves. The key point is that fairness is decided by the dispatcher, before the queue, not by the order messages arrived. If queue order decided it, A's five million would sit ahead of B and C. The footer says the result: B and C wait one round at most, and A is throttled, not rejected. Remove the running cap and A could fill every worker.</div>
 <h3>9.2 Time: zones, daylight saving, skew, and missed runs</h3>
 <p>Time is where schedulers go subtly wrong, so state the rules explicitly.</p>
 <ul>

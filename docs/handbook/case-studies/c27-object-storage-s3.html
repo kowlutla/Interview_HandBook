@@ -20,6 +20,70 @@
 <h1>Design Object Storage (S3-like)</h1>
 <p class="lead">We design a regional service that stores hundreds of billions of immutable blobs, promises eleven nines of durability, and still answers a listing request in milliseconds. The design hinges on one idea: split the small, strongly consistent index of objects (the metadata path) from the huge, cheap, append-only bytes (the data path), and then make every failure between the two safe.</p>
 
+<h2 id="approach">How to approach this problem (read this first)</h2>
+
+<p><b>What the interviewer is really testing.</b> Three things. First, whether you see that object storage is two systems: a small, strongly consistent index of keys, and a huge pile of immutable bytes. Second, whether you can explain how data survives drive, rack and zone failures cheaply, which means erasure coding versus replication with real arithmetic. Third, whether you know where the commit point is, so you can say what happens when a PUT crashes halfway, and how orphaned data is cleaned up later. Request volume is not the hard part; capacity, durability and correctness are.</p>
+
+<h3>The thinking order, step by step</h3>
+<ol>
+<li><b>Ask about scale, durability and consistency.</b> Ask: how much data, how many objects, what object size, what durability, is listing strongly consistent? Say: "I will assume 100 PB, 200 billion objects, average 500 KB, eleven nines, and strong read-after-write." Fix these first because every later number depends on them.</li>
+<li><b>Use immutability to simplify.</b> Say: "Objects are written whole and never edited, so the data plane needs no locks and no consensus." This is the key insight, so it comes before any architecture.</li>
+<li><b>Estimate metadata size before raw storage.</b> Say: "200 billion objects at about 500 bytes is 100 TB of metadata, so the index must be sharded; request rate is not the problem." Then raw storage: 180 PB with the hybrid scheme.</li>
+<li><b>Draft the API: PUT, GET with range, LIST, multipart.</b> Start with PUT and LIST because they force the two hard parts: where bytes go and how sorted listing works.</li>
+<li><b>Split metadata from data in the data model.</b> Say: "Key to chunk map in an ordered replicated store; bytes in append-only extents on storage nodes."</li>
+<li><b>Show the one-server design and why it fails.</b> A file per object on one disk fails on capacity, durability and listing a huge directory.</li>
+<li><b>Walk the PUT, naming the commit point.</b> Say: "Fragments first, then one metadata write makes the object visible." Then the GET and the range GET.</li>
+<li><b>Deep dive durability.</b> Compare 3x replication with erasure coding, show the arithmetic, then the hybrid by object size.</li>
+<li><b>Then listing, multipart, garbage collection and repair,</b> in that order, because each one builds on the commit point.</li>
+</ol>
+
+<h3>The decision points</h3>
+<ul>
+<li><b>Replication or erasure coding?</b> Ask: how big are the objects and how scarce are disk seeks? Large objects get erasure coding for cost; small objects stay replicated to protect IOPS.</li>
+<li><b>Hash or range sharding for metadata?</b> Ask: is ordered listing a feature? Yes, so range sharding, and split hot ranges.</li>
+<li><b>Where is the commit point?</b> Ask: when can a reader first see the object? After the metadata write, so a crash before it leaves only invisible orphans.</li>
+<li><b>How do I delete data safely?</b> Ask: can a leak or a race be tolerated? Use delayed delete plus mark and sweep with a grace period.</li>
+<li><b>How many fragments per zone?</b> Ask: must reads survive losing a whole zone? Yes, so parity must cover a zone's share of fragments.</li>
+</ul>
+
+<h3>A suggested time plan (45 minutes)</h3>
+<table>
+<tr><th>Minutes</th><th>Cover</th><th>Skip if short</th></tr>
+<tr><td>0 to 5</td><td>Clarify scale, durability, consistency</td><td>Lifecycle and versioning detail</td></tr>
+<tr><td>5 to 11</td><td>Estimation: metadata size, raw storage, disk reads</td><td>Repair traffic arithmetic</td></tr>
+<tr><td>11 to 15</td><td>API and data model</td><td>Full multipart API list</td></tr>
+<tr><td>15 to 22</td><td>Architecture and the PUT and GET flows</td><td>Range GET details</td></tr>
+<tr><td>22 to 32</td><td>Deep dive: erasure coding and durability math</td><td>LRC discussion</td></tr>
+<tr><td>32 to 39</td><td>Listing, multipart, garbage collection</td><td>Versioning and delete markers</td></tr>
+<tr><td>39 to 45</td><td>Failures, scaling, evolution</td><td>Security and cost</td></tr>
+</table>
+
+<h3>Common mistakes on this problem</h3>
+<ul>
+<li>Putting object bytes in a database. Fix: metadata in a replicated ordered store, bytes in extents.</li>
+<li>Hash sharding the index, which makes listing scatter across every shard. Fix: range shard on bucket and key.</li>
+<li>Saying "three copies" without cost arithmetic. Fix: compute raw capacity for both schemes.</li>
+<li>Claiming erasure coding for every object. Fix: explain the small-object and IOPS problem and use a hybrid.</li>
+<li>Having no answer for a crash mid-PUT. Fix: name the metadata commit point and the orphan sweep.</li>
+<li>Deleting garbage immediately, which can remove in-flight uploads. Fix: delay and a grace period that covers multipart parts.</li>
+</ul>
+
+<div class="callout tip"><b>Interview tip</b>
+Say early: "A PUT commits when one metadata record is written; everything else, repair, listing, garbage collection, follows from that." Return to that sentence whenever the interviewer asks about failure.
+</div>
+
+<h3>Sections of this page that match each step</h3>
+<ul>
+<li>Step 1: <a href="#problem">Problem</a>, <a href="#requirements">Requirements</a></li>
+<li>Step 3: <a href="#estimation">Estimation</a></li>
+<li>Step 4: <a href="#api">API design</a></li>
+<li>Step 5: <a href="#data-model">Data model</a></li>
+<li>Step 6: <a href="#architecture">Architecture</a></li>
+<li>Step 7: <a href="#flows">Request flows</a></li>
+<li>Step 8: <a href="#ec-vs-replication">Erasure coding and durability</a></li>
+<li>Step 9: <a href="#metadata-listing">Metadata and listing</a>, <a href="#multipart">Multipart</a>, <a href="#gc-repair">Garbage collection and repair</a>, <a href="#scaling">Scaling</a>, <a href="#failures">Failures</a>, <a href="#evolution">Evolution</a></li>
+</ul>
+
 <h2 id="problem">1. Problem statement and clarifying questions</h2>
 <p>The prompt is "Design an object store like Amazon S3." The product is easy to describe and hard to build. A user creates a <b>bucket</b> (a named container), then uploads <b>objects</b> (an arbitrary sequence of bytes plus a few headers) under a <b>key</b> (a string such as <code>photos/2025/cat.jpg</code>). The user can read an object back by key, delete it, and list the keys in a bucket. There is no in-place edit: to change an object you upload a new one with the same key. That single restriction, immutability of an object once written, is what makes the whole design tractable, because it lets us store data in write-once files and never coordinate partial updates.</p>
 <p>The conceptual background (buckets, storage classes, consistency, typical products) is in <a href="../chapters/21-object-storage.html">Chapter 21</a>. This page is the worked solution: we make concrete numbers and choices. As in the earlier case studies, we start by asking the interviewer questions and fixing assumptions.</p>
@@ -171,6 +235,7 @@ value:     size, etag, content_type, created_at, user_meta, storage_class,
 </svg>
 <figcaption>Clients talk only to stateless front-ends. The front-end resolves keys in the metadata service, asks the placement manager where a new chunk goes, and streams fragments directly to storage nodes spread across three AZs. Background workers read the metadata index and act on storage nodes, never in the request path.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> Blue is the stateless Front-end tier, green boxes hold durable state (Metadata service, the three AZ storage groups), amber is the Placement manager, red is the Background workers, purple is the Clients. Small green squares inside each AZ are individual drives holding data (D) or parity (P) fragments. Trace a write using the numbers on the arrows. 1. Clients send the request to a Front-end, which authenticates it. 2. The Front-end asks the Metadata service about the key (arrow 1) and asks the Placement manager which drives to use (arrow 2). 3. It streams fragments in parallel to storage nodes in all three AZs (arrow 3). 4. It records the result in Metadata. The dashed arrow shows the workers reading the index and acting on nodes without sitting in any request path. The choice drawn here is that only Metadata is strongly consistent while front-ends and nodes stay simple. Draw Metadata and storage as two separate worlds. If you remove the Placement manager, nobody can pick drives across failure domains. If workers move into the request path, a repair backlog slows every PUT.</div>
 <p>Front-end servers also act as the erasure-coding engine on writes (they compute parity from data as it streams through) and the reconstruction engine on degraded reads. This keeps storage nodes simple and puts CPU where it scales horizontally. Encoding at roughly several GB/s per core with vectorized instructions is typical for Reed-Solomon, so 15 GB/s peak ingest needs only a handful of cores; network is the limit, not coding.</p>
 
 <h2 id="flows">7. Request flows</h2>
@@ -203,6 +268,7 @@ value:     size, etag, content_type, created_at, user_meta, storage_class,
 </svg>
 <figcaption>The bytes land on storage nodes first, and only then does a single metadata write make the object visible. A crash anywhere before step 5 leaves orphan fragments but no visible object. The 12-of-15 early acknowledgement is a latency optimization that still keeps three more failures of headroom.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> Five lifelines: Client, Front-end, Placement, 15 drives, Metadata. Solid arrows are requests, dashed arrows are replies, the green boxed note is a local check. 1. The Client streams the PUT with a checksum to the Front-end. 2. The Front-end asks Placement for a placement group per segment, and Placement answers with the PG id and 15 drives. 3. The Front-end sends 9 data and 6 parity fragments to the drives in parallel. 4. The drives acknowledge, and the Front-end proceeds when 12 of 15 are in. It then verifies the end-to-end checksum. 5. It writes the commit record to Metadata, one Raft write, which is the commit point. 6. It returns 200 OK with the ETag. The order is deliberate: bytes first, visibility last. A crash before step 5 leaves orphan fragments, which garbage collection removes, but no half-visible object. On a whiteboard, mark step 5 with a star. If you swap the order and write metadata first, a reader could find an object whose bytes do not exist.</div>
 <h3>7.2 GET of an object, including a range</h3>
 <ol>
 <li>The front-end verifies the signature and reads the metadata record for the key (a point read on one shard). A small hot cache of metadata on the front-ends cuts load, but entries are validated by version or have short lifetimes so a delete is seen quickly (see <a href="../chapters/13-caching-patterns.html">Chapter 13</a>).</li>
@@ -251,6 +317,7 @@ value:     size, etag, content_type, created_at, user_meta, storage_class,
 </svg>
 <figcaption>Nine data fragments (green) and six parity fragments (amber) of 1 MB each, five per AZ. Losing a whole AZ removes 5 fragments, leaving 10, and any 9 are enough, so the segment stays readable with one more fragment of slack.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> On the left, a purple 9 MB segment goes into the blue RS(9,6) encoder inside the front-end. Three arrows fan out to three green bands, AZ-A, AZ-B and AZ-C. Inside each band are five squares: three green data fragments (D1 to D9 across the zones) and two amber parity fragments (P1 to P6). Each fragment is 1 MB. 1. The encoder cuts the segment into 9 data pieces. 2. It computes 6 parity pieces. 3. It places exactly 5 pieces in each zone, on different servers and racks. The number to remember is any 9 of 15 rebuild the segment. If a whole zone disappears, 5 pieces go, 10 remain, and one spare piece of slack is left. This even spread is the design choice: with an uneven spread, one zone could hold more pieces than the parity can cover. On a whiteboard, draw three bands of five boxes and cross out one band. Remove parity and a single drive failure loses data.</div>
 <h3>8.2 Why 9+6 across three AZs</h3>
 <p>The scheme must survive an AZ outage. With RS(10,4) placed across 3 AZs we would put about 5 fragments in an AZ, and losing one AZ loses 5, which is more than the 4 parity fragments, so data is unreadable (not lost, but unavailable) until the AZ returns. To keep reads alive through an AZ loss, the number of fragments per AZ must be at most m, so with 3 AZs and equal spread we need m of at least n/3, which means (k + m) / 3 &lt;= m, or equivalently m &gt;= k/2. For k = 9 we need m = 6 (k/2 = 4.5, and we want one failure of slack beyond the AZ loss, so 6). The price is 1.67x instead of 1.4x. That is the real tradeoff in an interview: <b>cross-AZ tolerance costs extra parity</b>. A cheaper alternative is to erasure-code inside a single AZ and replicate whole objects across regions, which many cold tiers do, but then an AZ outage is a data outage for that bucket.</p>
 <h3>8.3 Why small objects are replicated</h3>
@@ -279,6 +346,7 @@ value:     size, etag, content_type, created_at, user_meta, storage_class,
 </svg>
 <figcaption>In the independent-failure model erasure coding beats replication by many orders of magnitude at lower cost. The model is a lower bound on risk, not a promise: correlated failures dominate real loss, as explained below.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> This is a bar chart. Each row is a storage scheme, and the bar length is the number of nines of annual durability, drawn at 20 pixels per nine. The first bar, 3x replication, is the shortest at about 11 nines, and it costs 3.0x raw capacity. The second, RS(10,4), reaches about 17 nines for 1.4x. The third, RS(9,6), reaches about 26 nines for 1.67x. To read it, compare the length against the cost in the label, not just the length. The point is that erasure coding gives more durability for less raw disk, because loss needs many fragments to fail inside one short repair window. The chart rests on a model with independent failures, 2 percent annual drive failure and a 6 hour repair, so the 26 is a model number, not a promise. On a whiteboard, draw only the three bars and write the cost beside each. The first bar is also the target line. If repair took much longer, every bar would shrink.</div>
 <div class="callout watch"><b>Watch out</b> Do not claim 26 nines to an interviewer as if it were real. The independence assumption is false. Real loss comes from <b>correlated</b> events: a firmware bug that corrupts a whole drive model, a bad software release that writes wrong fragments, an operator deleting the wrong thing, a rack or power failure that takes many fragments at once, silent bit rot found only after the other fragments also rotted, and repair itself falling behind. These make the true figure dominated by software and operations, not by the drive failure model. The design answers them with placement across failure domains (distinct servers, racks, AZs for each fragment), end-to-end checksums, background scrubbing, staged rollouts, and deletion safeguards. The math justifies the scheme; the processes justify the number.</div>
 <h3>8.5 The repair window is the hidden variable</h3>
 <p>Every formula above depends on the repair time T through p = AFR x T / 8,760. Halving T cuts p by half and the 3x loss probability by 4x and the RS(9,6) loss probability by 64x. So durability engineering is largely repair speed engineering: declustered placement (each drive's fragments have peers spread over thousands of other drives, so rebuilding reads from many sources and writes to many targets in parallel), repair prioritization (objects with the fewest remaining fragments are repaired first), and capacity headroom so there is somewhere to rebuild. Section 11 returns to this.</p>
@@ -342,6 +410,7 @@ value:     size, etag, content_type, created_at, user_meta, storage_class,
 </svg>
 <figcaption>The prefix scan crosses a shard boundary but only touches two adjacent shards. Each time a common prefix is found, the scan seeks past every key beginning with it (red rows are never read). Results come back already sorted, so no merge step is needed.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> Two green panels are range shards: Shard 41 holds keys up to photos/2025/m, Shard 42 holds the keys after it. The right blue panel is the answer to listing prefix photos/2025/ with delimiter slash. Inside the shards, green rows are keys the scan actually reads and red rows are keys it skips. 1. The scan starts in Shard 41 at the first key under the prefix, photos/2025/jan/a.jpg. 2. It sees the delimiter after jan, so it emits the common prefix photos/2025/jan/ and seeks past b.jpg and c.jpg without reading them. 3. It repeats for feb. 4. It reads photos/2025/index.html as a plain object. 5. It crosses into Shard 42, emits photos/2025/mar/, and stops at the end of the prefix. The result is sorted without a merge because the keys are range sharded. The continuation token is the last key emitted. On a whiteboard, draw the two shards side by side with the boundary between them. With hash sharding, this single page would need all 2,000 shards.</div>
 <h3>9.3 Consistency of LIST and of the whole commit</h3>
 <p>A PUT that has returned 200 must appear in the next LIST and a DELETE must disappear. Because the object's metadata row lives in exactly one shard and the LIST reads shards with linearizable reads (a read that goes through the Raft leader, with a read-index or lease check, see <a href="../chapters/28-cap-consistency.html">Chapter 28</a>), this holds without further work. The tricky case is a LIST scan that spans several shards at slightly different moments: it can return a result that never existed as a single state (a key added on shard 42 after the scan left shard 41). That is acceptable and matches S3's documented behaviour: a list is a series of ordered reads, each page strongly consistent, not a transactional snapshot of the bucket. Objects whose creation completed before the list started are guaranteed present; objects created during the list may or may not be.</p>
 <p>Operations that touch two keys, such as COPY, are two independent steps: the data is not copied at all (the new metadata row points at the same chunks, with a reference count raised, see section 11), then one metadata write creates the destination key. Bucket deletion needs an emptiness check, which we do by a range scan that returns the first key, protected by marking the bucket "deleting" so no new object can slip in.</p>
@@ -384,6 +453,7 @@ value:     size, etag, content_type, created_at, user_meta, storage_class,
 </svg>
 <figcaption>Parts are ordinary stored chunks, committed one by one into an upload table. Complete is a single metadata transaction that stitches the part layouts into an object row. Superseded and abandoned parts leave garbage behind, which is why lifecycle rules for incomplete uploads matter.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> The purple Client on the left has a large file cut into four parts. The blue boxes in the second column are front-end uploads of parts 1 to 4, each stored with erasure coding. The green Upload table in the middle records one row per part, with its ETag and layout. The green Final object row on the right is the result. The red box at the bottom collects garbage. Follow the numbers. 1. Initiate returns upload id U. 2. The parts go up in parallel, in any order, and part 3 is retried so the table keeps the latest copy. 3. The client can list parts to resume after a crash. 4. Complete writes one object row whose layout is parts 1, 2, 3 and 4 joined, and no data is copied. The dashed red arrow shows that the first copy of part 3 and any unfinished uploads become garbage. The design makes Complete a metadata-only step, so it takes milliseconds even for terabytes. Without the upload table, parts would have nowhere to be recorded before the object exists.</div>
 <h3>10.2 Details interviewers probe</h3>
 <ul>
 <li><b>The ETag of a multipart object.</b> A single-part object's ETag is typically the MD5 of its bytes. For multipart objects it is conventionally the MD5 of the concatenated binary MD5s of the parts followed by a dash and the part count, so it is not a content hash of the whole file. We stick to that convention for compatibility, and offer a stronger additional checksum header per part and per object for end-to-end integrity.</li>
@@ -433,6 +503,7 @@ value:     size, etag, content_type, created_at, user_meta, storage_class,
 </svg>
 <figcaption>A chunk is written first, becomes live when a metadata row names it, becomes dead when the row is deleted, and is finally physically reclaimed through delayed deletion plus extent compaction. The dashed top path is the leak case, a chunk that never reached the live state, which only the sweep can catch.</figcaption>
 </figure>
+<div class="callout"><b>Walkthrough.</b> This is a state diagram for one chunk, drawn left to right. Amber Written means fragments are on drives but no metadata row names them. Green Live means a committed row names the chunk. Red Dead means the row was deleted and the chunk is queued. Red Fragment gone means the drive has dropped it, leaving a hole in the extent. Green Reclaimed at the bottom means the extent was compacted and the space is back. 1. The arrow labelled commit moves Written to Live. 2. Delete moves Live to Dead. 3. After 24 hours the fragment is dropped. 4. When more than 50 percent of an extent is garbage, compaction reclaims it. The long dashed arc along the top is the leak path: a chunk written but never committed is caught only by the weekly sweep, after the 7 day grace period. The dashed pair at the bottom shows scrub and repair acting on live chunks. On a whiteboard, draw the happy path first, then the arc. Without the sweep, crashed PUTs would leak space forever.</div>
 <h3>11.5 Repair and scrubbing</h3>
 <p><b>Repair</b> restores redundancy. Storage nodes report health by heartbeat; the placement manager treats a node as suspected after missing heartbeats (using a failure detector from <a href="../chapters/33-gossip-merkle.html">Chapter 33</a>) and as failed after a longer timeout, for example 15 minutes, to avoid rebuilding everything for a reboot. When a drive or node is declared failed, the manager enumerates the PGs that included it. Placement is <b>declustered</b>: with about 13,000 drives and fixed 15-drive PGs numbering in the hundreds of thousands, each drive belongs to many PGs and its peers are spread across essentially the whole fleet, so rebuilding is a many-to-many transfer rather than one hot replacement disk running at 100 MB/s. A repair worker reads 9 surviving fragments of each affected chunk, recomputes the missing one, writes it to a spare drive chosen in the same AZ and on a different rack than the other fragments, and updates the PG membership. Chunks with the fewest remaining fragments are repaired first.</p>
 <p><b>Scrubbing</b> finds silent corruption (bit rot). Drives can return wrong bytes without any error. Every fragment carries a checksum (CRC32C is typical and hardware accelerated) stored with it in the index. Reads verify it. Because cold data is rarely read, a background scrubber re-reads every fragment on a cycle, for example every two to four weeks, verifies the checksum, and queues a repair for any mismatch. With a 14 TB drive and a 30 day cycle the scrub reads 14 TB / 2.6 million seconds = about 5.4 MB/s per drive, which is under 5 percent of a drive's sequential bandwidth. Scrubbing is what converts "silent" into "repaired within a known window", which keeps the durability math honest.</p>

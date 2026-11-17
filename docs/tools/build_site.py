@@ -279,7 +279,7 @@ top = '''<!DOCTYPE html>
 <h1>System Design (HLD) Interview Prep</h1>
 <p class="lead">Two parts of one set. Learn each topic properly in the Handbook, then revise from the Quick Notes in the last day or two. Both follow the same order, and every study sheet names the Handbook chapters it condenses.</p>
 <div class="two2">
-<a class="big" href="handbook/index.html"><span class="k">Part 1: learn</span><span class="t">Handbook</span><span class="d">Complete, from the ground up: every component in depth, microservices, 22 worked case studies, and cheat sheets. Detailed prose with diagrams.</span><span class="m">%(np)d pages, about %(hw)dk words</span></a>
+<a class="big" href="handbook/index.html"><span class="k">Part 1: learn</span><span class="t">Handbook</span><span class="d">Complete, from the ground up: every component in depth, microservices, %(nc)d worked case studies, and cheat sheets. Detailed prose with diagrams.</span><span class="m">%(np)d pages, about %(hw)dk words</span></a>
 <a class="big" href="quicknotes/index.html"><span class="k">Part 2: revise</span><span class="t">Quick Notes</span><span class="d">Lookup sheets for the day before: key definitions, tables, numbers, say-aloud scripts, diagrams and detailed interview Q&amp;A in plain words.</span><span class="m">%(nm)d study sheets, %(nc)d case sheets, %(tq)d Q&amp;As</span></a>
 </div>
 <div class="how"><b>Suggested use:</b> Handbook chapter first, then the matching Quick Notes sheet to lock it in. In the final two days, skip the Handbook and read only the Quick Notes. Every Handbook page has a link to its Quick Notes sheet, and every Quick Notes page links back.</div>

@@ -67,6 +67,13 @@
 
   if (pageId.indexOf('ref-') === 0) heads = [];  // glossary: letter bar and filter replace the in-page list
 
+  // accessibility: skip link, labelled landmark, main target
+  (function () {
+    var mm = document.querySelector('main'); if (mm && !mm.id) mm.id = 'main';
+    var sk = document.createElement('a'); sk.className = 'skip'; sk.href = '#main'; sk.textContent = 'Skip to content';
+    document.body.insertBefore(sk, document.body.firstChild);
+  })();
+
   // ---- sidebar ----
   var nav = document.getElementById('toc');
   if (!nav) {
@@ -74,6 +81,7 @@
     var layout = document.querySelector('.layout');
     if (layout) layout.insertBefore(nav, layout.firstChild);
   }
+  nav.setAttribute('aria-label', 'Site contents');
   nav.textContent = '';
   var brand = el('a', 'brand', 'HLD Handbook');
   brand.href = base + 'index.html';
@@ -184,8 +192,8 @@
   var layoutEl = document.querySelector('.layout');
   if (layoutEl) {
     var bar = el('div', 'topbar');
-    var btn = el('button', null, '☰ Contents'); btn.type = 'button';
-    btn.addEventListener('click', function () { document.body.classList.toggle('nav-open'); });
+    var btn = el('button', null, '☰ Contents'); btn.type = 'button'; btn.setAttribute('aria-expanded', 'false');
+    btn.addEventListener('click', function () { var o = document.body.classList.toggle('nav-open'); btn.setAttribute('aria-expanded', o ? 'true' : 'false'); });
     bar.appendChild(btn);
     bar.appendChild(el('span', null, current >= 0 ? flat[current].it.t : 'HLD Handbook'));
     layoutEl.parentNode.insertBefore(bar, layoutEl);
