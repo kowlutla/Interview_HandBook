@@ -32,7 +32,7 @@
       var isCase = (it.id.indexOf('c') === 0 && /^c\d\d-/.test(it.id));
       var isCheat = it.id.indexOf('cs-') === 0;
       var label;
-      if (isCase) label = it.id.slice(1, 3);
+      if (isCase) label = 'C' + it.id.slice(1, 3);
       else if (isCheat) label = '★';
       else if (it.id.indexOf('ref-') === 0) label = 'A–Z';
       else label = it.id.slice(0, 2);
