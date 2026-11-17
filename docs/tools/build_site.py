@@ -244,6 +244,14 @@ write(os.path.join(QN, 'index.html'), qindex)
 IV = os.path.join(ROOT, 'interview')
 INT_TOPICS = [  # slug, short title. Order = reading order. Only topics whose page exists are built.
     ('git', 'Git'),
+    ('java-fundamentals', 'Java: Language and OOP'),
+    ('java-collections', 'Java: Collections'),
+    ('java-concurrency', 'Java: Concurrency'),
+    ('java-jvm', 'Java: JVM, Memory and GC'),
+    ('java-modern', 'Java: 8 to 21 Features'),
+    ('java-exceptions-io', 'Java: Exceptions, Generics and I/O'),
+    ('spring-framework', 'Spring Framework'),
+    ('spring-boot', 'Spring Boot'),
     ('maven-gradle', 'Maven and Gradle'),
     ('ci-cd', 'CI/CD'),
     ('docker-kubernetes', 'Docker, Kubernetes and Helm'),
