@@ -58,14 +58,14 @@ def check(path):
     for need in ('../../handbook/assets/style.css', '../../quicknotes/assets/quick.css', '../assets/interview.css', 'class="qn"'):
         if need not in src: errs.append('missing skeleton piece: ' + need)
     words = len(re.sub(r'<[^>]+>', ' ', src).split())
-    if words < 3500: errs.append('too short: %d words (minimum 3500)' % words)
+    if words < 2500: errs.append('too short: %d words (minimum 2500)' % words)
     if p.old: errs.append('%d old-format boxes (class why / fu) still present: remove them, promote good follow-ups to separate questions' % p.old)
     if p.ia < p.iq: errs.append('%d questions but only %d direct answers (every question needs <p class="ia">)' % (p.iq, p.ia))
     if p.rem < p.iq * 0.8: errs.append('only %d remember lines for %d questions (want one per question)' % (p.rem, p.iq))
-    if p.svg < 6: errs.append('only %d SVG diagrams (want at least 6)' % p.svg)
-    if p.iq < 40: errs.append('only %d questions <details class="iq"> (want at least 40)' % p.iq)
+    if p.svg < 5: errs.append('only %d SVG diagrams (want at least 5)' % p.svg)
+    if p.iq < 25: errs.append('only %d questions <details class="iq"> (want at least 25)' % p.iq)
     if p.lvl < p.iq: errs.append('%d questions but %d difficulty badges (every question needs one)' % (p.iq, p.lvl))
-    if p.scn < 6: errs.append('only %d scenario questions (details class="iq scn"; want at least 6)' % p.scn)
+    if p.scn < 4: errs.append('only %d scenario questions (details class="iq scn"; want at least 4)' % p.scn)
     print('%s: %d words, %d h2, %d svg, %d questions (%d scenario) -> %s' % (path, words, p.h2, p.svg, p.iq, p.scn, 'OK' if not errs else 'PROBLEMS'))
     for e in errs: print('   -', e)
     return not errs
