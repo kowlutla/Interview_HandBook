@@ -269,18 +269,34 @@ INT_TOPICS = [  # slug, short title. Order = reading order. Only topics whose pa
 INT_TOPICS = [t for t in INT_TOPICS if os.path.exists(os.path.join(IV, 'topics', t[0] + '.html'))]
 
 
+IV_GROUPS = [  # (group title, [slugs]); a group is shown only if it has built pages
+    ('Orientation', ['git']),
+    ('Java', ['java-fundamentals', 'java-collections', 'java-concurrency', 'java-jvm', 'java-modern', 'java-exceptions-io']),
+    ('Spring and Persistence', ['spring-framework', 'spring-boot', 'hibernate-jpa', 'sql-databases']),
+    ('Build and Delivery', ['maven-gradle', 'ci-cd', 'docker-kubernetes']),
+    ('Messaging, Caching and Search', ['kafka', 'redis-caching', 'elasticsearch']),
+    ('Architecture', ['microservices-rest', 'distributed-systems', 'design-patterns-lld']),
+    ('Data Engineering', ['data-engineering', 'spark']),
+]
+IV_QN = {'redis-caching': 'q04-caching', 'distributed-systems': 'q07-distributed-theory', 'microservices-rest': 'q10-microservices',
+         'kafka': 'q08-async', 'sql-databases': 'q05-data-stores', 'design-patterns-lld': 'q12-algorithms'}
+
+
 def iv_nav(cur, pre):
     """pre = relative prefix from the page to the interview root ('' for the index, '../' for topic pages)."""
     site = pre + '../'
+    ctx = ''
+    if cur in IV_QN:
+        ctx = '<a class="ctx" href="%squicknotes/notes/%s.html">📖 Related Quick Notes sheet</a>' % (site, IV_QN[cur])
     o = ['<a class="brand" href="%sindex.html">Interview Book</a>' % pre,
          '<div class="tagline">Questions with model answers, diagrams and real scenarios</div>',
-         '<div class="qlinks"><a href="%sindex.html">\U0001F3E0 Home</a><a href="%ssearch.html">\U0001F50D Search the whole site</a></div>' % (site, site)]
-    body = []
-    java_done = False
+         '<div class="qlinks">%s<a href="%sindex.html">🏠 Home</a><a href="%ssearch.html">🔍 Search the whole site</a></div>' % (ctx, site, site)]
+    titles = dict(INT_TOPICS)
 
-    def item(slug, title):
+    def item(slug, title, label):
         cls = 'ch current' if slug == cur else 'ch'
-        s = ['<a class="%s" href="%stopics/%s.html"><span>%s</span></a>' % (cls, pre, slug, esc(title))]
+        num = '<span class="num">%s</span>' % label if label else ''
+        s = ['<a class="%s" href="%stopics/%s.html">%s<span>%s</span></a>' % (cls, pre, slug, num, esc(title))]
         if slug == cur:
             heads = re.findall(r'<h2 id="([^"]+)"[^>]*>(.*?)</h2>', read(os.path.join(IV, 'topics', slug + '.html')), re.S)
             if heads:
@@ -289,18 +305,22 @@ def iv_nav(cur, pre):
                 s.append('</div>')
         return '\n'.join(s)
 
-    for slug, title in INT_TOPICS:
-        if slug.startswith('java-'):
-            if java_done: continue
-            java_done = True
-            parts = [(s, t.split(': ', 1)[-1]) for s, t in INT_TOPICS if s.startswith('java-')]
-            opened = ' open' if cur == 'java-hub' or cur in [s for s, _ in parts] else ''
+    n = 0
+    first = True
+    for gtitle, slugs in IV_GROUPS:
+        slugs = [x for x in slugs if x in titles]
+        if not slugs: continue
+        body = []
+        if gtitle == 'Java':
             hub_cls = 'ch current' if cur == 'java-hub' else 'ch'
-            inner = ['<a class="%s" href="%sjava.html"><span>Java overview</span></a>' % (hub_cls, pre)] + [item(s, t) for s, t in parts]
-            body.append('<details%s><summary>Java</summary>\n%s\n</details>' % (opened, '\n'.join(inner)))
-            continue
-        body.append(item(slug, title))
-    o.append('<details open><summary>Interview questions</summary>\n%s\n</details>' % '\n'.join(body))
+            body.append('<a class="%s" href="%sjava.html"><span>Java overview</span></a>' % (hub_cls, pre))
+        for x in slugs:
+            n += 1
+            t = titles[x].split(': ', 1)[-1] if x.startswith('java-') else titles[x]
+            body.append(item(x, t, '%02d' % n))
+        is_open = (cur is None and first) or cur in slugs or (gtitle == 'Java' and cur == 'java-hub')
+        first = False
+        o.append('<details%s><summary>%s</summary>\n%s\n</details>' %(' open' if is_open else '', esc(gtitle), '\n'.join(body)))
     return '\n'.join(o)
 
 
