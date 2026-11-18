@@ -129,7 +129,7 @@ def nav_html(cur, pre):
             if heads:
                 s.append('<div class="onpage">')
                 for hid, ht in heads:
-                    s.append('<a href="#%s">%s</a>' % (hid, esc(re.sub(r'<[^>]+>', '', ht).strip())))
+                    s.append('<a href="#%s">%s</a>' % (hid, esc(html.unescape(re.sub(r'<[^>]+>', '', ht).strip()))))
                 s.append('</div>')
         return ''.join(s) if False else '\n'.join(s)
 
@@ -321,7 +321,7 @@ def iv_nav(cur, pre):
             heads = re.findall(r'<h2 id="([^"]+)"[^>]*>(.*?)</h2>', read(os.path.join(IV, 'topics', slug + '.html')), re.S)
             if heads:
                 s.append('<div class="onpage">')
-                for hid, ht in heads: s.append('<a href="#%s">%s</a>' % (hid, esc(re.sub(r'<[^>]+>', '', ht).strip())))
+                for hid, ht in heads: s.append('<a href="#%s">%s</a>' % (hid, esc(html.unescape(re.sub(r'<[^>]+>', '', ht).strip()))))
                 s.append('</div>')
         return '\n'.join(s)
 
