@@ -26,10 +26,21 @@ for d, _, fs in os.walk(ROOT):
     for f in fs:
         if f.endswith('.html'):
             p = P()
-            p.feed(open(os.path.join(d, f), encoding='utf-8').read())
+            raw = open(os.path.join(d, f), encoding='utf-8').read()
+            p.feed(raw)
+            p.raw = raw
             pages[os.path.normpath(os.path.join(d, f))] = p
 
 errs = 0
+# stray authoring markers and double-escaped entities (visible garbage in the rendered page)
+LEAKS = [(re.compile(r'^@[a-z]+[ 	]*$', re.M), 'stray marker line'),
+         (re.compile(r'&amp;(amp|lt|gt|quot|nbsp);'), 'double-escaped entity'),
+         (re.compile(r'(TODO|FIXME)'), 'TODO/FIXME left in page')]
+for path, p in sorted(pages.items()):
+    for rx, what in LEAKS:
+        m = rx.search(p.raw)
+        if m:
+            print('LEAK   ', os.path.relpath(path, ROOT), '->', what, repr(m.group(0)[:30])); errs += 1
 for path, p in sorted(pages.items()):
     for l in p.links:
         if re.match(r'(https?:|mailto:|data:|javascript:|/)', l): continue
