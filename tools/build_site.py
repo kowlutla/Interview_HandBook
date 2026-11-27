@@ -3597,7 +3597,7 @@ DSA_PROBLEM_NOTES = {
     },
     "sum-of-xor-of-all-pairs": {
         "intuition": "<p>Sum XOR over all unordered pairs i&lt;j. For each bit, pairs differ when one value has the bit set and the other does not.</p>",
-        "steps": "<p>For each bit b, count ones and zeros; add ones*zeros*(1L<<b) to the total.</p>",
+        "steps": "<p>For each bit b, count ones and zeros; add ones*zeros*(1L&lt;&lt;b) to the total.</p>",
         "trace": "<p>At a bit with 2 ones and 3 zeros, 6 unordered pairs contribute that bit's weight.</p>",
         "proof": "<p>Each unordered pair contributes 2^b exactly when its two bits differ. There are ones*zeros such pairs at that position; summing independent bit contributions gives the total XOR sum.</p>",
         "complexity": "<p>O(w*n) time and O(1) extra space.</p>",
