@@ -41,7 +41,7 @@ def check(path):
     if p.stack: p.errors.append('unclosed tags: ' + repr(p.stack[-5:]))
     topics_root = os.path.join(ROOT, 'site', 'dsa', 'topics')
     relative_to_topics = os.path.relpath(full, topics_root)
-    is_problem = os.path.dirname(relative_to_topics) != '.'
+    is_problem = bool(os.path.dirname(relative_to_topics))
     is_foundations = full.endswith(os.path.join('topics', 'foundations.html'))
     if p.problems < 1 and not is_foundations: p.errors.append('no DSA problem article found')
     if is_problem and p.h2 < 5: p.errors.append('problem page should contain its problem title and detailed sections')
