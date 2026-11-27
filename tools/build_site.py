@@ -4198,6 +4198,23 @@ DSA_PROBLEM_NOTES = {
         "complexity": "<p>T(N)=2T(N-1)+1, so 2^N-1 moves; O(N) recursion depth.</p>",
         "edge": "<p>Test N=1 and N=0 contract. Output size is exponential; use long for move count when N is within supported range.</p>",
     },
+
+    "isomorphic-strings": {
+        "intuition": "<p>Two strings are isomorphic when there is a one-to-one character mapping from the first string to the second that preserves positions. Maintain mappings in both directions to prevent two source characters mapping to the same target.</p>",
+        "steps": "<ol><li>If lengths differ, return false.</li><li>Maintain source-to-target and target-to-source maps, initially unset.</li><li>For each character pair, verify any existing mappings agree.</li><li>If neither is mapped, record both directions.</li><li>Return true if all positions are consistent.</li></ol>",
+        "trace": "<p>\"egg\" and \"add\" map e→a and g→d, so they are isomorphic. \"foo\" and \"bar\" fail because both o characters would need to map to different target characters.</p>",
+        "proof": "<p>A valid isomorphism must be a function and injective: each source character has one target, and each target has at most one source. Checking both mapping directions at every position enforces these conditions across the complete strings.</p>",
+        "complexity": "<p>O(n) time and O(1) auxiliary space for a fixed 256-character alphabet; O(Σ) mapping space for alphabet size Σ.</p>",
+        "edge": "<p>Test unequal lengths, identical strings, repeated characters, one-to-many conflict and many-to-one conflict. The source uses 256-entry arrays, so it assumes an 8-bit character domain; Unicode requires a map keyed by code points/characters.</p>",
+    },
+    "number-following-a-pattern": {
+        "intuition": "<p>Build the smallest number using distinct digits 1..9 that satisfies a sequence of I (increase) and D (decrease) constraints. A run of D characters requires a descending block; an I boundary ends the current block.</p>",
+        "steps": "<ol><li>Scan the pattern plus one virtual final boundary.</li><li>Maintain the next unused digit.</li><li>When an I or the end is reached, fill the current unresolved block backward with increasing digits.</li><li>Continue after the boundary and return the constructed digit string.</li></ol>",
+        "trace": "<p>For pattern \"D\", the minimum number is \"21\". For \"IID\", the answer is \"1243\": the first two increases are followed by a decrease.</p>",
+        "proof": "<p>Every consecutive D run requires its digits to appear in descending order. Filling each such block with the smallest available consecutive digits in reverse order satisfies all D constraints; ending the block at I boundaries preserves increasing transitions and yields the lexicographically/numerically smallest valid arrangement.</p>",
+        "complexity": "<p>O(n) time and O(n) output space for pattern length n.</p>",
+        "edge": "<p>Test empty pattern (single digit 1), all I, all D, alternating pattern and maximum length 8 because digits 1..9 cannot repeat. Validate input contains only I and D.</p>",
+    },
 }
 def generate_dsa_topics():
     """Generate complete topic pages from the checked-out kowlutla/DSA source."""
