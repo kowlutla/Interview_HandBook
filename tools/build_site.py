@@ -4216,6 +4216,31 @@ DSA_PROBLEM_NOTES = {
         "edge": "<p>Test empty pattern (single digit 1), all I, all D, alternating pattern and maximum length 8 because digits 1..9 cannot repeat. Validate input contains only I and D.</p>",
     },
 }
+DSA_PATTERN_CURATED_PAGES = {
+    'AlphaHillPattern.java': 'alpha-hill',
+    'AlphaRampPattern.java': 'alphabet-ramp',
+    'AlphaTrianglePattern.java': 'descending-alpha-triangle',
+    'BinaryNumberTrianglePattern.java': 'binary-number-triangle',
+    'DiamondStarPattern.java': 'diamond-star',
+    'HalfDiamondStarPattern.java': 'half-diamond',
+    'HollowRectanglePattern.java': 'hollow-square',
+    'IncreasingLetterTrianglePattern.java': 'increasing-letter-triangle',
+    'IncreasingNumberTrianglePattern.java': 'floyd-triangle',
+    'InvertedNumberedRightPyramid.java': 'inverted-number-triangle',
+    'InvertedRightPyramid.java': 'inverted-right-triangle',
+    'InvertedStarPyramid.java': 'inverted-star-pyramid',
+    'NumberCrownPattern.java': 'number-crown',
+    'RectanglePattern.java': 'solid-square',
+    'ReverseLetterTrianglePattern.java': 'reverse-letter-triangle',
+    'RightAngleTriangle.java': 'right-angle-star',
+    'RightAngledNumberPyramid.java': 'ascending-number-triangle',
+    'RightAngledNumberPyramid2.java': 'repeated-row-number',
+    'StarPyramid.java': 'star-pyramid',
+    'SymmetricButterflyPattern.java': 'symmetric-butterfly',
+    'SymmetricVoidPattern.java': 'symmetric-void',
+    'TheNumberPattern.java': 'concentric-number-square',
+}
+
 def generate_dsa_topics():
     """Generate complete topic pages from the checked-out kowlutla/DSA source."""
     if not os.path.isdir(DSA_SOURCE):
@@ -4268,17 +4293,28 @@ def generate_dsa_topics():
             detail_dir = os.path.join(DSA, 'topics', slug)
             os.makedirs(detail_dir, exist_ok=True)
             detail_path = os.path.join(detail_dir, problem_slug + '.html')
-            write(detail_path, dsa_problem_page(slug, title, number, problem_slug, problem_title, source_files))
+            if not (slug == 'patterns' and problem_slug in DSA_PATTERN_CURATED_PAGES.values()):
+                write(detail_path, dsa_problem_page(slug, title, number, problem_slug, problem_title, source_files))
             detail_href = slug + '/' + problem_slug + '.html'
+            curated_pattern_links = ''
+            if slug == 'patterns':
+                curated_slugs = [DSA_PATTERN_CURATED_PAGES[os.path.basename(path)]
+                                 for path in source_paths
+                                 if os.path.basename(path) in DSA_PATTERN_CURATED_PAGES]
+                if curated_slugs:
+                    curated_pattern_links = '<p class="dsa-code-note"><b>Detailed pattern walkthroughs:</b> ' + ' · '.join(
+                        '<a href="patterns/%s.html">Open walkthrough %02d</a>' % (curated_slug, index)
+                        for index, curated_slug in enumerate(curated_slugs, 1)
+                    ) + '</p>'
             cards.append(
                 '<article class="dsa-problem-card dsa-problem-summary" id="%s">'
                 '<div class="dsa-card-head"><div><span class="dsa-number">%02d</span>'
                 '<span class="dsa-topic">%s</span></div></div>'
                 '<h3><a href="%s">%02d - %s</a></h3><p>%s</p>'
                 '<p class="dsa-code-note"><b>Original source:</b> %s</p>'
-                '<p><a href="%s">Open full problem page →</a></p></article>' %
+                '<p><a href="%s">Open full problem page →</a></p>%s</article>' %
                 (problem_slug, number, esc(title.upper()), esc(detail_href), number,
-                 esc(problem_title), esc(summary[:500]), source_links, esc(detail_href))
+                 esc(problem_title), esc(summary[:500]), source_links, esc(detail_href), curated_pattern_links)
             )
 
         foundation_content = ''
