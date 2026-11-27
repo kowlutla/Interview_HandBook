@@ -777,6 +777,47 @@ DSA_PROBLEM_NOTES = {
         'complexity': '<p>O(V+E) time and O(V) auxiliary space for visited state, stack and recursion. This implementation assumes a DAG; it does not detect cycles.</p>',
         'edge': '<p>Test isolated vertices, disconnected DAGs, a chain, multiple valid orders and a directed cycle that violates the precondition.</p>'
     }
+,
+    "a1-largest-number-in-array": {
+        "intuition": "<p>The maximum is the largest value seen so far. One scan compares each element with the current candidate exactly once.</p>",
+        "steps": "<ol><li>Initialize the candidate from the first element.</li><li>Scan the remaining values.</li><li>Replace the candidate whenever a larger value appears.</li><li>Return the candidate.</li></ol>",
+        "trace": "<p>For <code>[5,10,3,8,15]</code>, the candidate changes 5 → 10 → 15. The answer is 15.</p>",
+        "proof": "<p>After each iteration, the candidate is the maximum of the prefix processed so far. At termination that prefix is the entire array.</p>",
+        "complexity": "<p>O(n) time and O(1) auxiliary space.</p>",
+        "edge": "<p>The implementation reads <code>arr[0]</code>, so empty input needs a guard. Test one element, negative values, duplicate maxima and sorted/reverse-sorted input.</p>",
+    },
+    "a2-second-largest-and-smallest-numbers": {
+        "intuition": "<p>Maintain the best and second-best candidates for both directions during one scan. The stated contract requires unique, non-negative values.</p>",
+        "steps": "<ol><li>Initialize largest and second-largest candidates below the valid range, and smallest candidates above it.</li><li>Update the largest pair for each value.</li><li>Independently update the smallest pair.</li><li>Return second-largest followed by second-smallest.</li></ol>",
+        "trace": "<p>For <code>[1,2,3,4,5]</code>, the largest pair is 5 and 4; the smallest pair is 1 and 2. Return <code>[4,2]</code>.</p>",
+        "proof": "<p>Each update preserves the two best distinct values seen so far. A new extreme displaces the old extreme into second place; otherwise it may improve only the second candidate.</p>",
+        "complexity": "<p>O(n) time and O(1) auxiliary space.</p>",
+        "edge": "<p>The source initializes largest candidates to -1, which relies on non-negative input. Fewer than two values cannot provide both answers. Clarify whether duplicates count as distinct ranks if the contract changes.</p>",
+    },
+    "a3-check-array-sorted-or-not": {
+        "intuition": "<p>A non-decreasing array has no adjacent inversion. Checking neighbouring pairs is sufficient; comparing all pairs is unnecessary.</p>",
+        "steps": "<ol><li>Visit indices 0 through n-2.</li><li>If <code>arr[i] &gt; arr[i+1]</code>, return false.</li><li>If no inversion exists, return true.</li></ol>",
+        "trace": "<p><code>[10,20,30,40]</code> has no inversion and returns true. <code>[90,80,100,70]</code> fails at 90 &gt; 80 and returns false.</p>",
+        "proof": "<p>If every adjacent pair is ordered, transitivity implies every earlier element is no greater than every later element. One adjacent inversion disproves sortedness.</p>",
+        "complexity": "<p>O(n) worst-case time and O(1) auxiliary space; the scan exits early on the first inversion.</p>",
+        "edge": "<p>Empty and one-element arrays are sorted by convention. Equal neighbours are allowed: the requirement is non-decreasing, not strictly increasing.</p>",
+    },
+    "a3-check-rotated-array-is-sorted-or-not": {
+        "intuition": "<p>A sorted array viewed cyclically has at most one descent (a position where the next value is smaller), including the wraparound pair from the last value to the first.</p>",
+        "steps": "<ol><li>Compare every value with its cyclic successor.</li><li>Count positions where the current value is greater than the next.</li><li>Return false as soon as the count exceeds one; otherwise return true.</li></ol>",
+        "trace": "<p><code>[3,4,5,1,2]</code> has one descent (5 to 1), so it is valid. <code>[2,1,3,4]</code> has two cyclic descents and is invalid.</p>",
+        "proof": "<p>Rotating a non-decreasing sequence introduces at most one boundary where the maximum suffix meets the minimum prefix. If there is at most one cyclic descent, starting after it produces a non-decreasing traversal.</p>",
+        "complexity": "<p>O(n) time and O(1) auxiliary space.</p>",
+        "edge": "<p>Duplicates do not count as descents. Guard empty input before modulo; one-element and all-equal arrays are valid.</p>",
+    },
+    "a4-remove-duplicates-from-sorted-array": {
+        "intuition": "<p>Sorted duplicates are adjacent. A write pointer compacts each newly encountered distinct value into the prefix while a read pointer scans the input.</p>",
+        "steps": "<ol><li>Return 0 for an empty array.</li><li>Keep the first value and set the next write position to 1.</li><li>Scan the remaining values; when one differs from the last retained value, write it and advance the write pointer.</li><li>Return the number of retained values. Only that prefix is meaningful.</li></ol>",
+        "trace": "<p>For <code>[1,2,2,4]</code>, retain 1, retain the first 2, skip the duplicate 2, then retain 4. The prefix is <code>[1,2,4]</code>; return 3.</p>",
+        "proof": "<p>Before each read step, the written prefix contains exactly the distinct values in the processed input prefix, in sorted order. Writing only when the value differs from the last retained value preserves uniqueness.</p>",
+        "complexity": "<p>O(n) time and O(1) auxiliary space; the input is modified in place.</p>",
+        "edge": "<p>Test empty, one-element, all-equal and all-distinct arrays, plus duplicates at either end. Ignore the stale suffix beyond the returned length. The algorithm requires sorted input.</p>",
+    },
 }
 def generate_dsa_topics():
     """Generate complete topic pages from the checked-out kowlutla/DSA source."""
