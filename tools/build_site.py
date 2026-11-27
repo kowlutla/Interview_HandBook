@@ -519,6 +519,10 @@ top = '''<!DOCTYPE html>
 <div class="two2">
 %(ivcard)s
 </div>
+<h2>DSA</h2>
+<div class="two2">
+%(dsacard)s
+</div>
 <div class="how"><b>Suggested use:</b> for system design, read the Handbook chapter first, then the matching Quick Notes sheet to lock it in; in the final two days read only the Quick Notes. For everything else, work through the Interview Book topic by topic: answer each question out loud before you open it.</div>
 <h2>Jump straight to</h2>
 <div class="quick">
@@ -535,6 +539,7 @@ top = '''<!DOCTYPE html>
 </body>
 </html>
 ''' % dict(np=n_pages, hw=round(hand_words / 1000), nm=len(mods), nc=len(cases), tq=tq,
-    ivcard=('<a class="big" href="interview/index.html"><span class="k">Practise</span><span class="t">Interview Book</span><span class="d">Interview questions topic by topic (Git, Java, DSA, Spring, Kafka and more) with model answers, diagrams, follow-ups and real production scenarios.</span><span class="m">%d topics, %d questions</span></a>' % (len(mods), iv_q)) if INT_TOPICS else '')
+    ivcard=('<a class="big" href="interview/index.html"><span class="k">Practise</span><span class="t">Interview Book</span><span class="d">Interview questions topic by topic (Git, Java, Spring, Kafka and more) with model answers, diagrams, follow-ups and real production scenarios.</span><span class="m">%d topics, %d questions</span></a>' % (len(mods), iv_q)) if INT_TOPICS else '',
+    dsacard=('<a class="big" href="interview/dsa.html"><span class="k">Practise</span><span class="t">Data Structures and Algorithms</span><span class="d">Java coding problems organized by topic and pattern, with intuition, optimized solutions, dry runs and complexity analysis.</span><span class="m">%d topic pages, %d problems</span></a>' % (len(HUB_PARTS.get('dsa', [])), sum(iv_stats[x]['q'] for x, _ in HUB_PARTS.get('dsa', [])))) if HUB_PARTS.get('dsa') else '')
 write(os.path.join(ROOT, 'index.html'), top)
 print('built: %d quicknotes pages, %d words, %d Q&As, %d diagrams; handbook %d pages' % (len(items), tw, tq, ts, n_pages))
