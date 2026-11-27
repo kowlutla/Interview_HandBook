@@ -339,7 +339,7 @@ def iv_nav(cur, pre):
             body.append('<a class="%s" href="%s%s.html"><span>%s overview</span></a>' % (hub_cls, pre, hub[0], hub[1]))
         for x in slugs:
             n += 1
-            t = titles[x].split(': ', 1)[-1] if x.startswith(('java-', 'hld-')) else titles[x]
+            t = titles[x].split(': ', 1)[-1] if x.startswith(('java-', 'hld-', 'dsa-')) else titles[x]
             body.append(item(x, t, '%02d' % n))
         is_open = (cur is None and first) or cur in slugs or (hub is not None and cur == hub[0] + '-hub')
         first = False
@@ -353,7 +353,7 @@ for i, (slug, title) in enumerate(INT_TOPICS):
     s = read(p)
     s = re.sub(r'<!--qnav:start-->.*?<!--qnav:end-->\n?', '', s, flags=re.S)
     s = re.sub(r'<!--qfoot:start-->.*?<!--qfoot:end-->\n?', '', s, flags=re.S)
-    iv_stats[slug] = dict(q=s.count('<details class="iq'), svg=len(re.findall(r'<svg[^>]*viewBox', s)),
+    iv_stats[slug] = dict(q=s.count('<details class="iq') + s.count('<details class="dsa-problem'), svg=len(re.findall(r'<svg[^>]*viewBox', s)),
                           words=len(re.sub(r'<[^>]+>', ' ', s).split()), sub=sub_of(p))
     pg = ['<div class="pager">']
     if i > 0: pg.append('<a class="prev" href="%s.html"><span class="lbl">Previous</span>%s</a>' % (INT_TOPICS[i - 1][0], esc(INT_TOPICS[i - 1][1])))
@@ -432,7 +432,7 @@ for hb in IV_HUBS.values():
 <script src="../quicknotes/assets/quick.js"></script>
 </body>
 </html>
-''' % (hb[1], iv_nav(hb[0] + '-hub', ''), hb[1], hb[1], len(JAVA_PARTS), len(JAVA_PARTS), jq, java_cards)
+''' % (hb[1], iv_nav(hb[0] + '-hub', ''), hb[1], hb[1], len(JAVA_PARTS), len(JAVA_PARTS), 'problems' if hb[0] == 'dsa' else 'questions', jq, java_cards)
     write(os.path.join(IV, hb[0] + '.html'), java_page)
 iv_index = '''<!DOCTYPE html>
 <html lang="en">
