@@ -585,12 +585,19 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
     if not method_html: method_html = '<p>No public method was detected. Review the constructors and public API below.</p>'
     topic_reasoning = DSA_TOPIC_GUIDES.get(topic_slug, '')
     trace_guide, proof_guide, edge_guide = DSA_TOPIC_TRACE_GUIDES.get(topic_slug, ('', '', ''))
+    problem_notes = DSA_PROBLEM_NOTES.get(problem_slug, {})
     comments = []
     for x in re.findall(r'//\s*(.+)', all_source):
         x = re.sub(r'\s+', ' ', x).strip()
         if len(x) > 12 and x not in comments: comments.append(x)
         if len(comments) >= 7: break
     steps_html = '<ol>%s</ol>' % ''.join('<li>%s</li>' % esc(x) for x in comments) if comments else '<ol><li>Identify the input state and required output.</li><li>Trace the main loop or recursive state.</li><li>Explain the condition that advances the state and the termination condition.</li><li>Verify that every valid case is considered exactly as required.</li></ol>'
+    steps_html = problem_notes.get('steps', steps_html)
+    intuition_html = problem_notes.get('intuition', '<p>Identify the information the algorithm must retain, the repeated work it avoids, and the invariant it maintains.</p>' + topic_reasoning)
+    trace_html = problem_notes.get('trace', '<p>Use the documented sample above. Trace the selected method line by line and compare the final state with the expected output.</p>' + trace_guide)
+    proof_html = problem_notes.get('proof', '<p>Define an invariant before processing. Show that every transition preserves it and that the termination condition implies the required output.</p>' + proof_guide)
+    complexity_html = problem_notes.get('complexity', '<p>Derive time and auxiliary space separately for each implementation variant. Count loop iterations, recursive calls, collection operations, preprocessing and output storage.</p>')
+    edge_html = problem_notes.get('edge', edge_guide)
     source_links = []
     source_blocks = []
     for source_text, source_rel in source_files:
@@ -611,13 +618,13 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
 <section id="definition"><h2>1. Problem definition</h2>%(statement)s</section>
 <section id="examples"><h2>2. Examples</h2>%(examples)s</section>
 <section id="constraints"><h2>3. Constraints and assumptions</h2>%(constraints)s</section>
-<section id="intuition"><h2>4. Intuition and key observation</h2><p>Start from the operations demanded by the problem: search, count, order, compare, connect, construct or optimize. Identify which information must be retained while processing the input and which repeated work can be avoided. Evaluate the implementation against the exact contract and constraints above.</p>%(topic_reasoning)s<div class="dsa-insight"><span class="dsa-insight-icon">💡</span><div><b>Key question</b><p>What invariant does the algorithm maintain, and why does each state transition preserve it?</p></div></div></section>
+<section id="intuition"><h2>4. Intuition and key observation</h2>%(intuition_html)s<div class="dsa-insight"><span class="dsa-insight-icon">💡</span><div><b>Key question</b><p>What invariant does the algorithm maintain, and why does each state transition preserve it?</p></div></div></section>
 <section id="approach"><h2>5. Approach and implementation variants</h2>%(methods)s<h3>Step-by-step reading guide</h3>%(steps)s</section>
 <section id="solution"><h2>6. Java implementation</h2><p>Complete original Java source, including helper methods and comments. Evaluate each public method separately; variants may have different time and space trade-offs.</p><p><b>Original source files:</b> %(source_links)s</p>%(source_blocks)s</section>
-<section id="dry-run"><h2>7. Dry run and walkthrough</h2><p>Use the documented sample above. Trace the selected method line by line and compare the final state with the expected output. Where the source has no sample, first define tests from the confirmed problem contract rather than inventing constraints.</p>%(trace_guide)s</section>
-<section id="correctness"><h2>8. Correctness reasoning</h2><p>Define an invariant that is true before processing starts. Show that each loop iteration or recursive transition preserves it. At termination, connect the invariant to the required output. For recursion, justify the base case and show that every recursive branch makes progress toward it.</p>%(proof_guide)s</section>
-<section id="analysis"><h2>9. Complexity analysis</h2><p>Use method-level annotations above when present, then verify them against the actual implementation. Count loop iterations, recursive calls, collection operations, sorting and preprocessing.</p><div class="dsa-complexity"><div><small>TIME</small><strong>Per-method analysis</strong><p>Derive from the exact variant; do not assume all methods in one class have the same complexity.</p></div><div><small>AUXILIARY SPACE</small><strong>Per-method analysis</strong><p>Count extra collections, arrays and recursion depth. State whether output space is excluded.</p></div></div></section>
-<section id="edge-cases"><h2>10. Edge cases and common mistakes</h2>%(edge_guide)s<ul class="dsa-mistakes"><li>Empty and minimum-size inputs, if allowed.</li><li>Single-element input, duplicates and all-equal values.</li><li>Sorted, reverse-sorted and highly unbalanced inputs where relevant.</li><li>Negative values, zero, overflow and maximum constraints where relevant.</li><li>Null references, disconnected components, cycles or malformed structures where relevant.</li><li>Mutation, off-by-one errors and assumptions not enforced by the implementation.</li></ul></section>
+<section id="dry-run"><h2>7. Dry run and walkthrough</h2>%(trace_html)s</section>
+<section id="correctness"><h2>8. Correctness reasoning</h2>%(proof_html)s</section>
+<section id="analysis"><h2>9. Complexity analysis</h2>%(complexity_html)s</section>
+<section id="edge-cases"><h2>10. Edge cases and common mistakes</h2>%(edge_html)s<ul class="dsa-mistakes"><li>Empty and minimum-size inputs, if allowed.</li><li>Single-element input, duplicates and all-equal values.</li><li>Sorted, reverse-sorted and highly unbalanced inputs where relevant.</li><li>Negative values, zero, overflow and maximum constraints where relevant.</li><li>Null references, disconnected components, cycles or malformed structures where relevant.</li><li>Mutation, off-by-one errors and assumptions not enforced by the implementation.</li></ul></section>
 <section id="interview"><h2>11. Interview follow-ups</h2><ul><li>Explain the invariant without referring to code.</li><li>What is the brute-force baseline and what repeated work is removed?</li><li>Which constraints make this implementation valid?</li><li>Can the auxiliary space or worst-case time be improved?</li><li>How would you test this against a brute-force oracle?</li></ul></section>
 <p class="dsa-remember"><b>Revision checkpoint:</b> Restate the contract, explain the invariant, trace one example, justify correctness and derive complexity for the exact method.</p></article>
 <div class="dsa-page-actions"><a href="../%(topic_slug)s.html">← Back to %(topic)s</a><a href="../../../search.html">Search the whole site</a></div>
@@ -625,7 +632,7 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
         'problem': esc(problem_title), 'topic': esc(topic_title), 'topic_slug': topic_slug,
         'topic_upper': esc(topic_title.upper()), 'number': number, 'entry_kind': entry_kind, 'description': esc(description),
         'statement': statement_html, 'examples': examples_html, 'constraints': constraints_html,
-        'methods': method_html, 'steps': steps_html, 'topic_reasoning': topic_reasoning, 'trace_guide': trace_guide, 'proof_guide': proof_guide, 'edge_guide': edge_guide, 'source_links': ' · '.join(source_links),
+        'methods': method_html, 'steps': steps_html, 'topic_reasoning': topic_reasoning, 'trace_guide': trace_guide, 'proof_guide': proof_guide, 'edge_guide': edge_guide, 'intuition_html': intuition_html, 'trace_html': trace_html, 'proof_html': proof_html, 'complexity_html': complexity_html, 'edge_html': edge_html, 'source_links': ' · '.join(source_links),
         'source_blocks': ''.join(source_blocks)
     }
 
