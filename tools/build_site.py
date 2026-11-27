@@ -542,6 +542,387 @@ DSA_TOPIC_GUIDES = {
     'dynamic_programming': '<section class="dsa-section"><h2>DP design framework</h2><ul><li>Define a state that contains exactly the information needed to make future decisions; write the recurrence before coding.</li><li>Base cases represent the smallest subproblems. Tabulation order must ensure every dependency is already computed.</li><li>Memoization avoids recomputing states; tabulation makes evaluation order explicit. Both should represent the same recurrence.</li><li>Space optimization is valid only when discarded states are no longer needed. For 0/1 knapsack, one-dimensional updates run backward; for unbounded choices, update direction may differ.</li><li>Count states and transitions to derive time and space complexity instead of guessing from the code shape.</li></ul></section>'
 }
 
+def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_title, source, source_rel):
+    """Create one standalone study page per Java source file."""
+    doc = re.match(r'\s*/\*\*(.*?)\*/', source, re.S)
+    lines = []
+    if doc:
+        for line in doc.group(1).splitlines():
+            line = re.sub(r'^\s*\* ?', '', line).strip()
+            if line and not line.startswith('@') and not re.match(r'author\b', line, re.I):
+                lines.append(re.sub(r'\s+', ' ', line))
+    statement, examples, constraints = [], [], []
+    mode = 'statement'
+    for line in lines:
+        low = line.lower()
+        if re.match(r'(example|sample input|sample output)', low):
+            mode = 'examples'
+        elif re.match(r'(constraints?|expected time|expected space|time complexity|space complexity)', low):
+            mode = 'constraints'
+        (statement if mode == 'statement' else examples if mode == 'examples' else constraints).append(line)
+    method_pattern = re.compile(r'(?:(/\*\*.*?\*/)\s*)?(public\s+(?:static\s+)?(?:[\w<>\[\], ?]+\s+)+(\w+)\s*\([^;{}]*\)\s*\{)', re.S)
+    methods = []
+    for m in method_pattern.finditer(source):
+        if m.group(3) == 'main': continue
+        doc_text = m.group(1) or ''
+        desc = []
+        for line in re.sub(r'^/\*\*|\*/
+    """Generate complete topic pages from the checked-out kowlutla/DSA source."""
+    if not os.path.isdir(DSA_SOURCE):
+        print('DSA source checkout not found; building the checked-in Strings prototype only.')
+        return [('strings', 'Strings')], {'strings': [
+            ('isomorphic-strings', 'Isomorphic Strings'),
+            ('minimum-number-following-pattern', 'Minimum Number Following an I/D Pattern')
+        ]}
+
+    catalog = {}
+    for slug, title, description, patterns in DSA_TOPIC_CONFIG:
+        folder = os.path.join(DSA_SOURCE, slug)
+        if slug == 'foundations':
+            files = []
+        else:
+            if not os.path.isdir(folder):
+                continue
+            files = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith('.java')]
+        if slug == 'arrays':
+            files = [p for p in files if os.path.basename(p) not in DSA_MATRIX_FILES]
+        if slug == 'matrix':
+            array_folder = os.path.join(DSA_SOURCE, 'arrays')
+            files += [os.path.join(array_folder, f) for f in DSA_MATRIX_FILES
+                      if os.path.isfile(os.path.join(array_folder, f))]
+        files.sort(key=lambda p: [int(x) if x.isdigit() else x.lower()
+                                  for x in re.split(r'(\d+)', os.path.basename(p))])
+        catalog[slug] = [(dsa_slug(os.path.basename(p)), dsa_title(os.path.basename(p)), p)
+                         for p in files]
+        if slug == 'strings':
+            catalog[slug] = [
+                ('isomorphic-strings', 'Isomorphic Strings', os.path.join(folder, 'IsomorphicStrings.java')),
+                ('minimum-number-following-pattern', 'Minimum Number Following an I/D Pattern', os.path.join(folder, 'NumberFollowingAPattern.java'))
+            ]
+
+        if slug == 'strings':
+            continue  # The two Strings problems have individually authored teaching pages.
+
+        cards = []
+        for number, (problem_slug, problem_title, source_path) in enumerate(catalog[slug], 1):
+            source = read(source_path)
+            rel_source = os.path.relpath(source_path, DSA_SOURCE).replace(os.sep, '/')
+            summary = esc(dsa_source_summary(source, problem_title))
+            class_match = re.search(r'\bclass\s+([A-Za-z_$][\w$]*)', source)
+            type_name = class_match.group(1) if class_match else os.path.basename(source_path)[:-5]
+            source_url = 'https://github.com/kowlutla/DSA/blob/main/src/com/dsa/' + rel_source.replace(os.sep, '/').replace(' ', '%20')
+            cards.append(
+                '<article class="dsa-problem-card dsa-problem-summary" id="%s">'
+                '<div class="dsa-card-head"><div><span class="dsa-number">%02d</span>'
+                '<span class="dsa-topic">%s</span></div></div>'
+                '<h3>%02d - %s</h3><p>%s</p>'
+                '<p class="dsa-code-note"><b>Source:</b> <a href="%s"><code>%s</code></a> · '
+                '<b>Java type:</b> <code>%s</code></p>'
+                '<details class="dsa-source"><summary>View original Java implementation</summary>'
+                '<pre class="dsa-code"><code>%s</code></pre></details></article>' %
+                (problem_slug, number, esc(title.upper()), number, esc(problem_title), summary,
+                 source_url, esc(rel_source), esc(type_name), esc(source))
+            )
+
+        foundation_content = ''
+        if slug == 'foundations':
+            foundation_content = """<section class="dsa-section">
+<h2>1. What DSA means</h2>
+<p><b>Data structures</b> organize information; <b>algorithms</b> define the steps that transform it into an answer. Choose them together: the right structure makes the operations required by the algorithm efficient.</p>
+<h2>2. A repeatable problem-solving workflow</h2>
+<ol><li><b>Clarify the contract:</b> inputs, outputs, duplicates, ordering, mutation, null/empty cases and whether one or all answers are required.</li><li><b>Read the constraints:</b> estimate the largest input and rule out approaches that cannot finish in time or memory.</li><li><b>Build a correct baseline:</b> use a simple approach to understand the search space before optimizing.</li><li><b>Find repeated work:</b> look for rescans, recomputed prefixes, duplicate states and expensive membership checks.</li><li><b>Choose a pattern and data structure:</b> base the choice on required operations, not familiarity.</li><li><b>State an invariant:</b> explain what remains true after each iteration or recursive call.</li><li><b>Prove and test:</b> justify coverage and correctness, then test boundary cases and derive complexity.</li></ol>
+<h2>3. Complexity analysis</h2>
+<p>Big-O describes an asymptotic upper bound on growth; Big-Theta is a tight bound and Big-Omega is a lower bound. Ignore constants and lower-order terms when comparing growth, but keep input assumptions explicit.</p>
+<table><thead><tr><th>Complexity</th><th>Typical example</th><th>Growth</th></tr></thead><tbody><tr><td><code>O(1)</code></td><td>Array access by index</td><td>Constant</td></tr><tr><td><code>O(log n)</code></td><td>Binary search</td><td>Problem size shrinks by a factor</td></tr><tr><td><code>O(n)</code></td><td>One traversal</td><td>Linear</td></tr><tr><td><code>O(n log n)</code></td><td>Efficient comparison sorting</td><td>Linear work across logarithmic levels</td></tr><tr><td><code>O(n²)</code></td><td>All pairs / nested scans</td><td>Quadratic</td></tr><tr><td><code>O(2ⁿ)</code></td><td>Enumerating subsets</td><td>Exponential</td></tr><tr><td><code>O(n!)</code></td><td>Enumerating permutations</td><td>Factorial</td></tr></tbody></table>
+<p>Time complexity counts operations as input grows. Auxiliary space counts extra working memory, usually excluding input and required output. Include recursion call-stack space when it grows with input.</p>
+<h2>4. Choosing a data structure</h2>
+<table><thead><tr><th>Need</th><th>Typical choice</th><th>Reason</th></tr></thead><tbody><tr><td>Indexed sequential data</td><td>Array / ArrayList</td><td>Constant-time indexed reads</td></tr><tr><td>Average-case key lookup</td><td>HashMap / HashSet</td><td>Expected constant-time lookup</td></tr><tr><td>Last-in, first-out</td><td>Stack / Deque</td><td>Efficient operations at one end</td></tr><tr><td>First-in, first-out</td><td>Queue / Deque</td><td>Efficient operations at opposite ends</td></tr><tr><td>Repeated min/max extraction</td><td>PriorityQueue</td><td>Efficient access to the highest-priority item</td></tr><tr><td>Ordered neighbour queries</td><td>TreeMap / balanced tree</td><td>Maintains sorted keys</td></tr><tr><td>Relationships and connectivity</td><td>Graph adjacency list</td><td>Represents vertices and edges</td></tr></tbody></table>
+<h2>5. Java correctness checks</h2>
+<ul><li>Use <code>long</code> when sums, products or counts can exceed the <code>int</code> range; widen before multiplication.</li><li>Use <code>equals</code> for object-value equality; <code>==</code> compares primitive values or object references.</li><li>Java <code>char</code> is a UTF-16 code unit, not always a full Unicode code point.</li><li>Avoid subtraction-based comparators that can overflow; prefer <code>Integer.compare(a, b)</code>.</li><li>Recursive depth can overflow the Java call stack; consider iterative traversal for unbounded depth.</li><li>Check whether APIs mutate input and whether a map key is absent or mapped to a default value.</li></ul>
+<h2>6. Correctness and edge-case checklist</h2>
+<ul><li>Empty and single-element input</li><li>Duplicates, sorted and reverse-sorted input</li><li>Negative values and zero where allowed</li><li>Minimum and maximum constraint values</li><li>Disconnected graphs, cycles and unreachable nodes where relevant</li><li>Empty strings, repeated characters and Unicode where relevant</li><li>Overflow, off-by-one errors and invalid assumptions</li></ul>
+<p class="dsa-remember"><b>Interview habit:</b> explain the invariant and why the data structure fits before walking through code.</p>
+</section>"""
+        page = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%(title)s | DSA Problem-Solving Handbook</title>
+<meta name="description" content="%(description)s">
+<link rel="stylesheet" href="../../handbook/assets/style.css">
+<link rel="stylesheet" href="../../quicknotes/assets/quick.css">
+<link rel="stylesheet" href="../assets/dsa.css">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+</head>
+<body>
+<div class="qn"><div id="dsa-page">
+<nav class="dsa-breadcrumb" aria-label="Breadcrumb"><a href="../../index.html">Home</a><span>/</span><a href="../index.html">DSA</a><span>/</span><span aria-current="page">%(title)s</span></nav>
+<header class="dsa-hero">
+<p class="dsa-kicker">DATA STRUCTURES &amp; ALGORITHMS / JAVA</p>
+<h1>%(title)s</h1><p class="sub">%(description)s</p>
+<div class="dsa-meta"><span>%(count)d source entries</span><span>Java</span><span>%(level)s</span></div>
+</header>
+%(foundation_content)s
+%(topic_guide)s
+<section class="dsa-section">
+<h2>How to study this topic</h2>
+<p>Work through the problems in order. Before reading the implementation, restate the input contract and constraints. Then identify the key observation, explain why the chosen data structure fits, trace the important state, and derive the complexity from the actual operations.</p>
+<h3>Patterns and concepts</h3><p>%(patterns)s</p>
+<div class="dsa-callout"><b>For every problem:</b> Explain the invariant, test empty and boundary inputs, check integer and character constraints, and distinguish auxiliary space from output space. Do not assume a complexity claim without checking the loops and data-structure operations.</div>
+</section>
+<section class="dsa-section">
+<h2>How to reason through a solution</h2>
+<p>For each entry, identify the state that changes, the condition that advances the algorithm, and the point at which the result becomes final. Check whether the implementation mutates its input, relies on sorted data, assumes a restricted value range, or uses recursion depth proportional to the input.</p>
+</section>
+<section class="dsa-section">
+<h2>Problem and implementation index</h2>
+<p>This index includes every Java source file in the topic folder. Foundational node/stack/queue classes, demonstrations and alternative implementations are retained alongside interview problems so the source repository is fully represented.</p>
+%(cards)s
+</section>
+<div class="dsa-page-actions"><a href="../index.html">← All DSA topics</a><a href="../../search.html">Search the whole site</a></div>
+</div></div>
+</body></html>''' % {
+            'title': esc(title), 'description': esc(description), 'count': len(files),
+            'level': 'Foundations' if slug in ('patterns','mathematical','arrays','strings','sorting') else 'Core to advanced',
+            'patterns': esc(patterns), 'cards': ''.join(cards), 'foundation_content': foundation_content, 'topic_guide': DSA_TOPIC_GUIDES.get(slug, '')
+        }
+        write(os.path.join(DSA, 'topics', slug + '.html'), page)
+
+    return [(slug, title) for slug, title, _, _ in DSA_TOPIC_CONFIG if slug in catalog], {
+        slug: [(problem_slug, problem_title) for problem_slug, problem_title, _ in entries]
+        for slug, entries in catalog.items()
+    }
+
+DSA_TOPICS, DSA_PROBLEMS = generate_dsa_topics()
+DSA_TOPICS = [t for t in DSA_TOPICS if os.path.exists(os.path.join(DSA, 'topics', t[0] + '.html'))]
+print('DSA build: %d topics, %d Java source entries' % (len(DSA_TOPICS), sum(len(v) for v in DSA_PROBLEMS.values())))
+print('DSA build: %d topics, %d Java source entries' % (len(DSA_TOPICS), sum(len(v) for v in DSA_PROBLEMS.values())))
+
+def dsa_nav(cur, pre, active_problem=None):
+    """Use the same sidebar structure and shared classes as the Interview Book."""
+    site = pre + '../'
+    brand = ('<a class="brand" href="%sindex.html">Data Structures &amp; Algorithms</a>' % pre
+             if cur or active_problem else
+             '<div class="brand">Data Structures &amp; Algorithms</div>')
+    o = [brand, '<div class="tagline">Java problem-solving handbook</div>',
+         '<div class="qlinks"><a href="%sindex.html">🏠 Home</a><a href="%ssearch.html">🔍 Search the whole site</a></div>' % (site, site)]
+    topic_groups = []
+    for index, (slug, title) in enumerate(DSA_TOPICS, 1):
+        problem_links = []
+        for number, (problem_slug, problem_title) in enumerate(DSA_PROBLEMS.get(slug, []), 1):
+            active = ' current' if active_problem == problem_slug else ''
+            nested_page = os.path.join(DSA, 'topics', slug, problem_slug + '.html')
+            href = pre + ('topics/%s/%s.html' % (slug, problem_slug)) if os.path.exists(nested_page) else pre + 'topics/%s.html#%s' % (slug, problem_slug)
+            problem_links.append('<a class="ch%s" href="%s"><span class="num">%02d -</span><span>%s</span></a>' %
+                                 (active, href, number, esc(problem_title)))
+        is_open = ' open' if slug == cur else ''
+        topic_groups.append('<details%s><summary>%02d %s</summary>%s</details>' %
+                            (is_open, index, esc(title), ''.join(problem_links)))
+    topics_open = ' open' if cur is None or cur in dict(DSA_TOPICS) else ''
+    o.append('<details%s><summary>Topics</summary>%s</details>' % (topics_open, ''.join(topic_groups)))
+    return ''.join(o)
+
+dsa_stats = {}
+for i, (slug, title) in enumerate(DSA_TOPICS):
+    p = os.path.join(DSA, 'topics', slug + '.html')
+    s = read(p)
+    s = re.sub(r'<!--dnav:start-->.*?<!--dnav:end-->\n?', '', s, flags=re.S)
+    s = re.sub(r'<!--dfoot:start-->.*?<!--dfoot:end-->\n?', '', s, flags=re.S)
+    dsa_stats[slug] = dict(problems=len(re.findall(r'<article class="dsa-problem-card dsa-problem-summary"', s)),
+                           diagrams=len(re.findall(r'<svg[^>]*viewBox', s)),
+                           words=len(re.sub(r'<[^>]+>', ' ', s).split()), sub=sub_of(p))
+    pager = ['<div class="pager">']
+    if i > 0: pager.append('<a class="prev" href="%s.html"><span class="lbl">Previous</span>%s</a>' % (DSA_TOPICS[i-1][0], esc(DSA_TOPICS[i-1][1])))
+    if i < len(DSA_TOPICS)-1: pager.append('<a class="next" href="%s.html"><span class="lbl">Next</span>%s</a>' % (DSA_TOPICS[i+1][0], esc(DSA_TOPICS[i+1][1])))
+    pager.append('</div>')
+    head = '<!--dnav:start-->\n<div class="layout">\n<nav class="toc" id="toc">\n%s\n</nav>\n<main class="qmain">\n<!--dnav:end-->\n' % dsa_nav(slug, '../')
+    foot = '<!--dfoot:start-->\n%s\n</main>\n</div>\n<script src="../../quicknotes/assets/quick.js"></script>\n<!--dfoot:end-->\n' % ''.join(pager)
+    s = s.replace('<div class="qn">', head + '<div class="qn">', 1).replace('</body>', foot + '</body>', 1)
+    write(p, s)
+
+# Individual, deeply authored problem pages remain separate from the generated source index.
+dsa_problem_count = 0
+for topic_slug, problems in DSA_PROBLEMS.items():
+    for index, (problem_slug, problem_title) in enumerate(problems):
+        p = os.path.join(DSA, 'topics', topic_slug, problem_slug + '.html')
+        if not os.path.exists(p):
+            continue
+        s = read(p)
+        s = re.sub(r'<!--dnav:start-->.*?<!--dnav:end-->\n?', '', s, flags=re.S)
+        s = re.sub(r'<!--dfoot:start-->.*?<!--dfoot:end-->\n?', '', s, flags=re.S)
+        pager = ['<div class="pager">']
+        if index > 0:
+            prev_slug, prev_title = problems[index - 1]
+            pager.append('<a class="prev" href="%s.html"><span class="lbl">Previous problem</span>%s</a>' % (prev_slug, esc(prev_title)))
+        if index < len(problems) - 1:
+            next_slug, next_title = problems[index + 1]
+            pager.append('<a class="next" href="%s.html"><span class="lbl">Next problem</span>%s</a>' % (next_slug, esc(next_title)))
+        pager.append('</div>')
+        head = '<!--dnav:start-->\n<div class="layout">\n<nav class="toc" id="toc">\n%s\n</nav>\n<main class="qmain">\n<!--dnav:end-->\n' % dsa_nav(topic_slug, '../../', problem_slug)
+        foot = '<!--dfoot:start-->\n%s\n</main>\n</div>\n<script src="../../../quicknotes/assets/quick.js"></script>\n<!--dfoot:end-->\n' % ''.join(pager)
+        s = s.replace('<div class="qn">', head + '<div class="qn">', 1).replace('</body>', foot + '</body>', 1)
+        write(p, s)
+        dsa_problem_count += 1
+
+dsa_problems = sum(v['problems'] for v in dsa_stats.values())
+dsa_diagrams = sum(v['diagrams'] for v in dsa_stats.values())
+dsa_cards = '\n'.join('<a class="card" href="topics/%s.html"><span class="n">Topic %02d</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d source entries, %d diagrams</span></a>' %
+                         (slug, i+1, esc(title), esc(dsa_stats[slug]['sub']), dsa_stats[slug]['problems'], dsa_stats[slug]['diagrams'])
+                         for i, (slug, title) in enumerate(DSA_TOPICS))
+dsa_index = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Structures and Algorithms | DSA</title>
+<link rel="stylesheet" href="../handbook/assets/style.css">
+<link rel="stylesheet" href="../quicknotes/assets/quick.css">
+<link rel="stylesheet" href="assets/dsa.css">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+</head>
+<body>
+<div class="layout">
+<nav class="toc" id="toc">%(nav)s</nav>
+<main class="qmain">
+<div class="qn qhome">
+<h1>Data Structures and Algorithms</h1>
+<p class="sub">A complete Java DSA learning path, from programming-pattern fundamentals to advanced graph and dynamic-programming problems. Each topic contains the source implementations from the DSA repository.</p>
+<div class="stats"><div class="stat"><b>%(nt)d</b><span>topics</span></div><div class="stat"><b>%(np)d</b><span>source entries</span></div></div>
+<div class="tl"><b>How to use this section:</b> Follow the numbered topics in order. Study the concept and problem statement first, attempt the solution, then inspect the original Java implementation and derive its invariant and complexity.</div>
+<div class="grid">%(cards)s</div>
+<p><a href="../index.html">Home</a> · <a href="../search.html">Search the whole site</a></p>
+</div>
+</main>
+</div>
+<script src="../quicknotes/assets/quick.js"></script>
+</body>
+</html>
+''' % dict(nav=dsa_nav(None, ''), nt=len(DSA_TOPICS), np=dsa_problems, cards=dsa_cards)
+write(os.path.join(DSA, 'index.html'), dsa_index)
+
+
+# ---------------- index.html ----------------
+hb = read(os.path.join(ROOT, 'handbook', 'assets', 'chapters.js'))
+n_pages = len(re.findall(r'done: true', hb))
+hand_words = 0
+for sub in ('chapters', 'case-studies', 'cheatsheets'):
+    d = os.path.join(ROOT, 'handbook', sub)
+    for f in os.listdir(d):
+        if f.endswith('.html'): hand_words += len(re.sub(r'<[^>]+>', ' ', read(os.path.join(d, f))).split())
+
+top = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interview Prep: System Design and Core Topics</title>
+<link rel="stylesheet" href="handbook/assets/style.css">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<style>
+  .top { max-width: 1000px; margin: 0 auto; padding: 56px 24px 90px; }
+  .top h1 { font-size: 2.8rem; margin: 0 0 8px; }
+  .top .lead { color: var(--muted); font-size: 1.1rem; max-width: 720px; }
+  .two2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 20px; margin: 34px 0; }
+  .big { display: block; border: 1px solid var(--line); background: var(--card); border-radius: 16px; padding: 26px 28px; text-decoration: none; color: var(--fg); }
+  .big:hover { border-color: var(--accent); background: var(--accent-soft); }
+  .big .k { color: var(--accent); font-weight: 700; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; }
+  .big .t { display: block; font-size: 1.5rem; font-weight: 700; margin: 6px 0 8px; }
+  .big .d { color: var(--muted); display: block; line-height: 1.55; }
+  .big .m { display: block; margin-top: 14px; font-size: 14px; color: var(--fg); }
+  .how { border-left: 4px solid var(--accent); background: var(--accent-soft); border-radius: 6px; padding: 12px 18px; margin: 10px 0 26px; }
+  .quick a { display: inline-block; margin: 4px 10px 4px 0; padding: 4px 14px; border: 1px solid var(--line); border-radius: 20px; text-decoration: none; background: var(--card); }
+  .quick a:hover { border-color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="top">
+<h1>Interview Prep</h1>
+<p class="lead">One place to prepare for senior engineering interviews. Start with <b>System Design</b> (learn it in the Handbook, revise it in the Quick Notes), then practise topic by topic in the <b>Interview Book</b>: Git, Java, Spring, Kafka and more.</p>
+<h2>System Design</h2>
+<div class="two2">
+<a class="big" href="handbook/index.html"><span class="k">Learn</span><span class="t">System Design Handbook</span><span class="d">Complete, from the ground up: every component in depth, microservices, %(nc)d worked case studies, and cheat sheets. Detailed prose with diagrams.</span><span class="m">%(np)d pages, about %(hw)dk words</span></a>
+<a class="big" href="quicknotes/index.html"><span class="k">Revise</span><span class="t">System Design Quick Notes</span><span class="d">Lookup sheets for the day before: key definitions, tables, numbers, say-aloud scripts, diagrams and detailed interview Q&amp;A in plain words.</span><span class="m">%(nm)d study sheets, %(nc)d case sheets, %(tq)d Q&amp;As</span></a>
+</div>
+<h2>Interview Book</h2>
+<div class="two2">
+%(ivcard)s
+</div>
+<h2>DSA</h2>
+<div class="two2">
+%(dsacard)s
+</div>
+<div class="how"><b>Suggested use:</b> for system design, read the Handbook chapter first, then the matching Quick Notes sheet to lock it in; in the final two days read only the Quick Notes. For everything else, work through the Interview Book topic by topic: answer each question out loud before you open it.</div>
+<h2>Jump straight to</h2>
+<div class="quick">
+<a href="quicknotes/notes/q13-delivery-playbook.html">Last-hour cheat sheet</a>
+<a href="quicknotes/notes/q01-framework-estimation.html">Framework and estimation</a>
+<a href="handbook/cheatsheets/cs-numbers.html">Numbers to remember</a>
+<a href="handbook/cheatsheets/cs-decision-tables.html">Decision tables</a>
+<a href="quicknotes/index.html#cases">All case sheets</a>
+<a href="handbook/index.html">Handbook contents</a>
+<a href="search.html">Search</a>
+<a href="handbook/reference/ref-glossary.html">Glossary A-Z</a>
+</div>
+</div>
+</body>
+</html>
+''' % dict(np=n_pages, hw=round(hand_words / 1000), nm=len(mods), nc=len(cases), tq=tq,
+    ivcard=('<a class="big" href="interview/index.html"><span class="k">Practise</span><span class="t">Interview Book</span><span class="d">Interview questions topic by topic (Git, Java, Spring, Kafka and more) with model answers, diagrams, follow-ups and real production scenarios.</span><span class="m">%d topics, %d questions</span></a>' % (len(mods), iv_q)) if INT_TOPICS else '',
+    dsacard=('<a class="big" href="dsa/index.html"><span class="k">Practise</span><span class="t">Data Structures and Algorithms</span><span class="d">Java coding problems organized by topic and pattern, with intuition, optimized solutions, dry runs and complexity analysis.</span><span class="m">%d topic pages, %d problems</span></a>' % (len(DSA_TOPICS), dsa_problems)) if DSA_TOPICS else '')
+write(os.path.join(ROOT, 'index.html'), top)
+print('built: %d quicknotes pages, %d words, %d Q&As, %d diagrams; handbook %d pages' % (len(items), tw, tq, ts, n_pages))
+, '', doc_text, flags=re.S).splitlines():
+            line = re.sub(r'^\s*\* ?', '', line).strip()
+            if line and not line.startswith('@') and not re.search(r'(time|space) complexity', line, re.I): desc.append(line)
+        complexity = '; '.join(re.findall(r'(?i)(?:time|space)\s+complexity\s*:\s*[^*\n]+', doc_text))
+        methods.append((m.group(3), re.sub(r'\s+', ' ', m.group(2)).strip(), ' '.join(desc), complexity))
+    statement_html = ''.join('<p>%s</p>' % esc(x) for x in statement) or '<p>The source file does not include a formal problem statement. This page documents the class as a supporting implementation; add the original problem contract before treating it as a standalone interview question.</p>'
+    examples_html = '<pre class="dsa-code"><code>%s</code></pre>' % esc('\n'.join(examples)) if examples else '<p>No canonical sample is documented in the source. Confirm the external problem contract and create representative tests before relying on assumptions.</p>'
+    constraints_html = '<ul>%s</ul>' % ''.join('<li>%s</li>' % esc(x) for x in constraints) if constraints else '<p>Explicit constraints are not documented in the source file. Confirm the allowed input size, value range, nullability and mutation rules before finalizing the solution.</p>'
+    method_html = ''.join('<article class="dsa-approach"><h3>Implementation %02d — <code>%s</code></h3><p><code>%s</code></p><p>%s</p><p><b>Source complexity note:</b> %s</p></article>' % (i, esc(x[0]), esc(x[1]), esc(x[2] or 'No method-level explanation is documented.'), esc(x[3] or 'No complexity annotation is documented; derive it from the implementation.')) for i,x in enumerate(methods,1))
+    if not method_html: method_html = '<p>No public method was detected. Review the constructors and public API below.</p>'
+    comments = []
+    for x in re.findall(r'//\s*(.+)', source):
+        x = re.sub(r'\s+', ' ', x).strip()
+        if len(x) > 12 and x not in comments: comments.append(x)
+        if len(comments) >= 7: break
+    steps_html = '<ol>%s</ol>' % ''.join('<li>%s</li>' % esc(x) for x in comments) if comments else '<ol><li>Identify the input state and required output.</li><li>Trace the main loop or recursive state.</li><li>Explain the condition that advances the state and the termination condition.</li><li>Verify that every valid case is considered exactly as required.</li></ol>'
+    source_url = 'https://github.com/kowlutla/DSA/blob/main/src/com/dsa/' + source_rel.replace(' ', '%20')
+    description = statement[0] if statement else 'Java implementation reference for ' + problem_title
+    return '''<!DOCTYPE html>
+<html lang="en"><head><script src="../../../theme.js"></script><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%(problem)s — %(topic)s | DSA Handbook</title><meta name="description" content="%(description)s">
+<link rel="stylesheet" href="../../../handbook/assets/style.css"><link rel="stylesheet" href="../../../quicknotes/assets/quick.css"><link rel="stylesheet" href="../../assets/dsa.css"><link rel="icon" href="../../../favicon.svg" type="image/svg+xml"></head>
+<body><div class="qn"><div id="dsa-page">
+<nav class="dsa-breadcrumb" aria-label="Breadcrumb"><a href="../../../index.html">Home</a><span>/</span><a href="../../../dsa/index.html">DSA</a><span>/</span><a href="../%(topic_slug)s.html">%(topic)s</a><span>/</span><span aria-current="page">%(problem)s</span></nav>
+<header class="dsa-hero dsa-problem-hero"><p class="dsa-kicker">DATA STRUCTURES &amp; ALGORITHMS / %(topic_upper)s / JAVA</p><h1>%(problem)s</h1><p class="sub">%(description)s</p><div class="dsa-meta"><span>Problem %(number)02d</span><span>Java implementation</span><span>Original DSA source</span></div></header>
+<article class="dsa-problem-card" id="problem"><div class="dsa-card-head"><span class="dsa-number">%(number)02d</span><span class="dsa-topic">%(topic_upper)s</span></div>
+<nav class="dsa-problem-nav"><a href="#definition">Problem</a><a href="#examples">Examples</a><a href="#intuition">Intuition</a><a href="#approach">Approach</a><a href="#solution">Java</a><a href="#analysis">Analysis</a></nav>
+<section id="definition"><h2>1. Problem definition</h2>%(statement)s</section>
+<section id="examples"><h2>2. Examples</h2>%(examples)s</section>
+<section id="constraints"><h2>3. Constraints and assumptions</h2>%(constraints)s</section>
+<section id="intuition"><h2>4. Intuition and key observation</h2><p>Start from the operations demanded by the problem: search, count, order, compare, connect, construct or optimize. Identify which information must be retained while processing the input and which repeated work can be avoided. The source implementation should be evaluated against the exact contract and constraints above.</p><div class="dsa-insight"><span class="dsa-insight-icon">💡</span><div><b>Key question</b><p>What invariant does the algorithm maintain, and why does each state transition preserve it?</p></div></div></section>
+<section id="approach"><h2>5. Approach and implementation variants</h2>%(methods)s<h3>Step-by-step reading guide</h3>%(steps)s</section>
+<section id="solution"><h2>6. Java implementation</h2><p>Complete original Java source, including helper methods and comments. Each public method should be evaluated separately; variants may have different time/space trade-offs.</p><p><b>Source:</b> <a href="%(source_url)s" target="_blank" rel="noopener"><code>%(source_rel)s</code></a></p><pre class="dsa-code"><code>%(source)s</code></pre></section>
+<section id="dry-run"><h2>7. Dry run and walkthrough</h2><p>Use the documented sample above. Trace the selected method line by line, recording indices/pointers, accumulated values, recursive state or data-structure contents. Check that the final state produces the documented output. Where the source has no sample, first define tests from the confirmed problem contract rather than inventing constraints.</p></section>
+<section id="correctness"><h2>8. Correctness reasoning</h2><p>Define an invariant that is true before processing starts. Show that each loop iteration or recursive transition preserves it. At termination, connect the invariant to the required output. For recursion, justify the base case and show that every recursive branch makes progress toward it.</p></section>
+<section id="analysis"><h2>9. Complexity analysis</h2><p>Use the method-level annotations above when present, then verify them against the actual implementation. Count total loop iterations, recursive calls, collection operations, sorting and preprocessing.</p><div class="dsa-complexity"><div><small>TIME</small><strong>Per-method analysis</strong><p>Derive from the exact variant; do not assume all methods in one class have the same complexity.</p></div><div><small>AUXILIARY SPACE</small><strong>Per-method analysis</strong><p>Count extra collections, arrays and recursion depth. State whether output space is excluded.</p></div></div></section>
+<section id="edge-cases"><h2>10. Edge cases and common mistakes</h2><ul class="dsa-mistakes"><li>Empty and minimum-size inputs, if allowed.</li><li>Single-element input, duplicates and all-equal values.</li><li>Sorted, reverse-sorted and highly unbalanced inputs where relevant.</li><li>Negative values, zero, overflow and maximum constraints where relevant.</li><li>Null references, disconnected components, cycles or malformed structures where relevant.</li><li>Mutation, off-by-one errors and assumptions not enforced by the implementation.</li></ul></section>
+<section id="interview"><h2>11. Interview follow-ups</h2><ul><li>Explain the invariant without referring to code.</li><li>What is the brute-force baseline and what repeated work is removed?</li><li>Which constraints make this implementation valid?</li><li>Can the auxiliary space or worst-case time be improved?</li><li>How would you test this against a brute-force oracle?</li></ul></section>
+<p class="dsa-remember"><b>Revision checkpoint:</b> Restate the contract, explain the invariant, trace one example, justify correctness and derive complexity for the exact method.</p></article>
+<div class="dsa-page-actions"><a href="../%(topic_slug)s.html">← Back to %(topic)s</a><a href="../../../search.html">Search the whole site</a></div>
+</div></div></body></html>''' % {
+        'problem': esc(problem_title), 'topic': esc(topic_title), 'topic_slug': topic_slug,
+        'topic_upper': esc(topic_title.upper()), 'number': number,
+        'description': esc(description), 'statement': statement_html, 'examples': examples_html,
+        'constraints': constraints_html, 'methods': method_html, 'steps': steps_html,
+        'source_url': source_url, 'source_rel': esc(source_rel), 'source': esc(source)
+    }
+
 def generate_dsa_topics():
     """Generate complete topic pages from the checked-out kowlutla/DSA source."""
     if not os.path.isdir(DSA_SOURCE):
