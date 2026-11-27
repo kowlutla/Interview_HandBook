@@ -1067,7 +1067,6 @@ DSA_PROBLEM_NOTES = {
         "complexity": "<p>O(log n) time and O(1) auxiliary space.</p>",
         "edge": "<p>Test one element, strictly increasing, strictly decreasing, multiple peaks and peaks at either endpoint. The source contract defines outside neighbours as negative infinity and asks for any peak.</p>",
     },
-,
     "a26-majority-element2": {
         "intuition": "<p>There can be at most two values occurring more than floor(n/3) times. The extended Boyer–Moore algorithm tracks two candidates and cancels groups of three distinct values.</p>",
         "steps": "<ol><li>Maintain two candidates with two counters.</li><li>Increment a matching candidate; otherwise fill an empty candidate slot.</li><li>If neither matches and both slots are occupied, decrement both counters.</li><li>Count the final candidates in a second pass and return only those whose frequency exceeds n/3.</li></ol>",
@@ -1132,7 +1131,6 @@ DSA_PROBLEM_NOTES = {
         "complexity": "<p>O(n) time and O(1) auxiliary space for the greedy approach.</p>",
         "edge": "<p>Test a single element (zero jumps), a zero at the start, a zero that blocks progress, an already reachable destination and large jump values. Confirm whether unreachable input returns -1 or another sentinel.</p>",
     },
-,
     "kth-element-of-two-sorted-arrays": {
         "intuition": "<p>The kth element in the merged order can be found without building the merged array. Choose how many elements to take from each array so the left partition contains exactly k elements and every left value is no greater than every right value.</p>",
         "steps": "<ol><li>Binary-search the number of elements taken from the smaller array.</li><li>Let the other partition take k minus that count.</li><li>Inspect the four boundary values around the partitions.</li><li>If the left maximum of one array exceeds the right minimum of the other, adjust the partition; otherwise the kth value is the maximum of the two left boundaries.</li></ol>",
@@ -1204,6 +1202,39 @@ DSA_PROBLEM_NOTES = {
         "proof": "<p>For a fixed page limit, greedy contiguous allocation minimizes the number of students needed because each student receives the longest feasible prefix. Feasibility is monotonic: increasing the limit cannot require more students. Binary search therefore finds the minimum feasible maximum.</p>",
         "complexity": "<p>O(n log(sum(pages)-max(pages))) time and O(1) auxiliary space.</p>",
         "edge": "<p>Test students greater than books, one student, one book per student, large page totals and empty input. Use long for sums where constraints require it. Some formulations require exactly m non-empty groups; if greedy uses fewer than m and m≤n, groups can be split without increasing the maximum.</p>",
+    },
+
+    "a23-rotate-image-clockwise": {
+        "intuition": "<p>A 90-degree clockwise rotation maps each cell (r,c) to (c,n-1-r). For a square matrix, transpose it and then reverse every row to achieve that mapping in place.</p>",
+        "steps": "<ol><li>Transpose the matrix by swapping only entries above the main diagonal with their mirrored entries below it.</li><li>Reverse each row.</li><li>Return the modified matrix.</li></ol>",
+        "trace": "<p>For <code>[[1,2,3],[4,5,6],[7,8,9]]</code>, transposition gives [[1,4,7],[2,5,8],[3,6,9]]. Reversing each row yields <code>[[7,4,1],[8,5,2],[9,6,3]]</code>.</p>",
+        "proof": "<p>Transposition maps (r,c) to (c,r); reversing each row maps the transposed coordinate to (c,n-1-r). This is exactly the clockwise rotation mapping.</p>",
+        "complexity": "<p>The transpose-and-reverse approach is O(n²) time and O(1) auxiliary space. The source also contains an auxiliary-matrix variant using O(n²) extra space.</p>",
+        "edge": "<p>The operation assumes an n×n square matrix. Test n=1, n=2, odd/even dimensions and confirm whether mutation in place is required.</p>",
+    },
+    "a23-rotate-image-anti-clock-wise": {
+        "intuition": "<p>A 90-degree counter-clockwise rotation maps (r,c) to (n-1-c,r). Transpose the matrix and reverse each column, or use the equivalent row-reversal/transpose order.</p>",
+        "steps": "<ol><li>Transpose the square matrix.</li><li>Reverse each column from top to bottom.</li><li>Return the matrix.</li></ol>",
+        "trace": "<p>For <code>[[1,2,3],[4,5,6],[7,8,9]]</code>, the counter-clockwise result is <code>[[3,6,9],[2,5,8],[1,4,7]]</code>.</p>",
+        "proof": "<p>Transposition swaps coordinates. Reversing each column maps the transposed coordinate to (n-1-c,r), the required counter-clockwise destination.</p>",
+        "complexity": "<p>O(n²) time and O(1) auxiliary space for the in-place method.</p>",
+        "edge": "<p>The source problem requires a square matrix and no extra matrix. Test 1×1, 2×2, odd/even sizes and verify that the transformation is not accidentally clockwise.</p>",
+    },
+    "pythagorean-triplet": {
+        "intuition": "<p>For a triplet a²+b²=c², sort the squared values. Fix the largest square as c² and use two pointers to find two smaller squares whose sum equals it.</p>",
+        "steps": "<ol><li>Square each value, ensuring the multiplication uses a wide type.</li><li>Sort the squared values.</li><li>For each rightmost value as c², set left and middle pointers at the ends of the remaining prefix.</li><li>Move the pointer that makes the sum approach c² until a match is found or the interval closes.</li></ol>",
+        "trace": "<p>For values <code>[3,1,4,6,5]</code>, the squares include 9,1,16,36,25. The values 9 and 16 sum to 25, so 3,4,5 form a Pythagorean triplet.</p>",
+        "proof": "<p>After sorting, for a fixed c², if the two-pointer sum is too small, increasing the smaller square is the only safe way to increase it. If too large, decreasing the larger square is safe. Trying each possible largest square covers every triplet.</p>",
+        "complexity": "<p>O(n²) time after O(n log n) sorting. The source squares values in the input array, so it mutates input. Use long for squares and sums to avoid overflow.</p>",
+        "edge": "<p>Test duplicates, no triplet, negative values if allowed (squaring removes sign), zero values and large magnitudes. The three values must come from different indices.</p>",
+    },
+    "subarray-with-given-sum": {
+        "intuition": "<p>The source contract restricts values to positive integers. A sliding window works because expanding right increases the sum and shrinking left decreases it. This monotonicity would not hold with negative values.</p>",
+        "steps": "<ol><li>Initialize left=0 and running sum=0.</li><li>Expand right, adding each value.</li><li>While the sum exceeds target, subtract the leftmost value and advance left.</li><li>When the sum equals target, return the 1-based start and end indices.</li><li>If no window matches, return [-1].</li></ol>",
+        "trace": "<p>For <code>[1,2,3,7,5]</code> and target 12, the window [2,3,7] sums to 12. Its 1-based positions are 2 through 4.</p>",
+        "proof": "<p>With positive values, any window whose sum is too large can only become smaller by removing its leftmost value; any window whose sum is too small can only become larger by extending right. Thus the two pointers do not skip a valid first-occurring window.</p>",
+        "complexity": "<p>O(n) time and O(1) auxiliary space, excluding the returned index list.</p>",
+        "edge": "<p>Test target equal to one value, match at either boundary, no match, multiple matches (return the earliest by left-to-right contract), and target zero. Do not reuse this sliding-window proof for signed arrays.</p>",
     },
 }
 def generate_dsa_topics():
