@@ -2130,6 +2130,55 @@ DSA_PROBLEM_NOTES = {
         "complexity": "<p>O(n) time and O(n) auxiliary space for parent mapping and BFS.</p>",
         "edge": "<p>Test target at root, deepest leaf, one node, skewed tree and absent target. Count elapsed levels carefully: the target burns at time zero.</p>",
     },
+
+    "g12-detect-cycle-in-undirected-graph-dfs": {
+        "intuition": "<p>DFS explores one path deeply. In an undirected graph, an edge to a visited vertex other than the current node's parent indicates a cycle.</p>",
+        "steps": "<ol><li>Start DFS from each unvisited vertex.</li><li>Mark the current vertex visited.</li><li>For each neighbour, recurse if unvisited.</li><li>If a neighbour is already visited and is not the parent, return true.</li><li>Return false if every component finishes without such an edge.</li></ol>",
+        "trace": "<p>In a tree, every visited neighbour encountered from a node is its parent, so no cycle is reported. Adding an extra edge between two already connected non-parent vertices creates a cycle.</p>",
+        "proof": "<p>The DFS tree contains exactly the edges used to discover vertices. An undirected edge to a visited non-parent vertex connects two vertices already joined by a tree path, closing a cycle.</p>",
+        "complexity": "<p>O(V+E) time and O(V) visited/recursion space; recursion depth can reach O(V).</p>",
+        "edge": "<p>Test disconnected graphs, isolated vertices, self-loops, parallel edges and a long chain. Parent handling and multigraph assumptions must match the input contract.</p>",
+    },
+    "g17-bipartite-graph-bfs": {
+        "intuition": "<p>A graph is bipartite iff its vertices can be colored with two colors so every edge joins different colors. BFS assigns alternating colors along each edge.</p>",
+        "steps": "<ol><li>Initialize all vertices uncolored.</li><li>For every uncolored component, assign its start vertex color 0 and run BFS.</li><li>For each edge u-v, assign v the opposite color if uncolored.</li><li>If v already has the same color as u, return false.</li><li>Return true after all components are processed.</li></ol>",
+        "trace": "<p>A triangle cannot be two-colored: starting at 0, its two neighbours receive color 1, but the edge between them connects equal colors, so the graph is not bipartite.</p>",
+        "proof": "<p>BFS colors vertices by parity of path length from the component root. If an edge joins equal colors, it forms an odd cycle and no valid two-coloring exists. If no conflict occurs, the produced coloring satisfies every edge.</p>",
+        "complexity": "<p>O(V+E) time and O(V) auxiliary space.</p>",
+        "edge": "<p>Test disconnected components, isolated vertices, even cycles, odd cycles and empty graph. Do not process only the component containing vertex 0.</p>",
+    },
+    "g18-bipartite-graph-dfs": {
+        "intuition": "<p>DFS can perform the same two-coloring as BFS. Every newly visited neighbour receives the opposite color; a same-color edge is a conflict.</p>",
+        "steps": "<ol><li>Initialize every vertex as uncolored.</li><li>For each uncolored vertex, start DFS with one color.</li><li>For each neighbour, recursively assign the opposite color if uncolored.</li><li>If an already colored neighbour has the same color, return false.</li><li>Return true if all components are colored without conflict.</li></ol>",
+        "trace": "<p>On a square cycle, colors alternate 0,1,0,1 and every edge connects different colors. On a triangle, the final edge connects two vertices both colored 1, revealing a conflict.</p>",
+        "proof": "<p>DFS assigns colors so every discovery edge joins opposite colors. If all edges satisfy the condition, the coloring is a valid bipartition. A same-color edge proves no such coloring can exist under the assignments.</p>",
+        "complexity": "<p>O(V+E) time and O(V) visited/color/recursion space. Deep graphs may overflow the Java call stack.</p>",
+        "edge": "<p>Test disconnected components, isolated nodes, even and odd cycles and large-depth chains. For deep inputs, iterative BFS avoids recursion-depth risk.</p>",
+    },
+    "g20-eventual-safe-states-bfs": {
+        "intuition": "<p>A node is safe when no path from it can enter a cycle. Reverse every edge and run Kahn's topological process from terminal nodes (outdegree zero); nodes removed by the process are safe.</p>",
+        "steps": "<ol><li>Build the reverse adjacency list and record each original outdegree.</li><li>Queue all terminal nodes.</li><li>Remove a safe node and decrement the outdegree of its predecessors in the reverse graph.</li><li>When a predecessor's outdegree becomes zero, enqueue it.</li><li>Return all removed nodes in ascending order.</li></ol>",
+        "trace": "<p>In <code>[[1,2],[2,3],[5],[0],[5],[],[]]</code>, terminal nodes 5 and 6 are safe; reverse propagation marks 2 and 4 safe as well. Nodes in or leading to the cycle remain.</p>",
+        "proof": "<p>Terminal nodes are safe. A predecessor is safe once all of its outgoing neighbours are known safe. Kahn's algorithm removes exactly vertices whose outgoing paths can all terminate; vertices that remain are trapped in or can reach a directed cycle.</p>",
+        "complexity": "<p>O(V+E) time and O(V+E) space for reverse adjacency, degrees and queue.</p>",
+        "edge": "<p>Test all-terminal DAG, a pure cycle, a node leading into a cycle, disconnected components and self-loops. Sort the final list if the API requires ascending order.</p>",
+    },
+    "g20-eventual-safe-states-dfs": {
+        "intuition": "<p>Use three states: unvisited, visiting (on the current DFS path), and safe/visited-complete. Reaching a visiting node reveals a cycle; a node is safe only when all outgoing neighbours are safe.</p>",
+        "steps": "<ol><li>Start DFS from every unclassified vertex.</li><li>Mark a vertex visiting before exploring its neighbours.</li><li>If a neighbour is visiting, report unsafe due to a cycle.</li><li>If any neighbour is unsafe, the current vertex is unsafe.</li><li>After all neighbours are safe, mark the current vertex safe.</li></ol>",
+        "trace": "<p>A terminal node has no outgoing edges and becomes safe immediately. A cycle such as 0→1→2→0 causes each active DFS call to be marked unsafe; any predecessor that reaches this cycle is also unsafe.</p>",
+        "proof": "<p>A visiting-state edge identifies a directed cycle. A node can reach a terminal node along every possible path only if every outgoing neighbour is safe. Marking safe after all neighbours finish therefore matches the definition.</p>",
+        "complexity": "<p>O(V+E) time and O(V) state/recursion space.</p>",
+        "edge": "<p>Test terminal nodes, self-loops, DAG branches, multiple cycles, nodes leading into cycles and disconnected components. A single boolean visited flag is insufficient; distinguish active from completed nodes.</p>",
+    },
+    "g23-detect-cycle-in-directed-graph-bfs": {
+        "intuition": "<p>Kahn's algorithm detects a directed cycle by counting how many vertices can be removed from the graph using indegree-zero vertices. A cycle has no first vertex with zero indegree within that cycle.</p>",
+        "steps": "<ol><li>Compute indegrees.</li><li>Queue all zero-indegree vertices.</li><li>Remove vertices and decrement outgoing neighbours' indegrees.</li><li>Count removed vertices.</li><li>If the count is smaller than V, a directed cycle exists.</li></ol>",
+        "trace": "<p>For a directed cycle 0→1→2→3→0, every vertex has indegree one, so the queue starts empty and no vertex is removed. The removed count is 0, less than V.</p>",
+        "proof": "<p>Every DAG has at least one zero-indegree vertex and repeated removal yields a complete topological order. A directed cycle prevents all its vertices from being removed; therefore a removal count below V is equivalent to cycle existence.</p>",
+        "complexity": "<p>O(V+E) time and O(V) auxiliary space.</p>",
+        "edge": "<p>Test a DAG, self-loop, cycle with an incoming tail, disconnected cyclic component and isolated vertices. Ensure all graph components are represented in the indegree calculation.</p>",
+    },
 }
 def generate_dsa_topics():
     """Generate complete topic pages from the checked-out kowlutla/DSA source."""
