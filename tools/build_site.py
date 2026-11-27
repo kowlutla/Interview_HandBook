@@ -581,6 +581,7 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
     constraints_html = '<ul>%s</ul>' % ''.join('<li>%s</li>' % esc(x) for x in constraints) if constraints else '<p>Explicit constraints are not documented in the source file. Confirm the allowed input size, value range, nullability and mutation rules before finalizing the solution.</p>'
     method_html = ''.join('<article class="dsa-approach"><h3>Implementation %02d — <code>%s</code></h3><p><code>%s</code></p><p>%s</p><p><b>Source complexity note:</b> %s</p></article>' % (i, esc(x[0]), esc(x[1]), esc(x[2] or 'No method-level explanation is documented.'), esc(x[3] or 'No complexity annotation is documented; derive it from the implementation.')) for i,x in enumerate(methods,1))
     if not method_html: method_html = '<p>No public method was detected. Review the constructors and public API below.</p>'
+    topic_reasoning = DSA_TOPIC_GUIDES.get(topic_slug, '')
     comments = []
     for x in re.findall(r'//\s*(.+)', all_source):
         x = re.sub(r'\s+', ' ', x).strip()
@@ -606,7 +607,7 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
 <section id="definition"><h2>1. Problem definition</h2>%(statement)s</section>
 <section id="examples"><h2>2. Examples</h2>%(examples)s</section>
 <section id="constraints"><h2>3. Constraints and assumptions</h2>%(constraints)s</section>
-<section id="intuition"><h2>4. Intuition and key observation</h2><p>Start from the operations demanded by the problem: search, count, order, compare, connect, construct or optimize. Identify which information must be retained while processing the input and which repeated work can be avoided. Evaluate the implementation against the exact contract and constraints above.</p><div class="dsa-insight"><span class="dsa-insight-icon">💡</span><div><b>Key question</b><p>What invariant does the algorithm maintain, and why does each state transition preserve it?</p></div></div></section>
+<section id="intuition"><h2>4. Intuition and key observation</h2><p>Start from the operations demanded by the problem: search, count, order, compare, connect, construct or optimize. Identify which information must be retained while processing the input and which repeated work can be avoided. Evaluate the implementation against the exact contract and constraints above.</p>%(topic_reasoning)s<div class="dsa-insight"><span class="dsa-insight-icon">💡</span><div><b>Key question</b><p>What invariant does the algorithm maintain, and why does each state transition preserve it?</p></div></div></section>
 <section id="approach"><h2>5. Approach and implementation variants</h2>%(methods)s<h3>Step-by-step reading guide</h3>%(steps)s</section>
 <section id="solution"><h2>6. Java implementation</h2><p>Complete original Java source, including helper methods and comments. Evaluate each public method separately; variants may have different time and space trade-offs.</p><p><b>Original source files:</b> %(source_links)s</p>%(source_blocks)s</section>
 <section id="dry-run"><h2>7. Dry run and walkthrough</h2><p>Use the documented sample above. Trace the selected method line by line, recording indices/pointers, accumulated values, recursive state or data-structure contents. Check that the final state produces the documented output. Where the source has no sample, first define tests from the confirmed problem contract rather than inventing constraints.</p></section>
@@ -620,7 +621,7 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
         'problem': esc(problem_title), 'topic': esc(topic_title), 'topic_slug': topic_slug,
         'topic_upper': esc(topic_title.upper()), 'number': number, 'description': esc(description),
         'statement': statement_html, 'examples': examples_html, 'constraints': constraints_html,
-        'methods': method_html, 'steps': steps_html, 'source_links': ' · '.join(source_links),
+        'methods': method_html, 'steps': steps_html, 'topic_reasoning': topic_reasoning, 'source_links': ' · '.join(source_links),
         'source_blocks': ''.join(source_blocks)
     }
 
