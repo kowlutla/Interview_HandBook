@@ -51,10 +51,10 @@ def check(path):
         if required not in raw: p.errors.append('missing stylesheet: ' + required)
     if is_problem and 'dsa-breadcrumb' not in raw: p.errors.append('problem page is missing breadcrumbs')
     if not is_problem and not is_foundations and 'dsa-problem-summary' not in raw: p.errors.append('topic index must use concise problem summaries')
-    if is_problem and 'id="definition"' not in raw: p.errors.append('problem page is missing the problem definition section')
-    if is_problem and 'id="dry-run"' not in raw: p.errors.append('problem page is missing the walkthrough section')
-    if is_problem and 'id="correctness"' not in raw: p.errors.append('problem page is missing correctness reasoning')
-    if is_problem and 'id="analysis"' not in raw: p.errors.append('problem page is missing complexity analysis')
+    if is_problem and not any(x in raw for x in ('id="definition"', 'id="iso-understand"', 'id="id-understand"')): p.errors.append('problem page is missing the problem definition section')
+    if is_problem and not any(x in raw for x in ('id="dry-run"', 'id="iso-walkthrough"', 'id="id-walkthrough"')): p.errors.append('problem page is missing the walkthrough section')
+    if is_problem and not any(x in raw for x in ('id="correctness"', 'id="iso-proof"', 'id="id-proof"')): p.errors.append('problem page is missing correctness reasoning')
+    if is_problem and not any(x in raw for x in ('id="analysis"', 'id="iso-complexity"', 'id="id-complexity"')): p.errors.append('problem page is missing complexity analysis')
     print('%s: %d problem article(s), %d h2 headings -> %s' % (path, p.problems, p.h2, 'OK' if not p.errors else 'PROBLEMS'))
     for e in p.errors: print(' - ' + e)
     return not p.errors
@@ -64,7 +64,21 @@ def verify_source_coverage():
     if not os.path.isdir(source_root):
         print('DSA source checkout not present; source coverage check skipped')
         return True
-    expected = sum(1 for d, _, files in os.walk(source_root) for f in files if f.endswith('.java'))
+    expected_files = sum(1 for d, _, files in os.walk(source_root) for f in files if f.endswith('.java'))
+    topic_slugs = ['patterns','mathematical','arrays','strings','sorting','binarysearch','matrix','linkedlist','recursion','bit_magic','stack','queue','binary_tree','binary_search_tree','greedy','graphs','dynamic_programming']
+    expected_pages = 0
+    grouped_source_files = 0
+    for slug in topic_slugs:
+        folder = os.path.join(source_root, slug)
+        if not os.path.isdir(folder): continue
+        names = [f[:-5] for f in os.listdir(folder) if f.endswith('.java')]
+        if slug == 'arrays': names = [n for n in names if n + '.java' not in {'A22SetMatrixZeroes.java','A23RotateImageAntiClockWise.java','A23RotateImageClockwise.java'}]
+        if slug == 'matrix':
+            names += [f[:-5] for f in ('A22SetMatrixZeroes.java','A23RotateImageAntiClockWise.java','A23RotateImageClockwise.java') if os.path.isfile(os.path.join(source_root,'arrays',f))]
+        grouped = {}
+        for name in names: grouped.setdefault(name.rstrip('0123456789'), []).append(name)
+        expected_pages += len(grouped)
+        grouped_source_files += sum(len(v) for v in grouped.values())
     topic_root = os.path.join(ROOT, 'site', 'dsa', 'topics')
     topic_pages = [os.path.join(topic_root, f) for f in os.listdir(topic_root)
                    if f.endswith('.html') and os.path.isfile(os.path.join(topic_root, f))]
@@ -76,9 +90,9 @@ def verify_source_coverage():
     for current, _, names in os.walk(topic_root):
         if os.path.relpath(current, topic_root) == '.': continue
         detail_pages += sum(1 for name in names if name.endswith('.html'))
-    ok = len(topic_pages) == 18 and actual == expected and detail_pages == expected
-    print('DSA source coverage: %d Java files, %d indexed entries, %d standalone problem pages, %d topic pages -> %s' %
-          (expected, actual, detail_pages, len(topic_pages), 'OK' if ok else 'INCOMPLETE'))
+    ok = len(topic_pages) == 18 and grouped_source_files == expected_files and actual == expected_pages and detail_pages == expected_pages
+    print('DSA coverage: %d Java files grouped into %d problem/reference pages; %d indexed entries, %d standalone pages, %d topic pages -> %s' %
+          (expected_files, expected_pages, actual, detail_pages, len(topic_pages), 'OK' if ok else 'INCOMPLETE'))
     return ok
 
 
