@@ -484,50 +484,26 @@ DSA_PROBLEMS = {
 
 
 def dsa_nav(cur, pre, active_problem=None):
-    """Build a hierarchical DSA sidebar: expandable topics contain their problems."""
+    """Build a compact, expandable topic > problem navigation tree."""
     site = pre + '../'
     o = [
-        ('<a class="dsa-nav-brand" href="%sindex.html"><span class="dsa-nav-mark">DSA</span><span><b>Data Structures &amp; Algorithms</b><small>Java problem-solving handbook</small></span></a>' % pre),
-        '<div class="qlinks dsa-nav-links"><a href="%sindex.html">⌂ <span>DSA Home</span></a><a href="%sindex.html">↗ <span>Main Handbook</span></a><a href="%ssearch.html">⌕ <span>Global Search</span></a></div>' % (pre, site, site),
+        ('<a class="brand" href="%sindex.html">Data Structures &amp; Algorithms</a>' % pre),
+        '<div class="tagline">Java problem-solving handbook</div>',
+        '<div class="qlinks"><a href="%sindex.html">⌂ Home</a><a href="%sindex.html">↗ Main Handbook</a><a href="%ssearch.html">⌕ Global Search</a></div>' % (site, site, site),
     ]
-    topic_groups = []
     for index, (slug, title) in enumerate(DSA_TOPICS, 1):
-        is_topic = slug == cur
-        topic_body = [
-            '<a class="ch dsa-topic-overview" href="%stopics/%s.html">Open %s overview</a>' %
-            (pre, slug, esc(title))
-        ]
+        topic_body = []
         for number, (problem_slug, problem_title) in enumerate(DSA_PROBLEMS.get(slug, []), 1):
             active = ' current' if active_problem == problem_slug else ''
             topic_body.append(
                 '<a class="ch dsa-sidebar-problem%s" href="%stopics/%s/%s.html"><span class="num">%02d -</span><span>%s</span></a>' %
                 (active, pre, slug, problem_slug, number, esc(problem_title))
             )
-
-        # Keep section anchors within the active topic, below its problem links.
-        if is_topic:
-            current_path = (os.path.join(DSA, 'topics', slug, active_problem + '.html')
-                            if active_problem else os.path.join(DSA, 'topics', slug + '.html'))
-            if os.path.exists(current_path):
-                heads = re.findall(r'<h2 id="([^"]+)"[^>]*>(.*?)</h2>', read(current_path), re.S)
-                if heads:
-                    topic_body.append('<div class="dsa-nav-onpage"><span class="dsa-nav-label">ON THIS PAGE</span><div class="onpage">')
-                    for hid, ht in heads:
-                        label = html.unescape(re.sub(r'<[^>]+>', '', ht).strip())
-                        topic_body.append('<a href="#%s">%s</a>' % (hid, esc(label)))
-                    topic_body.append('</div></div>')
-
-        topic_groups.append(
-            '<details class="dsa-topic-group"%s><summary><span class="dsa-topic-number">%02d</span><span class="dsa-topic-title">%s</span><span class="dsa-topic-chevron"></span></summary>\n<div class="dsa-topic-children">\n%s\n</div>\n</details>' %
-            (' open' if is_topic else '', index, esc(title), '\n'.join(topic_body))
-        )
-
-    if topic_groups:
         o.append(
-            '<details class="dsa-nav-group" open><summary><span>LEARNING PATH</span><small>%d topic%s</small></summary>\n%s\n</details>' %
-            (len(DSA_TOPICS), '' if len(DSA_TOPICS) == 1 else 's', '\n'.join(topic_groups))
+            '<details class="dsa-topic-group"%s><summary><span class="dsa-topic-number">%02d</span><span class="dsa-topic-title">%s</span></summary>\\n<div class="dsa-topic-children">\\n%s\\n</div>\\n</details>' %
+            (' open' if slug == cur else '', index, esc(title), '\\n'.join(topic_body))
         )
-    return '\n'.join(o)
+    return '\\n'.join(o)
 
 
 dsa_stats = {}
