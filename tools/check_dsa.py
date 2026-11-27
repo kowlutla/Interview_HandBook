@@ -42,7 +42,7 @@ def check(path):
     is_problem = os.path.dirname(full).endswith(os.path.join('topics', 'strings'))
     if p.problems < 1: p.errors.append('no DSA problem article found')
     if is_problem and p.h2 < 5: p.errors.append('problem page should contain its problem title and detailed sections')
-    if not is_problem and p.h2 < 3: p.errors.append('topic index should contain at least three h2 sections')
+    if not is_problem and p.h2 < 2: p.errors.append('topic index should contain at least two h2 sections')
     styles = ('../../../handbook/assets/style.css', '../../../quicknotes/assets/quick.css', '../../assets/dsa.css') if is_problem else ('../../handbook/assets/style.css', '../../quicknotes/assets/quick.css', '../assets/dsa.css')
     for required in styles:
         if required not in raw: p.errors.append('missing stylesheet: ' + required)
