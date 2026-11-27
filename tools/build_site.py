@@ -507,14 +507,15 @@ def dsa_nav(cur, pre, active_problem=None):
 
         is_open = ' open' if slug == cur else ''
         topic_groups.append(
-            '<details%s><summary>%02d %s</summary>\n%s\n</details>' %
-            (is_open, index, esc(title), '\n'.join(problem_links))
+            '<details%s><summary>%02d %s</summary>%s</details>' %
+            (is_open, index, esc(title), ''.join(problem_links))
         )
 
     topics_open = ' open' if cur is None or cur in dict(DSA_TOPICS) else ''
-    o.append('<details%s><summary>Topics</summary>\n%s\n</details>' %
-             (topics_open, '\n'.join(topic_groups)))
-    return '\n'.join(o)
+    o.append('<details%s><summary>Topics</summary>%s</details>' %
+             (topics_open, ''.join(topic_groups)))
+    return ''.join(o)
+
 
 
 dsa_stats = {}
