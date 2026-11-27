@@ -3581,7 +3581,7 @@ DSA_PROBLEM_NOTES = {
     },
     "set-kth-bit": {
         "intuition": "<p>Set the zero-based kth bit from the least significant side while leaving all other bits unchanged.</p>",
-        "steps": "<p>Return n | (1<<k), using 1L for long values.</p>",
+        "steps": "<p>Return <code>n | (1 &lt;&lt; k)</code>, using <code>1L</code> for long values.</p>",
         "trace": "<p>For n=8 (1000₂), setting k=1 produces 1010₂ = 10.</p>",
         "proof": "<p>OR with a mask containing only bit k changes that bit to 1 and preserves every other bit.</p>",
         "complexity": "<p>O(1) time and O(1) space.</p>",
