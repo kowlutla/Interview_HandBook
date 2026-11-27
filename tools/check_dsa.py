@@ -52,6 +52,26 @@ def check(path):
     for e in p.errors: print(' - ' + e)
     return not p.errors
 
+def verify_source_coverage():
+    source_root = os.path.join(ROOT, 'dsa-source', 'src', 'com', 'dsa')
+    if not os.path.isdir(source_root):
+        print('DSA source checkout not present; source coverage check skipped')
+        return True
+    expected = sum(1 for d, _, files in os.walk(source_root) for f in files if f.endswith('.java'))
+    topic_root = os.path.join(ROOT, 'site', 'dsa', 'topics')
+    topic_pages = [os.path.join(topic_root, f) for f in os.listdir(topic_root)
+                   if f.endswith('.html') and os.path.isfile(os.path.join(topic_root, f))]
+    actual = 0
+    for path in topic_pages:
+        raw = open(path, encoding='utf-8').read()
+        actual += len(re.findall(r'<article class="dsa-problem-card dsa-problem-summary"', raw))
+    ok = len(topic_pages) == 17 and actual == expected
+    print('DSA source coverage: %d Java files, %d indexed entries, %d topic pages -> %s' %
+          (expected, actual, len(topic_pages), 'OK' if ok else 'INCOMPLETE'))
+    return ok
+
+
 if __name__ == '__main__':
     if len(sys.argv) < 2: raise SystemExit('Pass one or more DSA HTML paths')
-    raise SystemExit(0 if all(check(x) for x in sys.argv[1:]) else 1)
+    valid = all(check(x) for x in sys.argv[1:])
+    raise SystemExit(0 if valid and verify_source_coverage() else 1)
