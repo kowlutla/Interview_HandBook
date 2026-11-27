@@ -1,5 +1,5 @@
 """Focused structural checker for DSA topic pages.
-Usage: python -I tools/check_dsa.py site/interview/dsa/strings.html
+Usage: python -I tools/check_dsa.py site/interview/topics/dsa-strings.html
 """
 import os, re, sys
 from html.parser import HTMLParser
