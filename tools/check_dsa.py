@@ -18,7 +18,7 @@ class Page(HTMLParser):
             if a['id'] in self.ids: self.errors.append('duplicate id: ' + a['id'])
             self.ids.add(a['id'])
         if tag == 'a' and a.get('href'): self.hrefs.append(a['href'])
-        if tag == 'details' and 'dsa-problem' in (a.get('class') or '').split(): self.problems += 1
+        if ('dsa-problem' in (a.get('class') or '').split() and tag == 'details') or ('dsa-problem-card' in (a.get('class') or '').split() and tag == 'article'): self.problems += 1
         if tag == 'h2': self.h2 += 1
         if tag not in VOID: self.stack.append(tag)
     def handle_startendtag(self, tag, attrs): pass
