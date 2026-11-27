@@ -598,13 +598,14 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
         source_links.append('<a href="%s" target="_blank" rel="noopener"><code>%s</code></a>' % (source_url, esc(source_rel)))
         source_blocks.append('<h3>%s</h3><pre class="dsa-code"><code>%s</code></pre>' % (esc(source_rel), esc(source_text)))
     description = statement[0] if statement else 'Java implementation reference for ' + problem_title
+    entry_kind = 'Problem' if statement else 'Implementation reference'
     return '''<!DOCTYPE html>
 <html lang="en"><head><script src="../../../theme.js"></script><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>%(problem)s — %(topic)s | DSA Handbook</title><meta name="description" content="%(description)s">
 <link rel="stylesheet" href="../../../handbook/assets/style.css"><link rel="stylesheet" href="../../../quicknotes/assets/quick.css"><link rel="stylesheet" href="../../assets/dsa.css"><link rel="icon" href="../../../favicon.svg" type="image/svg+xml"></head>
 <body><div class="qn"><div id="dsa-page">
 <nav class="dsa-breadcrumb" aria-label="Breadcrumb"><a href="../../../index.html">Home</a><span>/</span><a href="../../../dsa/index.html">DSA</a><span>/</span><a href="../%(topic_slug)s.html">%(topic)s</a><span>/</span><span aria-current="page">%(problem)s</span></nav>
-<header class="dsa-hero dsa-problem-hero"><p class="dsa-kicker">DATA STRUCTURES &amp; ALGORITHMS / %(topic_upper)s / JAVA</p><h1>%(problem)s</h1><p class="sub">%(description)s</p><div class="dsa-meta"><span>Problem %(number)02d</span><span>Java implementation</span><span>Original DSA source</span></div></header>
+<header class="dsa-hero dsa-problem-hero"><p class="dsa-kicker">DATA STRUCTURES &amp; ALGORITHMS / %(topic_upper)s / JAVA</p><h1>%(problem)s</h1><p class="sub">%(description)s</p><div class="dsa-meta"><span>%(entry_kind)s %(number)02d</span><span>Java implementation</span><span>Original DSA source</span></div></header>
 <article class="dsa-problem-card" id="problem"><div class="dsa-card-head"><span class="dsa-number">%(number)02d</span><span class="dsa-topic">%(topic_upper)s</span></div>
 <nav class="dsa-problem-nav"><a href="#definition">Problem</a><a href="#examples">Examples</a><a href="#intuition">Intuition</a><a href="#approach">Approach</a><a href="#solution">Java</a><a href="#analysis">Analysis</a></nav>
 <section id="definition"><h2>1. Problem definition</h2>%(statement)s</section>
@@ -622,7 +623,7 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
 <div class="dsa-page-actions"><a href="../%(topic_slug)s.html">← Back to %(topic)s</a><a href="../../../search.html">Search the whole site</a></div>
 </div></div></body></html>''' % {
         'problem': esc(problem_title), 'topic': esc(topic_title), 'topic_slug': topic_slug,
-        'topic_upper': esc(topic_title.upper()), 'number': number, 'description': esc(description),
+        'topic_upper': esc(topic_title.upper()), 'number': number, 'entry_kind': entry_kind, 'description': esc(description),
         'statement': statement_html, 'examples': examples_html, 'constraints': constraints_html,
         'methods': method_html, 'steps': steps_html, 'topic_reasoning': topic_reasoning, 'trace_guide': trace_guide, 'proof_guide': proof_guide, 'edge_guide': edge_guide, 'source_links': ' · '.join(source_links),
         'source_blocks': ''.join(source_blocks)
