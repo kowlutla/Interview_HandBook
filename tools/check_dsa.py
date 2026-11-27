@@ -87,12 +87,22 @@ def verify_source_coverage():
         raw = open(path, encoding='utf-8').read()
         actual += len(re.findall(r'<article class="dsa-problem-card dsa-problem-summary"', raw))
     detail_pages = 0
+    quality_gaps = {'statement': 0, 'examples': 0, 'constraints': 0, 'method_explanation': 0, 'complexity_note': 0}
     for current, _, names in os.walk(topic_root):
         if os.path.relpath(current, topic_root) == '.': continue
-        detail_pages += sum(1 for name in names if name.endswith('.html'))
+        for name in names:
+            if not name.endswith('.html'): continue
+            detail_pages += 1
+            raw = open(os.path.join(current, name), encoding='utf-8').read()
+            if 'does not include a formal problem statement' in raw: quality_gaps['statement'] += 1
+            if 'No canonical sample is documented' in raw: quality_gaps['examples'] += 1
+            if 'Explicit constraints are not documented' in raw: quality_gaps['constraints'] += 1
+            if 'No method-level explanation is documented' in raw: quality_gaps['method_explanation'] += 1
+            if 'No complexity annotation is documented' in raw: quality_gaps['complexity_note'] += 1
     ok = len(topic_pages) == 18 and grouped_source_files == expected_files and actual == expected_pages and detail_pages == expected_pages
     print('DSA coverage: %d Java files grouped into %d problem/reference pages; %d indexed entries, %d standalone pages, %d topic pages -> %s' %
           (expected_files, expected_pages, actual, detail_pages, len(topic_pages), 'OK' if ok else 'INCOMPLETE'))
+    print('Source-documentation gaps (pages needing manual enrichment): ' + ', '.join('%s=%d' % (k, v) for k, v in quality_gaps.items()))
     return ok
 
 
