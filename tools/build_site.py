@@ -376,7 +376,7 @@ for slug, title in INT_TOPICS:
         if hb[0] in hub_added: continue
         hub_added.add(hb[0])
         parts = HUB_PARTS[hb[0]]
-        mods.append((hb[0] + '.html', hb[1], 'All %s interview questions in %d parts: %s.' % (hb[1], len(parts), ', '.join(t for _, t in parts)),
+        mods.append((hb[0] + '.html', hb[1], ('All %s coding problems in %d topic pages: %s.' if hb[0] == 'dsa' else 'All %s interview questions in %d parts: %s.') % (hb[1], len(parts), ', '.join(t for _, t in parts)),
                      sum(iv_stats[s]['q'] for s, _ in parts), sum(iv_stats[s]['svg'] for s, _ in parts)))
     else:
         mods.append(('topics/%s.html' % slug, title, iv_stats[slug]['sub'], iv_stats[slug]['q'], iv_stats[slug]['svg']))
@@ -432,7 +432,7 @@ for hb in IV_HUBS.values():
 <script src="../quicknotes/assets/quick.js"></script>
 </body>
 </html>
-''' % (hb[1], iv_nav(hb[0] + '-hub', ''), hb[1], hb[1], len(JAVA_PARTS), len(JAVA_PARTS), 'problems' if hb[0] == 'dsa' else 'questions', jq, java_cards)
+''' % (hb[1], iv_nav(hb[0] + '-hub', ''), hb[1], hb[1], len(JAVA_PARTS), len(JAVA_PARTS), jq, 'problems' if hb[0] == 'dsa' else 'questions', java_cards)
     write(os.path.join(IV, hb[0] + '.html'), java_page)
 iv_index = '''<!DOCTYPE html>
 <html lang="en">
