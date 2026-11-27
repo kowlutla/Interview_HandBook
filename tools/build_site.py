@@ -390,13 +390,13 @@ def card_label(h):
     return 'Topic %02d' % ([i for i, (a, _t) in enumerate(INT_TOPICS) if a == sl][0] + 1)
 
 
-iv_cards = '\n'.join('<a class="card" href="%s"><span class="n">%s</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d questions, %d diagrams</span></a>'
-                     % (h, card_label(h), esc(t), esc(d), q, g) for (h, t, d, q, g) in mods)
+iv_cards = '\n'.join('<a class="card" href="%s"><span class="n">%s</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d %s, %d diagrams</span></a>'
+                     % (h, card_label(h), esc(t), esc(d), q, 'problems' if h == 'dsa.html' else 'questions', g) for (h, t, d, q, g) in mods)
 for hb in IV_HUBS.values():
     JAVA_PARTS = HUB_PARTS[hb[0]]
     if not JAVA_PARTS: continue
-    java_cards = '\n'.join('<a class="card" href="topics/%s.html"><span class="n">Part %d</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d questions, %d diagrams</span></a>'
-                           % (s, i + 1, esc(t), esc(iv_stats[s]['sub']), iv_stats[s]['q'], iv_stats[s]['svg']) for i, (s, t) in enumerate(JAVA_PARTS))
+    java_cards = '\n'.join('<a class="card" href="topics/%s.html"><span class="n">Part %d</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d %s, %d diagrams</span></a>'
+                           % (s, i + 1, esc(t), esc(iv_stats[s]['sub']), iv_stats[s]['q'], 'problems' if hb[0] == 'dsa' else 'questions', iv_stats[s]['svg']) for i, (s, t) in enumerate(JAVA_PARTS))
     jq = sum(iv_stats[s]['q'] for s, _ in JAVA_PARTS)
     java_page = '''<!DOCTYPE html>
 <html lang="en">
@@ -421,7 +421,7 @@ for hb in IV_HUBS.values():
 <p class="sub">Everything about %s in one place, split into %d parts. Work through them in order, or jump to the part you need.</p>
 <div class="stats">
 <div class="stat"><b>%d</b><span>parts</span></div>
-<div class="stat"><b>%d</b><span>questions</span></div>
+<div class="stat"><b>%d</b><span>%s</span></div>
 </div>
 <div class="grid">
 %s
