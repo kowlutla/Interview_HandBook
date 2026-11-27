@@ -267,6 +267,7 @@ INT_TOPICS = [  # slug, short title. Order = reading order. Only topics whose pa
     ('resume-deep-dive', 'Your Projects: Resume Deep Dive'),
     ('data-engineering', 'Data Engineering (Avro, Iceberg)'),
     ('spark', 'Apache Spark'),
+    ('dsa-strings', 'DSA: Strings'),
     ('hld-approach', 'HLD: Interview Approach and Estimation'),
     ('hld-networking-api', 'HLD: Networking, Load Balancing and APIs'),
     ('hld-scaling-caching', 'HLD: Scaling and Caching'),
@@ -292,12 +293,13 @@ IV_GROUPS = [  # (group title, [slugs]); a group is shown only if it has built p
     ('Messaging, Caching and Search', ['kafka', 'redis-caching', 'elasticsearch']),
     ('Architecture', ['microservices-rest', 'distributed-systems', 'design-patterns-lld', 'security-api-design']),
     ('Data Engineering', ['data-engineering', 'spark']),
+    ('Data Structures and Algorithms', ['dsa-strings']),
     ('System Design (HLD)', ['hld-approach', 'hld-networking-api', 'hld-scaling-caching', 'hld-databases', 'hld-replication-sharding', 'hld-distributed-theory', 'hld-async-messaging', 'hld-resilience', 'hld-microservices-arch', 'hld-cross-cutting', 'hld-building-blocks', 'hld-real-world-scenarios', 'hld-design-tradeoffs']),
     ('Your Experience', ['resume-deep-dive']),
 ]
 _ord = [x for _g, _sl in IV_GROUPS for x in _sl]
 INT_TOPICS.sort(key=lambda t: _ord.index(t[0]) if t[0] in _ord else 999)
-IV_HUBS = {'Java': ('java', 'Java', 'java-'), 'System Design (HLD)': ('hld', 'System Design (HLD)', 'hld-')}  # group -> (hub file/slug, name, topic prefix)
+IV_HUBS = {'Java': ('java', 'Java', 'java-'), 'System Design (HLD)': ('hld', 'System Design (HLD)', 'hld-'), 'Data Structures and Algorithms': ('dsa', 'Data Structures and Algorithms', 'dsa-')}  # group -> (hub file/slug, name, topic prefix)
 IV_QN = {'redis-caching': 'q04-caching', 'distributed-systems': 'q07-distributed-theory', 'microservices-rest': 'q10-microservices',
          'kafka': 'q08-async', 'sql-databases': 'q05-data-stores', 'design-patterns-lld': 'q12-algorithms'}
 
@@ -507,7 +509,7 @@ top = '''<!DOCTYPE html>
 <body>
 <div class="top">
 <h1>Interview Prep</h1>
-<p class="lead">One place to prepare for senior engineering interviews. Start with <b>System Design</b> (learn it in the Handbook, revise it in the Quick Notes), then practise topic by topic in the <b>Interview Book</b>: Git today, with Java, Spring, Kafka and more being added.</p>
+<p class="lead">One place to prepare for senior engineering interviews. Start with <b>System Design</b> (learn it in the Handbook, revise it in the Quick Notes), then practise topic by topic in the <b>Interview Book</b>: Git, Java, DSA, Spring, Kafka and more.</p>
 <h2>System Design</h2>
 <div class="two2">
 <a class="big" href="handbook/index.html"><span class="k">Learn</span><span class="t">System Design Handbook</span><span class="d">Complete, from the ground up: every component in depth, microservices, %(nc)d worked case studies, and cheat sheets. Detailed prose with diagrams.</span><span class="m">%(np)d pages, about %(hw)dk words</span></a>
@@ -533,6 +535,6 @@ top = '''<!DOCTYPE html>
 </body>
 </html>
 ''' % dict(np=n_pages, hw=round(hand_words / 1000), nm=len(mods), nc=len(cases), tq=tq,
-    ivcard=('<a class="big" href="interview/index.html"><span class="k">Practise</span><span class="t">Interview Book</span><span class="d">Interview questions topic by topic (Git, Java, Spring, Kafka and more) with model answers, diagrams, follow-ups and real production scenarios.</span><span class="m">%d topics, %d questions</span></a>' % (len(mods), iv_q)) if INT_TOPICS else '')
+    ivcard=('<a class="big" href="interview/index.html"><span class="k">Practise</span><span class="t">Interview Book</span><span class="d">Interview questions topic by topic (Git, Java, DSA, Spring, Kafka and more) with model answers, diagrams, follow-ups and real production scenarios.</span><span class="m">%d topics, %d questions</span></a>' % (len(mods), iv_q)) if INT_TOPICS else '')
 write(os.path.join(ROOT, 'index.html'), top)
 print('built: %d quicknotes pages, %d words, %d Q&As, %d diagrams; handbook %d pages' % (len(items), tw, tq, ts, n_pages))
