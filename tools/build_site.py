@@ -557,7 +557,7 @@ dsa_index = '''<!DOCTYPE html>
 ''' % dict(nav=dsa_nav(None, ''), nt=len(DSA_TOPICS), np=dsa_problems, cards=dsa_cards)
 write(os.path.join(DSA, 'index.html'), dsa_index)
 
-\n
+
 # ---------------- index.html ----------------
 hb = read(os.path.join(ROOT, 'handbook', 'assets', 'chapters.js'))
 n_pages = len(re.findall(r'done: true', hb))
