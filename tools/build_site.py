@@ -721,6 +721,62 @@ DSA_PROBLEM_NOTES = {
         'complexity': '<p>O(n²) time after sorting: there are O(n) fixed positions and an O(n) two-pointer scan for each. Sorting costs O(n log n). Auxiliary space depends on the sorting implementation; the result list is output space and is excluded from auxiliary-space analysis.</p>',
         'edge': '<p>Test fewer than three elements, all zeros, no valid triplet, many duplicates, positive-only/negative-only arrays and sums that require long arithmetic.</p>'
     }
+    'st11-trapping-rain-water': {
+        'intuition': '<p>Water above a bar is <code>min(maxLeft,maxRight)-height[i]</code>. The shorter boundary limits the water level. The source contains brute-force, prefix/suffix and two-pointer variants.</p>',
+        'steps': '<ol><li>For each bar, determine the tallest wall on its left and right.</li><li>In the two-pointer method, process the shorter boundary because the opposite boundary is already at least as tall.</li><li>Add the difference between the known side maximum and the current height when positive.</li></ol>',
+        'trace': '<p>For <code>[3,0,0,2,0,4]</code>, the trapped water is 3 + 3 + 1 + 3 = 10 units. Track leftMax and rightMax as the pointers move; each processed side is safe because the opposite boundary is no shorter.</p>',
+        'proof': '<p>When the left height is no greater than the right height, a right boundary at least as high already exists, so the left-side maximum determines the water above the left bar. The symmetric argument holds on the right. Each pointer step finalizes one position.</p>',
+        'complexity': '<p>Two pointers: O(n) time, O(1) auxiliary space. Prefix/suffix arrays: O(n) time, O(n) space. Per-position rescanning: O(n²) time, O(1) space.</p>',
+        'edge': '<p>Test fewer than three bars, monotonic heights, equal heights, a flat valley, one peak and large accumulated water.</p>'
+    },
+    'l33-clone-linked-list-with-random-pointer': {
+        'intuition': '<p>The clone must preserve next and random links while ensuring cloned links never point into the original list. A HashMap translates original node identity to clone identity; interleaving makes the clone of a node its immediate successor.</p>',
+        'steps': '<ol><li>Map approach: create all clone nodes and store original→clone mappings.</li><li>In a second pass, set clone.next and clone.random by looking up the original targets.</li><li>Interleaving approach: insert each clone after its original, assign random links through <code>original.random.next</code>, then split the two lists and restore the original.</li></ol>',
+        'trace': '<p>For 1→2→3 with 1.random→3, interleaving produces 1→1′→2→2′→3→3′. The random pointer of 1′ targets 3′. The final pass restores 1→2→3 and creates 1′→2′→3′.</p>',
+        'proof': '<p>The map is a one-to-one correspondence between original and cloned nodes, so translating each pointer through it preserves the graph. In the interleaved version, every clone is adjacent to its original, allowing random targets to be translated in O(1); separation then restores both lists.</p>',
+        'complexity': '<p>Both approaches take O(n) time. HashMap uses O(n) auxiliary space. Interleaving uses O(1) auxiliary space excluding the newly allocated clone nodes, but temporarily mutates the original list and must restore it.</p>',
+        'edge': '<p>Test empty list, one node, null random pointers, self-random pointers, random-to-head/tail and several nodes sharing one random target.</p>'
+    },
+    'bt15-diameter-of-binary-tree': {
+        'intuition': '<p>A longest path through a node has <code>leftHeight + rightHeight + 1</code> nodes. The overall diameter may instead lie wholly in one subtree, so retain the maximum seen across all nodes.</p>',
+        'steps': '<ol><li>Naive variant recomputes subtree heights at each node and recursively calculates both subtree diameters.</li><li>Optimized postorder variant computes each child height once.</li><li>At each node, update the diameter with leftHeight + rightHeight, then return 1 + max(leftHeight,rightHeight).</li></ol>',
+        'trace': '<p>For 10 with children 20 and 30, and 20 with children 40 and 60, the longest path 40→20→10→30 contains four nodes. The optimized recursion computes heights bottom-up and updates the answer at the root.</p>',
+        'proof': '<p>Any longest path in a subtree is either entirely in its left child, entirely in its right child, or passes through the current node. Postorder provides the two child heights, so comparing these cases at every node considers every possible path.</p>',
+        'complexity': '<p>Naive: O(n²) worst-case time due to repeated height calculations. Optimized: O(n) time, visiting each node once. Both use O(h) recursion stack space.</p>',
+        'edge': '<p>Test empty tree, one node, skewed tree, balanced tree and a diameter entirely inside one subtree. This source definition counts nodes, not edges.</p>'
+    },
+    'dp25-longest-common-subsequence': {
+        'intuition': '<p>Let dp[i][j] be the LCS length of the first i characters of s and first j characters of t. Matching final characters extend the diagonal state; otherwise one of the two final characters must be excluded.</p>',
+        'steps': '<ol><li>Base case: either prefix empty gives 0.</li><li>If s[i−1] equals t[j−1], use 1 + dp[i−1][j−1].</li><li>Otherwise use max(dp[i−1][j], dp[i][j−1]).</li><li>Memoization caches states; tabulation fills smaller prefixes first; space optimization keeps only the previous and current rows.</li></ol>',
+        'trace': '<p>For <code>abcde</code> and <code>ace</code>, the matches a, c and e extend the common subsequence to length 3. The LCS is "ace".</p>',
+        'proof': '<p>If the final characters match, an optimal subsequence can include that character and the best preceding prefixes. If they differ, an optimal answer must omit at least one final character, so the maximum of the two smaller-prefix states is sufficient. These cases cover all possibilities.</p>',
+        'complexity': '<p>Naive recursion is exponential due to repeated states. Memoization/tabulation take O(n·m) time and O(n·m) space. Two-row optimization takes O(n·m) time and O(m) auxiliary space; use the shorter string as the column dimension for O(min(n,m)) space.</p>',
+        'edge': '<p>Test empty strings, identical strings, no common characters, repeated characters and highly unbalanced lengths.</p>'
+    },
+    'lower-bound': {
+        'intuition': '<p>Lower bound is the first index whose value is greater than or equal to x. It is not exact-match search; if no value qualifies, the answer is n.</p>',
+        'steps': '<ol><li>Initialize the candidate answer to n.</li><li>If arr[mid] ≥ x, save mid and search left for an earlier valid index.</li><li>If arr[mid] &lt; x, discard mid and its left side.</li><li>Return the saved candidate when the interval is empty.</li></ol>',
+        'trace': '<p>For <code>[1,3,5,7,9,11,13]</code> and x=6, the first qualifying value is 7 at index 3. For x=14, no element qualifies and the result is 7 (n).</p>',
+        'proof': '<p>Sorted order means that when arr[mid] ≥ x, mid and everything right are valid candidates, so the first valid index is at mid or left. When arr[mid] &lt; x, mid and everything left are invalid. Each step preserves the first-valid-index candidate.</p>',
+        'complexity': '<p>O(log n) time and O(1) auxiliary space. The input must be sorted in non-decreasing order.</p>',
+        'edge': '<p>Test x below minimum, equal to minimum, between values, duplicate values, equal to maximum and greater than maximum.</p>'
+    },
+    'koko-eating-bananas': {
+        'intuition': '<p>At speed k, hours required are the sum of <code>ceil(pile/k)</code>. Feasibility is monotonic: a speed that works implies every larger speed also works, so binary search finds the minimum feasible speed.</p>',
+        'steps': '<ol><li>Search speed from 1 to the largest pile.</li><li>For mid, sum the ceiling-divided hours for every pile.</li><li>If total hours ≤ h, save mid and search slower; otherwise search faster.</li><li>The final candidate is the minimum feasible speed.</li></ol>',
+        'trace': '<p>For piles <code>[3,6,7,11]</code> and h=8, speed 4 needs 1+2+2+3 = 8 hours. Speed 3 needs 1+2+3+4 = 10 hours, so it is too slow. The minimum valid speed is 4.</p>',
+        'proof': '<p>The required hours never increase as speed increases. Binary search maintains the boundary between infeasible and feasible speeds; a feasible midpoint allows searching left, while an infeasible midpoint requires searching right.</p>',
+        'complexity': '<p>For n piles and maximum pile size M, each feasibility check is O(n), and there are O(log M) checks: O(n log M) time and O(1) auxiliary space. Accumulate hours in long.</p>',
+        'edge': '<p>Test h equal to the number of piles, h much larger than the pile count, one pile, equal piles and large values that could overflow an int hour sum.</p>'
+    },
+    'g21-topological-sort': {
+        'intuition': '<p>A topological order places u before v for every directed edge u→v. DFS pushes a vertex only after all its outgoing neighbours finish; popping the stack reverses finishing order.</p>',
+        'steps': '<ol><li>Build an adjacency list.</li><li>Run DFS from every unvisited vertex, including disconnected components.</li><li>After exploring all neighbours, push the current vertex.</li><li>Pop the stack to produce the ordering.</li></ol>',
+        'trace': '<p>For edges 3→1, 1→2, 0→2 and 0→4, a valid order is <code>3,1,0,4,2</code>. Other orders may also be correct as long as every edge points forward.</p>',
+        'proof': '<p>In a DAG, DFS finishes every reachable neighbour before the current vertex. Therefore the current vertex is pushed later and popped earlier, placing it before each outgoing neighbour. Visiting all vertices covers disconnected components too.</p>',
+        'complexity': '<p>O(V+E) time and O(V) auxiliary space for visited state, stack and recursion. This implementation assumes a DAG; it does not detect cycles.</p>',
+        'edge': '<p>Test isolated vertices, disconnected DAGs, a chain, multiple valid orders and a directed cycle that violates the precondition.</p>'
+    }
 }
 def generate_dsa_topics():
     """Generate complete topic pages from the checked-out kowlutla/DSA source."""
