@@ -478,6 +478,7 @@ DSA_SOURCE = os.path.join(os.path.dirname(ROOT), 'dsa-source', 'src', 'com', 'ds
 # The order is a deliberate learning progression: fundamentals first, then core
 # data structures, trees/greedy, and finally graph and dynamic-programming topics.
 DSA_TOPIC_CONFIG = [
+    ('foundations', 'Foundations', 'Learn algorithm analysis, constraints, data-structure selection and a repeatable problem-solving process.', 'Asymptotic analysis; time and auxiliary space; Java correctness; data-structure selection; testing.'),
     ('patterns', 'Patterns', 'Translate visual patterns into row/column relationships and precise loop bounds.', 'Nested loops; row and column progression; symmetry; spacing and boundaries.'),
     ('mathematical', 'Mathematics', 'Build fluency with digits, divisibility, primes, factors, powers, roots and numeric edge cases.', 'Digit extraction; divisors and primes; modular arithmetic; numeric limits.'),
     ('arrays', 'Arrays', 'Learn traversal, in-place updates, two pointers, prefix sums, hashing, subarrays and greedy reasoning.', 'Single-pass traversal; two pointers; prefix sums; sliding windows; frequency maps.'),
@@ -533,9 +534,12 @@ def generate_dsa_topics():
     catalog = {}
     for slug, title, description, patterns in DSA_TOPIC_CONFIG:
         folder = os.path.join(DSA_SOURCE, slug)
-        if not os.path.isdir(folder):
-            continue
-        files = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith('.java')]
+        if slug == 'foundations':
+            files = []
+        else:
+            if not os.path.isdir(folder):
+                continue
+            files = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith('.java')]
         if slug == 'arrays':
             files = [p for p in files if os.path.basename(p) not in DSA_MATRIX_FILES]
         if slug == 'matrix':
@@ -628,6 +632,7 @@ def generate_dsa_topics():
 
 DSA_TOPICS, DSA_PROBLEMS = generate_dsa_topics()
 DSA_TOPICS = [t for t in DSA_TOPICS if os.path.exists(os.path.join(DSA, 'topics', t[0] + '.html'))]
+print('DSA build: %d topics, %d Java source entries' % (len(DSA_TOPICS), sum(len(v) for v in DSA_PROBLEMS.values())))
 print('DSA build: %d topics, %d Java source entries' % (len(DSA_TOPICS), sum(len(v) for v in DSA_PROBLEMS.values())))
 
 def dsa_nav(cur, pre, active_problem=None):
