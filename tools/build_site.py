@@ -3501,7 +3501,7 @@ DSA_PROBLEM_NOTES = {
     },
     "maximum-and-value": {
         "intuition": "<p>Find the maximum bitwise AND obtainable from two distinct array elements. Greedily attempt to set result bits from most significant to least significant and count whether at least two numbers contain the candidate mask.</p>",
-        "steps": "<p>Initialize result=0; for each bit high-to-low, form candidate=result|(1<<bit); count array elements satisfying (value&candidate)==candidate; keep candidate if count≥2.</p>",
+        "steps": "<p>Initialize result=0; for each bit high-to-low, form candidate=result|(1&lt;&lt;bit); count array elements satisfying (value&candidate)==candidate; keep candidate if count≥2.</p>",
         "trace": "<p>If two values share the high bits 1010, that mask is a feasible AND; lower bits are considered only if at least two values still contain them.</p>",
         "proof": "<p>A bit can belong to the final AND only if at least two distinct elements have every bit in the candidate mask set. Greedy high-to-low selection preserves the largest possible numeric prefix.</p>",
         "complexity": "<p>O(w*n) time and O(1) extra space.</p>",
