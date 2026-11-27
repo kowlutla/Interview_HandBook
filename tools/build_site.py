@@ -777,7 +777,6 @@ DSA_PROBLEM_NOTES = {
         'complexity': '<p>O(V+E) time and O(V) auxiliary space for visited state, stack and recursion. This implementation assumes a DAG; it does not detect cycles.</p>',
         'edge': '<p>Test isolated vertices, disconnected DAGs, a chain, multiple valid orders and a directed cycle that violates the precondition.</p>'
     }
-,
     "a1-largest-number-in-array": {
         "intuition": "<p>The maximum is the largest value seen so far. One scan compares each element with the current candidate exactly once.</p>",
         "steps": "<ol><li>Initialize the candidate from the first element.</li><li>Scan the remaining values.</li><li>Replace the candidate whenever a larger value appears.</li><li>Return the candidate.</li></ol>",
@@ -882,7 +881,6 @@ DSA_PROBLEM_NOTES = {
         "complexity": "<p>Average and typical cases are O(log n), but worst-case time is O(n) when many duplicates force one-step boundary trimming. Auxiliary space is O(1).</p>",
         "edge": "<p>Test all-equal values, target equal to duplicated boundaries, duplicates spanning the rotation pivot, one element and empty input. Do not claim strict O(log n) worst-case time when duplicates are allowed.</p>",
     },
-,
     "a10-max-consecutive-ones": {
         "intuition": "<p>The repository groups two related variants: maximum consecutive ones with no flips, and maximum consecutive ones when at most k zeros may be flipped. The first is a simple run counter; the second is a sliding window containing at most k zeros.</p>",
         "steps": "<ol><li><b>Basic variant:</b> increment the current run on 1, reset it on 0, and maintain the maximum.</li><li><b>At-most-k variant:</b> expand the right edge, count zeros, and move the left edge until the window contains no more than k zeros.</li><li>Update the best window length after each valid expansion.</li></ol>",
