@@ -1,5 +1,5 @@
-"""Focused structural checker for DSA topic pages.
-Usage: python -I tools/check_dsa.py site/dsa/topics/strings.html
+"""Structural checker for DSA topic indexes and individual problem pages.
+Usage: python -I tools/check_dsa.py site/dsa/topics/strings.html site/dsa/topics/strings/isomorphic-strings.html
 """
 import os, re, sys
 from html.parser import HTMLParser
@@ -11,15 +11,16 @@ class Page(HTMLParser):
     def __init__(self):
         super().__init__()
         self.stack, self.errors, self.ids, self.hrefs = [], [], set(), []
-        self.problems, self.h2 = 0, 0
+        self.problems, self.h2, self.h3 = 0, 0, 0
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         if a.get('id'):
             if a['id'] in self.ids: self.errors.append('duplicate id: ' + a['id'])
             self.ids.add(a['id'])
         if tag == 'a' and a.get('href'): self.hrefs.append(a['href'])
-        if ('dsa-problem' in (a.get('class') or '').split() and tag == 'details') or ('dsa-problem-card' in (a.get('class') or '').split() and tag == 'article'): self.problems += 1
+        if tag == 'article' and 'dsa-problem-card' in (a.get('class') or '').split(): self.problems += 1
         if tag == 'h2': self.h2 += 1
+        if tag == 'h3': self.h3 += 1
         if tag not in VOID: self.stack.append(tag)
     def handle_startendtag(self, tag, attrs): pass
     def handle_endtag(self, tag):
@@ -38,11 +39,16 @@ def check(path):
     for anchor in re.findall(r'href="#([^"]+)"', raw):
         if anchor not in p.ids: p.errors.append('missing anchor: #' + anchor)
     if p.stack: p.errors.append('unclosed tags: ' + repr(p.stack[-5:]))
-    if p.problems < 1: p.errors.append('no DSA problem blocks found')
-    if p.h2 < 3: p.errors.append('expected at least three topic sections')
-    for required in ('../../handbook/assets/style.css', '../../quicknotes/assets/quick.css', '../assets/dsa.css'):
+    is_problem = os.path.dirname(full).endswith(os.path.join('topics', 'strings'))
+    if p.problems < 1: p.errors.append('no DSA problem article found')
+    if is_problem and p.h2 < 5: p.errors.append('problem page should contain its problem title and detailed sections')
+    if not is_problem and p.h2 < 3: p.errors.append('topic index should contain at least three h2 sections')
+    styles = ('../../../handbook/assets/style.css', '../../../quicknotes/assets/quick.css', '../../assets/dsa.css') if is_problem else ('../../handbook/assets/style.css', '../../quicknotes/assets/quick.css', '../assets/dsa.css')
+    for required in styles:
         if required not in raw: p.errors.append('missing stylesheet: ' + required)
-    print('%s: %d problems, %d sections -> %s' % (path, p.problems, p.h2, 'OK' if not p.errors else 'PROBLEMS'))
+    if is_problem and 'dsa-breadcrumb' not in raw: p.errors.append('problem page is missing breadcrumbs')
+    if not is_problem and 'dsa-problem-summary' not in raw: p.errors.append('topic index must use concise problem summaries')
+    print('%s: %d problem article(s), %d h2 headings -> %s' % (path, p.problems, p.h2, 'OK' if not p.errors else 'PROBLEMS'))
     for e in p.errors: print(' - ' + e)
     return not p.errors
 
