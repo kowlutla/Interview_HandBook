@@ -720,7 +720,7 @@ DSA_PROBLEM_NOTES = {
         'proof': '<p>After sorting, for a fixed i, increasing left increases or preserves the sum, while decreasing right decreases or preserves it. Therefore the pointer movement cannot skip a solution. Skipping equal fixed values and equal pointer values removes duplicate triplets without removing a distinct value combination.</p>',
         'complexity': '<p>O(n²) time after sorting: there are O(n) fixed positions and an O(n) two-pointer scan for each. Sorting costs O(n log n). Auxiliary space depends on the sorting implementation; the result list is output space and is excluded from auxiliary-space analysis.</p>',
         'edge': '<p>Test fewer than three elements, all zeros, no valid triplet, many duplicates, positive-only/negative-only arrays and sums that require long arithmetic.</p>'
-    }
+    },
     'st11-trapping-rain-water': {
         'intuition': '<p>Water above a bar is <code>min(maxLeft,maxRight)-height[i]</code>. The shorter boundary limits the water level. The source contains brute-force, prefix/suffix and two-pointer variants.</p>',
         'steps': '<ol><li>For each bar, determine the tallest wall on its left and right.</li><li>In the two-pointer method, process the shorter boundary because the opposite boundary is already at least as tall.</li><li>Add the difference between the known side maximum and the current height when positive.</li></ol>',
