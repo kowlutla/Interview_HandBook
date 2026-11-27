@@ -916,7 +916,7 @@ def generate_dsa_topics():
 
 DSA_TOPICS, DSA_PROBLEMS = generate_dsa_topics()
 DSA_TOPICS = [t for t in DSA_TOPICS if os.path.exists(os.path.join(DSA, 'topics', t[0] + '.html'))]
-print('DSA build: %d topics, %d Java source entries' % (len(DSA_TOPICS), sum(len(v) for v in DSA_PROBLEMS.values())))
+print('DSA build: %d topics, %d problem/reference pages, %d curated problem explanations' % (len(DSA_TOPICS), sum(len(v) for v in DSA_PROBLEMS.values()), len(DSA_PROBLEM_NOTES)))
 print('DSA build: %d topics, %d Java source entries' % (len(DSA_TOPICS), sum(len(v) for v in DSA_PROBLEMS.values())))
 
 def dsa_nav(cur, pre, active_problem=None):
