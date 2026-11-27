@@ -971,6 +971,23 @@ DSA_PROBLEM_NOTES = {
         "complexity": "<p>O(n) time and O(n) result space for a list-based implementation.</p>",
         "edge": "<p>The rightmost element is always a leader. Equal values qualify because the definition uses greater-than-or-equal. Test increasing, decreasing, all-equal and single-element arrays.</p>",
     },
+
+    "a22-set-matrix-zeroes": {
+        "intuition": "<p>A zero at (r,c) requires row r and column c to become zero. The key is to remember which rows and columns were originally marked, without allowing newly written zeros to trigger additional rows or columns.</p>",
+        "steps": "<ol><li>Record whether the first row and first column originally contain zero.</li><li>Use the first cell of each remaining row and column as marker storage.</li><li>Scan the interior and mark its row/column when an original zero is found.</li><li>Zero marked rows and columns, then apply the saved first-row/first-column flags.</li></ol>",
+        "trace": "<p>For <code>[[1,1,1],[1,0,1],[1,1,1]]</code>, the zero at (1,1) marks row 1 and column 1. Applying the markers yields <code>[[1,0,1],[0,0,0],[1,0,1]]</code>.</p>",
+        "proof": "<p>Marker cells encode exactly which rows and columns contain an original zero. The separate flags preserve the information for the first row and first column, whose marker cells overlap. Applying markers after the discovery pass prevents newly written zeros from being mistaken for original input zeros.</p>",
+        "complexity": "<p>The marker-in-first-row/column approach is O(mn) time and O(1) auxiliary space. A simpler boolean row/column array solution is O(mn) time and O(m+n) extra space.</p>",
+        "edge": "<p>Test zero in the first row, first column, top-left cell, multiple zeros, no zeros, one row, one column and rectangular matrices. The source also has a sentinel-marker variant; ensure the sentinel cannot be a legitimate input value before using it.</p>",
+    },
+    "a24-matrix-spiral-order": {
+        "intuition": "<p>Maintain the unvisited rectangle using top, bottom, left and right boundaries. Each iteration traverses one outer layer and then shrinks the rectangle inward.</p>",
+        "steps": "<ol><li>Traverse the top row from left to right, then increment top.</li><li>Traverse the right column from top to bottom, then decrement right.</li><li>If rows remain, traverse the bottom row right to left, then decrement bottom.</li><li>If columns remain, traverse the left column bottom to top, then increment left.</li><li>Repeat while the boundaries still describe an unvisited cell.</li></ol>",
+        "trace": "<p>For a 3×4 matrix containing 1 through 12 row-wise, the first layer is <code>1,2,3,4,8,12,11,10,9,5</code>; the remaining inner row contributes <code>6,7</code>. The full order is <code>1,2,3,4,8,12,11,10,9,5,6,7</code>.</p>",
+        "proof": "<p>The four boundary traversals visit the current outer layer exactly once. Shrinking the corresponding boundary removes that layer from future consideration. The remaining rectangle is therefore precisely the set of unvisited cells.</p>",
+        "complexity": "<p>O(mn) time because every cell is emitted once, and O(1) auxiliary traversal space excluding the output list.</p>",
+        "edge": "<p>Test 1×1, 1×n, m×1, 2×2, rectangular matrices, and dimensions where the final layer contains only one row or one column. Guard bottom/left traversals after shrinking to avoid duplicates.</p>",
+    },
 }
 def generate_dsa_topics():
     """Generate complete topic pages from the checked-out kowlutla/DSA source."""
