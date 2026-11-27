@@ -498,16 +498,16 @@ def dsa_nav(cur, pre):
                     body.append('<a href="#%s">%s</a>' % (hid, esc(html.unescape(re.sub(r'<[^>]+>', '', ht).strip()))))
                 body.append('</div>')
     if body:
-        o.append('<details open><summary>Topics</summary>\\n%s\\n</details>' % '\\n'.join(body))
-    return '\\n'.join(o)
+        o.append('<details open><summary>Topics</summary>\n%s\n</details>' % '\n'.join(body))
+    return '\n'.join(o)
 
 
 dsa_stats = {}
 for i, (slug, title) in enumerate(DSA_TOPICS):
     p = os.path.join(DSA, 'topics', slug + '.html')
     s = read(p)
-    s = re.sub(r'<!--dnav:start-->.*?<!--dnav:end-->\\n?', '', s, flags=re.S)
-    s = re.sub(r'<!--dfoot:start-->.*?<!--dfoot:end-->\\n?', '', s, flags=re.S)
+    s = re.sub(r'<!--dnav:start-->.*?<!--dnav:end-->\n?', '', s, flags=re.S)
+    s = re.sub(r'<!--dfoot:start-->.*?<!--dfoot:end-->\n?', '', s, flags=re.S)
     dsa_stats[slug] = dict(problems=len(re.findall(r'<details class="dsa-problem', s)),
                            diagrams=len(re.findall(r'<svg[^>]*viewBox', s)),
                            words=len(re.sub(r'<[^>]+>', ' ', s).split()), sub=sub_of(p))
@@ -515,14 +515,14 @@ for i, (slug, title) in enumerate(DSA_TOPICS):
     if i > 0: pager.append('<a class="prev" href="%s.html"><span class="lbl">Previous</span>%s</a>' % (DSA_TOPICS[i-1][0], esc(DSA_TOPICS[i-1][1])))
     if i < len(DSA_TOPICS)-1: pager.append('<a class="next" href="%s.html"><span class="lbl">Next</span>%s</a>' % (DSA_TOPICS[i+1][0], esc(DSA_TOPICS[i+1][1])))
     pager.append('</div>')
-    head = '<!--dnav:start-->\\n<div class="layout">\\n<nav class="toc" id="toc">\\n%s\\n</nav>\\n<main class="qmain">\\n<!--dnav:end-->\\n' % dsa_nav(slug, '../')
-    foot = '<!--dfoot:start-->\\n%s\\n</main>\\n</div>\\n<script src="../../quicknotes/assets/quick.js"></script>\\n<!--dfoot:end-->\\n' % ''.join(pager)
+    head = '<!--dnav:start-->\n<div class="layout">\n<nav class="toc" id="toc">\n%s\n</nav>\n<main class="qmain">\n<!--dnav:end-->\n' % dsa_nav(slug, '../')
+    foot = '<!--dfoot:start-->\n%s\n</main>\n</div>\n<script src="../../quicknotes/assets/quick.js"></script>\n<!--dfoot:end-->\n' % ''.join(pager)
     s = s.replace('<div class="qn">', head + '<div class="qn">', 1).replace('</body>', foot + '</body>', 1)
     write(p, s)
 
 dsa_problems = sum(v['problems'] for v in dsa_stats.values())
 dsa_diagrams = sum(v['diagrams'] for v in dsa_stats.values())
-dsa_cards = '\\n'.join('<a class="card" href="topics/%s.html"><span class="n">Topic %02d</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d problems, %d diagrams</span></a>' %
+dsa_cards = '\n'.join('<a class="card" href="topics/%s.html"><span class="n">Topic %02d</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d problems, %d diagrams</span></a>' %
                          (slug, i+1, esc(title), esc(dsa_stats[slug]['sub']), dsa_stats[slug]['problems'], dsa_stats[slug]['diagrams'])
                          for i, (slug, title) in enumerate(DSA_TOPICS))
 dsa_index = '''<!DOCTYPE html>
@@ -557,7 +557,8 @@ dsa_index = '''<!DOCTYPE html>
 ''' % dict(nav=dsa_nav(None, ''), nt=len(DSA_TOPICS), np=dsa_problems, cards=dsa_cards)
 write(os.path.join(DSA, 'index.html'), dsa_index)
 
-\n# ---------------- index.html ----------------
+\n
+# ---------------- index.html ----------------
 hb = read(os.path.join(ROOT, 'handbook', 'assets', 'chapters.js'))
 n_pages = len(re.findall(r'done: true', hb))
 hand_words = 0
