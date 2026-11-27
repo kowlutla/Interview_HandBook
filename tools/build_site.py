@@ -488,7 +488,7 @@ def dsa_nav(cur, pre, active_problem=None):
     site = pre + '../'
     o = [
         ('<a class="dsa-nav-brand" href="%sindex.html"><span class="dsa-nav-mark">DSA</span><span><b>Data Structures &amp; Algorithms</b><small>Java problem-solving handbook</small></span></a>' % pre),
-        '<div class="dsa-nav-links"><a href="%sindex.html">⌂ <span>DSA Home</span></a><a href="%sindex.html">↗ <span>Main Handbook</span></a><a href="%ssearch.html">⌕ <span>Global Search</span></a></div>' % (pre, site, site),
+        '<div class="qlinks dsa-nav-links"><a href="%sindex.html">⌂ <span>DSA Home</span></a><a href="%sindex.html">↗ <span>Main Handbook</span></a><a href="%ssearch.html">⌕ <span>Global Search</span></a></div>' % (pre, site, site),
     ]
     body = []
     for index, (slug, title) in enumerate(DSA_TOPICS, 1):
