@@ -3159,6 +3159,55 @@ DSA_PROBLEM_NOTES = {
         "complexity": "<p>O(n log n) time for sorting and O(1) auxiliary space beyond sorting.</p>",
         "edge": "<p>Test empty, one interval, nested intervals, equal end times and touching endpoints. The comparison for touching endpoints depends on whether the problem defines closed or half-open intervals.</p>",
     },
+
+    "bst5-floor": {
+        "intuition": "<p>The floor is the greatest key less than or equal to x. When a node is at most x, it is a candidate; searching its right subtree may find a larger valid key.</p>",
+        "steps": "<ol><li>Start at root with no candidate.</li><li>If current.key equals x, return it.</li><li>If current.key is less than x, save it and move right.</li><li>If current.key is greater than x, move left.</li><li>Return the best candidate or -1 if none exists.</li></ol>",
+        "trace": "<p>For a BST containing 1,2,3,5,7 and x=4, the greatest key not exceeding 4 is 3.</p>",
+        "proof": "<p>When current is below x, it is a valid floor and every key in its left subtree is smaller, so only the right subtree can improve it. When current is above x, it and its right subtree are too large, so move left.</p>",
+        "complexity": "<p>O(h) time and O(1) auxiliary space.</p>",
+        "edge": "<p>Test exact match, x below minimum, x above maximum, empty tree and skewed BST. Return -1 when no floor exists.</p>",
+    },
+    "bt39-binary-tree-from-in-order-post-order-i": {
+        "intuition": "<p>Postorder ends with the root; inorder splits the node values into left and right subtrees. When consuming postorder backward, build the right subtree before the left.</p>",
+        "steps": "<ol><li>Map each unique value to its inorder index.</li><li>Start a postorder cursor at the final element.</li><li>Create the root from the current postorder value.</li><li>Build the right inorder range first, then the left range.</li><li>Return null for an empty range.</li></ol>",
+        "trace": "<p>For inorder [9,3,15,20,7] and postorder [9,15,7,20,3], root is 3. The right subtree is rooted at 20 with children 15 and 7; the left child is 9.</p>",
+        "proof": "<p>The final postorder value is the root, and inorder uniquely identifies the left and right value ranges. Reversing postorder consumption visits root-right-left, so constructing right before left consumes the correct traversal segments.</p>",
+        "complexity": "<p>O(n) time and O(n) map plus O(h) recursion space. Repeated inorder scans can degrade to O(n²).</p>",
+        "edge": "<p>Test one node, skewed trees, negative values, mismatched traversals and duplicates. The source contract guarantees unique values and consistent traversals.</p>",
+    },
+    "bt39-binary-tree-from-in-order-post-order-ii": {
+        "intuition": "<p>Use postorder's final value as the current root and inorder to divide left and right subtrees. This repository variant provides an alternate implementation of the same reconstruction problem.</p>",
+        "steps": "<ol><li>Maintain an active inorder range and a postorder cursor starting at the end.</li><li>Create the root from postorder[cursor] and decrement the cursor.</li><li>Locate the root in the active inorder range.</li><li>Construct the right subtree before the left subtree.</li><li>Return the root after both ranges are consumed.</li></ol>",
+        "trace": "<p>For inorder [4,8,2,5,1,6,3,7] and postorder [8,4,5,2,6,7,3,1], root is 1; the left subtree is built from [4,8,2,5] and the right from [6,3,7].</p>",
+        "proof": "<p>Postorder determines the root at the end of each subtree segment; inorder determines the segment boundaries. Recursing right then left while consuming postorder backward preserves the traversal order and reconstructs the same structure.</p>",
+        "complexity": "<p>O(n) with indexed inorder lookup, or O(n²) if each root is found by scanning the active range. Recursion uses O(h) space.</p>",
+        "edge": "<p>Test empty/single-node input, skewed trees, duplicate values and inconsistent traversals. Duplicate values may make reconstruction ambiguous without an explicit occurrence-selection rule.</p>",
+    },
+    "predict-the-column": {
+        "intuition": "<p>The task is to find the column containing the greatest number of zeros. Scan columns, count zeros in each, and keep the first column that achieves a new maximum.</p>",
+        "steps": "<ol><li>Initialize best count to -1 and best column to -1.</li><li>For each column, count its zero entries across all rows.</li><li>Update the answer only when the count is strictly greater than the current best, preserving the first column on ties.</li><li>If the maximum count is zero, return -1.</li></ol>",
+        "trace": "<p>For a 3×3 matrix where column 1 contains two zeros and other columns contain at most one, return column index 1.</p>",
+        "proof": "<p>Every column is examined and its exact zero count is computed. Keeping the largest count yields the maximum-zero column; strict update preserves the earliest index among ties.</p>",
+        "complexity": "<p>O(n²) time and O(1) auxiliary space for an n×n matrix.</p>",
+        "edge": "<p>Test all ones (return -1), all zeros (first column), ties, one column and one row. Clarify whether output column indexing is zero-based or one-based.</p>",
+    },
+    "print-matrix-in-snake-pattern": {
+        "intuition": "<p>Snake traversal visits rows alternately: even-indexed rows left-to-right and odd-indexed rows right-to-left. Every cell is visited exactly once.</p>",
+        "steps": "<ol><li>Iterate rows from top to bottom.</li><li>For an even row, append columns from 0 to n-1.</li><li>For an odd row, append columns from n-1 down to 0.</li><li>Return the collected sequence.</li></ol>",
+        "trace": "<p>For <code>[[1,2,3],[4,5,6],[7,8,9]]</code>, the snake order is <code>[1,2,3,6,5,4,7,8,9]</code>.</p>",
+        "proof": "<p>The outer loop visits each row once. The inner loop visits every column exactly once in the chosen direction, so no cell is skipped or repeated.</p>",
+        "complexity": "<p>O(n²) time and O(n²) output storage for an n×n matrix.</p>",
+        "edge": "<p>Test one row, one column, odd/even row counts and rectangular matrices if supported. The source assumes a square matrix.</p>",
+    },
+    "sum-of-upper-and-lower-triangles": {
+        "intuition": "<p>In a square matrix, upper-triangle cells satisfy column ≥ row and lower-triangle cells satisfy column ≤ row. The main diagonal belongs to both under this source's definition.</p>",
+        "steps": "<ol><li>Initialize upper and lower sums to zero.</li><li>For each row i, add columns 0..i to the lower sum.</li><li>Add columns i..n-1 to the upper sum.</li><li>Return both sums in the required order.</li></ol>",
+        "trace": "<p>For <code>[[1,2],[3,4]]</code>, upper sum is 1+2+4=7 and lower sum is 1+3+4=8; diagonal values are included in both.</p>",
+        "proof": "<p>The conditions j≤i and j≥i partition the matrix into lower and upper triangular regions with the diagonal shared. The nested loops visit exactly those index ranges.</p>",
+        "complexity": "<p>O(n²) time and O(1) auxiliary space, excluding the two returned sums.</p>",
+        "edge": "<p>Test n=1, all zeros, negative values and large sums. Confirm that the diagonal is included in both sums, not assigned to only one triangle.</p>",
+    },
 }
 def generate_dsa_topics():
     """Generate complete topic pages from the checked-out kowlutla/DSA source."""
