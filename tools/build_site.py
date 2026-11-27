@@ -553,7 +553,7 @@ def generate_dsa_topics():
         cards = []
         for number, (problem_slug, problem_title, source_path) in enumerate(catalog[slug], 1):
             source = read(source_path)
-            rel_source = os.path.relpath(source_path, os.path.dirname(DSA_SOURCE)).replace(os.sep, '/')
+            rel_source = os.path.relpath(source_path, DSA_SOURCE).replace(os.sep, '/')
             summary = esc(dsa_source_summary(source, problem_title))
             class_match = re.search(r'\bclass\s+([A-Za-z_$][\w$]*)', source)
             type_name = class_match.group(1) if class_match else os.path.basename(source_path)[:-5]
@@ -597,6 +597,10 @@ def generate_dsa_topics():
 <p>Work through the problems in order. Before reading the implementation, restate the input contract and constraints. Then identify the key observation, explain why the chosen data structure fits, trace the important state, and derive the complexity from the actual operations.</p>
 <h3>Patterns and concepts</h3><p>%(patterns)s</p>
 <div class="dsa-callout"><b>For every problem:</b> Explain the invariant, test empty and boundary inputs, check integer and character constraints, and distinguish auxiliary space from output space. Do not assume a complexity claim without checking the loops and data-structure operations.</div>
+</section>
+<section class="dsa-section">
+<h2>How to reason through a solution</h2>
+<p>For each entry, identify the state that changes, the condition that advances the algorithm, and the point at which the result becomes final. Check whether the implementation mutates its input, relies on sorted data, assumes a restricted value range, or uses recursion depth proportional to the input.</p>
 </section>
 <section class="dsa-section">
 <h2>Problem and implementation index</h2>
