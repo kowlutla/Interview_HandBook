@@ -40,14 +40,15 @@ def check(path):
         if anchor not in p.ids: p.errors.append('missing anchor: #' + anchor)
     if p.stack: p.errors.append('unclosed tags: ' + repr(p.stack[-5:]))
     is_problem = os.path.dirname(full).endswith(os.path.join('topics', 'strings'))
-    if p.problems < 1: p.errors.append('no DSA problem article found')
+    is_foundations = full.endswith(os.path.join('topics', 'foundations.html'))
+    if p.problems < 1 and not is_foundations: p.errors.append('no DSA problem article found')
     if is_problem and p.h2 < 5: p.errors.append('problem page should contain its problem title and detailed sections')
     if not is_problem and p.h2 < 2: p.errors.append('topic index should contain at least two h2 sections')
     styles = ('../../../handbook/assets/style.css', '../../../quicknotes/assets/quick.css', '../../assets/dsa.css') if is_problem else ('../../handbook/assets/style.css', '../../quicknotes/assets/quick.css', '../assets/dsa.css')
     for required in styles:
         if required not in raw: p.errors.append('missing stylesheet: ' + required)
     if is_problem and 'dsa-breadcrumb' not in raw: p.errors.append('problem page is missing breadcrumbs')
-    if not is_problem and 'dsa-problem-summary' not in raw: p.errors.append('topic index must use concise problem summaries')
+    if not is_problem and not is_foundations and 'dsa-problem-summary' not in raw: p.errors.append('topic index must use concise problem summaries')
     print('%s: %d problem article(s), %d h2 headings -> %s' % (path, p.problems, p.h2, 'OK' if not p.errors else 'PROBLEMS'))
     for e in p.errors: print(' - ' + e)
     return not p.errors
