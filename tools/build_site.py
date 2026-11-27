@@ -475,9 +475,15 @@ if INT_TOPICS: write(os.path.join(IV, 'index.html'), iv_index)
 DSA = os.path.join(ROOT, 'dsa')
 DSA_TOPICS = [('strings', 'Strings')]
 DSA_TOPICS = [t for t in DSA_TOPICS if os.path.exists(os.path.join(DSA, 'topics', t[0] + '.html'))]
+DSA_PROBLEMS = {
+    'strings': [
+        ('isomorphic-strings', 'Isomorphic Strings'),
+        ('minimum-number-following-pattern', 'Minimum Number Following an I/D Pattern'),
+    ],
+}
 
 
-def dsa_nav(cur, pre):
+def dsa_nav(cur, pre, active_problem=None):
     """Independent DSA navigation; pre is relative to the DSA root."""
     site = pre + '../'
     o = [
@@ -491,12 +497,19 @@ def dsa_nav(cur, pre):
         body.append('<a class="%s" href="%stopics/%s.html"><span class="num">%02d</span><span>%s</span></a>' %
                     (cls, pre, slug, DSA_TOPICS.index((slug, title)) + 1, esc(title)))
         if slug == cur:
-            heads = re.findall(r'<h2 id="([^"]+)"[^>]*>(.*?)</h2>', read(os.path.join(DSA, 'topics', slug + '.html')), re.S)
-            if heads:
-                body.append('<div class="onpage">')
-                for hid, ht in heads:
-                    body.append('<a href="#%s">%s</a>' % (hid, esc(html.unescape(re.sub(r'<[^>]+>', '', ht).strip()))))
-                body.append('</div>')
+            body.append('<div class="dsa-sidebar-problems">')
+            for number, (problem_slug, problem_title) in enumerate(DSA_PROBLEMS.get(slug, []), 1):
+                active = ' current' if active_problem == problem_slug else ''
+                body.append('<a class="dsa-sidebar-problem%s" href="%stopics/%s/%s.html"><span>%02d</span>%s</a>' %
+                            (active, pre, slug, problem_slug, number, esc(problem_title)))
+            body.append('</div>')
+            if active_problem is None:
+                heads = re.findall(r'<h2 id="([^"]+)"[^>]*>(.*?)</h2>', read(os.path.join(DSA, 'topics', slug + '.html')), re.S)
+                if heads:
+                    body.append('<div class="onpage">')
+                    for hid, ht in heads:
+                        body.append('<a href="#%s">%s</a>' % (hid, esc(html.unescape(re.sub(r'<[^>]+>', '', ht).strip()))))
+                    body.append('</div>')
     if body:
         o.append('<details open><summary>Topics</summary>\n%s\n</details>' % '\n'.join(body))
     return '\n'.join(o)
@@ -508,7 +521,7 @@ for i, (slug, title) in enumerate(DSA_TOPICS):
     s = read(p)
     s = re.sub(r'<!--dnav:start-->.*?<!--dnav:end-->\n?', '', s, flags=re.S)
     s = re.sub(r'<!--dfoot:start-->.*?<!--dfoot:end-->\n?', '', s, flags=re.S)
-    dsa_stats[slug] = dict(problems=len(re.findall(r'<details class="dsa-problem', s)),
+    dsa_stats[slug] = dict(problems=len(re.findall(r'<article class="dsa-problem-card dsa-problem-summary"', s)),
                            diagrams=len(re.findall(r'<svg[^>]*viewBox', s)),
                            words=len(re.sub(r'<[^>]+>', ' ', s).split()), sub=sub_of(p))
     pager = ['<div class="pager">']
@@ -519,6 +532,30 @@ for i, (slug, title) in enumerate(DSA_TOPICS):
     foot = '<!--dfoot:start-->\n%s\n</main>\n</div>\n<script src="../../quicknotes/assets/quick.js"></script>\n<!--dfoot:end-->\n' % ''.join(pager)
     s = s.replace('<div class="qn">', head + '<div class="qn">', 1).replace('</body>', foot + '</body>', 1)
     write(p, s)
+
+# Individual problem pages use the same shell but remain separate, focused documents.
+dsa_problem_count = 0
+for topic_slug, problems in DSA_PROBLEMS.items():
+    for index, (problem_slug, problem_title) in enumerate(problems):
+        p = os.path.join(DSA, 'topics', topic_slug, problem_slug + '.html')
+        if not os.path.exists(p):
+            continue
+        s = read(p)
+        s = re.sub(r'<!--dnav:start-->.*?<!--dnav:end-->\n?', '', s, flags=re.S)
+        s = re.sub(r'<!--dfoot:start-->.*?<!--dfoot:end-->\n?', '', s, flags=re.S)
+        pager = ['<div class="pager">']
+        if index > 0:
+            prev_slug, prev_title = problems[index - 1]
+            pager.append('<a class="prev" href="%s.html"><span class="lbl">Previous problem</span>%s</a>' % (prev_slug, esc(prev_title)))
+        if index < len(problems) - 1:
+            next_slug, next_title = problems[index + 1]
+            pager.append('<a class="next" href="%s.html"><span class="lbl">Next problem</span>%s</a>' % (next_slug, esc(next_title)))
+        pager.append('</div>')
+        head = '<!--dnav:start-->\n<div class="layout">\n<nav class="toc" id="toc">\n%s\n</nav>\n<main class="qmain">\n<!--dnav:end-->\n' % dsa_nav(topic_slug, '../../', problem_slug)
+        foot = '<!--dfoot:start-->\n%s\n</main>\n</div>\n<script src="../../../quicknotes/assets/quick.js"></script>\n<!--dfoot:end-->\n' % ''.join(pager)
+        s = s.replace('<div class="qn">', head + '<div class="qn">', 1).replace('</body>', foot + '</body>', 1)
+        write(p, s)
+        dsa_problem_count += 1
 
 dsa_problems = sum(v['problems'] for v in dsa_stats.values())
 dsa_diagrams = sum(v['diagrams'] for v in dsa_stats.values())
@@ -545,7 +582,7 @@ dsa_index = '''<!DOCTYPE html>
 <h1>Data Structures and Algorithms</h1>
 <p class="sub">Java coding problems organized by topic and pattern. Build problem-solving intuition, understand the invariant, practise optimized implementations and revise complexity.</p>
 <div class="stats"><div class="stat"><b>%(nt)d</b><span>topics</span></div><div class="stat"><b>%(np)d</b><span>problems</span></div></div>
-<div class="tl"><b>How to use this section:</b> Try each problem before opening its solution. Explain the brute-force idea, identify the pattern, implement the optimized approach, and verify it with a dry run and complexity analysis.</div>
+<div class="tl"><b>How to use this section:</b> Choose a topic, attempt a problem independently, then study its dedicated explanation, Java implementation, dry run and complexity analysis.</div>
 <div class="grid">%(cards)s</div>
 <p><a href="../index.html">Home</a> · <a href="../search.html">Search the whole site</a></p>
 </div>
