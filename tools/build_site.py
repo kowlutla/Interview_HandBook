@@ -572,8 +572,8 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
             candidate = prefix[prefix.rfind('/**'):] if '/**' in prefix else ''
             doc_text = candidate.split(close_comment, 1)[0] if close_comment in candidate and not candidate.split(close_comment, 1)[1].strip() else ''
             if not doc_text:
-                doc_text = '\\n'.join(line.strip()[2:].strip() for line in prefix[-500:].splitlines() if line.strip().startswith('//'))
-            if re.search(r'\\bprivate\\s+$', prefix[-40:]): continue
+                doc_text = '\n'.join(line.strip()[2:].strip() for line in prefix[-500:].splitlines() if line.strip().startswith('//'))
+            if prefix.rstrip().endswith('private'): continue
             for line in doc_text.splitlines():
                 line = re.sub(r'^\s*\* ?', '', line).strip()
                 if line and not line.startswith('@') and not re.search(r'(time|space) complexity', line, re.I):
