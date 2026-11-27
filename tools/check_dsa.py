@@ -1,5 +1,5 @@
 """Focused structural checker for DSA topic pages.
-Usage: python -I tools/check_dsa.py site/interview/topics/dsa-strings.html
+Usage: python -I tools/check_dsa.py site/dsa/topics/strings.html
 """
 import os, re, sys
 from html.parser import HTMLParser
@@ -40,7 +40,7 @@ def check(path):
     if p.stack: p.errors.append('unclosed tags: ' + repr(p.stack[-5:]))
     if p.problems < 1: p.errors.append('no DSA problem blocks found')
     if p.h2 < 3: p.errors.append('expected at least three topic sections')
-    for required in ('../../handbook/assets/style.css', '../../quicknotes/assets/quick.css', '../assets/interview.css', '../assets/dsa.css'):
+    for required in ('../../handbook/assets/style.css', '../../quicknotes/assets/quick.css', '../assets/dsa.css'):
         if required not in raw: p.errors.append('missing stylesheet: ' + required)
     print('%s: %d problems, %d sections -> %s' % (path, p.problems, p.h2, 'OK' if not p.errors else 'PROBLEMS'))
     for e in p.errors: print(' - ' + e)
