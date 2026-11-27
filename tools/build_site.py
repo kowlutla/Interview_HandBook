@@ -546,6 +546,11 @@ def generate_dsa_topics():
                                   for x in re.split(r'(\d+)', os.path.basename(p))])
         catalog[slug] = [(dsa_slug(os.path.basename(p)), dsa_title(os.path.basename(p)), p)
                          for p in files]
+        if slug == 'strings':
+            catalog[slug] = [
+                ('isomorphic-strings', 'Isomorphic Strings', os.path.join(folder, 'IsomorphicStrings.java')),
+                ('minimum-number-following-pattern', 'Minimum Number Following an I/D Pattern', os.path.join(folder, 'NumberFollowingAPattern.java'))
+            ]
 
         if slug == 'strings':
             continue  # The two Strings problems have individually authored teaching pages.
