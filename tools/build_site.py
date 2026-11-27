@@ -818,7 +818,6 @@ DSA_PROBLEM_NOTES = {
         "complexity": "<p>O(n) time and O(1) auxiliary space; the input is modified in place.</p>",
         "edge": "<p>Test empty, one-element, all-equal and all-distinct arrays, plus duplicates at either end. Ignore the stale suffix beyond the returned length. The algorithm requires sorted input.</p>",
     },
-,
     "upper-bound": {
         "intuition": "<p>The upper bound is the first index whose value is strictly greater than the target. It is a boundary-search problem, not an ordinary search for an arbitrary matching element.</p>",
         "steps": "<ol><li>Search the half-open candidate range using start and end.</li><li>If the middle value is greater than x, remember mid and continue left.</li><li>Otherwise continue right.</li><li>If no qualifying value exists, return n.</li></ol>",
