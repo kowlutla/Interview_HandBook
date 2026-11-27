@@ -2890,7 +2890,7 @@ DSA_PROBLEM_NOTES = {
         "trace": "<p>Push 5,2,4. The minimum is 2; popping 4 leaves minimum 2; popping 2 restores minimum 5.</p>",
         "proof": "<p>The min stack stores each value that becomes a new minimum, including duplicates. When that value is removed, the previous minimum becomes the top again, so getMin always returns the minimum among active elements.</p>",
         "complexity": "<p>O(1) time per operation and O(n) auxiliary space for the two stacks.</p>",
-        "edge": "<p>Test duplicate minimums, popping the minimum, empty operations, negative values and integer extremes. Use <= on push if the pop logic removes a min entry when values are equal.</p>",
+        "edge": "<p>Test duplicate minimums, popping the minimum, empty operations, negative values and integer extremes. Use &lt;= on push if the pop logic removes a min entry when values are equal.</p>",
     },
     "st9-next-greater-element2": {
         "intuition": "<p>The array is circular, so the next greater element may appear after wrapping from the end to the beginning. Scan two passes while maintaining a decreasing stack of indices.</p>",
@@ -3429,7 +3429,7 @@ DSA_PROBLEM_NOTES = {
     },
     "copy-set-bits-in-range": {
         "intuition": "<p>Copy every set bit of Y in the 1-based inclusive bit range [L,R] into X; bits not set in Y are left unchanged in X.</p>",
-        "steps": "<p>For each bit position p from L through R, test Y with mask 1<<(p-1); if set, OR that mask into X.</p>",
+        "steps": "<p>For each bit position p from L through R, test Y with mask 1&lt;&lt;(p-1); if set, OR that mask into X.</p>",
         "trace": "<p>If X=10 (1010), Y=13 (1101), and range [1,3], copy Y's set bits at positions 1 and 3 into X.</p>",
         "proof": "<p>OR only adds set bits and never clears existing bits. The loop examines every permitted position, so the result has the union of X's set bits and Y's in-range set bits.</p>",
         "complexity": "<p>O(R-L+1) time and O(1) space.</p>",
@@ -3441,7 +3441,7 @@ DSA_PROBLEM_NOTES = {
         "trace": "<p>For N=3, binary values 01,10,11 contain 1+1+2=4 set bits in total.</p>",
         "proof": "<p>At each bit, zeros and ones alternate in fixed blocks. Counting the number of indices in the one-blocks gives the exact contribution; summing over bit positions counts every set bit once.</p>",
         "complexity": "<p>O(log N) time and O(1) space for the positional formula; the source's brute-force variant is O(N log N).</p>",
-        "edge": "<p>N=0 returns 0. Use long arithmetic for cycle lengths and products; avoid overflow in 1<<(b+1).</p>",
+        "edge": "<p>N=0 returns 0. Use long arithmetic for cycle lengths and products; avoid overflow in 1&lt;&lt;(b+1).</p>",
     },
     "counts-zeros-xor-pairs": {
         "intuition": "<p>XOR of two integers is zero exactly when the integers are equal. Therefore count equal-value unordered index pairs.</p>",
@@ -3461,7 +3461,7 @@ DSA_PROBLEM_NOTES = {
     },
     "first-position-of-set-bit": {
         "intuition": "<p>The input must contain exactly one set bit; return its 1-based position from the least significant bit, otherwise -1.</p>",
-        "steps": "<p>Reject n<=0; test power-of-two property; if valid, use trailing-zero count plus one.</p>",
+        "steps": "<p>Reject n&lt;=0; test power-of-two property; if valid, use trailing-zero count plus one.</p>",
         "trace": "<p>For 16 (10000₂), the only set bit is at 1-based position 5.</p>",
         "proof": "<p>A positive power of two has exactly one set bit. Number of trailing zeros gives the number of lower zero positions, so adding one gives the required position.</p>",
         "complexity": "<p>O(1) word operation using trailing-zero count; O(1) space.</p>",
@@ -3485,9 +3485,9 @@ DSA_PROBLEM_NOTES = {
     },
     "longest-consecutive1s": {
         "intuition": "<p>Find the longest run of consecutive 1 bits in an integer's binary representation.</p>",
-        "steps": "<p>Scan bits while maintaining current run and maximum, or repeatedly apply n=n&(n<<1) and count iterations.</p>",
+        "steps": "<p>Scan bits while maintaining current run and maximum, or repeatedly apply n=n&(n&lt;&lt;1) and count iterations.</p>",
         "trace": "<p>For 14 (1110₂), the longest run is 3.</p>",
-        "proof": "<p>The bit trick n&(n<<1) removes the trailing 1 from every run while shortening each consecutive run by one; the number of iterations equals the longest run length.</p>",
+        "proof": "<p>The bit trick n&(n&lt;&lt;1) removes the trailing 1 from every run while shortening each consecutive run by one; the number of iterations equals the longest run length.</p>",
         "complexity": "<p>O(w) time for scanning or O(k) for the bit trick, where k is longest run; O(1) space.</p>",
         "edge": "<p>Test zero, all ones, alternating bits and negative values. Clarify whether the input is treated as signed 32-bit or non-negative.</p>",
     },
@@ -3505,7 +3505,7 @@ DSA_PROBLEM_NOTES = {
         "trace": "<p>If two values share the high bits 1010, that mask is a feasible AND; lower bits are considered only if at least two values still contain them.</p>",
         "proof": "<p>A bit can belong to the final AND only if at least two distinct elements have every bit in the candidate mask set. Greedy high-to-low selection preserves the largest possible numeric prefix.</p>",
         "complexity": "<p>O(w*n) time and O(1) extra space.</p>",
-        "edge": "<p>Test n<2, duplicate values at distinct indices, zero values and highest bit. Use unsigned shifts or long for sign-bit handling; the source assumes positive elements.</p>",
+        "edge": "<p>Test n&lt;2, duplicate values at distinct indices, zero values and highest bit. Use unsigned shifts or long for sign-bit handling; the source assumes positive elements.</p>",
     },
     "maximum-subset-xor": {
         "intuition": "<p>Find the maximum XOR obtainable from any subset. A linear XOR basis stores independent bit vectors; greedily combine basis vectors from high bits to low to maximize the result.</p>",
@@ -3589,7 +3589,7 @@ DSA_PROBLEM_NOTES = {
     },
     "sum-of-two-numbers": {
         "intuition": "<p>Add integers without arithmetic + or -. XOR computes the sum bits without carry; AND followed by left shift computes carry bits. Repeat until carry is zero.</p>",
-        "steps": "<p>While b!=0, compute sum=a^b and carry=(a&b)<<1; assign a=sum,b=carry; return a.</p>",
+        "steps": "<p>While b!=0, compute sum=a^b and carry=(a&b)&lt;&lt;1; assign a=sum,b=carry; return a.</p>",
         "trace": "<p>For 5+3: XOR gives 6 and carry gives 2; 6+2 gives 4 with carry 4; 4+4 gives 0 with carry 8; final result is 8.</p>",
         "proof": "<p>At each bit, XOR is addition modulo 2 and AND identifies positions generating carry. Shifting carry aligns it with the next higher bit; iteration propagates all carries.</p>",
         "complexity": "<p>O(w) time for fixed-width integers and O(1) space.</p>",
@@ -3601,7 +3601,7 @@ DSA_PROBLEM_NOTES = {
         "trace": "<p>At a bit with 2 ones and 3 zeros, 6 unordered pairs contribute that bit's weight.</p>",
         "proof": "<p>Each unordered pair contributes 2^b exactly when its two bits differ. There are ones*zeros such pairs at that position; summing independent bit contributions gives the total XOR sum.</p>",
         "complexity": "<p>O(w*n) time and O(1) extra space.</p>",
-        "edge": "<p>Test n<2, all equal values, zeros, negative values and large totals. Use long for pair counts and bit weights.</p>",
+        "edge": "<p>Test n&lt;2, all equal values, zeros, negative values and large totals. Use long for pair counts and bit weights.</p>",
     },
     "swap-all-odd-and-even-bits": {
         "intuition": "<p>Swap every adjacent pair of bits in a fixed-width integer: bits at even positions move left and bits at odd positions move right.</p>",
@@ -3613,7 +3613,7 @@ DSA_PROBLEM_NOTES = {
     },
     "swap-two-nibbles-in-a-byte": {
         "intuition": "<p>Swap the high and low 4-bit nibbles of an 8-bit value.</p>",
-        "steps": "<p>Return ((n&0x0F)<<4)|((n&0xF0)>>>4), then mask with 0xFF if needed.</p>",
+        "steps": "<p>Return ((n&0x0F)&lt;&lt;4)|((n&0xF0)>>>4), then mask with 0xFF if needed.</p>",
         "trace": "<p>For 0xAB (1010 1011), swapping nibbles yields 0xBA (1011 1010).</p>",
         "proof": "<p>The low mask isolates bits 0..3 and shifts them into bits 4..7; the high mask isolates bits 4..7 and shifts them into bits 0..3. OR combines disjoint results.</p>",
         "complexity": "<p>O(1) time and O(1) space.</p>",
@@ -3702,7 +3702,7 @@ DSA_PROBLEM_NOTES = {
     },
     "largest-number-possible": {
         "intuition": "<p>Construct the largest N-digit decimal number whose digit sum is S; return -1 if impossible.</p>",
-        "steps": "<p>If S>9N or S<0, return -1. Fill digits from left to right with min(9,S), subtracting each chosen digit; remaining positions become zero.</p>",
+        "steps": "<p>If S>9N or S&lt;0, return -1. Fill digits from left to right with min(9,S), subtracting each chosen digit; remaining positions become zero.</p>",
         "trace": "<p>N=3,S=20 gives 992; N=2,S=3 gives 30.</p>",
         "proof": "<p>The most significant digit dominates numeric value. Assigning as much sum as possible to earlier digits (up to 9) is lexicographically and numerically optimal.</p>",
         "complexity": "<p>O(N) time and O(N) output space.</p>",
@@ -3774,11 +3774,11 @@ DSA_PROBLEM_NOTES = {
     },
     "primality-test": {
         "intuition": "<p>Determine whether N has exactly two positive divisors: 1 and itself.</p>",
-        "steps": "<p>Reject N<2; test divisors from 2 while d*d≤N; if any divides N, return false; otherwise true.</p>",
+        "steps": "<p>Reject N&lt;2; test divisors from 2 while d*d≤N; if any divides N, return false; otherwise true.</p>",
         "trace": "<p>29 is prime; 21 is composite because 3 divides it.</p>",
         "proof": "<p>If N is composite, it has a factor no greater than sqrt(N). Checking all candidates up to that bound is sufficient.</p>",
         "complexity": "<p>O(sqrt N) time and O(1) space; checking only 2 then odd divisors reduces constants.</p>",
-        "edge": "<p>Use d<=N/d instead of d*d<=N to avoid overflow. 0 and 1 are not prime.</p>",
+        "edge": "<p>Use d&lt;=N/d instead of d*d&lt;=N to avoid overflow. 0 and 1 are not prime.</p>",
     },
     "quadratic-equation-roots": {
         "intuition": "<p>Solve ax²+bx+c=0 using the discriminant D=b²-4ac and return real roots when D≥0.</p>",
@@ -3810,7 +3810,7 @@ DSA_PROBLEM_NOTES = {
         "trace": "<p>100! has floor(100/5)+floor(100/25)=20+4=24 trailing zeros.</p>",
         "proof": "<p>Each multiple of 5 contributes at least one factor 5, multiples of 25 contribute an extra, and so on. Summing these counts gives the total number of factor-5s.</p>",
         "complexity": "<p>O(log5 N) time and O(1) space.</p>",
-        "edge": "<p>N<0 is invalid; 0! and values below 5 have zero trailing zeros. Avoid overflow when multiplying the power-of-five factor; repeated division is safer.</p>",
+        "edge": "<p>N&lt;0 is invalid; 0! and values below 5 have zero trailing zeros. Avoid overflow when multiplying the power-of-five factor; repeated division is safer.</p>",
     },
 
     "alpha-hill-pattern": {
@@ -4024,7 +4024,7 @@ DSA_PROBLEM_NOTES = {
     },
     "digital-root": {
         "intuition": "<p>Repeatedly sum decimal digits until one digit remains.</p>",
-        "steps": "<p>If n<10 return n; otherwise recursively call digitalRoot(sumDigits(n)).</p>",
+        "steps": "<p>If n&lt;10 return n; otherwise recursively call digitalRoot(sumDigits(n)).</p>",
         "trace": "<p>9875 -> 9+8+7+5=29 -> 2+9=11 -> 1+1=2.</p>",
         "proof": "<p>Each call replaces n with a smaller digit sum. The recursion terminates at a single digit, which is the digital root.</p>",
         "complexity": "<p>O(log n) per digit-sum pass and O(log n) recursion levels; O(log n) overall digit work for standard bounds.</p>",
