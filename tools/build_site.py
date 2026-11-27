@@ -580,6 +580,25 @@ def generate_dsa_topics():
                  source_url, esc(rel_source), esc(type_name), esc(source))
             )
 
+        foundation_content = ''
+        if slug == 'foundations':
+            foundation_content = """<section class="dsa-section">
+<h2>1. What DSA means</h2>
+<p><b>Data structures</b> organize information; <b>algorithms</b> define the steps that transform it into an answer. Choose them together: the right structure makes the operations required by the algorithm efficient.</p>
+<h2>2. A repeatable problem-solving workflow</h2>
+<ol><li><b>Clarify the contract:</b> inputs, outputs, duplicates, ordering, mutation, null/empty cases and whether one or all answers are required.</li><li><b>Read the constraints:</b> estimate the largest input and rule out approaches that cannot finish in time or memory.</li><li><b>Build a correct baseline:</b> use a simple approach to understand the search space before optimizing.</li><li><b>Find repeated work:</b> look for rescans, recomputed prefixes, duplicate states and expensive membership checks.</li><li><b>Choose a pattern and data structure:</b> base the choice on required operations, not familiarity.</li><li><b>State an invariant:</b> explain what remains true after each iteration or recursive call.</li><li><b>Prove and test:</b> justify coverage and correctness, then test boundary cases and derive complexity.</li></ol>
+<h2>3. Complexity analysis</h2>
+<p>Big-O describes an asymptotic upper bound on growth; Big-Theta is a tight bound and Big-Omega is a lower bound. Ignore constants and lower-order terms when comparing growth, but keep input assumptions explicit.</p>
+<table><thead><tr><th>Complexity</th><th>Typical example</th><th>Growth</th></tr></thead><tbody><tr><td><code>O(1)</code></td><td>Array access by index</td><td>Constant</td></tr><tr><td><code>O(log n)</code></td><td>Binary search</td><td>Problem size shrinks by a factor</td></tr><tr><td><code>O(n)</code></td><td>One traversal</td><td>Linear</td></tr><tr><td><code>O(n log n)</code></td><td>Efficient comparison sorting</td><td>Linear work across logarithmic levels</td></tr><tr><td><code>O(n²)</code></td><td>All pairs / nested scans</td><td>Quadratic</td></tr><tr><td><code>O(2ⁿ)</code></td><td>Enumerating subsets</td><td>Exponential</td></tr><tr><td><code>O(n!)</code></td><td>Enumerating permutations</td><td>Factorial</td></tr></tbody></table>
+<p>Time complexity counts operations as input grows. Auxiliary space counts extra working memory, usually excluding input and required output. Include recursion call-stack space when it grows with input.</p>
+<h2>4. Choosing a data structure</h2>
+<table><thead><tr><th>Need</th><th>Typical choice</th><th>Reason</th></tr></thead><tbody><tr><td>Indexed sequential data</td><td>Array / ArrayList</td><td>Constant-time indexed reads</td></tr><tr><td>Average-case key lookup</td><td>HashMap / HashSet</td><td>Expected constant-time lookup</td></tr><tr><td>Last-in, first-out</td><td>Stack / Deque</td><td>Efficient operations at one end</td></tr><tr><td>First-in, first-out</td><td>Queue / Deque</td><td>Efficient operations at opposite ends</td></tr><tr><td>Repeated min/max extraction</td><td>PriorityQueue</td><td>Efficient access to the highest-priority item</td></tr><tr><td>Ordered neighbour queries</td><td>TreeMap / balanced tree</td><td>Maintains sorted keys</td></tr><tr><td>Relationships and connectivity</td><td>Graph adjacency list</td><td>Represents vertices and edges</td></tr></tbody></table>
+<h2>5. Java correctness checks</h2>
+<ul><li>Use <code>long</code> when sums, products or counts can exceed the <code>int</code> range; widen before multiplication.</li><li>Use <code>equals</code> for object-value equality; <code>==</code> compares primitive values or object references.</li><li>Java <code>char</code> is a UTF-16 code unit, not always a full Unicode code point.</li><li>Avoid subtraction-based comparators that can overflow; prefer <code>Integer.compare(a, b)</code>.</li><li>Recursive depth can overflow the Java call stack; consider iterative traversal for unbounded depth.</li><li>Check whether APIs mutate input and whether a map key is absent or mapped to a default value.</li></ul>
+<h2>6. Correctness and edge-case checklist</h2>
+<ul><li>Empty and single-element input</li><li>Duplicates, sorted and reverse-sorted input</li><li>Negative values and zero where allowed</li><li>Minimum and maximum constraint values</li><li>Disconnected graphs, cycles and unreachable nodes where relevant</li><li>Empty strings, repeated characters and Unicode where relevant</li><li>Overflow, off-by-one errors and invalid assumptions</li></ul>
+<p class="dsa-remember"><b>Interview habit:</b> explain the invariant and why the data structure fits before walking through code.</p>
+</section>"""
         page = '''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -601,6 +620,7 @@ def generate_dsa_topics():
 <h1>%(title)s</h1><p class="sub">%(description)s</p>
 <div class="dsa-meta"><span>%(count)d source entries</span><span>Java</span><span>%(level)s</span></div>
 </header>
+%(foundation_content)s
 <section class="dsa-section">
 <h2>How to study this topic</h2>
 <p>Work through the problems in order. Before reading the implementation, restate the input contract and constraints. Then identify the key observation, explain why the chosen data structure fits, trace the important state, and derive the complexity from the actual operations.</p>
@@ -621,7 +641,7 @@ def generate_dsa_topics():
 </body></html>''' % {
             'title': esc(title), 'description': esc(description), 'count': len(files),
             'level': 'Foundations' if slug in ('patterns','mathematical','arrays','strings','sorting') else 'Core to advanced',
-            'patterns': esc(patterns), 'cards': ''.join(cards)
+            'patterns': esc(patterns), 'cards': ''.join(cards), 'foundation_content': foundation_content
         }
         write(os.path.join(DSA, 'topics', slug + '.html'), page)
 
