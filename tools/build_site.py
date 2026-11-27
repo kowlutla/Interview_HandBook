@@ -542,8 +542,10 @@ DSA_TOPIC_GUIDES = {
     'dynamic_programming': '<section class="dsa-section"><h2>DP design framework</h2><ul><li>Define a state that contains exactly the information needed to make future decisions; write the recurrence before coding.</li><li>Base cases represent the smallest subproblems. Tabulation order must ensure every dependency is already computed.</li><li>Memoization avoids recomputing states; tabulation makes evaluation order explicit. Both should represent the same recurrence.</li><li>Space optimization is valid only when discarded states are no longer needed. For 0/1 knapsack, one-dimensional updates run backward; for unbounded choices, update direction may differ.</li><li>Count states and transitions to derive time and space complexity instead of guessing from the code shape.</li></ul></section>'
 }
 
-def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_title, source, source_rel):
-    """Create one standalone study page per Java source file."""
+def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_title, source_files):
+    """Create one standalone study page per problem, combining alternative Java source files."""
+    source = source_files[0][0]
+    all_source = '\n'.join(item[0] for item in source_files)
     close_comment = chr(42) + chr(47)
     doc = re.match(r'\s*/\*\*(.*?)' + re.escape(close_comment), source, re.S)
     lines = []
@@ -563,9 +565,9 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
         (statement if mode == 'statement' else examples if mode == 'examples' else constraints).append(line)
     method_pattern = re.compile(r'(public\s+(?:static\s+)?(?:[\w<>\[\], ?]+\s+)+(\w+)\s*\([^;{}]*\)\s*\{)', re.S)
     methods = []
-    for m in method_pattern.finditer(source):
+    for m in method_pattern.finditer(all_source):
         if m.group(2) == 'main': continue
-        prefix = source[max(0, m.start() - 1000):m.start()]
+        prefix = all_source[max(0, m.start() - 1000):m.start()]
         doc_text = prefix.rsplit('/**', 1)[-1].split(close_comment, 1)[0] if '/**' in prefix and close_comment in prefix.rsplit('/**', 1)[-1] else ''
         desc = []
         for line in doc_text.splitlines():
@@ -580,12 +582,17 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
     method_html = ''.join('<article class="dsa-approach"><h3>Implementation %02d — <code>%s</code></h3><p><code>%s</code></p><p>%s</p><p><b>Source complexity note:</b> %s</p></article>' % (i, esc(x[0]), esc(x[1]), esc(x[2] or 'No method-level explanation is documented.'), esc(x[3] or 'No complexity annotation is documented; derive it from the implementation.')) for i,x in enumerate(methods,1))
     if not method_html: method_html = '<p>No public method was detected. Review the constructors and public API below.</p>'
     comments = []
-    for x in re.findall(r'//\s*(.+)', source):
+    for x in re.findall(r'//\s*(.+)', all_source):
         x = re.sub(r'\s+', ' ', x).strip()
         if len(x) > 12 and x not in comments: comments.append(x)
         if len(comments) >= 7: break
     steps_html = '<ol>%s</ol>' % ''.join('<li>%s</li>' % esc(x) for x in comments) if comments else '<ol><li>Identify the input state and required output.</li><li>Trace the main loop or recursive state.</li><li>Explain the condition that advances the state and the termination condition.</li><li>Verify that every valid case is considered exactly as required.</li></ol>'
-    source_url = 'https://github.com/kowlutla/DSA/blob/main/src/com/dsa/' + source_rel.replace(' ', '%20')
+    source_links = []
+    source_blocks = []
+    for source_text, source_rel in source_files:
+        source_url = 'https://github.com/kowlutla/DSA/blob/main/src/com/dsa/' + source_rel.replace(' ', '%20')
+        source_links.append('<a href="%s" target="_blank" rel="noopener"><code>%s</code></a>' % (source_url, esc(source_rel)))
+        source_blocks.append('<h3>%s</h3><pre class="dsa-code"><code>%s</code></pre>' % (esc(source_rel), esc(source_text)))
     description = statement[0] if statement else 'Java implementation reference for ' + problem_title
     return '''<!DOCTYPE html>
 <html lang="en"><head><script src="../../../theme.js"></script><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -601,7 +608,7 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
 <section id="constraints"><h2>3. Constraints and assumptions</h2>%(constraints)s</section>
 <section id="intuition"><h2>4. Intuition and key observation</h2><p>Start from the operations demanded by the problem: search, count, order, compare, connect, construct or optimize. Identify which information must be retained while processing the input and which repeated work can be avoided. Evaluate the implementation against the exact contract and constraints above.</p><div class="dsa-insight"><span class="dsa-insight-icon">💡</span><div><b>Key question</b><p>What invariant does the algorithm maintain, and why does each state transition preserve it?</p></div></div></section>
 <section id="approach"><h2>5. Approach and implementation variants</h2>%(methods)s<h3>Step-by-step reading guide</h3>%(steps)s</section>
-<section id="solution"><h2>6. Java implementation</h2><p>Complete original Java source, including helper methods and comments. Evaluate each public method separately; variants may have different time and space trade-offs.</p><p><b>Source:</b> <a href="%(source_url)s" target="_blank" rel="noopener"><code>%(source_rel)s</code></a></p><pre class="dsa-code"><code>%(source)s</code></pre></section>
+<section id="solution"><h2>6. Java implementation</h2><p>Complete original Java source, including helper methods and comments. Evaluate each public method separately; variants may have different time and space trade-offs.</p><p><b>Original source files:</b> %(source_links)s</p>%(source_blocks)s</section>
 <section id="dry-run"><h2>7. Dry run and walkthrough</h2><p>Use the documented sample above. Trace the selected method line by line, recording indices/pointers, accumulated values, recursive state or data-structure contents. Check that the final state produces the documented output. Where the source has no sample, first define tests from the confirmed problem contract rather than inventing constraints.</p></section>
 <section id="correctness"><h2>8. Correctness reasoning</h2><p>Define an invariant that is true before processing starts. Show that each loop iteration or recursive transition preserves it. At termination, connect the invariant to the required output. For recursion, justify the base case and show that every recursive branch makes progress toward it.</p></section>
 <section id="analysis"><h2>9. Complexity analysis</h2><p>Use method-level annotations above when present, then verify them against the actual implementation. Count loop iterations, recursive calls, collection operations, sorting and preprocessing.</p><div class="dsa-complexity"><div><small>TIME</small><strong>Per-method analysis</strong><p>Derive from the exact variant; do not assume all methods in one class have the same complexity.</p></div><div><small>AUXILIARY SPACE</small><strong>Per-method analysis</strong><p>Count extra collections, arrays and recursion depth. State whether output space is excluded.</p></div></div></section>
@@ -613,8 +620,8 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
         'problem': esc(problem_title), 'topic': esc(topic_title), 'topic_slug': topic_slug,
         'topic_upper': esc(topic_title.upper()), 'number': number, 'description': esc(description),
         'statement': statement_html, 'examples': examples_html, 'constraints': constraints_html,
-        'methods': method_html, 'steps': steps_html, 'source_url': source_url,
-        'source_rel': esc(source_rel), 'source': esc(source)
+        'methods': method_html, 'steps': steps_html, 'source_links': ' · '.join(source_links),
+        'source_blocks': ''.join(source_blocks)
     }
 
 
