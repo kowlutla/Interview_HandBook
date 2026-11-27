@@ -267,7 +267,6 @@ INT_TOPICS = [  # slug, short title. Order = reading order. Only topics whose pa
     ('resume-deep-dive', 'Your Projects: Resume Deep Dive'),
     ('data-engineering', 'Data Engineering (Avro, Iceberg)'),
     ('spark', 'Apache Spark'),
-    ('dsa-strings', 'DSA: Strings'),
     ('hld-approach', 'HLD: Interview Approach and Estimation'),
     ('hld-networking-api', 'HLD: Networking, Load Balancing and APIs'),
     ('hld-scaling-caching', 'HLD: Scaling and Caching'),
@@ -293,13 +292,12 @@ IV_GROUPS = [  # (group title, [slugs]); a group is shown only if it has built p
     ('Messaging, Caching and Search', ['kafka', 'redis-caching', 'elasticsearch']),
     ('Architecture', ['microservices-rest', 'distributed-systems', 'design-patterns-lld', 'security-api-design']),
     ('Data Engineering', ['data-engineering', 'spark']),
-    ('Data Structures and Algorithms', ['dsa-strings']),
     ('System Design (HLD)', ['hld-approach', 'hld-networking-api', 'hld-scaling-caching', 'hld-databases', 'hld-replication-sharding', 'hld-distributed-theory', 'hld-async-messaging', 'hld-resilience', 'hld-microservices-arch', 'hld-cross-cutting', 'hld-building-blocks', 'hld-real-world-scenarios', 'hld-design-tradeoffs']),
     ('Your Experience', ['resume-deep-dive']),
 ]
 _ord = [x for _g, _sl in IV_GROUPS for x in _sl]
 INT_TOPICS.sort(key=lambda t: _ord.index(t[0]) if t[0] in _ord else 999)
-IV_HUBS = {'Java': ('java', 'Java', 'java-'), 'System Design (HLD)': ('hld', 'System Design (HLD)', 'hld-'), 'Data Structures and Algorithms': ('dsa', 'Data Structures and Algorithms', 'dsa-')}  # group -> (hub file/slug, name, topic prefix)
+IV_HUBS = {'Java': ('java', 'Java', 'java-'), 'System Design (HLD)': ('hld', 'System Design (HLD)', 'hld-')}  # group -> (hub file/slug, name, topic prefix)
 IV_QN = {'redis-caching': 'q04-caching', 'distributed-systems': 'q07-distributed-theory', 'microservices-rest': 'q10-microservices',
          'kafka': 'q08-async', 'sql-databases': 'q05-data-stores', 'design-patterns-lld': 'q12-algorithms'}
 
@@ -353,7 +351,7 @@ for i, (slug, title) in enumerate(INT_TOPICS):
     s = read(p)
     s = re.sub(r'<!--qnav:start-->.*?<!--qnav:end-->\n?', '', s, flags=re.S)
     s = re.sub(r'<!--qfoot:start-->.*?<!--qfoot:end-->\n?', '', s, flags=re.S)
-    iv_stats[slug] = dict(q=s.count('<details class="iq') + s.count('<details class="dsa-problem'), svg=len(re.findall(r'<svg[^>]*viewBox', s)),
+    iv_stats[slug] = dict(q=s.count('<details class="iq'), svg=len(re.findall(r'<svg[^>]*viewBox', s)),
                           words=len(re.sub(r'<[^>]+>', ' ', s).split()), sub=sub_of(p))
     pg = ['<div class="pager">']
     if i > 0: pg.append('<a class="prev" href="%s.html"><span class="lbl">Previous</span>%s</a>' % (INT_TOPICS[i - 1][0], esc(INT_TOPICS[i - 1][1])))
@@ -472,7 +470,94 @@ iv_index = '''<!DOCTYPE html>
 ''' % dict(nav=iv_nav(None, ''), nt=len(mods), nq=iv_q, cards=iv_cards)
 if INT_TOPICS: write(os.path.join(IV, 'index.html'), iv_index)
 
-# ---------------- index.html ----------------
+
+# ---------------- dsa/ (independent Data Structures and Algorithms section) ----------------
+DSA = os.path.join(ROOT, 'dsa')
+DSA_TOPICS = [('strings', 'Strings')]
+DSA_TOPICS = [t for t in DSA_TOPICS if os.path.exists(os.path.join(DSA, 'topics', t[0] + '.html'))]
+
+
+def dsa_nav(cur, pre):
+    """Independent DSA navigation; pre is relative to the DSA root."""
+    site = pre + '../'
+    o = [
+        ('<a class="brand" href="%sindex.html">Data Structures and Algorithms</a>' % pre) if cur else '<div class="brand">Data Structures and Algorithms</div>',
+        '<div class="tagline">Java coding problems, patterns and solutions</div>',
+        '<div class="qlinks"><a href="%sindex.html">🏠 Home</a><a href="%ssearch.html">🔍 Search the whole site</a></div>' % (site, site),
+    ]
+    body = []
+    for slug, title in DSA_TOPICS:
+        cls = 'ch current' if slug == cur else 'ch'
+        body.append('<a class="%s" href="%stopics/%s.html"><span class="num">%02d</span><span>%s</span></a>' %
+                    (cls, pre, slug, DSA_TOPICS.index((slug, title)) + 1, esc(title)))
+        if slug == cur:
+            heads = re.findall(r'<h2 id="([^"]+)"[^>]*>(.*?)</h2>', read(os.path.join(DSA, 'topics', slug + '.html')), re.S)
+            if heads:
+                body.append('<div class="onpage">')
+                for hid, ht in heads:
+                    body.append('<a href="#%s">%s</a>' % (hid, esc(html.unescape(re.sub(r'<[^>]+>', '', ht).strip()))))
+                body.append('</div>')
+    if body:
+        o.append('<details open><summary>Topics</summary>\\n%s\\n</details>' % '\\n'.join(body))
+    return '\\n'.join(o)
+
+
+dsa_stats = {}
+for i, (slug, title) in enumerate(DSA_TOPICS):
+    p = os.path.join(DSA, 'topics', slug + '.html')
+    s = read(p)
+    s = re.sub(r'<!--dnav:start-->.*?<!--dnav:end-->\\n?', '', s, flags=re.S)
+    s = re.sub(r'<!--dfoot:start-->.*?<!--dfoot:end-->\\n?', '', s, flags=re.S)
+    dsa_stats[slug] = dict(problems=len(re.findall(r'<details class="dsa-problem', s)),
+                           diagrams=len(re.findall(r'<svg[^>]*viewBox', s)),
+                           words=len(re.sub(r'<[^>]+>', ' ', s).split()), sub=sub_of(p))
+    pager = ['<div class="pager">']
+    if i > 0: pager.append('<a class="prev" href="%s.html"><span class="lbl">Previous</span>%s</a>' % (DSA_TOPICS[i-1][0], esc(DSA_TOPICS[i-1][1])))
+    if i < len(DSA_TOPICS)-1: pager.append('<a class="next" href="%s.html"><span class="lbl">Next</span>%s</a>' % (DSA_TOPICS[i+1][0], esc(DSA_TOPICS[i+1][1])))
+    pager.append('</div>')
+    head = '<!--dnav:start-->\\n<div class="layout">\\n<nav class="toc" id="toc">\\n%s\\n</nav>\\n<main class="qmain">\\n<!--dnav:end-->\\n' % dsa_nav(slug, '../')
+    foot = '<!--dfoot:start-->\\n%s\\n</main>\\n</div>\\n<script src="../../quicknotes/assets/quick.js"></script>\\n<!--dfoot:end-->\\n' % ''.join(pager)
+    s = s.replace('<div class="qn">', head + '<div class="qn">', 1).replace('</body>', foot + '</body>', 1)
+    write(p, s)
+
+dsa_problems = sum(v['problems'] for v in dsa_stats.values())
+dsa_diagrams = sum(v['diagrams'] for v in dsa_stats.values())
+dsa_cards = '\\n'.join('<a class="card" href="topics/%s.html"><span class="n">Topic %02d</span><span class="t">%s</span><span class="d">%s</span><span class="d">%d problems, %d diagrams</span></a>' %
+                         (slug, i+1, esc(title), esc(dsa_stats[slug]['sub']), dsa_stats[slug]['problems'], dsa_stats[slug]['diagrams'])
+                         for i, (slug, title) in enumerate(DSA_TOPICS))
+dsa_index = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="../theme.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Structures and Algorithms | DSA</title>
+<link rel="stylesheet" href="../handbook/assets/style.css">
+<link rel="stylesheet" href="../quicknotes/assets/quick.css">
+<link rel="stylesheet" href="assets/dsa.css">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+</head>
+<body>
+<div class="layout">
+<nav class="toc" id="toc">%(nav)s</nav>
+<main class="qmain">
+<div class="qn qhome">
+<h1>Data Structures and Algorithms</h1>
+<p class="sub">Java coding problems organized by topic and pattern. Build problem-solving intuition, understand the invariant, practise optimized implementations and revise complexity.</p>
+<div class="stats"><div class="stat"><b>%(nt)d</b><span>topics</span></div><div class="stat"><b>%(np)d</b><span>problems</span></div></div>
+<div class="tl"><b>How to use this section:</b> Try each problem before opening its solution. Explain the brute-force idea, identify the pattern, implement the optimized approach, and verify it with a dry run and complexity analysis.</div>
+<div class="grid">%(cards)s</div>
+<p><a href="../index.html">Home</a> · <a href="../search.html">Search the whole site</a></p>
+</div>
+</main>
+</div>
+<script src="../quicknotes/assets/quick.js"></script>
+</body>
+</html>
+''' % dict(nav=dsa_nav(None, ''), nt=len(DSA_TOPICS), np=dsa_problems, cards=dsa_cards)
+write(os.path.join(DSA, 'index.html'), dsa_index)
+
+\n# ---------------- index.html ----------------
 hb = read(os.path.join(ROOT, 'handbook', 'assets', 'chapters.js'))
 n_pages = len(re.findall(r'done: true', hb))
 hand_words = 0
@@ -540,6 +625,6 @@ top = '''<!DOCTYPE html>
 </html>
 ''' % dict(np=n_pages, hw=round(hand_words / 1000), nm=len(mods), nc=len(cases), tq=tq,
     ivcard=('<a class="big" href="interview/index.html"><span class="k">Practise</span><span class="t">Interview Book</span><span class="d">Interview questions topic by topic (Git, Java, Spring, Kafka and more) with model answers, diagrams, follow-ups and real production scenarios.</span><span class="m">%d topics, %d questions</span></a>' % (len(mods), iv_q)) if INT_TOPICS else '',
-    dsacard=('<a class="big" href="interview/dsa.html"><span class="k">Practise</span><span class="t">Data Structures and Algorithms</span><span class="d">Java coding problems organized by topic and pattern, with intuition, optimized solutions, dry runs and complexity analysis.</span><span class="m">%d topic pages, %d problems</span></a>' % (len(HUB_PARTS.get('dsa', [])), sum(iv_stats[x]['q'] for x, _ in HUB_PARTS.get('dsa', [])))) if HUB_PARTS.get('dsa') else '')
+    dsacard=('<a class="big" href="dsa/index.html"><span class="k">Practise</span><span class="t">Data Structures and Algorithms</span><span class="d">Java coding problems organized by topic and pattern, with intuition, optimized solutions, dry runs and complexity analysis.</span><span class="m">%d topic pages, %d problems</span></a>' % (len(DSA_TOPICS), dsa_problems)) if DSA_TOPICS else '')
 write(os.path.join(ROOT, 'index.html'), top)
 print('built: %d quicknotes pages, %d words, %d Q&As, %d diagrams; handbook %d pages' % (len(items), tw, tq, ts, n_pages))
