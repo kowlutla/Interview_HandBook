@@ -65,7 +65,7 @@ def verify_source_coverage():
     for path in topic_pages:
         raw = open(path, encoding='utf-8').read()
         actual += len(re.findall(r'<article class="dsa-problem-card dsa-problem-summary"', raw))
-    ok = len(topic_pages) == 17 and actual == expected
+    ok = len(topic_pages) == 18 and actual == expected
     print('DSA source coverage: %d Java files, %d indexed entries, %d topic pages -> %s' %
           (expected, actual, len(topic_pages), 'OK' if ok else 'INCOMPLETE'))
     return ok
