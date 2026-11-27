@@ -607,21 +607,24 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
         for number, (problem_slug, problem_title, source_path) in enumerate(catalog[slug], 1):
             source = read(source_path)
             rel_source = os.path.relpath(source_path, DSA_SOURCE).replace(os.sep, '/')
-            summary = esc(dsa_source_summary(source, problem_title))
-            class_match = re.search(r'\bclass\s+([A-Za-z_$][\w$]*)', source)
-            type_name = class_match.group(1) if class_match else os.path.basename(source_path)[:-5]
-            source_url = 'https://github.com/kowlutla/DSA/blob/main/src/com/dsa/' + rel_source.replace(os.sep, '/').replace(' ', '%20')
+            summary = dsa_source_summary(source, problem_title)
+            source_url = 'https://github.com/kowlutla/DSA/blob/main/src/com/dsa/' + rel_source.replace(' ', '%20')
+            detail_dir = os.path.join(DSA, 'topics', slug)
+            os.makedirs(detail_dir, exist_ok=True)
+            detail_path = os.path.join(detail_dir, problem_slug + '.html')
+            detail_html = dsa_problem_page(slug, title, number, problem_slug, problem_title, source, rel_source)
+            write(detail_path, detail_html)
+            detail_href = slug + '/' + problem_slug + '.html'
             cards.append(
                 '<article class="dsa-problem-card dsa-problem-summary" id="%s">'
                 '<div class="dsa-card-head"><div><span class="dsa-number">%02d</span>'
                 '<span class="dsa-topic">%s</span></div></div>'
-                '<h3>%02d - %s</h3><p>%s</p>'
-                '<p class="dsa-code-note"><b>Source:</b> <a href="%s"><code>%s</code></a> · '
-                '<b>Java type:</b> <code>%s</code></p>'
-                '<details class="dsa-source"><summary>View original Java implementation</summary>'
-                '<pre class="dsa-code"><code>%s</code></pre></details></article>' %
-                (problem_slug, number, esc(title.upper()), number, esc(problem_title), summary,
-                 source_url, esc(rel_source), esc(type_name), esc(source))
+                '<h3><a href="%s">%02d - %s</a></h3><p>%s</p>'
+                '<p class="dsa-code-note"><b>Original source:</b> <a href="%s"><code>%s</code></a></p>'
+                '<p><a href="%s">Open full problem page →</a></p></article>' %
+                (problem_slug, number, esc(title.upper()), esc(detail_href),
+                 number, esc(problem_title), esc(summary[:500]), source_url, esc(rel_source),
+                 esc(detail_href))
             )
 
         foundation_content = ''
