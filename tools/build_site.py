@@ -1590,7 +1590,6 @@ DSA_PROBLEM_NOTES = {
         "complexity": "<p>O(log n) time and O(1) auxiliary space.</p>",
         "edge": "<p>Test n=0, n=1, perfect squares, values between squares and maximum int. Avoid multiplying two ints if the product can overflow.</p>",
     },
-,
     "climbing-stairs": {
         "intuition": "<p>To reach step n, the final move must come from n-1 or n-2. Therefore the number of ways is the sum of the ways to reach those two previous steps.</p>",
         "steps": "<ol><li>Define dp[i] as the number of ways to reach step i.</li><li>Set dp[0]=1 and dp[1]=1 (with base cases adapted to the source indexing).</li><li>For each i≥2, compute dp[i]=dp[i-1]+dp[i-2].</li><li>Return dp[n]. A rolling pair of variables reduces space.</li></ol>",
