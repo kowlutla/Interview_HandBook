@@ -101,23 +101,3 @@ From `C:/Users/kmangali/HLD/interview`: `python -I tools/check_interview.py topi
 
 ## CURATION RULE (the user asked for this explicitly, applies on top of v2)
 Keep only the questions that are REALLY asked in interviews for a senior developer (5-10 yrs), and the follow-ups that interviewers genuinely ask next. Having a huge list does not help revision. Remove trivia, rarely-asked edge cases, tool-version minutiae and anything an ops/platform specialist would be asked instead of a developer. Do not cut drastically: keep as many as the topic truly needs, but not every question has to survive. Every surviving answer must be in depth (mechanism + trade-off + example) yet in natural, simple language. Each topic has a target question count given in your brief: land within about plus or minus 15 percent. Prefer cutting from the rapid-fire/cheat-sheet padding too; keep those compact. Keep ids stable for surviving questions.
-
-
-## DSA topic pages
-
-DSA pages are problem-centred, not conceptual Q&A pages. Preserve the Interview Book's typography, navigation, responsive layout and plain-English teaching style, but use a structure suited to solving coding problems.
-
-For each problem, include:
-- Clear problem statement and representative examples.
-- The underlying pattern and intuition before showing code.
-- Brute force when it teaches an important trade-off; do not add it mechanically.
-- An optimized, compilable Java solution with required imports and explicit input assumptions.
-- A meaningful dry run that traces the important state.
-- Time and auxiliary-space complexity, explaining where each term comes from.
-- Correctness reasoning or the invariant that makes the approach work.
-- Common mistakes and edge cases worth testing.
-- A short remember line with the central insight.
-
-Use the Java source repository as the source of problem selection and initial implementations, not as an unquestionable source of truth. Review every implementation for correctness, boundary conditions, Java character/overflow behaviour, complexity and input constraints. Correct bugs and explain material deviations from the original. Do not copy misleading comments or unsupported complexity claims.
-
-Group problems by learning topic and pattern. Avoid duplicate problem entries; keep genuinely different approaches only when the comparison is useful. Keep explanations detailed enough to teach the reasoning, but concise enough for interview revision. Use Java as the canonical language. DSA pages may use their own problem markup and validator; do not force algorithm problems into the conceptual `details.iq` Q&A format.
