@@ -654,8 +654,17 @@ def generate_dsa_topics():
         grouped = {}
         for path in files:
             filename = os.path.basename(path)[:-5]
-            base = re.sub(r'\\d+
-
+            base = filename.rstrip('0123456789')
+            grouped.setdefault(base, []).append(path)
+        catalog[slug] = []
+        for base, paths in grouped.items():
+            display_name = base if len(paths) > 1 else os.path.basename(paths[0])[:-5]
+            catalog[slug].append((dsa_slug(display_name), dsa_title(display_name), paths))
+        if slug == 'strings':
+            catalog[slug] = [
+                ('isomorphic-strings', 'Isomorphic Strings', [os.path.join(folder, 'IsomorphicStrings.java')]),
+                ('minimum-number-following-pattern', 'Minimum Number Following an I/D Pattern', [os.path.join(folder, 'NumberFollowingAPattern.java')])
+            ]
         if slug == 'strings':
             continue  # The two Strings problems have individually authored teaching pages.
 
@@ -663,7 +672,6 @@ def generate_dsa_topics():
         for number, (problem_slug, problem_title, source_paths) in enumerate(catalog[slug], 1):
             source_files = [(read(path), os.path.relpath(path, DSA_SOURCE).replace(os.sep, '/')) for path in source_paths]
             source = source_files[0][0]
-            rel_source = source_files[0][1]
             summary = dsa_source_summary(source, problem_title)
             source_links = ' · '.join('<a href="https://github.com/kowlutla/DSA/blob/main/src/com/dsa/%s"><code>%s</code></a>' % (rel.replace(' ', '%20'), esc(rel)) for _, rel in source_files)
             detail_dir = os.path.join(DSA, 'topics', slug)
@@ -676,10 +684,10 @@ def generate_dsa_topics():
                 '<div class="dsa-card-head"><div><span class="dsa-number">%02d</span>'
                 '<span class="dsa-topic">%s</span></div></div>'
                 '<h3><a href="%s">%02d - %s</a></h3><p>%s</p>'
-                '<p class="dsa-code-note"><b>Original source:</b> <a href="%s"><code>%s</code></a></p>'
+                '<p class="dsa-code-note"><b>Original source:</b> %s</p>'
                 '<p><a href="%s">Open full problem page →</a></p></article>' %
                 (problem_slug, number, esc(title.upper()), esc(detail_href), number,
-                 esc(problem_title), esc(summary[:500]), source_url, esc(rel_source), esc(detail_href))
+                 esc(problem_title), esc(summary[:500]), source_links, esc(detail_href))
             )
 
         foundation_content = ''
