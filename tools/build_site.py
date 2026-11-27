@@ -1848,7 +1848,6 @@ DSA_PROBLEM_NOTES = {
         "complexity": "<p>O(n) time and O(1) auxiliary space.</p>",
         "edge": "<p>Test deleting head, tail, only node, invalid x greater than length and empty input. Confirm whether invalid positions are ignored or reported by the API.</p>",
     },
-,
     "bst2-search-for-node-in-bst": {
         "intuition": "<p>A BST orders every key in the left subtree below the node and every key in the right subtree above it. Compare the target with the current node and discard one entire subtree at each step.</p>",
         "steps": "<ol><li>Start at the root.</li><li>If the current key equals the target, report found.</li><li>If target is smaller, move left; if larger, move right.</li><li>If the pointer becomes null, the key is absent.</li></ol>",
@@ -1928,6 +1927,55 @@ DSA_PROBLEM_NOTES = {
         "proof": "<p>Any possible collision must involve a previously processed right-moving asteroid and the current left-moving one. Resolving the top collision first is necessary because that is the nearest possible opponent; after a smaller asteroid explodes, the current one may meet the next survivor. The stack therefore maintains the surviving order.</p>",
         "complexity": "<p>O(n) time and O(n) auxiliary space; each asteroid is pushed and popped at most once.</p>",
         "edge": "<p>Test same-direction asteroids, equal-size collision, chains of collisions, zero if allowed and large negative values. Compare magnitudes carefully because abs(Integer.MIN_VALUE) overflows.</p>",
+    },
+
+    "bt17-check-two-binary-trees-identical": {
+        "intuition": "<p>Two binary trees are identical only when their structure and corresponding node values match. Recursively compare matching positions.</p>",
+        "steps": "<ol><li>If both nodes are null, return true.</li><li>If exactly one is null or values differ, return false.</li><li>Compare left subtrees and right subtrees recursively.</li><li>Return true only when both comparisons succeed.</li></ol>",
+        "trace": "<p>Trees with root 1, left child 2 and right child 3 are identical. A second tree with children swapped is not, even though it contains the same values.</p>",
+        "proof": "<p>The recursive definition checks the root value and requires equality of both corresponding subtrees. By induction, it checks every node and every null/non-null structural position.</p>",
+        "complexity": "<p>O(min(n,m)) time until a mismatch is found; O(h) recursion space. Worst case visits all corresponding nodes.</p>",
+        "edge": "<p>Test both empty, one empty, different root values, same values but different structure, and identical skewed trees.</p>",
+    },
+    "bt19-boundary-traversal-of-binary-tree": {
+        "intuition": "<p>The boundary is the root, then the left boundary excluding leaves, all leaves left-to-right, and the right boundary excluding leaves in reverse order. Separating these phases prevents duplicates.</p>",
+        "steps": "<ol><li>Add the root once.</li><li>Walk down the left boundary, preferring left then right, excluding leaves.</li><li>Traverse all leaves from left to right.</li><li>Collect the right boundary, preferring right then left, excluding leaves; append it in reverse.</li></ol>",
+        "trace": "<p>For root 1, left boundary 2, leaves 4,8,9,6,7 and right boundary 3, the traversal is <code>1,2,4,8,9,6,7,3</code>.</p>",
+        "proof": "<p>The phases partition boundary nodes into root, non-leaf left edge, leaves, and non-leaf right edge. Each phase follows the required direction and excludes nodes owned by earlier phases, so every boundary node appears exactly once in boundary order.</p>",
+        "complexity": "<p>O(n) time and O(h) auxiliary recursion/stack space for leaf and boundary traversal, excluding output.</p>",
+        "edge": "<p>Test empty, single node, root with only left or right subtree, skewed tree and a root whose child is a leaf. Avoid adding leaf nodes twice.</p>",
+    },
+    "bt20-vertical-order-traversal": {
+        "intuition": "<p>Assign each node a horizontal distance (column) from the root: left decreases it and right increases it. BFS preserves top-to-bottom order; store values by column and then emit columns from smallest to largest.</p>",
+        "steps": "<ol><li>Queue pairs of node and column, starting at column 0.</li><li>For each dequeued node, append its value to that column's sequence.</li><li>Enqueue left child at column-1 and right child at column+1.</li><li>Output columns in ascending column order, preserving BFS order within each column.</li></ol>",
+        "trace": "<p>For a root 1 with children 2 and 3, their columns are -1 and +1; root is column 0. Deeper nodes are appended to the column they occupy in level order.</p>",
+        "proof": "<p>The column coordinate uniquely represents horizontal displacement. BFS visits nodes in non-decreasing depth, so insertion order within each column matches the required level-order tie handling. Sorting column keys yields left-to-right output.</p>",
+        "complexity": "<p>O(n log c) time when ordered maps sort c columns; O(n) storage. A hash map plus sorted keys has similar ordering cost.</p>",
+        "edge": "<p>Test left/right skewed trees, multiple nodes sharing a column and depth, negative columns and empty tree. Some vertical traversal variants additionally sort ties by node value; follow the exact source contract.</p>",
+    },
+    "bt21-top-view-of-binary-tree": {
+        "intuition": "<p>Each horizontal distance contributes the first node encountered from the top. BFS visits shallower nodes before deeper nodes, so the first value recorded for a column is visible from above.</p>",
+        "steps": "<ol><li>Queue the root with horizontal distance 0.</li><li>For each node, store its value only if its distance has not been seen.</li><li>Enqueue left at distance-1 and right at distance+1.</li><li>Return recorded values in ascending horizontal-distance order.</li></ol>",
+        "trace": "<p>For root 1 with children 2 and 3, the columns -1, 0, +1 first receive 2, 1, 3; top view is <code>[2,1,3]</code>.</p>",
+        "proof": "<p>BFS processes nodes in increasing depth. The first node encountered at a horizontal distance is therefore a shallowest node at that column; retaining it implements the top-view rule. Ordered columns produce left-to-right output.</p>",
+        "complexity": "<p>O(n log c) time with an ordered map of c columns, and O(n) queue/map space.</p>",
+        "edge": "<p>Test a single node, left/right chains, two nodes sharing a column and a deeper node hidden behind a shallower one. Tie behavior must match the source's BFS ordering rule.</p>",
+    },
+    "bt22-bottom-view-of-binary-tree": {
+        "intuition": "<p>For each horizontal distance, keep the node that is deepest. BFS visits nodes level by level; overwriting the value for a column means the last visited node becomes its bottom view.</p>",
+        "steps": "<ol><li>Queue the root with horizontal distance 0.</li><li>For every dequeued node, overwrite the map entry for its column.</li><li>Enqueue left and right children at column-1 and column+1.</li><li>Return map values in ascending column order.</li></ol>",
+        "trace": "<p>For the common example rooted at 20, the bottom view across columns is <code>5,10,3,14,25</code>. At a shared depth and column, later BFS order wins as specified by the source.</p>",
+        "proof": "<p>BFS visits nodes in non-decreasing depth. Overwriting a column on each visit leaves a deepest node for that column. Ordered column keys provide left-to-right output; processing order resolves equal-depth ties.</p>",
+        "complexity": "<p>O(n log c) time with ordered columns and O(n) auxiliary queue/map space.</p>",
+        "edge": "<p>Test left/right chains, nodes sharing a column at different depths, equal-depth collisions, a single node and empty tree. Tie policy matters when two nodes have the same depth and horizontal distance.</p>",
+    },
+    "bt23-left-view-of-binary-tree": {
+        "intuition": "<p>The left view contains the first node encountered at each depth. Level-order traversal makes that node the first item in each level.</p>",
+        "steps": "<ol><li>Run BFS using a queue.</li><li>Capture the queue size at the start of each level.</li><li>Record the first node removed for that level.</li><li>Enqueue its children and continue.</li></ol>",
+        "trace": "<p>For a tree with root 1, left child 2, and left grandchild 4, the first node at each level is 1, 2, 4, so the left view is <code>[1,2,4]</code>.</p>",
+        "proof": "<p>BFS processes each level from left to right. The first dequeued node at a depth is therefore the leftmost node at that depth and is exactly the visible left-view node.</p>",
+        "complexity": "<p>O(n) time and O(w) queue space, where w is maximum tree width.</p>",
+        "edge": "<p>Test empty tree, one node, right-only chains (the right child is still visible), and levels where the left subtree is missing.</p>",
     },
 }
 def generate_dsa_topics():
