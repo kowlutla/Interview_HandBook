@@ -516,9 +516,9 @@ def dsa_source_summary(source, title):
     if match:
         lines = [re.sub(r'^\s*\* ?|^\s*/\*\*?', '', line).strip()
                  for line in match.group(1).splitlines()]
-        summary = ' '.join(x for x in lines if x and not x.startswith('@'))
+        summary = ' '.join(x for x in lines if x and not x.startswith('@') and not re.search(r'(time|space) complexity', x, re.I))
         if summary:
-            return summary[:500]
+            return summary[:2200]
     return 'Study the ' + title.lower() + ' implementation. Identify its input contract, the key observation, the invariant maintained by the algorithm, and the boundary cases.'
 
 def generate_dsa_topics():
@@ -628,6 +628,7 @@ def generate_dsa_topics():
 
 DSA_TOPICS, DSA_PROBLEMS = generate_dsa_topics()
 DSA_TOPICS = [t for t in DSA_TOPICS if os.path.exists(os.path.join(DSA, 'topics', t[0] + '.html'))]
+print('DSA build: %d topics, %d Java source entries' % (len(DSA_TOPICS), sum(len(v) for v in DSA_PROBLEMS.values())))
 
 def dsa_nav(cur, pre, active_problem=None):
     """Use the same sidebar structure and shared classes as the Interview Book."""
