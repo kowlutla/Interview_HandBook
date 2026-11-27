@@ -2746,6 +2746,63 @@ DSA_PROBLEM_NOTES = {
         "complexity": "<p>O(n²) time and O(n) DP/parent space, plus O(n log n) sorting.</p>",
         "edge": "<p>Test one value, all values in a divisibility chain, no pair divides, duplicates and positive-only assumptions. Zero and negative values require a different contract.</p>",
     },
+
+    "q1-array-queue": {
+        "intuition": "<p>A queue is FIFO: enqueue at the rear and dequeue from the front. A circular array reuses freed slots instead of shifting all remaining elements.</p>",
+        "steps": "<ol><li>Maintain an array, front index, rear index and size.</li><li>Enqueue at (front+size) modulo capacity and increment size.</li><li>Dequeue from front, advance front modulo capacity and decrement size.</li><li>Check size for empty/full conditions before operations.</li></ol>",
+        "trace": "<p>Enqueue A, B, C then dequeue returns A. Enqueue D reuses the freed circular slot; the next dequeue returns B.</p>",
+        "proof": "<p>Elements are stored in insertion order relative to front. Enqueue appends after the current logical tail; dequeue advances the logical front, preserving FIFO order.</p>",
+        "complexity": "<p>O(1) amortized/constant time per operation for a fixed-capacity circular array; O(capacity) storage.</p>",
+        "edge": "<p>Test empty dequeue, full enqueue, wraparound, repeated enqueue/dequeue, capacity one and reset after becoming empty. Define whether overflow throws, returns false or resizes.</p>",
+    },
+    "q2-linked-queue": {
+        "intuition": "<p>A linked queue keeps references to the first and last nodes. Enqueue appends after rear; dequeue removes front, so neither operation needs to shift elements.</p>",
+        "steps": "<ol><li>For enqueue, create a node and link it after rear; if empty, set both front and rear.</li><li>For dequeue, remove front and advance it to front.next.</li><li>If the queue becomes empty, set rear to null too.</li><li>Return the removed value.</li></ol>",
+        "trace": "<p>Enqueue 1,2,3 gives front→1→2→3←rear. Dequeue removes 1 and advances front to 2.</p>",
+        "proof": "<p>Appending only at the tail preserves insertion order; removing only from the head returns the earliest inserted remaining node. Updating both pointers on empty transitions preserves the queue invariant.</p>",
+        "complexity": "<p>O(1) time per enqueue/dequeue and O(n) storage for n elements.</p>",
+        "edge": "<p>Test enqueue into empty queue, dequeue last element, repeated operations and null data if allowed. Ensure rear is reset when front becomes null.</p>",
+    },
+    "q3-queue-using-stack1": {
+        "intuition": "<p>Two stacks can implement a queue. In the costly-enqueue variant, reverse the existing stack into a helper, push the new value, then move everything back so the oldest value remains on top.</p>",
+        "steps": "<ol><li>For enqueue, move all elements from the main stack to a helper stack.</li><li>Push the new element onto the now-empty main stack.</li><li>Move helper elements back.</li><li>Dequeue by popping the main stack.</li></ol>",
+        "trace": "<p>Enqueue 1 then 2 leaves 1 on top of the main stack. Dequeue therefore returns 1 before 2.</p>",
+        "proof": "<p>After each enqueue, the main stack is ordered with the oldest queued element on top. Popping therefore implements FIFO.</p>",
+        "complexity": "<p>O(n) per enqueue and O(1) per dequeue for the costly-enqueue design; O(n) total storage.</p>",
+        "edge": "<p>Test empty dequeue, one element, several enqueues and interleaved enqueue/dequeue. Confirm which stack operation is intended to be costly for this variant.</p>",
+    },
+    "q4-queue-using-stack2": {
+        "intuition": "<p>Use an input stack for enqueues and an output stack for dequeues. Reverse input into output only when output is empty; this amortizes the transfer cost.</p>",
+        "steps": "<ol><li>Enqueue by pushing onto input.</li><li>For dequeue, if output is empty, move every input element to output.</li><li>Pop output to return the oldest element.</li><li>If both stacks are empty, the queue is empty.</li></ol>",
+        "trace": "<p>Enqueue 1,2,3 pushes them onto input. The first dequeue transfers them so output top is 1; subsequent dequeues return 2 and 3 without further transfers.</p>",
+        "proof": "<p>Input stores newer elements above older ones. Reversing the entire input stack makes the oldest element the output top. Since transfer occurs only when output is empty, no older item can be bypassed.</p>",
+        "complexity": "<p>O(1) amortized per operation; an individual dequeue can cost O(n) during transfer. O(n) total storage.</p>",
+        "edge": "<p>Test alternating operations, repeated dequeues, empty queue and enqueue after output has partially drained. Transfer only when output is empty.</p>",
+    },
+    "q5-queue-using-stack3": {
+        "intuition": "<p>This is another queue-via-stacks implementation. The essential invariant is that the oldest enqueued element must be the next one returned; verify whether the source uses costly enqueue or lazy transfer before interpreting its method costs.</p>",
+        "steps": "<ol><li>Identify the input and output stack roles in the source implementation.</li><li>Push new values onto the input side.</li><li>When removing, ensure the output side contains elements in FIFO order, transferring only as required.</li><li>Return the top of the output stack or report empty.</li></ol>",
+        "trace": "<p>For enqueue sequence 4,5,6, dequeue order must be 4,5,6 regardless of which stack is used internally.</p>",
+        "proof": "<p>Stack operations reverse order. The implementation is correct when its transfer policy ensures that the oldest queued value is always exposed at the removal point.</p>",
+        "complexity": "<p>Depends on the chosen transfer strategy: costly enqueue is O(n) enqueue/O(1) dequeue; lazy two-stack transfer is O(1) amortized per operation. Storage is O(n).</p>",
+        "edge": "<p>Test empty operations, interleaving, multiple transfer cycles and enqueue after partial dequeue. Do not assume worst-case O(1) for a transfer-based operation.</p>",
+    },
+    "queue": {
+        "intuition": "<p>The queue abstraction exposes FIFO behaviour independently of its underlying representation. Its contract usually includes enqueue, dequeue, peek/front and empty checks.</p>",
+        "steps": "<ol><li>Enqueue adds an element at the rear.</li><li>Dequeue removes and returns the front element.</li><li>Peek returns the front without removing it.</li><li>isEmpty reports whether the structure contains no elements.</li></ol>",
+        "trace": "<p>Starting empty, enqueue A, B, C; peek returns A; dequeue returns A; the new front is B.</p>",
+        "proof": "<p>The defining invariant is that removal order matches insertion order. A correct implementation maintains the logical front and rear boundaries across every operation.</p>",
+        "complexity": "<p>Operation costs depend on implementation. A linked queue or circular array provides O(1) enqueue/dequeue; a naive shifting array may make dequeue O(n).</p>",
+        "edge": "<p>Define underflow and overflow behaviour, test empty queue, one element, wraparound and transition back to empty. Keep the abstract contract separate from the implementation.</p>",
+    },
+    "queue-demo": {
+        "intuition": "<p>A demo program exercises the queue API; it is not a separate queue algorithm. The important checks are observable FIFO order and correct empty/full handling.</p>",
+        "steps": "<ol><li>Create the queue with a known capacity or empty linked representation.</li><li>Enqueue a small sequence of distinguishable values.</li><li>Inspect the front without removing it.</li><li>Dequeue values and verify insertion order.</li><li>Exercise the empty state and any capacity boundary.</li></ol>",
+        "trace": "<p>Enqueue 10, 20, 30; successive dequeue operations should print 10, then 20, then 30.</p>",
+        "proof": "<p>The demo validates the queue contract by observing that the earliest inserted remaining element is always removed first.</p>",
+        "complexity": "<p>Depends on the concrete queue implementation; the demo itself is O(k) for k operations.</p>",
+        "edge": "<p>Use deterministic test values, include an empty dequeue case and avoid relying only on console output for automated verification; assertions are preferable.</p>",
+    },
 }
 def generate_dsa_topics():
     """Generate complete topic pages from the checked-out kowlutla/DSA source."""
