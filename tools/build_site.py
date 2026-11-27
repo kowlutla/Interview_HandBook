@@ -565,21 +565,23 @@ def dsa_problem_page(topic_slug, topic_title, number, problem_slug, problem_titl
         (statement if mode == 'statement' else examples if mode == 'examples' else constraints).append(line)
     method_pattern = re.compile(r'(public\s+(?:static\s+)?(?:[\w<>\[\], ?]+\s+)+(\w+)\s*\([^;{}]*\)\s*\{)', re.S)
     methods = []
-    for m in method_pattern.finditer(all_source):
-        if m.group(2) == 'main': continue
-        prefix = all_source[max(0, m.start() - 1000):m.start()]
-        doc_text = prefix.rsplit('/**', 1)[-1].split(close_comment, 1)[0] if '/**' in prefix and close_comment in prefix.rsplit('/**', 1)[-1] else ''
-        desc = []
-        for line in doc_text.splitlines():
-            line = re.sub(r'^\s*\* ?', '', line).strip()
-            if line and not line.startswith('@') and not re.search(r'(time|space) complexity', line, re.I):
-                desc.append(line)
-        complexity = '; '.join(re.findall(r'(?i)(?:time|space)\s+complexity\s*:\s*[^*]+', doc_text))
-        methods.append((m.group(2), re.sub(r'\s+', ' ', m.group(1)).strip(), ' '.join(desc), complexity))
+    for source_text, source_rel in source_files:
+        for m in method_pattern.finditer(source_text):
+            if m.group(2) == 'main': continue
+            prefix = source_text[max(0, m.start() - 1000):m.start()]
+            candidate = prefix[prefix.rfind('/**'):] if '/**' in prefix else ''
+            doc_text = candidate.split(close_comment, 1)[0] if close_comment in candidate and not candidate.split(close_comment, 1)[1].strip() else ''
+            desc = []
+            for line in doc_text.splitlines():
+                line = re.sub(r'^\s*\* ?', '', line).strip()
+                if line and not line.startswith('@') and not re.search(r'(time|space) complexity', line, re.I):
+                    desc.append(line)
+            complexity = '; '.join(re.findall(r'(?i)(?:time|space)\s+complexity\s*:\s*[^*]+', doc_text))
+            methods.append((source_rel, m.group(2), re.sub(r'\s+', ' ', m.group(1)).strip(), ' '.join(desc), complexity))
     statement_html = ''.join('<p>%s</p>' % esc(x) for x in statement) or '<p>The source file does not include a formal problem statement. This page documents the class as a supporting implementation; add the original problem contract before treating it as a standalone interview question.</p>'
     examples_html = '<pre class="dsa-code"><code>%s</code></pre>' % esc('\n'.join(examples)) if examples else '<p>No canonical sample is documented in the source. Confirm the external problem contract and create representative tests before relying on assumptions.</p>'
     constraints_html = '<ul>%s</ul>' % ''.join('<li>%s</li>' % esc(x) for x in constraints) if constraints else '<p>Explicit constraints are not documented in the source file. Confirm the allowed input size, value range, nullability and mutation rules before finalizing the solution.</p>'
-    method_html = ''.join('<article class="dsa-approach"><h3>Implementation %02d — <code>%s</code></h3><p><code>%s</code></p><p>%s</p><p><b>Source complexity note:</b> %s</p></article>' % (i, esc(x[0]), esc(x[1]), esc(x[2] or 'No method-level explanation is documented.'), esc(x[3] or 'No complexity annotation is documented; derive it from the implementation.')) for i,x in enumerate(methods,1))
+    method_html = ''.join('<article class="dsa-approach"><h3>Implementation %02d — <code>%s</code></h3><p class="dsa-code-note">Source: <code>%s</code></p><p><code>%s</code></p><p>%s</p><p><b>Source complexity note:</b> %s</p></article>' % (i, esc(x[1]), esc(x[0]), esc(x[2]), esc(x[3] or 'No method-level explanation is documented.'), esc(x[4] or 'No complexity annotation is documented; derive it from the implementation.')) for i,x in enumerate(methods,1))
     if not method_html: method_html = '<p>No public method was detected. Review the constructors and public API below.</p>'
     topic_reasoning = DSA_TOPIC_GUIDES.get(topic_slug, '')
     comments = []
