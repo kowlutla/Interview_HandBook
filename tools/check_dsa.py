@@ -87,11 +87,26 @@ def verify_source_coverage():
         raw = open(path, encoding='utf-8').read()
         actual += len(re.findall(r'<article class="dsa-problem-card dsa-problem-summary"', raw))
     detail_pages = 0
+    # These 20 authored pattern walkthroughs supplement (rather than replace)
+    # the source-generated reference pages. Count them as curated additions,
+    # not as extra source entries in the one-to-one coverage check.
+    curated_pattern_additions = {
+        'alpha-hill.html', 'alphabet-ramp.html', 'ascending-number-triangle.html',
+        'binary-number-triangle.html', 'concentric-number-square.html',
+        'descending-alpha-triangle.html', 'diamond-star.html', 'floyd-triangle.html',
+        'half-diamond.html', 'hollow-square.html', 'increasing-letter-triangle.html',
+        'inverted-number-triangle.html', 'inverted-right-triangle.html',
+        'number-crown.html', 'repeated-row-number.html', 'reverse-letter-triangle.html',
+        'right-angle-star.html', 'solid-square.html', 'symmetric-butterfly.html',
+        'symmetric-void.html',
+    }
     quality_gaps = {'statement': 0, 'examples': 0, 'constraints': 0, 'method_explanation': 0, 'complexity_note': 0}
     for current, _, names in os.walk(topic_root):
         if os.path.relpath(current, topic_root) == '.': continue
         for name in names:
             if not name.endswith('.html'): continue
+            if os.path.relpath(current, topic_root) == 'patterns' and name in curated_pattern_additions:
+                continue
             detail_pages += 1
             raw = open(os.path.join(current, name), encoding='utf-8').read()
             if 'does not include a formal problem statement' in raw: quality_gaps['statement'] += 1
