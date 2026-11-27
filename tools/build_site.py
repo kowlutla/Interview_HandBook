@@ -484,26 +484,37 @@ DSA_PROBLEMS = {
 
 
 def dsa_nav(cur, pre, active_problem=None):
-    """Build a compact, expandable topic > problem navigation tree."""
+    """Use the same sidebar structure and shared classes as the Interview Book."""
     site = pre + '../'
+    brand = ('<a class="brand" href="%sindex.html">Data Structures &amp; Algorithms</a>' % pre
+             if cur or active_problem else
+             '<div class="brand">Data Structures &amp; Algorithms</div>')
     o = [
-        ('<a class="brand" href="%sindex.html">Data Structures &amp; Algorithms</a>' % pre),
+        brand,
         '<div class="tagline">Java problem-solving handbook</div>',
         '<div class="qlinks"><a href="%sindex.html">🏠 Home</a><a href="%ssearch.html">🔍 Search the whole site</a></div>' % (site, site),
     ]
+
+    topic_groups = []
     for index, (slug, title) in enumerate(DSA_TOPICS, 1):
-        topic_body = []
+        problem_links = []
         for number, (problem_slug, problem_title) in enumerate(DSA_PROBLEMS.get(slug, []), 1):
             active = ' current' if active_problem == problem_slug else ''
-            topic_body.append(
-                '<a class="ch dsa-sidebar-problem%s" href="%stopics/%s/%s.html"><span class="num">%02d -</span><span>%s</span></a>' %
+            problem_links.append(
+                '<a class="ch%s" href="%stopics/%s/%s.html"><span class="num">%02d -</span><span>%s</span></a>' %
                 (active, pre, slug, problem_slug, number, esc(problem_title))
             )
-        o.append(
-            '<details class="dsa-topic-group"%s><summary><span class="dsa-topic-number">%02d</span><span class="dsa-topic-title">%s</span></summary>\\n<div class="dsa-topic-children">\\n%s\\n</div>\\n</details>' %
-            (' open' if slug == cur else '', index, esc(title), '\\n'.join(topic_body))
+
+        is_open = ' open' if slug == cur else ''
+        topic_groups.append(
+            '<details%s><summary>%02d %s</summary>\n%s\n</details>' %
+            (is_open, index, esc(title), '\n'.join(problem_links))
         )
-    return '\\n'.join(o)
+
+    topics_open = ' open' if cur is None or cur in dict(DSA_TOPICS) else ''
+    o.append('<details%s><summary>Topics</summary>\n%s\n</details>' %
+             (topics_open, '\n'.join(topic_groups)))
+    return '\n'.join(o)
 
 
 dsa_stats = {}
