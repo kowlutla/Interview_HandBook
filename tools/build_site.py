@@ -651,7 +651,7 @@ def generate_dsa_topics():
             files += [os.path.join(array_folder, f) for f in DSA_MATRIX_FILES
                       if os.path.isfile(os.path.join(array_folder, f))]
         files.sort(key=lambda p: [int(x) if x.isdigit() else x.lower()
-                                  for x in re.split(r'(\\d+)', os.path.basename(p))])
+                                  for x in re.split(r'([0-9]+)', os.path.basename(p))])
         grouped = {}
         for path in files:
             filename = os.path.basename(path)[:-5]
