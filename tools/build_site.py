@@ -484,40 +484,49 @@ DSA_PROBLEMS = {
 
 
 def dsa_nav(cur, pre, active_problem=None):
-    """Build DSA-specific navigation with topic, problem and page-section levels."""
+    """Build a hierarchical DSA sidebar: expandable topics contain their problems."""
     site = pre + '../'
     o = [
         ('<a class="dsa-nav-brand" href="%sindex.html"><span class="dsa-nav-mark">DSA</span><span><b>Data Structures &amp; Algorithms</b><small>Java problem-solving handbook</small></span></a>' % pre),
         '<div class="qlinks dsa-nav-links"><a href="%sindex.html">⌂ <span>DSA Home</span></a><a href="%sindex.html">↗ <span>Main Handbook</span></a><a href="%ssearch.html">⌕ <span>Global Search</span></a></div>' % (pre, site, site),
     ]
-    body = []
+    topic_groups = []
     for index, (slug, title) in enumerate(DSA_TOPICS, 1):
         is_topic = slug == cur
-        topic_cls = 'ch dsa-topic-link current' if is_topic and active_problem is None else 'ch dsa-topic-link'
-        body.append('<a class="%s" href="%stopics/%s.html"><span class="num">%02d</span><span>%s</span></a>' %
-                    (topic_cls, pre, slug, index, esc(title)))
+        topic_body = [
+            '<a class="ch dsa-topic-overview" href="%stopics/%s.html">Open %s overview</a>' %
+            (pre, slug, esc(title))
+        ]
+        for number, (problem_slug, problem_title) in enumerate(DSA_PROBLEMS.get(slug, []), 1):
+            active = ' current' if active_problem == problem_slug else ''
+            topic_body.append(
+                '<a class="ch dsa-sidebar-problem%s" href="%stopics/%s/%s.html"><span class="num">%02d -</span><span>%s</span></a>' %
+                (active, pre, slug, problem_slug, number, esc(problem_title))
+            )
+
+        # Keep section anchors within the active topic, below its problem links.
         if is_topic:
-            body.append('<div class="dsa-nav-subgroup"><span class="dsa-nav-label">PROBLEMS IN %s</span>' % esc(title.upper()))
-            for number, (problem_slug, problem_title) in enumerate(DSA_PROBLEMS.get(slug, []), 1):
-                active = ' current' if active_problem == problem_slug else ''
-                body.append('<a class="ch dsa-sidebar-problem%s" href="%stopics/%s/%s.html"><span class="num">%02d</span><span>%s</span></a>' %
-                            (active, pre, slug, problem_slug, number, esc(problem_title)))
-            body.append('</div>')
-            # Show section anchors for the page currently being read.
             current_path = (os.path.join(DSA, 'topics', slug, active_problem + '.html')
                             if active_problem else os.path.join(DSA, 'topics', slug + '.html'))
             if os.path.exists(current_path):
-                current_html = read(current_path)
-                heads = re.findall(r'<h2 id="([^"]+)"[^>]*>(.*?)</h2>', current_html, re.S)
+                heads = re.findall(r'<h2 id="([^"]+)"[^>]*>(.*?)</h2>', read(current_path), re.S)
                 if heads:
-                    body.append('<div class="dsa-nav-onpage"><span class="dsa-nav-label">ON THIS PAGE</span><div class="onpage">')
+                    topic_body.append('<div class="dsa-nav-onpage"><span class="dsa-nav-label">ON THIS PAGE</span><div class="onpage">')
                     for hid, ht in heads:
                         label = html.unescape(re.sub(r'<[^>]+>', '', ht).strip())
-                        body.append('<a href="#%s">%s</a>' % (hid, esc(label)))
-                    body.append('</div></div>')
-    if body:
-        o.append('<details class="dsa-nav-group" open><summary><span>LEARNING PATH</span><small>%d topic%s</small></summary>\n%s\n</details>' %
-                 (len(DSA_TOPICS), '' if len(DSA_TOPICS) == 1 else 's', '\n'.join(body)))
+                        topic_body.append('<a href="#%s">%s</a>' % (hid, esc(label)))
+                    topic_body.append('</div></div>')
+
+        topic_groups.append(
+            '<details class="dsa-topic-group"%s><summary><span class="dsa-topic-number">%02d</span><span class="dsa-topic-title">%s</span><span class="dsa-topic-chevron"></span></summary>\n<div class="dsa-topic-children">\n%s\n</div>\n</details>' %
+            (' open' if is_topic else '', index, esc(title), '\n'.join(topic_body))
+        )
+
+    if topic_groups:
+        o.append(
+            '<details class="dsa-nav-group" open><summary><span>LEARNING PATH</span><small>%d topic%s</small></summary>\n%s\n</details>' %
+            (len(DSA_TOPICS), '' if len(DSA_TOPICS) == 1 else 's', '\n'.join(topic_groups))
+        )
     return '\n'.join(o)
 
 
