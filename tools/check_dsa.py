@@ -39,7 +39,9 @@ def check(path):
     for anchor in re.findall(r'href="#([^"]+)"', raw):
         if anchor not in p.ids: p.errors.append('missing anchor: #' + anchor)
     if p.stack: p.errors.append('unclosed tags: ' + repr(p.stack[-5:]))
-    is_problem = os.path.dirname(full).endswith(os.path.join('topics', 'strings'))
+    topics_root = os.path.join(ROOT, 'site', 'dsa', 'topics')
+    relative_to_topics = os.path.relpath(full, topics_root)
+    is_problem = os.path.dirname(relative_to_topics) != '.'
     is_foundations = full.endswith(os.path.join('topics', 'foundations.html'))
     if p.problems < 1 and not is_foundations: p.errors.append('no DSA problem article found')
     if is_problem and p.h2 < 5: p.errors.append('problem page should contain its problem title and detailed sections')
@@ -49,6 +51,10 @@ def check(path):
         if required not in raw: p.errors.append('missing stylesheet: ' + required)
     if is_problem and 'dsa-breadcrumb' not in raw: p.errors.append('problem page is missing breadcrumbs')
     if not is_problem and not is_foundations and 'dsa-problem-summary' not in raw: p.errors.append('topic index must use concise problem summaries')
+    if is_problem and 'id="definition"' not in raw: p.errors.append('problem page is missing the problem definition section')
+    if is_problem and 'id="dry-run"' not in raw: p.errors.append('problem page is missing the walkthrough section')
+    if is_problem and 'id="correctness"' not in raw: p.errors.append('problem page is missing correctness reasoning')
+    if is_problem and 'id="analysis"' not in raw: p.errors.append('problem page is missing complexity analysis')
     print('%s: %d problem article(s), %d h2 headings -> %s' % (path, p.problems, p.h2, 'OK' if not p.errors else 'PROBLEMS'))
     for e in p.errors: print(' - ' + e)
     return not p.errors
@@ -66,9 +72,13 @@ def verify_source_coverage():
     for path in topic_pages:
         raw = open(path, encoding='utf-8').read()
         actual += len(re.findall(r'<article class="dsa-problem-card dsa-problem-summary"', raw))
-    ok = len(topic_pages) == 18 and actual == expected
-    print('DSA source coverage: %d Java files, %d indexed entries, %d topic pages -> %s' %
-          (expected, actual, len(topic_pages), 'OK' if ok else 'INCOMPLETE'))
+    detail_pages = 0
+    for current, _, names in os.walk(topic_root):
+        if os.path.relpath(current, topic_root) == '.': continue
+        detail_pages += sum(1 for name in names if name.endswith('.html'))
+    ok = len(topic_pages) == 18 and actual == expected and detail_pages == expected
+    print('DSA source coverage: %d Java files, %d indexed entries, %d standalone problem pages, %d topic pages -> %s' %
+          (expected, actual, detail_pages, len(topic_pages), 'OK' if ok else 'INCOMPLETE'))
     return ok
 
 
