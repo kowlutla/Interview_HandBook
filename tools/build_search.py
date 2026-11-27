@@ -21,7 +21,7 @@ for d, _, fs in os.walk(ROOT):
         s = open(os.path.join(d, f), encoding='utf-8').read()
         m = re.search(r'<h1[^>]*>(.*?)</h1>', s, re.S)
         title = clean(m.group(1)) if m else f
-        part = 'Handbook' if rel.startswith('handbook/') else 'Interview Book' if rel.startswith('interview/') else 'Quick Notes'
+        part = 'Handbook' if rel.startswith('handbook/') else 'DSA' if rel.startswith('dsa/') else 'Interview Book' if rel.startswith('interview/') else 'Quick Notes'
         body = s[s.find('<main'):] if '<main' in s else s
         pieces = re.split(r'(?=<h2\b)', body)
         intro = clean(pieces[0])[:400]
