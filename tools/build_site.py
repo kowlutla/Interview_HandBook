@@ -484,34 +484,40 @@ DSA_PROBLEMS = {
 
 
 def dsa_nav(cur, pre, active_problem=None):
-    """Independent DSA navigation; pre is relative to the DSA root."""
+    """Build DSA-specific navigation with topic, problem and page-section levels."""
     site = pre + '../'
     o = [
-        ('<a class="brand" href="%sindex.html">Data Structures and Algorithms</a>' % pre) if cur else '<div class="brand">Data Structures and Algorithms</div>',
-        '<div class="tagline">Java coding problems, patterns and solutions</div>',
-        '<div class="qlinks"><a href="%sindex.html">🏠 Home</a><a href="%ssearch.html">🔍 Search the whole site</a></div>' % (site, site),
+        ('<a class="dsa-nav-brand" href="%sindex.html"><span class="dsa-nav-mark">DSA</span><span><b>Data Structures &amp; Algorithms</b><small>Java problem-solving handbook</small></span></a>' % pre),
+        '<div class="dsa-nav-links"><a href="%sindex.html">⌂ <span>DSA Home</span></a><a href="%sindex.html">↗ <span>Main Handbook</span></a><a href="%ssearch.html">⌕ <span>Global Search</span></a></div>' % (pre, site, site),
     ]
     body = []
-    for slug, title in DSA_TOPICS:
-        cls = 'ch current' if slug == cur else 'ch'
+    for index, (slug, title) in enumerate(DSA_TOPICS, 1):
+        is_topic = slug == cur
+        topic_cls = 'ch dsa-topic-link current' if is_topic and active_problem is None else 'ch dsa-topic-link'
         body.append('<a class="%s" href="%stopics/%s.html"><span class="num">%02d</span><span>%s</span></a>' %
-                    (cls, pre, slug, DSA_TOPICS.index((slug, title)) + 1, esc(title)))
-        if slug == cur:
-            body.append('<div class="dsa-sidebar-problems">')
+                    (topic_cls, pre, slug, index, esc(title)))
+        if is_topic:
+            body.append('<div class="dsa-nav-subgroup"><span class="dsa-nav-label">PROBLEMS IN %s</span>' % esc(title.upper()))
             for number, (problem_slug, problem_title) in enumerate(DSA_PROBLEMS.get(slug, []), 1):
                 active = ' current' if active_problem == problem_slug else ''
-                body.append('<a class="dsa-sidebar-problem%s" href="%stopics/%s/%s.html"><span>%02d</span>%s</a>' %
+                body.append('<a class="ch dsa-sidebar-problem%s" href="%stopics/%s/%s.html"><span class="num">%02d</span><span>%s</span></a>' %
                             (active, pre, slug, problem_slug, number, esc(problem_title)))
             body.append('</div>')
-            if active_problem is None:
-                heads = re.findall(r'<h2 id="([^"]+)"[^>]*>(.*?)</h2>', read(os.path.join(DSA, 'topics', slug + '.html')), re.S)
+            # Show section anchors for the page currently being read.
+            current_path = (os.path.join(DSA, 'topics', slug, active_problem + '.html')
+                            if active_problem else os.path.join(DSA, 'topics', slug + '.html'))
+            if os.path.exists(current_path):
+                current_html = read(current_path)
+                heads = re.findall(r'<h2 id="([^"]+)"[^>]*>(.*?)</h2>', current_html, re.S)
                 if heads:
-                    body.append('<div class="onpage">')
+                    body.append('<div class="dsa-nav-onpage"><span class="dsa-nav-label">ON THIS PAGE</span><div class="onpage">')
                     for hid, ht in heads:
-                        body.append('<a href="#%s">%s</a>' % (hid, esc(html.unescape(re.sub(r'<[^>]+>', '', ht).strip()))))
-                    body.append('</div>')
+                        label = html.unescape(re.sub(r'<[^>]+>', '', ht).strip())
+                        body.append('<a href="#%s">%s</a>' % (hid, esc(label)))
+                    body.append('</div></div>')
     if body:
-        o.append('<details open><summary>Topics</summary>\n%s\n</details>' % '\n'.join(body))
+        o.append('<details class="dsa-nav-group" open><summary><span>LEARNING PATH</span><small>%d topic%s</small></summary>\n%s\n</details>' %
+                 (len(DSA_TOPICS), '' if len(DSA_TOPICS) == 1 else 's', '\n'.join(body)))
     return '\n'.join(o)
 
 
