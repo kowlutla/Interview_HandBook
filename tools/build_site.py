@@ -776,7 +776,7 @@ DSA_PROBLEM_NOTES = {
         'proof': '<p>In a DAG, DFS finishes every reachable neighbour before the current vertex. Therefore the current vertex is pushed later and popped earlier, placing it before each outgoing neighbour. Visiting all vertices covers disconnected components too.</p>',
         'complexity': '<p>O(V+E) time and O(V) auxiliary space for visited state, stack and recursion. This implementation assumes a DAG; it does not detect cycles.</p>',
         'edge': '<p>Test isolated vertices, disconnected DAGs, a chain, multiple valid orders and a directed cycle that violates the precondition.</p>'
-    }
+    },
     "a1-largest-number-in-array": {
         "intuition": "<p>The maximum is the largest value seen so far. One scan compares each element with the current candidate exactly once.</p>",
         "steps": "<ol><li>Initialize the candidate from the first element.</li><li>Scan the remaining values.</li><li>Replace the candidate whenever a larger value appears.</li><li>Return the candidate.</li></ol>",
